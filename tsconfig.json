@@ -10,6 +10,7 @@
     "isolatedModules": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "types": ["@webgpu/types"],
     "outDir": "dist",
     "rootDir": "src",
     "declaration": true

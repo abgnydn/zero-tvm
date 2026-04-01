@@ -5,12 +5,30 @@
 
 import { LLMEngine, MODELS } from './engine.js'
 import { ChatUI } from './ui.js'
+import { patchDevice, startProfile, stopProfile, summarizeProfile } from './profiler.js'
 
 async function main(): Promise<void> {
   const ui = new ChatUI()
   const engine = new LLMEngine()
 
   ui.appendLog('Starting...')
+
+  // Monkey-patch GPU to intercept WebLLM's device
+  if (navigator.gpu) {
+    const origRequestAdapter = navigator.gpu.requestAdapter.bind(navigator.gpu)
+    navigator.gpu.requestAdapter = async function(...args: Parameters<GPU['requestAdapter']>) {
+      const adapter = await origRequestAdapter(...args)
+      if (!adapter) return adapter
+      const origRequestDevice = adapter.requestDevice.bind(adapter)
+      adapter.requestDevice = async function(...dArgs: Parameters<GPUAdapter['requestDevice']>) {
+        const device = await origRequestDevice(...dArgs)
+        patchDevice(device)
+        ui.appendLog('GPU profiler attached to WebLLM device')
+        return device
+      }
+      return adapter
+    }
+  }
 
   // Load model
   try {
@@ -46,6 +64,7 @@ async function main(): Promise<void> {
     let count = 0
 
     try {
+      startProfile()
       const stats = await engine.chat(text, (token) => {
         ui.appendToken(token)
         count++
@@ -53,10 +72,14 @@ async function main(): Promise<void> {
         ui.setStats(`${count} tok | ${(count / elapsed).toFixed(1)} tok/s | ${elapsed.toFixed(1)}s`)
       })
 
-      // Log detailed stats
+      // Profile report
+      const profile = stopProfile()
+      ui.appendLog(summarizeProfile(profile))
+
       const runtimeStats = await engine.getStats()
       ui.appendLog(runtimeStats)
       ui.appendLog(`Generation: ${stats.decodeTokens} tokens, ${stats.tokPerSec.toFixed(1)} tok/s`)
+      ui.appendLog(`Dispatches per token: ${(profile.totalDispatches / stats.decodeTokens).toFixed(0)}`)
 
     } catch (e) {
       ui.setError(e instanceof Error ? e.message : String(e))
