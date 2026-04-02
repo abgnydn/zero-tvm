@@ -7,6 +7,8 @@
 import { LLMEngine, MODELS } from './engine.js'
 import { ChatUI } from './ui.js'
 import * as loop from './own-loop.js'
+import { patchForCapture, getCaptureResult } from './capture.js'
+import { buildStandaloneEngine } from './standalone.js'
 
 async function main(): Promise<void> {
   const ui = new ChatUI()
@@ -23,7 +25,8 @@ async function main(): Promise<void> {
       const origRD = adapter.requestDevice.bind(adapter)
       adapter.requestDevice = async function(...dArgs: Parameters<GPUAdapter['requestDevice']>) {
         const device = await origRD(...dArgs)
-        loop.patch(device)
+        patchForCapture(device)  // capture shaders + pipelines + weights
+        loop.patch(device)       // capture dispatch tape (still used for now)
         return device
       }
       return adapter
@@ -36,6 +39,20 @@ async function main(): Promise<void> {
   })
 
   const decode = engine.getDecoder()
+
+  // Log capture results
+  const capture = getCaptureResult()
+  if (capture) {
+    ui.appendLog(`Captured: ${capture.shaders.length} shaders, ${capture.pipelines.length} pipelines, ${capture.weights.length} weight writes`)
+    try {
+      const standalone = buildStandaloneEngine(capture)
+      ui.appendLog('Standalone engine: pipelines found')
+      void standalone  // will use later
+    } catch (e) {
+      ui.appendLog(`Standalone: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
   ui.setBadge('Ready')
   ui.setEnabled(true)
   ui.setInitialMessage('Fast Chat — 50 tok/s decode\nTVM prefill → own decode loop.\nEverything local on your GPU.')

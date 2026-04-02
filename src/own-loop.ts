@@ -141,15 +141,19 @@ export async function generate(maxTokens: number): Promise<number[]> {
       for (const idx of attnIndices) write(tape.writes[idx].buffer, tape.writes[idx].offset + 16, u32(nnz))
     }
 
-    // Dispatch all
-    for (let d = 0; d < tape.dispatches.length; d++) {
-      const disp = tape.dispatches[d]
+    // Dispatch all (batched for speed)
+    const BATCH = 32
+    for (let d = 0; d < tape.dispatches.length; d += BATCH) {
+      const end = Math.min(d + BATCH, tape.dispatches.length)
       const enc = encoder()
-      const pass = enc.beginComputePass()
-      pass.setPipeline(disp.pipeline)
-      for (const bg of disp.bindGroups) pass.setBindGroup(bg.index, bg.group)
-      pass.dispatchWorkgroups(...disp.workgroups)
-      pass.end()
+      for (let j = d; j < end; j++) {
+        const disp = tape.dispatches[j]
+        const pass = enc.beginComputePass()
+        pass.setPipeline(disp.pipeline)
+        for (const bg of disp.bindGroups) pass.setBindGroup(bg.index, bg.group)
+        pass.dispatchWorkgroups(...disp.workgroups)
+        pass.end()
+      }
       submit([enc.finish()])
     }
 
