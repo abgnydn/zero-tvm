@@ -10,7 +10,7 @@
 
 import { LLMEngine, MODELS } from './engine.js'
 import { patchForCapture, getCaptureResult } from './capture.js'
-import { buildStandaloneEngine } from './standalone.js'
+import { buildPhi3Engine } from './phi3.js'
 
 const log = (msg: string) => {
   const el = document.getElementById('log')!
@@ -60,7 +60,7 @@ async function run(): Promise<void> {
   }
   log(`Captured: ${cap.dispatches.length} dispatches, ${cap.writes.length} writes, copy=${cap.copy ? 'yes' : 'no'}`)
 
-  const standalone = buildStandaloneEngine(cap)
+  const standalone = buildPhi3Engine(cap)
 
   // Generate with standalone engine
   log('')

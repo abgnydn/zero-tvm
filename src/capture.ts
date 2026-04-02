@@ -243,10 +243,17 @@ export function patchForCapture(device: GPUDevice): void {
     return enc
   }
 
-  // Token boundary detection (same as own-loop)
+  // Token boundary detection + prevent buffer destruction
   const origCreateBuf = device.createBuffer.bind(device)
   device.createBuffer = function(desc: GPUBufferDescriptor): GPUBuffer {
     const buf = origCreateBuf(desc)
+
+    // Prevent destruction of any buffer after capture starts
+    const realDestroy = buf.destroy.bind(buf)
+    buf.destroy = function() {
+      if (capturePhase === 'capturing' || capturePhase === 'done') return
+      return realDestroy()
+    }
     if (desc.usage & GPUBufferUsage.MAP_READ) {
       const realMap = buf.mapAsync.bind(buf)
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
