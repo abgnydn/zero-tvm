@@ -70,8 +70,9 @@ interface DecodeEngine {
   stableBuffers: Map<GPUBuffer, GPUBuffer>
   bindGroups: Array<{ index: number; group: GPUBindGroup }[]>
   dispatchWriteMap: Array<Map<GPUBuffer, GPUBuffer>>
-  largeBufferSnapshots: LargeBufferSnapshot[]  // full-buffer snapshots for partial-write buffers
+  largeBufferSnapshots: LargeBufferSnapshot[]
   position: number
+  initialPosition: number  // position at capture time (for sequence counter offset)
   tokenId: number
   attentionUniformIndices: number[]
   initialNnzPages: number
@@ -259,7 +260,7 @@ function buildEngine(device: GPUDevice, snapshot: TokenSnapshot): DecodeEngine {
     : 0
   console.log(`[own-loop] Captured token_id=${capturedTokenId}`)
 
-  return { device, snapshot, stableBuffers, bindGroups, dispatchWriteMap, largeBufferSnapshots, position, tokenId: capturedTokenId, attentionUniformIndices, initialNnzPages, pageSize: PAGE_SIZE }
+  return { device, snapshot, stableBuffers, bindGroups, dispatchWriteMap, largeBufferSnapshots, position, initialPosition: position, tokenId: capturedTokenId, attentionUniformIndices, initialNnzPages, pageSize: PAGE_SIZE }
 }
 
 // ============================================================
@@ -275,7 +276,36 @@ export async function generate(maxTokens: number): Promise<number[]> {
     throw new Error('Engine not ready')
   }
 
-  console.log(`[own-loop] Starting generate with token_id=${engine.tokenId}, pos=${engine.position}`)
+  // Pure replay to get the CORRECT output token, then use it as starting token_id
+  console.log(`[own-loop] Pure replay to get first output token...`)
+  {
+    for (const w of engine.snapshot.writes) {
+      origWriteBuffer(w.buffer, w.offset, w.data.slice().buffer)
+    }
+    for (let d = 0; d < engine.snapshot.dispatches.length; d++) {
+      const dispatch = engine.snapshot.dispatches[d]
+      const enc = origCreateEncoder()
+      const pass = enc.beginComputePass()
+      pass.setPipeline(dispatch.pipeline)
+      for (const bg of engine.bindGroups[d]) pass.setBindGroup(bg.index, bg.group)
+      pass.dispatchWorkgroups(...dispatch.workgroups)
+      pass.end()
+      origSubmit([enc.finish()])
+    }
+    const diagBuf = engine.device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    if (engine.snapshot.copy) {
+      const enc = origCreateEncoder()
+      enc.copyBufferToBuffer(engine.snapshot.copy.src, engine.snapshot.copy.srcOffset, diagBuf, 0, engine.snapshot.copy.size)
+      origSubmit([enc.finish()])
+    }
+    await diagBuf.mapAsync(GPUMapMode.READ)
+    const firstOutput = new DataView(diagBuf.getMappedRange()).getInt32(0, true)
+    diagBuf.unmap()
+    diagBuf.destroy()
+    engine.tokenId = firstOutput
+    engine.position++  // pure replay consumed one position
+    console.log(`[own-loop] First output token: ${firstOutput}, now at pos=${engine.position}`)
+  }
 
   const tokens: number[] = []
   // Phi-3-mini stop tokens
@@ -284,37 +314,46 @@ export async function generate(maxTokens: number): Promise<number[]> {
   for (let i = 0; i < maxTokens; i++) {
     engine.position++
 
-    // Restore large buffers from GPU-side snapshots (page tables, position maps)
-    if (engine.largeBufferSnapshots.length > 0) {
-      const enc = origCreateEncoder()
-      for (const s of engine.largeBufferSnapshots) {
-        enc.copyBufferToBuffer(s.snapshot, 0, s.original, 0, s.size)
-      }
-      origSubmit([enc.finish()])
+    // ONLY write values that change per token (from recorder 3-token diff):
+    //   write[0]:  token_id (changes unpredictably)
+    //   write[4]:  position (increments by 1)
+    //   write[8]:  sequence counter (increments by 1, starts at 1 at capture)
+    //   write[11]: position (same as write[4])
+    //   write[12]: position (same as write[4])
+    //   write[349]: sampling random seed (we don't control this, leave as-is)
+
+    // Token ID
+    origWriteBuffer(engine.snapshot.writes[0].buffer, engine.snapshot.writes[0].offset, writeU32(engine.tokenId))
+
+    // Position counters
+    for (const idx of [4, 11, 12]) {
+      origWriteBuffer(engine.snapshot.writes[idx].buffer, engine.snapshot.writes[idx].offset, writeU32(engine.position))
     }
 
-    // Write ALL uniforms from snapshot, patching the ones that change per token.
-    // We must write all because TVM may have overwritten the original buffers
-    // while starting the next token before we aborted.
-    for (let w = 0; w < engine.snapshot.writes.length; w++) {
-      const recorded = engine.snapshot.writes[w]
-      let data: ArrayBuffer = recorded.data.slice().buffer
+    // Sequence counter (write[8]) — increments each token from capture
+    // At capture it was value X. Each subsequent token: X+1, X+2, ...
+    const seqBase = engine.snapshot.writes[8].data[0] | (engine.snapshot.writes[8].data[1] << 8) | (engine.snapshot.writes[8].data[2] << 16) | (engine.snapshot.writes[8].data[3] << 24)
+    const seqVal = seqBase + (engine.position - engine.initialPosition)
+    origWriteBuffer(engine.snapshot.writes[8].buffer, engine.snapshot.writes[8].offset, writeU32(seqVal))
 
-      if (w === 0) data = writeU32(engine.tokenId)
-      else if (w === 4 || w === 11 || w === 12) data = writeU32(engine.position)
+    // Sampling random seed (write[349]) — must change each token for proper sampling
+    if (engine.snapshot.writes.length > 349) {
+      const seedBuf = new ArrayBuffer(4)
+      new DataView(seedBuf).setFloat32(0, Math.random(), true)
+      origWriteBuffer(engine.snapshot.writes[349].buffer, engine.snapshot.writes[349].offset, seedBuf)
+    }
 
-      origWriteBuffer(recorded.buffer, recorded.offset, data)
-
-      if (recorded.data.length === 56 && engine.attentionUniformIndices.includes(w)) {
-        const currentNnzPages = Math.floor(engine.position / engine.pageSize) + 1
-        if (currentNnzPages !== engine.initialNnzPages) {
-          origWriteBuffer(recorded.buffer, recorded.offset + 16, writeU32(currentNnzPages))
-        }
+    // nnz_pages at page boundaries
+    const currentNnzPages = Math.floor(engine.position / engine.pageSize) + 1
+    if (currentNnzPages !== engine.initialNnzPages) {
+      for (const idx of engine.attentionUniformIndices) {
+        origWriteBuffer(engine.snapshot.writes[idx].buffer, engine.snapshot.writes[idx].offset + 16, writeU32(currentNnzPages))
       }
     }
 
-    // Submit all dispatches in batches — safe because each dispatch reads from its own copy
-    const BATCH = 32
+    // Submit dispatches. BATCH=1 matches TVM's 1:1 pattern (for correctness testing).
+    // BATCH=32 is faster but may produce different f16 results.
+    const BATCH = 1  // TODO: set to 32 after correctness is verified
     for (let d = 0; d < engine.snapshot.dispatches.length; d += BATCH) {
       const end = Math.min(d + BATCH, engine.snapshot.dispatches.length)
       const enc = origCreateEncoder()
@@ -503,21 +542,27 @@ export function patchDeviceOwnLoop(device: GPUDevice): void {
         console.log('[own-loop] Capturing first decode token...')
       }
     } else if (phase === 'capturing') {
-      // Done capturing
+      // Keep re-capturing each token. After WARMUP tokens, freeze and build engine.
+      const WARMUP_TOKENS = 3
       capturedSnapshot = {
         dispatches: currentDispatches,
         copy: currentCopy,
         writes: currentWrites,
       }
-      console.log(`[own-loop] Captured: ${currentDispatches.length} dispatches, ${currentWrites.length} writes, copy=${currentCopy ? 'yes' : 'no'}`)
+      // Reset for next token
+      currentDispatches = []
+      currentWrites = []
+      currentCopy = null
+      tokenCount++
 
-      // Build the engine — tokenId will be set from getMappedRange capture
-      engine = buildEngine(capturedDevice!, capturedSnapshot)
-      // lastCapturedOutputToken was set by getMappedRange during the captured token's readback
-      // It gets the token that was the OUTPUT of the captured dispatch sequence
-      phase = 'ready'
-
-      if (onReadyCallback) onReadyCallback()
+      if (tokenCount >= WARMUP_TOKENS) {
+        console.log(`[own-loop] Captured after ${tokenCount} warmup tokens: ${capturedSnapshot.dispatches.length} dispatches, ${capturedSnapshot.writes.length} writes`)
+        engine = buildEngine(capturedDevice!, capturedSnapshot)
+        phase = 'ready'
+        if (onReadyCallback) onReadyCallback()
+      } else {
+        console.log(`[own-loop] Warmup token ${tokenCount}/${WARMUP_TOKENS}`)
+      }
     }
   }
 }

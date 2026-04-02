@@ -44,14 +44,31 @@ async function run(): Promise<void> {
   log('Loading model...')
   await engine.load(MODELS.PHI3_MINI_Q4, (msg) => log(msg))
 
-  // Phase 2: Capture — chat, abort after first decode token
+  // Grab tokenizer before TVM gets corrupted
+  const decoder = engine.getDecoder()
+  if (decoder) log('Tokenizer grabbed')
+
+  // Phase 2: Let TVM generate, capture tokens, abort after engine ready
   log('')
-  log('=== Capturing first decode token ===')
+  log('=== TVM warmup + capture ===')
   const prompt = 'Write a detailed paragraph about the history of the internet from its origins to the modern day.'
+
+  const tvmTokenIds: number[] = []
+  // Capture TVM's token IDs via getMappedRange
+  const origGetMapped = GPUBuffer.prototype.getMappedRange
+  GPUBuffer.prototype.getMappedRange = function(offset?: number, size?: number) {
+    const range = origGetMapped.call(this, offset, size)
+    if (range.byteLength >= 4 && range.byteLength <= 8) {
+      const val = new DataView(range).getInt32(0, true)
+      if (val >= 0 && val < 100000) tvmTokenIds.push(val)
+    }
+    return range
+  }
 
   const readyPromise = new Promise<void>(resolve => {
     onReady(() => {
-      log('[own-loop] Engine ready — aborting TVM')
+      log(`[own-loop] Engine ready after ${tvmTokenIds.length} TVM tokens`)
+      log(`TVM tokens: [${tvmTokenIds.join(', ')}]`)
       resolve()
     })
   })
@@ -78,11 +95,12 @@ async function run(): Promise<void> {
   log(`${tokens.length} tokens in ${(elapsed / 1000).toFixed(1)}s = ${tokPerSec.toFixed(1)} tok/s`)
   log(`Token IDs: [${tokens.slice(0, 30).join(', ')}${tokens.length > 30 ? '...' : ''}]`)
 
-  // Decode tokens to text using a simple lookup
-  // (We can't use TVM's tokenizer since TVM is corrupted)
+  if (decoder && tokens.length > 0) {
+    const text = decoder(new Int32Array(tokens))
+    log(`\nGenerated text:\n${text}`)
+  }
   log('')
-  log('Done. TVM baseline not available (state corrupted after own-loop).')
-  log('To compare: run baseline separately at /?clean=1 with same prompt.')
+  log('Done.')
 }
 
 run().catch(e => log(`FATAL: ${e}`))

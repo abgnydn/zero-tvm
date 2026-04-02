@@ -81,7 +81,7 @@ export class LLMEngine {
         content: m.content,
       })),
       stream: true,
-      temperature: 0,
+      temperature: 0.7,
       max_tokens: 500,
     })
 
@@ -110,6 +110,29 @@ export class LLMEngine {
   /** Get runtime stats from the last completion's usage field */
   getStats(): string {
     return '' // stats now come from our profiler instead of deprecated runtimeStatsText
+  }
+
+  /** Get the internal pipeline's tokenizer decode function */
+  getDecoder(): ((ids: Int32Array) => string) | null {
+    if (!this.engine) return null
+    // Access private pipeline map → first pipeline → tokenizer
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const eng = this.engine as any
+    try {
+      // MLCEngine stores pipelines in a Map
+      const pipelines = eng.loadedModelIdToPipeline || eng.pipeline
+      if (pipelines instanceof Map) {
+        const pipeline = pipelines.values().next().value
+        if (pipeline?.tokenizer?.decode) {
+          return (ids: Int32Array) => pipeline.tokenizer.decode(ids)
+        }
+      }
+      // Direct pipeline access
+      if (eng.pipeline?.tokenizer?.decode) {
+        return (ids: Int32Array) => eng.pipeline.tokenizer.decode(ids)
+      }
+    } catch { /* tokenizer not accessible */ }
+    return null
   }
 
   /** Reset conversation (keep model loaded) */
