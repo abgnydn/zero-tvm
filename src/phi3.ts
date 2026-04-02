@@ -24,6 +24,8 @@
  */
 
 import { CaptureResult } from './capture.js'
+// @ts-ignore — Vite raw import
+import argmaxWGSL from './shaders/argmax.wgsl?raw'
 
 // ============================================================
 // Model Config
@@ -95,20 +97,14 @@ export function buildPhi3Engine(capture: CaptureResult) {
 
   console.log('[phi3] Pipelines found')
 
-  // Step 2: Identify which of the 342 captured dispatches are "tail" (LM head + sampling)
-  // Layer dispatches = first 2 (preamble) + 320 (32 layers × 10) = 322
-  // Tail = dispatches 322-341 (20 dispatches)
+  // Step 2: Tail dispatches (LM head + sampling) — use TVM's pipelines
   if (capture.dispatches.length >= 342) {
     for (let i = 322; i < capture.dispatches.length; i++) {
       const d = capture.dispatches[i]
-      // For tail dispatches, use TVM's original bind groups (sampling is complex)
-      // We'll build our own bind groups for layers 0-31
-      const bgEntries: GPUBindGroupEntry[] = d.entries.map(e => ({
-        binding: e.binding,
-        resource: { buffer: e.buffer, offset: e.offset, size: e.size },
-      }))
-      const layout = d.pipeline.getBindGroupLayout(0)
-      const bg = dev.createBindGroup({ layout, entries: bgEntries })
+      const bg = dev.createBindGroup({
+        layout: d.pipeline.getBindGroupLayout(0),
+        entries: d.entries.map(e => ({ binding: e.binding, resource: { buffer: e.buffer, offset: e.offset, size: e.size } })),
+      })
       pipes.tail.push({ pipeline: d.pipeline, bindGroup: bg, workgroups: d.workgroups })
     }
     console.log(`[phi3] Tail: ${pipes.tail.length} dispatches (LM head + sampling)`)
@@ -227,11 +223,11 @@ export function buildPhi3Engine(capture: CaptureResult) {
       dispatch(pipes.addNorm, bg.addNorm2, capture.dispatches[base + 9].workgroups)
     }
 
-    // Tail (LM head + sampling)
-    for (const t of pipes.tail) {
-      dispatch(t.pipeline, t.bindGroup, t.workgroups)
-    }
+    // Tail: use TVM's sampling pipeline (includes temperature + top-p)
+    // TODO: replace with our own fused sampling shader
+    for (const t of pipes.tail) dispatch(t.pipeline, t.bindGroup, t.workgroups)
 
+    flushDispatches()
     let tokenId = await readToken()
     console.log(`[phi3] First token: ${tokenId}`)
 
@@ -278,6 +274,7 @@ export function buildPhi3Engine(capture: CaptureResult) {
       // Tail
       for (const t of pipes.tail) dispatch(t.pipeline, t.bindGroup, t.workgroups)
 
+      flushDispatches()
       tokenId = await readToken()
       if (tokenId < 0 || tokenId >= CFG.VOCAB) break
       tokens.push(tokenId)
@@ -288,20 +285,38 @@ export function buildPhi3Engine(capture: CaptureResult) {
     return tokens
   }
 
+  // Batched dispatch — accumulate passes, flush periodically
+  let pendingEncoder: GPUCommandEncoder | null = null
+  let pendingCount = 0
+  const BATCH = 1  // correctness first, speed from fusion
+
   function dispatch(pipeline: GPUComputePipeline, bindGroup: GPUBindGroup, workgroups: [number, number, number]): void {
-    const enc = dev.createCommandEncoder()
-    const pass = enc.beginComputePass()
+    if (!pendingEncoder) pendingEncoder = dev.createCommandEncoder()
+    const pass = pendingEncoder.beginComputePass()
     pass.setPipeline(pipeline)
     pass.setBindGroup(0, bindGroup)
     pass.dispatchWorkgroups(...workgroups)
     pass.end()
-    dev.queue.submit([enc.finish()])
+    pendingCount++
+    if (pendingCount >= BATCH) flushDispatches()
+  }
+
+  function flushDispatches(): void {
+    if (pendingEncoder && pendingCount > 0) {
+      dev.queue.submit([pendingEncoder.finish()])
+      pendingEncoder = null
+      pendingCount = 0
+    }
   }
 
   async function readToken(): Promise<number> {
+    const src = copySrc!
+    const srcOff = copySrcOff
+    const sz = copySize
+
     const buf = dev.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
     const enc = dev.createCommandEncoder()
-    enc.copyBufferToBuffer(copySrc!, copySrcOff, buf, 0, copySize)
+    enc.copyBufferToBuffer(src, srcOff, buf, 0, sz)
     dev.queue.submit([enc.finish()])
     await buf.mapAsync(GPUMapMode.READ)
     const token = new DataView(buf.getMappedRange()).getInt32(0, true)
