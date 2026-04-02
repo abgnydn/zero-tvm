@@ -40,17 +40,10 @@ async function main(): Promise<void> {
 
   const decode = engine.getDecoder()
 
-  // Log capture results
+  // Log capture results (shaders + pipelines captured at load time)
   const capture = getCaptureResult()
   if (capture) {
     ui.appendLog(`Captured: ${capture.shaders.length} shaders, ${capture.pipelines.length} pipelines, ${capture.weights.length} weight writes`)
-    try {
-      const standalone = buildStandaloneEngine(capture)
-      ui.appendLog('Standalone engine: pipelines found')
-      void standalone  // will use later
-    } catch (e) {
-      ui.appendLog(`Standalone: ${e instanceof Error ? e.message : String(e)}`)
-    }
   }
 
   ui.setBadge('Ready')
@@ -106,6 +99,16 @@ async function main(): Promise<void> {
       })
 
       await loop.generate(500)
+
+      // After first chat: build standalone engine from captured dispatches
+      const cap = getCaptureResult()
+      if (cap && cap.dispatches.length > 0) {
+        try {
+          buildStandaloneEngine(cap)
+        } catch (e) {
+          ui.appendLog(`Standalone: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
     } catch (e) {
       ui.setError(e instanceof Error ? e.message : String(e))
     }

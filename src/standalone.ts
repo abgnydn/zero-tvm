@@ -99,13 +99,49 @@ export function buildStandaloneEngine(capture: CaptureResult): StandaloneEngine 
   console.log(`  lm_head: ${lmHeadPipeline.entryPoint}`)
   console.log(`  Total pipelines: ${pipelines.length}`)
 
-  // TODO Phase 2: Allocate own buffers
-  // TODO Phase 3: Build bind groups using pipeline.getBindGroupLayout(0)
-  // TODO Phase 4: Implement decode loop
+  // Phase 2: Analyze buffer landscape from captured dispatches
+  if (capture.dispatches.length > 0) {
+    const allBuffers = new Map<GPUBuffer, { size: number; bindings: Set<string>; dispatchCount: number }>()
+
+    for (const d of capture.dispatches) {
+      const pName = capture.pipelines[d.pipelineIndex]?.entryPoint ?? '?'
+      for (const e of d.entries) {
+        let info = allBuffers.get(e.buffer)
+        if (!info) {
+          info = { size: e.buffer.size, bindings: new Set(), dispatchCount: 0 }
+          allBuffers.set(e.buffer, info)
+        }
+        info.bindings.add(`${pName}@${e.binding}`)
+        info.dispatchCount++
+      }
+    }
+
+    // Classify by size
+    const weights: GPUBuffer[] = []
+    const activations: GPUBuffer[] = []
+    const uniforms: GPUBuffer[] = []
+    const kvCache: GPUBuffer[] = []
+
+    for (const [buf, info] of allBuffers) {
+      if (info.size > 1_000_000) weights.push(buf)         // >1MB = weights
+      else if (info.size > 10_000) kvCache.push(buf)        // >10KB = KV cache pages
+      else if (info.size <= 64) uniforms.push(buf)           // <=64B = uniforms
+      else activations.push(buf)                              // 65B-10KB = activations
+    }
+
+    console.log(`[standalone] Buffer landscape:`)
+    console.log(`  Weights: ${weights.length} (${weights.reduce((s, b) => s + b.size, 0) / 1e6 | 0}MB)`)
+    console.log(`  KV cache: ${kvCache.length} (${kvCache.reduce((s, b) => s + b.size, 0) / 1e6 | 0}MB)`)
+    console.log(`  Activations: ${activations.length} (${activations.reduce((s, b) => s + b.size, 0) / 1e3 | 0}KB)`)
+    console.log(`  Uniforms: ${uniforms.length} (${uniforms.reduce((s, b) => s + b.size, 0)}B)`)
+    console.log(`  Total unique buffers: ${allBuffers.size}`)
+  } else {
+    console.log(`[standalone] No dispatches captured yet — send a chat message first`)
+  }
 
   return {
     async generate(_maxTokens: number, _onToken?: (id: number) => void): Promise<number[]> {
-      throw new Error('Not implemented yet — need Phase 2-4')
+      throw new Error('Not implemented yet — need dispatch capture (send a chat first)')
     }
   }
 }
