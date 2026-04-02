@@ -5,13 +5,48 @@
 
 import { LLMEngine, MODELS } from './engine.js'
 import { ChatUI } from './ui.js'
-import { patchDevice, startProfile, stopProfile, summarizeProfile } from './profiler.js'
+import { patchDevice, startProfile, stopProfile, summarizeProfile, getShaderSummary, captured } from './profiler.js'
+import { dumpShader, dumpLayerShaders, dumpAllShaders } from './shader-dump.js'
+import { setInterceptEnabled, patchDeviceIntercept, getInterceptStats } from './interceptor.js'
+import { setRecorderEnabled, patchDeviceRecorder } from './recorder.js'
+import { setBatcherEnabled, patchDeviceBatcher, getBatcherStats } from './batcher.js'
+import { setReplayEnabled, patchDeviceReplay, patchStagingReadback, getReplayStats } from './replay.js'
 
 async function main(): Promise<void> {
   const ui = new ChatUI()
   const engine = new LLMEngine()
 
   ui.appendLog('Starting...')
+
+  const params = new URLSearchParams(window.location.search)
+
+  // ?fuse=1 — shader interception
+  const useFusion = params.has('fuse')
+  if (useFusion) {
+    setInterceptEnabled(true)
+    ui.appendLog('FUSION MODE: shader interception enabled')
+  }
+
+  // ?record=1 — dispatch tape recording (auto-diffs two decode tokens)
+  const useRecorder = params.has('record')
+  if (useRecorder) {
+    setRecorderEnabled(true)
+    ui.appendLog('RECORDER MODE: capturing dispatch tape for diff analysis')
+  }
+
+  // ?batch=1 — submit batching (accumulate command buffers, submit once per token)
+  const useBatcher = params.has('batch')
+  if (useBatcher) {
+    setBatcherEnabled(true)
+    ui.appendLog('BATCH MODE: accumulating submits, flushing at mapAsync')
+  }
+
+  // ?replay=1 — dispatch tape replay (record first token, bypass TVM for rest)
+  const useReplay = params.has('replay')
+  if (useReplay) {
+    setReplayEnabled(true)
+    ui.appendLog('REPLAY MODE: will record first decode token, then bypass TVM')
+  }
 
   // Monkey-patch GPU to intercept WebLLM's device
   if (navigator.gpu) {
@@ -22,8 +57,15 @@ async function main(): Promise<void> {
       const origRequestDevice = adapter.requestDevice.bind(adapter)
       adapter.requestDevice = async function(...dArgs: Parameters<GPUAdapter['requestDevice']>) {
         const device = await origRequestDevice(...dArgs)
-        patchDevice(device)
-        ui.appendLog('GPU profiler attached to WebLLM device')
+        // ?clean=1 — skip profiler for clean batcher measurement
+        if (!params.has('clean')) {
+          patchDevice(device)
+          if (useFusion) patchDeviceIntercept(device)
+          if (useRecorder) patchDeviceRecorder(device)
+        }
+        if (useBatcher) patchDeviceBatcher(device)
+        if (useReplay) { patchDeviceReplay(device); patchStagingReadback(device) }
+        ui.appendLog(params.has('clean') ? 'Clean mode (no profiler)' : 'GPU profiler attached')
         return device
       }
       return adapter
@@ -39,6 +81,15 @@ async function main(): Promise<void> {
 
     ui.setBadge('Ready')
     ui.setEnabled(true)
+    ui.appendLog(getShaderSummary())
+    ui.appendLog(`Total WGSL lines: ${captured.shaders.reduce((s, sh) => s + sh.lineCount, 0)}`)
+    // Expose shaders on window for inspection in devtools
+    ;(window as unknown as Record<string, unknown>).__capturedShaders = captured
+    ;(window as unknown as Record<string, unknown>).__dumpShader = dumpShader
+    ;(window as unknown as Record<string, unknown>).__dumpLayerShaders = dumpLayerShaders
+    ;(window as unknown as Record<string, unknown>).__dumpAllShaders = dumpAllShaders
+    if (useFusion) ui.appendLog(getInterceptStats())
+    ui.appendLog('Devtools: __dumpShader(idx), __dumpLayerShaders(), __dumpAllShaders()')
     ui.setInitialMessage('Phi-3-mini loaded. Ask me anything!\n\nEverything runs locally on your GPU. Zero server requests.')
 
   } catch (e) {
@@ -80,6 +131,8 @@ async function main(): Promise<void> {
       ui.appendLog(runtimeStats)
       ui.appendLog(`Generation: ${stats.decodeTokens} tokens, ${stats.tokPerSec.toFixed(1)} tok/s`)
       ui.appendLog(`Dispatches per token: ${(profile.totalDispatches / stats.decodeTokens).toFixed(0)}`)
+      if (useBatcher) ui.appendLog(getBatcherStats())
+      if (useReplay) ui.appendLog(getReplayStats())
 
     } catch (e) {
       ui.setError(e instanceof Error ? e.message : String(e))

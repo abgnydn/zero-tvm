@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Replay Correctness Test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #111; color: #eee; padding: 16px; }
+    h1 { font-size: 18px; margin-bottom: 12px; }
+    .controls { display: flex; gap: 12px; margin-bottom: 12px; }
+    button { padding: 8px 16px; background: #333; color: #eee; border: 1px solid #555; cursor: pointer; font-family: monospace; font-size: 14px; }
+    button:hover { background: #444; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .panels { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; height: calc(100vh - 100px); }
+    .panel { background: #1a1a1a; border: 1px solid #333; padding: 8px; overflow-y: auto; }
+    .panel h2 { font-size: 14px; color: #888; margin-bottom: 8px; border-bottom: 1px solid #333; padding-bottom: 4px; }
+    pre { font-size: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Dispatch Replay Correctness Test</h1>
+  <div class="controls">
+    <button id="btn-baseline" style="display:none">Run Baseline</button>
+    <button id="btn-replay" style="display:none">Run Replay</button>
+    <span style="color:#888">Auto-running: baseline → replay → compare</span>
+  </div>
+  <div class="panels">
+    <div class="panel">
+      <h2>Baseline (normal WebLLM)</h2>
+      <pre id="baseline-log"></pre>
+    </div>
+    <div class="panel">
+      <h2>Replay (frozen tape)</h2>
+      <pre id="replay-log"></pre>
+    </div>
+    <div class="panel">
+      <h2>Comparison</h2>
+      <pre id="compare-log"></pre>
+    </div>
+  </div>
+  <script type="module" src="/src/test-harness.ts"></script>
+</body>
+</html>

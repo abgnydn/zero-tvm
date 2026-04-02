@@ -81,7 +81,7 @@ export class LLMEngine {
         content: m.content,
       })),
       stream: true,
-      temperature: 0.7,
+      temperature: 0,
       max_tokens: 500,
     })
 
@@ -98,30 +98,25 @@ export class LLMEngine {
 
     const elapsed = performance.now() - t0
 
-    // Get detailed stats from WebLLM
-    let prefillMs = 0, prefillTokens = 0
-    try {
-      const statsText = await this.engine.runtimeStatsText()
-      // Parse: "prefill: X tok/s, decode: Y tok/s, ..."
-      const prefillMatch = statsText.match(/prefill:\s*([\d.]+)\s*tok/)
-      if (prefillMatch) prefillMs = parseFloat(prefillMatch[1])
-    } catch {
-      // Stats not available
-    }
-
     return {
-      prefillTokens,
-      prefillMs,
+      prefillTokens: 0,
+      prefillMs: 0,
       decodeTokens: tokenCount,
       decodeMs: elapsed,
       tokPerSec: tokenCount / (elapsed / 1000),
     }
   }
 
-  /** Get raw runtime stats string from WebLLM */
-  async getStats(): Promise<string> {
-    if (!this.engine) return 'Not loaded'
-    return this.engine.runtimeStatsText()
+  /** Get runtime stats from the last completion's usage field */
+  getStats(): string {
+    return '' // stats now come from our profiler instead of deprecated runtimeStatsText
+  }
+
+  /** Reset conversation (keep model loaded) */
+  async reset(): Promise<void> {
+    if (this.engine) {
+      await this.engine.resetChat()
+    }
   }
 
   /** Cleanup */

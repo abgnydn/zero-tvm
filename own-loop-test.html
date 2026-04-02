@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Own Loop Test</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: monospace; background: #111; color: #eee; padding: 16px; }
+    h1 { font-size: 18px; margin-bottom: 12px; }
+    pre { background: #1a1a1a; border: 1px solid #333; padding: 12px; overflow-y: auto; height: calc(100vh - 60px); font-size: 12px; white-space: pre-wrap; word-wrap: break-word; }
+  </style>
+</head>
+<body>
+  <h1>Own Decode Loop — No TVM in hot path</h1>
+  <pre id="log"></pre>
+  <script type="module" src="/src/own-loop-test.ts"></script>
+</body>
+</html>
