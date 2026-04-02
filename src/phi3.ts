@@ -26,6 +26,8 @@
 import { CaptureResult } from './capture.js'
 // @ts-ignore — Vite raw import
 import argmaxWGSL from './shaders/argmax.wgsl?raw'
+// @ts-ignore — Vite raw import
+import fusedFFNWGSL from './shaders/fused-ffn.wgsl?raw'
 
 // ============================================================
 // Model Config
@@ -95,7 +97,18 @@ export function buildPhi3Engine(capture: CaptureResult) {
     tail: [],  // built from captured dispatches
   }
 
-  console.log('[phi3] Pipelines found')
+  // Create fused FFN pipeline from our WGSL
+  const fusedFFNModule = dev.createShaderModule({ code: fusedFFNWGSL, label: 'fused_ffn' })
+  const fusedFFNPipeline = dev.createComputePipeline({
+    layout: 'auto',
+    compute: { module: fusedFFNModule, entryPoint: 'fused_ffn_kernel' },
+  })
+
+  // Fused FFN uniform: packGridDimX = 8191 (8192 - 1)
+  const fusedFFNUniform = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+  dev.queue.writeBuffer(fusedFFNUniform, 0, new Uint32Array([8191]))
+
+  console.log('[phi3] Pipelines found (including fused FFN)')
 
   // Step 2: Tail dispatches (LM head + sampling) — use TVM's pipelines
   if (capture.dispatches.length >= 342) {
@@ -117,6 +130,8 @@ export function buildPhi3Engine(capture: CaptureResult) {
 
   // For now, use TVM's captured bind group entries directly for each layer
   // This still uses TVM's buffers but with proper per-layer isolation
+  const USE_FUSED_FFN = false  // toggle fused FFN (disabled until correctness verified)
+
   const layerBindGroups: Array<{
     qkv: GPUBindGroup
     rope: GPUBindGroup
@@ -124,6 +139,7 @@ export function buildPhi3Engine(capture: CaptureResult) {
     attention: GPUBindGroup
     oProj: GPUBindGroup
     addNorm1: GPUBindGroup
+    fusedFFN: GPUBindGroup | null  // fused gate+up+silu (replaces ffnUp + silu)
     ffnUp: GPUBindGroup
     silu: GPUBindGroup
     ffnDown: GPUBindGroup
@@ -143,6 +159,40 @@ export function buildPhi3Engine(capture: CaptureResult) {
       return dev.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries })
     }
 
+    // Build fused FFN bind group:
+    // output = SiLU's output buffer (dispatch base+7, binding 0)
+    // input = FFN up's input buffer (dispatch base+6, binding 1)
+    // scales = FFN up's scales (dispatch base+6, binding 2)
+    // weights = FFN up's weights (dispatch base+6, binding 3)
+    // uniform = our fused FFN uniform
+    let fusedFFNBG: GPUBindGroup | null = null
+    if (USE_FUSED_FFN) {
+      const ffnUpDisp = capture.dispatches[base + 6]
+      const siluDisp = capture.dispatches[base + 7]
+      if (ffnUpDisp && siluDisp) {
+        const siluOutput = siluDisp.entries.find(e => e.binding === 0)  // SiLU output
+        const ffnInput = ffnUpDisp.entries.find(e => e.binding === 1)   // normed hidden state
+        const ffnScales = ffnUpDisp.entries.find(e => e.binding === 2)  // weight scales
+        const ffnWeights = ffnUpDisp.entries.find(e => e.binding === 3) // int4 weights
+        if (siluOutput && ffnInput && ffnScales && ffnWeights) {
+          try {
+            fusedFFNBG = dev.createBindGroup({
+              layout: fusedFFNPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: siluOutput.buffer, offset: siluOutput.offset, size: siluOutput.size } },
+                { binding: 1, resource: { buffer: ffnInput.buffer, offset: ffnInput.offset, size: ffnInput.size } },
+                { binding: 2, resource: { buffer: ffnScales.buffer, offset: ffnScales.offset, size: ffnScales.size } },
+                { binding: 3, resource: { buffer: ffnWeights.buffer, offset: ffnWeights.offset, size: ffnWeights.size } },
+                { binding: 4, resource: { buffer: fusedFFNUniform, offset: 0, size: 16 } },
+              ],
+            })
+          } catch (e) {
+            console.warn(`[phi3] Layer ${layer} fused FFN bind group failed: ${e}`)
+          }
+        }
+      }
+    }
+
     layerBindGroups.push({
       qkv: makeBG(base + 0, pipes.qkv),
       rope: makeBG(base + 1, pipes.rope),
@@ -150,6 +200,7 @@ export function buildPhi3Engine(capture: CaptureResult) {
       attention: makeBG(base + 3, pipes.attention),
       oProj: makeBG(base + 4, pipes.oProj),
       addNorm1: makeBG(base + 5, pipes.addNorm),
+      fusedFFN: fusedFFNBG,
       ffnUp: makeBG(base + 6, pipes.ffnUp),
       silu: makeBG(base + 7, pipes.silu),
       ffnDown: makeBG(base + 8, pipes.ffnDown),
@@ -217,8 +268,12 @@ export function buildPhi3Engine(capture: CaptureResult) {
       dispatch(pipes.attention, bg.attention, capture.dispatches[base + 3].workgroups)
       dispatch(pipes.oProj, bg.oProj, capture.dispatches[base + 4].workgroups)
       dispatch(pipes.addNorm, bg.addNorm1, capture.dispatches[base + 5].workgroups)
-      dispatch(pipes.ffnUp, bg.ffnUp, capture.dispatches[base + 6].workgroups)
-      dispatch(pipes.silu, bg.silu, capture.dispatches[base + 7].workgroups)
+      if (USE_FUSED_FFN && bg.fusedFFN) {
+        dispatch(fusedFFNPipeline, bg.fusedFFN, [8192, 1, 1])  // fused: gate+up+silu in one
+      } else {
+        dispatch(pipes.ffnUp, bg.ffnUp, capture.dispatches[base + 6].workgroups)
+        dispatch(pipes.silu, bg.silu, capture.dispatches[base + 7].workgroups)
+      }
       dispatch(pipes.ffnDown, bg.ffnDown, capture.dispatches[base + 8].workgroups)
       dispatch(pipes.addNorm, bg.addNorm2, capture.dispatches[base + 9].workgroups)
     }
