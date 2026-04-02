@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebGPU Shader Interception for Browser LLMs</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; line-height: 1.6; }
+    a { color: #4a9eff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre { font-family: 'SF Mono', 'Fira Code', monospace; }
+
+    /* Nav */
+    nav { position: sticky; top: 0; z-index: 100; background: #0a0a0aee; backdrop-filter: blur(10px); border-bottom: 1px solid #222; padding: 12px 24px; display: flex; gap: 24px; font-size: 13px; }
+    nav a { color: #888; } nav a:hover { color: #fff; }
+
+    /* Sections */
+    section { max-width: 1100px; margin: 0 auto; padding: 80px 24px; }
+    h1 { font-size: 48px; font-weight: 700; letter-spacing: -1px; margin-bottom: 16px; }
+    h2 { font-size: 28px; font-weight: 600; margin-bottom: 24px; border-bottom: 1px solid #222; padding-bottom: 12px; }
+    h3 { font-size: 18px; font-weight: 600; margin: 24px 0 8px; }
+    p { margin-bottom: 16px; color: #bbb; }
+    .subtitle { font-size: 20px; color: #888; max-width: 700px; margin-bottom: 32px; }
+
+    /* Stats pills */
+    .pills { display: flex; flex-wrap: wrap; gap: 12px; margin: 32px 0; }
+    .pill { background: #1a1a2e; border: 1px solid #333; border-radius: 24px; padding: 8px 20px; font-size: 14px; font-weight: 600; }
+    .pill span { color: #4a9eff; font-size: 20px; }
+
+    /* Dispatch timeline */
+    #timeline-canvas { width: 100%; height: 200px; border: 1px solid #222; border-radius: 8px; cursor: crosshair; }
+    #timeline-tooltip { position: absolute; background: #1a1a2e; border: 1px solid #444; padding: 8px 12px; border-radius: 6px; font-size: 12px; pointer-events: none; display: none; z-index: 10; }
+    .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px; font-size: 13px; }
+    .legend-item { display: flex; align-items: center; gap: 6px; }
+    .legend-dot { width: 12px; height: 12px; border-radius: 3px; }
+
+    /* Shader gallery */
+    .shader-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+    .shader-card { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px; cursor: pointer; transition: border-color 0.2s; }
+    .shader-card:hover { border-color: #444; }
+    .shader-card .name { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+    .shader-card .meta { font-size: 12px; color: #666; }
+    .shader-card .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; margin-top: 8px; }
+    .badge-matmul { background: #4a9eff22; color: #4a9eff; }
+    .badge-attn { background: #ff9f4322; color: #ff9f43; }
+    .badge-norm { background: #2ecc7122; color: #2ecc71; }
+    .badge-act { background: #a855f722; color: #a855f7; }
+    .badge-custom { background: #ff6b6b22; color: #ff6b6b; }
+    .badge-sample { background: #ffd54f22; color: #ffd54f; }
+
+    /* Buffer treemap */
+    #buffer-canvas { width: 100%; height: 300px; border: 1px solid #222; border-radius: 8px; }
+    .buffer-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 16px; }
+    .buffer-stat { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px; text-align: center; }
+    .buffer-stat .val { font-size: 24px; font-weight: 700; }
+    .buffer-stat .label { font-size: 12px; color: #666; }
+
+    /* Deep dives */
+    details { background: #111; border: 1px solid #222; border-radius: 8px; margin-bottom: 12px; }
+    summary { padding: 16px; cursor: pointer; font-weight: 600; }
+    summary:hover { color: #fff; }
+    details[open] summary { border-bottom: 1px solid #222; }
+    details .content { padding: 16px; font-size: 14px; }
+    details pre { background: #0a0a0a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 12px; margin: 8px 0; }
+
+    /* Live demo */
+    .demo-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    @media (max-width: 768px) { .demo-layout { grid-template-columns: 1fr; } }
+    .demo-chat { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px; min-height: 400px; display: flex; flex-direction: column; }
+    .demo-stats { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px; }
+    .speed-display { font-size: 48px; font-weight: 700; color: #4a9eff; text-align: center; margin: 24px 0; }
+    .speed-label { font-size: 14px; color: #666; text-align: center; }
+    #demo-chat-area { flex: 1; overflow-y: auto; margin-bottom: 12px; font-size: 14px; }
+    #demo-input { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #333; color: #eee; border-radius: 6px; font-size: 14px; }
+    .msg { padding: 8px 12px; margin: 4px 0; border-radius: 8px; max-width: 85%; }
+    .msg.user { background: #1a2a4a; margin-left: auto; }
+    .msg.ai { background: #1a1a2e; }
+
+    /* Footer */
+    footer { text-align: center; padding: 40px; color: #444; font-size: 13px; border-top: 1px solid #111; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <a href="#hero">Overview</a>
+  <a href="#timeline">Dispatch Map</a>
+  <a href="#shaders">Shaders</a>
+  <a href="#buffers">Buffers</a>
+  <a href="#findings">Findings</a>
+  <a href="#demo">Live Demo</a>
+</nav>
+
+<!-- Section 1: Hero -->
+<section id="hero">
+  <h1>WebGPU Shader Interception<br>for Browser LLMs</h1>
+  <p class="subtitle">We intercepted a 3.8B parameter AI model running entirely in your browser, captured every GPU operation, decoded its architecture, and built a faster engine from scratch.</p>
+
+  <div class="pills">
+    <div class="pill"><span>85</span> GPU shaders captured</div>
+    <div class="pill"><span>342</span> dispatches per token</div>
+    <div class="pill"><span>728</span> GPU buffers mapped</div>
+    <div class="pill"><span>13,042</span> lines of WGSL</div>
+    <div class="pill"><span>30-50</span> tok/s decode</div>
+  </div>
+
+  <details>
+    <summary>How does an LLM run in a browser?</summary>
+    <div class="content">
+      <p>Large Language Models like Phi-3 generate text one word at a time. For each word, the model runs 342 GPU compute operations ("dispatches") across 32 neural network layers. Each layer does matrix multiplication, attention computation, and activation functions — all running on your GPU via WebGPU.</p>
+      <p>Normally, a framework called TVM manages these operations. TVM's runtime (written in WASM) decides which GPU shader to run, writes the parameters, submits the work, and reads the result — 342 times per word.</p>
+      <p>We intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, and built our own dispatch loop that drives the GPU directly. Same shaders, same weights, same math — but without TVM's WASM overhead.</p>
+    </div>
+  </details>
+</section>
+
+<!-- Section 2: Dispatch Timeline -->
+<section id="timeline">
+  <h2>The 342 Dispatches</h2>
+  <p>Every token the model generates requires exactly 342 GPU compute dispatches. Here's what each one does:</p>
+
+  <canvas id="timeline-canvas"></canvas>
+  <div id="timeline-tooltip"></div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#4a9eff"></div> Matmul (int4 dequant)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ff9f43"></div> Attention</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#2ecc71"></div> Norm + Residual</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#a855f7"></div> Activation (RoPE, SiLU)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ffd54f"></div> KV Cache</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#ff6b6b"></div> Sampling</div>
+  </div>
+</section>
+
+<!-- Section 3: Shader Gallery -->
+<section id="shaders">
+  <h2>85 Captured Shaders</h2>
+  <p>We intercepted every <code>createShaderModule</code> call during model load, capturing 85 WGSL compute shaders totaling 13,042 lines. We also wrote 3 custom fused shaders.</p>
+
+  <h3>Per-Layer Pattern (10 dispatches × 32 layers)</h3>
+  <div class="shader-grid" id="layer-shaders"></div>
+
+  <h3 style="margin-top:32px">Custom Fused Shaders</h3>
+  <div class="shader-grid" id="custom-shaders"></div>
+</section>
+
+<!-- Section 4: Buffer Landscape -->
+<section id="buffers">
+  <h2>728 GPU Buffers</h2>
+  <p>Every buffer referenced in the 342 dispatches, classified by purpose:</p>
+
+  <div class="buffer-stats">
+    <div class="buffer-stat"><div class="val" style="color:#4a9eff">270</div><div class="label">Weight buffers<br>3.8 GB</div></div>
+    <div class="buffer-stat"><div class="val" style="color:#2ecc71">71</div><div class="label">Activation buffers<br>424 KB</div></div>
+    <div class="buffer-stat"><div class="val" style="color:#ffd54f">37</div><div class="label">KV Cache buffers<br>19 MB</div></div>
+    <div class="buffer-stat"><div class="val" style="color:#a855f7">350</div><div class="label">Uniform buffers<br>7.7 KB</div></div>
+  </div>
+
+  <canvas id="buffer-canvas" style="margin-top:24px"></canvas>
+</section>
+
+<!-- Section 5: Technical Findings -->
+<section id="findings">
+  <h2>Key Findings</h2>
+
+  <details>
+    <summary>Submit batching (337x fewer submits) doesn't help on Apple Silicon</summary>
+    <div class="content">
+      <p>We accumulated all 342 command buffers and submitted them as a single GPU submit — a 337x reduction. The output was correct (coherent English, proper EOS detection). But it was <strong>30% slower</strong> than TVM's 1:1 submit pattern.</p>
+      <p>Why? Chrome's GPU driver on Apple M2 already pipelines submits. While the CPU prepares dispatch N+1, the GPU executes dispatch N. Batching breaks this pipeline — the GPU sits idle during the entire CPU preparation phase.</p>
+      <pre>TVM:     CPU: [setup1][setup2][setup3]...  ← overlaps with GPU
+         GPU:    [work1][work2][work3]...
+
+Batched: CPU: [setup1][setup2]...[setup342]  ← GPU idle
+         GPU:                               [work1][work2]...[work342]</pre>
+    </div>
+  </details>
+
+  <details>
+    <summary>TVM already fuses elementwise operations</summary>
+    <div class="content">
+      <p>TVM's compiler isn't naive. It already fuses across elementwise boundaries:</p>
+      <pre>fused_dequantize + NT_matmul     — int4 dequant + matmul in one shader
+fuse_add_norm_decode             — residual add + RMSNorm in one shader
+fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
+      <p>It does NOT fuse across matmul boundaries. Our fused shaders (FFN+SiLU, RMSNorm+Matmul) cross this boundary.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>GPU f16 parallel reduction is non-deterministic</summary>
+    <div class="content">
+      <p>Running the exact same TVM code twice with the same prompt produces different tokens after position 7-156 (depending on prompt length). The f16 parallel reduction in matmul shaders accumulates partial sums in a tree pattern — different GPU scheduling = different rounding = different result.</p>
+      <p>This is a hardware-level non-determinism on Apple M2. It means any replay-based approach (including ours) can only match TVM's output up to this natural divergence point.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>The memory bandwidth wall</summary>
+    <div class="content">
+      <p>At ~27-48 tok/s on M2 Pro (200 GB/s memory bandwidth), the model loads ~1.8GB of weights per token:</p>
+      <pre>1.8 GB / 200 GB/s = 9ms per token = ~111 tok/s theoretical maximum</pre>
+      <p>Current performance (27-48 tok/s) represents 25-43% of the theoretical bandwidth limit. The remaining gap is from compute (attention, matmul reduction) and framework overhead. Our engine reduces framework overhead but can't change the bandwidth limit.</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>The attention uniform struct (56 bytes, 14 fields)</summary>
+    <div class="content">
+      <p>The most complex uniform in the model, decoded from the WGSL <code>batch_decode_paged_kv_kernel</code> shader:</p>
+      <pre>struct PODArgs {
+  B: i32,                            // offset 0:  batch size (=1)
+  k_rope_pos_offset_elem_offset: i32,// offset 4:  =0
+  length_info_elem_offset: i32,      // offset 8:  =0
+  max_num_pages: i32,                // offset 12: =257
+  nnz_pages: i32,                    // offset 16: CHANGES at page boundaries
+  page_indptr_elem_offset: i32,      // offset 20: =0
+  page_values_elem_offset: i32,      // offset 24: =0
+  pages_elem_offset: i32,            // offset 28: =0
+  q_rope_position_elem_offset: i32,  // offset 32: =0
+  rope_scale: f32,                   // offset 36: =1.0
+  rope_theta: f32,                   // offset 40: =10000.0
+  rotary_mode: i32,                  // offset 44: =0
+  sm_scale: f32,                     // offset 48: =1/sqrt(96)
+  packGridDimX: u32                  // offset 52: =1
+}</pre>
+      <p>This struct was reverse-engineered from the captured WGSL source and verified against TVM's runtime writes. All 14 fields mapped correctly.</p>
+    </div>
+  </details>
+</section>
+
+<!-- Section 6: Live Demo -->
+<section id="demo">
+  <h2>Live Demo</h2>
+  <p>Chat with Phi-3-mini running entirely in your browser. First message loads the model and captures the GPU state. Subsequent messages use our engine.</p>
+  <p style="color:#666; font-size:13px;">Requires Chrome with WebGPU support. Model download: ~2GB (cached after first load).</p>
+
+  <div class="demo-layout" style="margin-top:24px">
+    <div class="demo-chat">
+      <div id="demo-chat-area"></div>
+      <input id="demo-input" placeholder="Type a message... (loads model on first send)" disabled>
+    </div>
+    <div class="demo-stats">
+      <div class="speed-display" id="demo-speed">—</div>
+      <div class="speed-label">tokens / second</div>
+      <div style="margin-top:24px; font-size:13px; color:#666;">
+        <div id="demo-status">Click input to start</div>
+        <div id="demo-log" style="margin-top:12px; max-height:200px; overflow-y:auto; font-family:monospace; font-size:11px;"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  WebGPU Shader Interception Research &mdash; Phi-3-mini 3.8B Q4 on Apple M2 Pro, Chrome WebGPU<br>
+  Built with TypeScript + WebGPU + Vite. No frameworks.
+</footer>
+
+<script type="module" src="/src/demo.ts"></script>
+</body>
+</html>
