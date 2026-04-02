@@ -1,16 +1,12 @@
 /**
- * FAST CHAT — Chat UI powered by own decode loop.
+ * FAST CHAT — TVM prefill + own decode loop.
  *
- * Flow:
- * 1. Load model via WebLLM (gets TVM to do prefill + compile shaders)
- * 2. Grab tokenizer from WebLLM before corruption
- * 3. For each message: let TVM prefill, capture first decode, abort, run own loop
- * 4. Decode token IDs to text via grabbed tokenizer
+ * TVM handles first few tokens (correct). Our loop handles the rest (fast).
  */
 
 import { LLMEngine, MODELS } from './engine.js'
 import { ChatUI } from './ui.js'
-import { setOwnLoopEnabled, patchDeviceOwnLoop, generate, onReady, onToken, getOwnLoopStats } from './own-loop.js'
+import * as loop from './own-loop.js'
 
 async function main(): Promise<void> {
   const ui = new ChatUI()
@@ -18,8 +14,7 @@ async function main(): Promise<void> {
 
   ui.appendLog('Loading model...')
 
-  // Patch device for own-loop capture
-  setOwnLoopEnabled(true)
+  loop.enable()
   if (navigator.gpu) {
     const origRA = navigator.gpu.requestAdapter.bind(navigator.gpu)
     navigator.gpu.requestAdapter = async function(...args: Parameters<GPU['requestAdapter']>) {
@@ -28,30 +23,22 @@ async function main(): Promise<void> {
       const origRD = adapter.requestDevice.bind(adapter)
       adapter.requestDevice = async function(...dArgs: Parameters<GPUAdapter['requestDevice']>) {
         const device = await origRD(...dArgs)
-        patchDeviceOwnLoop(device)
+        loop.patch(device)
         return device
       }
       return adapter
     }
   }
 
-  // Load model
   await engine.load(MODELS.PHI3_MINI_Q4, (msg) => {
     ui.setBadge(msg, true)
     ui.appendLog(msg)
   })
 
-  // Grab tokenizer BEFORE any chat (TVM is clean at this point)
   const decode = engine.getDecoder()
-  if (!decode) {
-    ui.appendLog('WARNING: Could not grab tokenizer. Will show token IDs only.')
-  } else {
-    ui.appendLog('Tokenizer grabbed successfully')
-  }
-
   ui.setBadge('Ready')
   ui.setEnabled(true)
-  ui.setInitialMessage('Fast Chat — Own Decode Loop\n52 tok/s, no TVM in hot path.\nEverything runs locally on your GPU.')
+  ui.setInitialMessage('Fast Chat — 50 tok/s decode\nTVM prefill → own decode loop.\nEverything local on your GPU.')
 
   let generating = false
 
@@ -69,48 +56,39 @@ async function main(): Promise<void> {
     let count = 0
 
     try {
-      // Reset own-loop state for fresh capture
-      setOwnLoopEnabled(true)
+      loop.enable()  // fresh capture each message
 
-      // Let TVM do prefill + 3 warmup tokens, capture, then own loop
-      const readyPromise = new Promise<void>(resolve => {
-        onReady(() => resolve())
-      })
-
-      // TVM generates — we capture in background, abort when ready
+      // TVM generates — we capture, abort when ready
+      const ready = new Promise<void>(r => loop.onReady(r))
       try {
         await engine.chat(text, (tok) => {
           count++
           ui.appendToken(tok)
           const elapsed = (performance.now() - t0) / 1000
           ui.setStats(`${count} tok | ${(count / elapsed).toFixed(1)} tok/s | ${elapsed.toFixed(1)}s`)
-          if (getOwnLoopStats().includes('ready')) throw new Error('abort')
+          if (loop.status() === 'ready') throw new Error('switch')
         })
       } catch {
-        // Expected abort after capture
+        // Expected: switch to own loop
       }
+      await ready
 
-      await readyPromise
-
-      // Stream token callback — decode cumulatively for correct spacing
-      const allTokenIds: number[] = []
+      // Own loop — cumulative decode for correct spacing
+      const allIds: number[] = []
       let prevText = ''
-      onToken((tokenId) => {
+      loop.onToken((id) => {
         count++
-        allTokenIds.push(tokenId)
+        allIds.push(id)
         if (decode) {
-          const fullText = decode(new Int32Array(allTokenIds))
-          const newText = fullText.slice(prevText.length)
-          prevText = fullText
-          ui.appendToken(newText)
+          const full = decode(new Int32Array(allIds))
+          ui.appendToken(full.slice(prevText.length))
+          prevText = full
         }
         const elapsed = (performance.now() - t0) / 1000
         ui.setStats(`${count} tok | ${(count / elapsed).toFixed(1)} tok/s | ${elapsed.toFixed(1)}s`)
       })
 
-      // Run own decode loop
-      await generate(500)
-
+      await loop.generate(500)
     } catch (e) {
       ui.setError(e instanceof Error ? e.message : String(e))
     }
