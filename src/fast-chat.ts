@@ -100,11 +100,19 @@ async function main(): Promise<void> {
 
       await loop.generate(500)
 
-      // After first chat: build standalone engine from captured dispatches
+      // After first chat: try standalone engine
       const cap = getCaptureResult()
-      if (cap && cap.dispatches.length > 0) {
+      if (cap && cap.dispatches.length > 0 && cap.writes.length > 0) {
         try {
-          buildStandaloneEngine(cap)
+          const standalone = buildStandaloneEngine(cap)
+          ui.appendLog('Standalone engine ready — testing generate...')
+          const sTokens = await standalone.generate(100)
+          if (decode && sTokens.length > 0) {
+            const text = decode(new Int32Array(sTokens))
+            ui.appendLog(`Standalone (${sTokens.length} tok): ${text}`)
+          } else {
+            ui.appendLog(`Standalone: ${sTokens.length} tokens: [${sTokens.slice(0, 20).join(', ')}]`)
+          }
         } catch (e) {
           ui.appendLog(`Standalone: ${e instanceof Error ? e.message : String(e)}`)
         }

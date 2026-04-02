@@ -46,11 +46,28 @@ export interface CapturedDispatch {
   workgroups: [number, number, number]
 }
 
+/** A writeBuffer call from the captured decode token */
+export interface CapturedWrite {
+  buffer: GPUBuffer
+  offset: number
+  data: Uint8Array
+}
+
+export interface CapturedCopy {
+  src: GPUBuffer
+  srcOffset: number
+  dst: GPUBuffer
+  dstOffset: number
+  size: number
+}
+
 export interface CaptureResult {
   shaders: CapturedShader[]
   pipelines: CapturedPipeline[]
   weights: CapturedWeight[]
-  dispatches: CapturedDispatch[]  // the 342-dispatch tape from first decode token
+  dispatches: CapturedDispatch[]
+  writes: CapturedWrite[]
+  copy: CapturedCopy | null  // the copyBufferToBuffer from captured decode token
   device: GPUDevice
 }
 
@@ -58,6 +75,8 @@ let shaders: CapturedShader[] = []
 let pipelines: CapturedPipeline[] = []
 let weights: CapturedWeight[] = []
 let dispatches: CapturedDispatch[] = []
+let capturedWrites: CapturedWrite[] = []
+let capturedCopy: CapturedCopy | null = null
 let capturedDevice: GPUDevice | null = null
 
 // Dispatch capture state
@@ -70,7 +89,7 @@ const bgToEntries = new WeakMap<GPUBindGroup, CapturedBGEntry[]>()
 
 export function getCaptureResult(): CaptureResult | null {
   if (!capturedDevice) return null
-  return { shaders, pipelines, weights, dispatches, device: capturedDevice }
+  return { shaders, pipelines, weights, dispatches, writes: capturedWrites, copy: capturedCopy, device: capturedDevice }
 }
 
 /**
@@ -128,6 +147,20 @@ export function patchForCapture(device: GPUDevice): void {
     if (dataSize > 1024) {
       weights.push({ buffer, offset, size: dataSize })
     }
+    // Capture write data during decode token
+    if (capturePhase === 'capturing') {
+      let bytes: Uint8Array
+      if (data instanceof ArrayBuffer) {
+        const o = dataOffset ?? 0, s = size ?? (data.byteLength - o)
+        bytes = new Uint8Array(data.slice(o, o + s))
+      } else if (ArrayBuffer.isView(data)) {
+        const o = dataOffset ?? 0, s = size ?? (data.byteLength - o)
+        bytes = new Uint8Array(data.buffer.slice(data.byteOffset + o, data.byteOffset + o + s))
+      } else {
+        bytes = new Uint8Array(0)
+      }
+      pendingWrites.push({ buffer, offset, data: bytes })
+    }
     origWriteBuffer(buffer, offset, data, dataOffset, size)
   }
 
@@ -152,13 +185,25 @@ export function patchForCapture(device: GPUDevice): void {
     return bg
   }
 
-  // Capture dispatches during first decode token
+  // Capture dispatches + writes during first decode token
   const pendingDispatches: CapturedDispatch[] = []
+  const pendingWrites: CapturedWrite[] = []
 
   const origCreateEnc = device.createCommandEncoder.bind(device)
   device.createCommandEncoder = function(desc?: GPUCommandEncoderDescriptor): GPUCommandEncoder {
     const enc = origCreateEnc(desc)
     if (capturePhase !== 'capturing') return enc
+
+    // Capture copyBufferToBuffer
+    const origCopy = enc.copyBufferToBuffer.bind(enc)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(enc as any).copyBufferToBuffer = function(...args: unknown[]) {
+      if (args.length >= 5) {
+        const [s, so, d, d2, sz] = args as [GPUBuffer, number, GPUBuffer, number, number]
+        capturedCopy = { src: s, srcOffset: so, dst: d, dstOffset: d2, size: sz }
+      }
+      return (origCopy as Function)(...args)
+    }
 
     const origBeginPass = enc.beginComputePass.bind(enc)
     enc.beginComputePass = function(pd?: GPUComputePassDescriptor): GPUComputePassEncoder {
@@ -217,8 +262,9 @@ export function patchForCapture(device: GPUDevice): void {
           pendingDispatches.length = 0
         } else if (capturePhase === 'capturing') {
           dispatches = [...pendingDispatches]
+          capturedWrites = [...pendingWrites]
           capturePhase = 'done'
-          console.log(`[capture] Captured ${dispatches.length} dispatches with bind group entries`)
+          console.log(`[capture] Captured ${dispatches.length} dispatches, ${capturedWrites.length} writes`)
         }
         return realMap(...args)
       }

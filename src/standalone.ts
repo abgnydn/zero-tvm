@@ -212,11 +212,115 @@ export function buildStandaloneEngine(capture: CaptureResult): StandaloneEngine 
 
     console.log(`[standalone] Ready: ${dispatchList.length} dispatches with own bind groups`)
 
+    // Map TVM write buffers to our copies for uniform patching
+    const writeRemap = capture.writes.map(w => ({
+      buffer: bufferRemap.get(w.buffer) ?? w.buffer,
+      offset: w.offset,
+      data: w.data,
+    }))
+
     return {
-      async generate(_maxTokens: number, _onToken?: (id: number) => void): Promise<number[]> {
-        // TODO Phase 5: implement the actual decode loop using dispatchList
-        console.log(`[standalone] Generate called with ${dispatchList.length} dispatches`)
-        return []
+      async generate(maxTokens: number, onTokenCb?: (id: number) => void): Promise<number[]> {
+        const dev = capture.device
+
+        // The copy source buffer needs to be remapped to our copy
+        const copySrc = capture.copy ? (bufferRemap.get(capture.copy.src) ?? capture.copy.src) : null
+        const copySrcOffset = capture.copy?.srcOffset ?? 0
+        const copySize = capture.copy?.size ?? 4
+
+        if (!copySrc) { console.error('[standalone] No copy operation captured'); return [] }
+
+        // Helper: read token from GPU
+        async function readToken(): Promise<number> {
+          const buf = dev.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+          const enc = dev.createCommandEncoder()
+          enc.copyBufferToBuffer(copySrc!, copySrcOffset, buf, 0, copySize)
+          dev.queue.submit([enc.finish()])
+          await buf.mapAsync(GPUMapMode.READ)
+          const token = new DataView(buf.getMappedRange()).getInt32(0, true)
+          buf.unmap()
+          buf.destroy()
+          return token
+        }
+
+        // Step 1: Pure replay — write ALL captured uniform data, dispatch, read
+        console.log(`[standalone] Pure replay with OWN buffers...`)
+        for (const w of writeRemap) {
+          dev.queue.writeBuffer(w.buffer, w.offset, w.data.slice().buffer)
+        }
+        for (const d of dispatchList) {
+          const enc = dev.createCommandEncoder()
+          const pass = enc.beginComputePass()
+          pass.setPipeline(d.pipeline)
+          pass.setBindGroup(0, d.bindGroup)
+          pass.dispatchWorkgroups(...d.workgroups)
+          pass.end()
+          dev.queue.submit([enc.finish()])
+        }
+
+        let tokenId = await readToken()
+        console.log(`[standalone] Pure replay output: ${tokenId}`)
+
+        // Derive position from captured writes
+        const readU32 = (d: Uint8Array) => d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24)
+        const writeU32 = (v: number) => { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, v, true); return a }
+
+        let pos = readU32(capture.writes[4]?.data ?? new Uint8Array(4)) + 1
+        const seqBase = readU32(capture.writes[8]?.data ?? new Uint8Array(4))
+        const pos0 = pos - 1
+
+        const attnIndices: number[] = []
+        let nnz0 = 0
+        for (let i = 0; i < writeRemap.length; i++) {
+          if (writeRemap[i].data.length === 56) {
+            attnIndices.push(i)
+            if (!nnz0) nnz0 = readU32(writeRemap[i].data.slice(16, 20))
+          }
+        }
+
+        const STOP = new Set([2, 32000, 32007])
+        const tokens: number[] = []
+
+        // Step 2: Generate loop — patch 6 values, dispatch with OWN bind groups
+        for (let i = 0; i < maxTokens; i++) {
+          pos++
+
+          // Patch changing values into OUR buffers
+          dev.queue.writeBuffer(writeRemap[0].buffer, writeRemap[0].offset, writeU32(tokenId))
+          for (const idx of [4, 11, 12]) dev.queue.writeBuffer(writeRemap[idx].buffer, writeRemap[idx].offset, writeU32(pos))
+          dev.queue.writeBuffer(writeRemap[8].buffer, writeRemap[8].offset, writeU32(seqBase + (pos - pos0)))
+
+          if (writeRemap.length > 349) {
+            const seed = new ArrayBuffer(4)
+            new DataView(seed).setFloat32(0, Math.random(), true)
+            dev.queue.writeBuffer(writeRemap[349].buffer, writeRemap[349].offset, seed)
+          }
+
+          const nnz = Math.floor(pos / 16) + 1
+          if (nnz !== nnz0) {
+            for (const idx of attnIndices) dev.queue.writeBuffer(writeRemap[idx].buffer, writeRemap[idx].offset + 16, writeU32(nnz))
+          }
+
+          // Dispatch all with OWN bind groups
+          for (const d of dispatchList) {
+            const enc = dev.createCommandEncoder()
+            const pass = enc.beginComputePass()
+            pass.setPipeline(d.pipeline)
+            pass.setBindGroup(0, d.bindGroup)
+            pass.dispatchWorkgroups(...d.workgroups)
+            pass.end()
+            dev.queue.submit([enc.finish()])
+          }
+
+          tokenId = await readToken()
+          if (tokenId < 0 || tokenId >= 32064) break
+          tokens.push(tokenId)
+          if (onTokenCb) onTokenCb(tokenId)
+          if (STOP.has(tokenId)) break
+        }
+
+        console.log(`[standalone] Generated ${tokens.length} tokens`)
+        return tokens
       }
     }
   } else {
