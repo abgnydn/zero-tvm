@@ -92,6 +92,15 @@ export function getCaptureResult(): CaptureResult | null {
   return { shaders, pipelines, weights, dispatches, writes: capturedWrites, copy: capturedCopy, device: capturedDevice }
 }
 
+/** Reset capture to re-capture dispatches for a new message */
+export function resetCapture(): void {
+  capturePhase = 'loading'
+  tokenBoundaryCount = 0
+  dispatches = []
+  capturedWrites = []
+  capturedCopy = null
+}
+
 /**
  * Patch a GPUDevice to capture shaders, pipelines, and weight writes.
  * Call before model load.
@@ -267,6 +276,8 @@ export function patchForCapture(device: GPUDevice): void {
         } else if (capturePhase === 'prefill_done') {
           capturePhase = 'capturing'
           pendingDispatches.length = 0
+          pendingWrites.length = 0
+          capturedCopy = null
         } else if (capturePhase === 'capturing') {
           dispatches = [...pendingDispatches]
           capturedWrites = [...pendingWrites]

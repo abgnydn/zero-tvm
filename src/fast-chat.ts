@@ -7,7 +7,7 @@
 
 import { LLMEngine, MODELS } from './engine.js'
 import { ChatUI } from './ui.js'
-import { patchForCapture, getCaptureResult } from './capture.js'
+import { patchForCapture, getCaptureResult, resetCapture } from './capture.js'
 import { buildPhi3Engine } from './phi3.js'
 
 async function main(): Promise<void> {
@@ -82,25 +82,45 @@ async function main(): Promise<void> {
           ui.appendLog(`Phi3Engine ready — ${cap.dispatches.length} dispatches captured`)
         }
       } else {
-        // Our engine — no TVM
-        // The engine still uses TVM's KV cache and weight buffers,
-        // but the dispatch loop is entirely ours.
-        // For now, we can only continue generating from the same conversation
-        // (since we share TVM's KV cache which has the previous context).
+        // Re-capture fresh dispatch tape for this message
+        resetCapture()
 
-        const allIds: number[] = []
-        let prevText = ''
+        // TVM prefills + 3 warmup tokens, fresh capture builds
+        let tvmCount = 0
+        try {
+          await llm.chat(text, (tok) => {
+            tvmCount++
+            count++
+            ui.appendToken(tok)
+            updateStats()
+            if (tvmCount >= 3) throw new Error('switch')
+          })
+        } catch {
+          // Expected: switch
+        }
 
-        await phi3.generate(500, (id) => {
-          count++
-          allIds.push(id)
-          if (tokenizer) {
-            const full = tokenizer.decode(new Int32Array(allIds))
-            ui.appendToken(full.slice(prevText.length))
-            prevText = full
-          }
-          updateStats()
-        })
+        // Rebuild engine with fresh capture
+        const cap = getCaptureResult()
+        if (cap && cap.dispatches.length > 0 && cap.writes.length > 0 && cap.copy) {
+          phi3 = buildPhi3Engine(cap)
+
+          const allIds: number[] = []
+          let prevText = ''
+          await phi3.generate(500, (id) => {
+            count++
+            allIds.push(id)
+            if (tokenizer) {
+              const full = tokenizer.decode(new Int32Array(allIds))
+              ui.appendToken(full.slice(prevText.length))
+              prevText = full
+            }
+            updateStats()
+          })
+        } else {
+          // Capture didn't complete — let TVM finish
+          ui.appendLog('Re-capture incomplete, using TVM')
+          await llm.chat(text, (tok) => { count++; ui.appendToken(tok); updateStats() })
+        }
       }
     } catch (e) {
       ui.setError(e instanceof Error ? e.message : String(e))
