@@ -10,7 +10,7 @@
 
 import { LLMEngine, MODELS } from './engine.js'
 import { patchForCapture, getCaptureResult } from './capture.js'
-import { buildPhi3Engine } from './phi3.js'
+import { buildPhi3v2 } from './phi3v2.js'
 
 const log = (msg: string) => {
   const el = document.getElementById('log')!
@@ -60,14 +60,20 @@ async function run(): Promise<void> {
   }
   log(`Captured: ${cap.dispatches.length} dispatches, ${cap.writes.length} writes, copy=${cap.copy ? 'yes' : 'no'}`)
 
-  const standalone = buildPhi3Engine(cap)
+  const phi3 = buildPhi3v2(cap)
 
-  // Generate with standalone engine
+  // Get starting position from TVM's generation
+  // TVM generated N tokens, so position = prefill_length + N
+  // We can estimate from the number of TVM tokens
+  const startPos = tvmTokens.length + 30  // rough estimate: ~30 prefill tokens + decode tokens
+  const lastTokenId = 0  // placeholder — engine uses embedding lookup
+
+  // Generate with our engine
   log('')
-  log('=== Standalone generate ===')
+  log('=== Phi3v2 generate ===')
   const t0 = performance.now()
-  const tokens = await standalone.generate(200, (id) => {
-    void id
+  const tokens = await phi3.generate(startPos, lastTokenId, 200, (_id: number) => {
+    void _id
   })
   const elapsed = performance.now() - t0
   const tokPerSec = tokens.length / (elapsed / 1000)
