@@ -1,8 +1,8 @@
 /**
  * FAST CHAT — Phi3Engine powered chat.
  *
- * TVM loads model + handles prefill + first response (triggers capture).
- * Phi3Engine takes over for subsequent messages.
+ * Message 1: TVM generates (captures shaders + pipelines)
+ * Message 2+: Our Phi3Engine generates everything. No TVM.
  */
 
 import { LLMEngine, MODELS } from './engine.js'
@@ -36,11 +36,12 @@ async function main(): Promise<void> {
     ui.appendLog(msg)
   })
 
-  const decode = llm.getDecoder()
+  const tokenizer = llm.getTokenizer()
+  if (tokenizer) ui.appendLog('Tokenizer grabbed (encode + decode)')
 
   ui.setBadge('Ready')
   ui.setEnabled(true)
-  ui.setInitialMessage('Phi-3 Engine — Own inference, no TVM runtime.\nFirst message uses TVM (captures shaders).\nAll subsequent messages use our engine.')
+  ui.setInitialMessage('Phi-3 Engine\nMessage 1: TVM (captures shaders)\nMessage 2+: Our engine, no TVM')
 
   let phi3: ReturnType<typeof buildPhi3Engine> | null = null
   let generating = false
@@ -58,7 +59,6 @@ async function main(): Promise<void> {
 
     const t0 = performance.now()
     let count = 0
-
     const updateStats = () => {
       const elapsed = (performance.now() - t0) / 1000
       ui.setStats(`${count} tok | ${(count / elapsed).toFixed(1)} tok/s | ${elapsed.toFixed(1)}s`)
@@ -67,72 +67,38 @@ async function main(): Promise<void> {
     try {
       messageCount++
 
-      if (messageCount === 1) {
-        // First message: TVM generates (triggers capture)
-        ui.appendLog('First message — TVM generating (capturing shaders)...')
+      if (!phi3) {
+        // No engine yet — TVM generates + we capture
+        ui.appendLog('TVM generating (capturing)...')
         await llm.chat(text, (tok) => {
           count++
           ui.appendToken(tok)
           updateStats()
         })
 
-        // Build Phi3Engine from captured data
         const cap = getCaptureResult()
         if (cap && cap.dispatches.length > 0 && cap.writes.length > 0 && cap.copy) {
           phi3 = buildPhi3Engine(cap)
-          ui.appendLog('Phi3Engine ready — next messages use our engine')
-        } else {
-          ui.appendLog('Capture incomplete — will keep using TVM')
+          ui.appendLog(`Phi3Engine ready — ${cap.dispatches.length} dispatches captured`)
         }
-      } else if (phi3) {
-        // Subsequent messages: Phi3Engine generates
-        // TVM still does prefill (we need it for the prompt encoding)
-        // But we intercept after prefill and use our engine for decode
+      } else {
+        // Our engine — no TVM
+        // The engine still uses TVM's KV cache and weight buffers,
+        // but the dispatch loop is entirely ours.
+        // For now, we can only continue generating from the same conversation
+        // (since we share TVM's KV cache which has the previous context).
 
-        // For now: let TVM prefill + generate 1 token, then switch to our engine
-        // The capture from first message has the dispatch tape
-        // We re-use TVM for prefill each time (it handles tokenization + KV cache init)
-
-        // Actually, simpler: just use our engine directly since TVM's chat
-        // already populated the KV cache during the first message.
-        // For a new message, we need TVM to prefill the new prompt.
-
-        // Hybrid approach: TVM prefills, we decode
-        let tvmTokenCount = 0
-        try {
-          await llm.chat(text, (tok) => {
-            tvmTokenCount++
-            count++
-            ui.appendToken(tok)
-            updateStats()
-            // After 3 TVM tokens, abort and switch to our engine
-            if (tvmTokenCount >= 3) throw new Error('switch')
-          })
-        } catch {
-          // Expected: switch to our engine
-        }
-
-        // Our engine generates the rest
         const allIds: number[] = []
         let prevText = ''
 
-        const tokens = await phi3.generate(500, (id) => {
+        await phi3.generate(500, (id) => {
           count++
           allIds.push(id)
-          if (decode) {
-            const full = decode(new Int32Array(allIds))
+          if (tokenizer) {
+            const full = tokenizer.decode(new Int32Array(allIds))
             ui.appendToken(full.slice(prevText.length))
             prevText = full
           }
-          updateStats()
-        })
-
-        void tokens
-      } else {
-        // Fallback: TVM generates
-        await llm.chat(text, (tok) => {
-          count++
-          ui.appendToken(tok)
           updateStats()
         })
       }
