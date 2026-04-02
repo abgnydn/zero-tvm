@@ -135,13 +135,94 @@ export function buildStandaloneEngine(capture: CaptureResult): StandaloneEngine 
     console.log(`  Activations: ${activations.length} (${activations.reduce((s, b) => s + b.size, 0) / 1e3 | 0}KB)`)
     console.log(`  Uniforms: ${uniforms.length} (${uniforms.reduce((s, b) => s + b.size, 0)}B)`)
     console.log(`  Total unique buffers: ${allBuffers.size}`)
+
+    // Phase 2: Allocate OUR activation + uniform buffers
+    // Weights + KV cache → keep TVM's originals
+    // Activations + uniforms → create our own copies
+    const bufferRemap = new Map<GPUBuffer, GPUBuffer>()  // TVM buf → our buf
+
+    for (const [buf, info] of allBuffers) {
+      if (info.size > 10_000) {
+        // Weight or KV cache — keep original
+        bufferRemap.set(buf, buf)
+      } else {
+        // Activation or uniform — create our own
+        const ours = capture.device.createBuffer({
+          size: buf.size,
+          usage: buf.usage | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+          label: `own_${info.size}B`,
+        })
+        bufferRemap.set(buf, ours)
+      }
+    }
+
+    const ownBufCount = [...bufferRemap.values()].filter((v, _i, _a) => {
+      const orig = [...bufferRemap.entries()].find(([, mapped]) => mapped === v)
+      return orig && orig[0] !== v
+    }).length
+    console.log(`[standalone] Created ${ownBufCount} own buffers (activations + uniforms)`)
+
+    // Phase 3: Rebuild bind groups with our buffers
+    const ownBindGroups: GPUBindGroup[] = []
+    for (let i = 0; i < capture.dispatches.length; i++) {
+      const d = capture.dispatches[i]
+      // Get layout from the pipeline itself (captured during model load)
+      const capturedPipeline = capture.pipelines[d.pipelineIndex]
+      const layout = capturedPipeline?.layout ?? d.pipeline.getBindGroupLayout(0)
+
+      const entries: GPUBindGroupEntry[] = d.entries.map(e => ({
+        binding: e.binding,
+        resource: {
+          buffer: bufferRemap.get(e.buffer) ?? e.buffer,
+          offset: e.offset,
+          size: e.size,
+        },
+      }))
+
+      try {
+        const bg = capture.device.createBindGroup({ layout, entries })
+        ownBindGroups.push(bg)
+      } catch (err) {
+        console.warn(`[standalone] Dispatch ${i}: bind group failed: ${err}`)
+        ownBindGroups.push(null as unknown as GPUBindGroup)
+      }
+    }
+
+    console.log(`[standalone] Built ${ownBindGroups.length} bind groups`)
+
+    // Copy initial activation/uniform data from TVM's buffers to ours
+    // Only copy from buffers that have COPY_SRC usage
+    const enc = capture.device.createCommandEncoder()
+    let copyCount = 0
+    for (const [tvmBuf, ourBuf] of bufferRemap) {
+      if (tvmBuf !== ourBuf && (tvmBuf.usage & GPUBufferUsage.COPY_SRC)) {
+        enc.copyBufferToBuffer(tvmBuf, 0, ourBuf, 0, tvmBuf.size)
+        copyCount++
+      }
+    }
+    capture.device.queue.submit([enc.finish()])
+    console.log(`[standalone] Copied ${copyCount} buffers (skipped ${[...bufferRemap].filter(([t, o]) => t !== o).length - copyCount} without COPY_SRC)`)
+
+    // Store everything for the decode loop
+    const dispatchList = capture.dispatches.map((d, i) => ({
+      pipeline: d.pipeline,
+      bindGroup: ownBindGroups[i],
+      workgroups: d.workgroups,
+    })).filter(d => d.pipeline && d.bindGroup)
+
+    console.log(`[standalone] Ready: ${dispatchList.length} dispatches with own bind groups`)
+
+    return {
+      async generate(_maxTokens: number, _onToken?: (id: number) => void): Promise<number[]> {
+        // TODO Phase 5: implement the actual decode loop using dispatchList
+        console.log(`[standalone] Generate called with ${dispatchList.length} dispatches`)
+        return []
+      }
+    }
   } else {
     console.log(`[standalone] No dispatches captured yet — send a chat message first`)
-  }
-
-  return {
-    async generate(_maxTokens: number, _onToken?: (id: number) => void): Promise<number[]> {
-      throw new Error('Not implemented yet — need dispatch capture (send a chat first)')
+    return {
+      async generate(): Promise<number[]> { return [] }
     }
   }
 }

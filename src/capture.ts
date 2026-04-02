@@ -40,6 +40,7 @@ export interface CapturedBGEntry {
 
 /** A full dispatch as TVM executed it (during first decode token) */
 export interface CapturedDispatch {
+  pipeline: GPUComputePipeline
   pipelineIndex: number
   entries: CapturedBGEntry[]
   workgroups: [number, number, number]
@@ -64,8 +65,6 @@ type CapturePhase = 'loading' | 'prefill_done' | 'capturing' | 'done'
 let capturePhase: CapturePhase = 'loading'
 let tokenBoundaryCount = 0
 
-// Map pipeline objects to their index
-const pipelineToIndex = new WeakMap<GPUComputePipeline, number>()
 // Map bind group objects to their entries
 const bgToEntries = new WeakMap<GPUBindGroup, CapturedBGEntry[]>()
 
@@ -164,12 +163,12 @@ export function patchForCapture(device: GPUDevice): void {
     const origBeginPass = enc.beginComputePass.bind(enc)
     enc.beginComputePass = function(pd?: GPUComputePassDescriptor): GPUComputePassEncoder {
       const pass = origBeginPass(pd)
-      let currentPipelineIdx = -1
+      let currentPipeline: GPUComputePipeline | null = null
       let currentEntries: CapturedBGEntry[] = []
 
       const origSetPipeline = pass.setPipeline.bind(pass)
       pass.setPipeline = function(p: GPUComputePipeline) {
-        currentPipelineIdx = pipelineToIndex.get(p) ?? -1
+        currentPipeline = p
         return origSetPipeline(p)
       }
 
@@ -183,11 +182,15 @@ export function patchForCapture(device: GPUDevice): void {
 
       const origDispatch = pass.dispatchWorkgroups.bind(pass)
       pass.dispatchWorkgroups = function(x: number, y?: number, z?: number) {
-        pendingDispatches.push({
-          pipelineIndex: currentPipelineIdx,
-          entries: currentEntries,
-          workgroups: [x, y ?? 1, z ?? 1],
-        })
+        if (currentPipeline) {
+          const idx = pipelines.findIndex(p => p.pipeline === currentPipeline)
+          pendingDispatches.push({
+            pipeline: currentPipeline,
+            pipelineIndex: idx,
+            entries: currentEntries,
+            workgroups: [x, y ?? 1, z ?? 1],
+          })
+        }
         return origDispatch(x, y, z)
       }
       return pass
