@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Own Compiler — Zero TVM</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Own Compiler</h1>
+      <span id="badge" class="badge loading">Loading...</span>
+      <span id="stats" class="stats"></span>
+    </header>
+    <div id="chat" class="chat"></div>
+    <div class="input-row">
+      <input id="inp" type="text" placeholder="Type a message..." disabled>
+      <button id="btn" disabled>Send</button>
+    </div>
+    <pre id="log" class="log"></pre>
+  </div>
+  <footer>10 shaders, ~100 dispatches. Zero TVM in hot path.</footer>
+  <script type="module" src="/src/compiler/chat.ts"></script>
+</body>
+</html>
