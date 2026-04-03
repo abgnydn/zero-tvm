@@ -123,8 +123,7 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
   const kvNtokenBuf   = w[10]  // BUF#18
   const qRopePosBuf   = w[11]  // BUF#17
   const attnLenBuf    = w[12]  // BUF#22
-  const initBuf1      = w[13]  // BUF#1082 = -1
-  const initBuf2      = w[14]  // BUF#1083 = -1
+  // w[13] = BUF#1082 init=-1, w[14] = BUF#1083 init=-1 (replayed via staticWrites)
   const seedBuf       = w.length > 349 ? w[349] : null
 
   // Copy source for token readback
