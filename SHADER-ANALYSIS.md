@@ -1,0 +1,1 @@
+Good, exactly 85 shaders. Now let me read all of them. I'll batch the reads for efficiency.
