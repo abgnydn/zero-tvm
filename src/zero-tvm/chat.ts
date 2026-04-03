@@ -96,7 +96,8 @@ function buildDecodeEngine(
 
   // Activation buffers
   const B = {
-    residual:  makeBuf(device, PHI3.D * 2, 'residual'),      // persistent running residual
+    residual:  makeBuf(device, PHI3.D * 2, 'residual'),      // running residual (ping)
+    residual2: makeBuf(device, PHI3.D * 2, 'residual2'),     // running residual (pong)
     hidden1:   makeBuf(device, PHI3.D * 2, 'hidden1'),       // normed scratch
     hidden2:   makeBuf(device, PHI3.D * 2, 'hidden2'),       // matmul output scratch
     qkvOut:    makeBuf(device, 9216 * 2, 'qkvOut'),
@@ -146,7 +147,7 @@ function buildDecodeEngine(
 
     const enc = device.createCommandEncoder()
 
-    // --- EMBEDDING → B.residual ---
+    // --- EMBEDDING → B.residual (ping) ---
     dispatch(enc, P.embedding, bg(device, P.embedding, [
       B.residual, B.inputIds, weights.embdScales, weights.embdWeights, embU,
     ]), 12)
@@ -157,6 +158,11 @@ function buildDecodeEngine(
     ]), 1)
 
     // --- 32 TRANSFORMER LAYERS ---
+    // Ping-pong between B.residual and B.residual2 so add_norm reads one and writes the other.
+    // This avoids WebGPU's same-buffer read+write in a single dispatch.
+    let resIn = B.residual   // current residual (read source for add_norm @1)
+    let resOut = B.residual2 // next residual    (write dest  for add_norm @4)
+
     for (let L = 0; L < PHI3.LAYERS; L++) {
       const lw = weights.layers[L]
 
@@ -192,12 +198,13 @@ function buildDecodeEngine(
         B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU,
       ]), 3072)
 
-      // [5] AddNorm (attention):
-      //   residual += hidden2 (OProj), normalize with normGamma2, write to hidden1
-      //   B.residual updated in-place (safe: read B then write B within same thread)
+      // [5] AddNorm (attention): A=hidden2(OProj), B=resIn, out=hidden1, residual=resOut
+      //   resOut = A + resIn (raw new residual)
+      //   hidden1 = RMSNorm(resOut, normGamma2) for FFN input
       dispatch(enc, P.addNorm, bg(device, P.addNorm, [
-        B.hidden2, B.residual, lw.normGamma2, B.hidden1, B.residual, normU,
+        B.hidden2, resIn, lw.normGamma2, B.hidden1, resOut, normU,
       ]), 1)
+      ;[resIn, resOut] = [resOut, resIn]  // swap: resIn now has the updated residual
 
       // [6] Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
       dispatch(enc, P.fusedFfn, bg(device, P.fusedFfn, [
@@ -209,19 +216,15 @@ function buildDecodeEngine(
         B.hidden2, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU,
       ]), 3072)
 
-      // [8] AddNorm (FFN):
-      //   residual += hidden2 (FFN down), normalize with next layer's normGamma1
-      //   For last layer: use model.norm.weight (finalNormGamma) so hidden1 is ready for LM head
+      // [8] AddNorm (FFN): A=hidden2(FFN down), B=resIn, out=hidden1, residual=resOut
+      //   For last layer: nextGamma = finalNormGamma → hidden1 ready for LM head
       const nextGamma = L < PHI3.LAYERS - 1
         ? weights.layers[L + 1].normGamma1
         : weights.finalNormGamma
       dispatch(enc, P.addNorm, bg(device, P.addNorm, [
-        B.hidden2, B.residual, nextGamma, B.hidden1, B.residual, normU,
+        B.hidden2, resIn, nextGamma, B.hidden1, resOut, normU,
       ]), 1)
-
-      // After AddNorm:
-      //   B.hidden1 = RMSNorm(ffn_out + residual, nextGamma)  ← pre-normed for next QKV
-      //   B.residual = ffn_out + residual (updated)
+      ;[resIn, resOut] = [resOut, resIn]  // swap again
     }
 
     // --- LM HEAD: B.hidden1 (already normalized with model.norm) → B.logits ---
