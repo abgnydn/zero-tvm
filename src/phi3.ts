@@ -130,7 +130,7 @@ export function buildPhi3Engine(capture: CaptureResult) {
 
   // For now, use TVM's captured bind group entries directly for each layer
   // This still uses TVM's buffers but with proper per-layer isolation
-  const USE_FUSED_FFN = false  // toggle fused FFN (disabled until correctness verified)
+  const USE_FUSED_FFN = true  // fused gate+up+silu replaces 2 TVM dispatches with 1
 
   const layerBindGroups: Array<{
     qkv: GPUBindGroup
@@ -432,8 +432,12 @@ export function buildPhi3Engine(capture: CaptureResult) {
         dispatch(pipes.attention, bg.attention, capture.dispatches[base + 3].workgroups)
         dispatch(pipes.oProj, bg.oProj, capture.dispatches[base + 4].workgroups)
         dispatch(pipes.addNorm, bg.addNorm1, capture.dispatches[base + 5].workgroups)
-        dispatch(pipes.ffnUp, bg.ffnUp, capture.dispatches[base + 6].workgroups)
-        dispatch(pipes.silu, bg.silu, capture.dispatches[base + 7].workgroups)
+        if (USE_FUSED_FFN && bg.fusedFFN) {
+          dispatch(fusedFFNPipeline, bg.fusedFFN, [8192, 1, 1])
+        } else {
+          dispatch(pipes.ffnUp, bg.ffnUp, capture.dispatches[base + 6].workgroups)
+          dispatch(pipes.silu, bg.silu, capture.dispatches[base + 7].workgroups)
+        }
         dispatch(pipes.ffnDown, bg.ffnDown, capture.dispatches[base + 8].workgroups)
         dispatch(pipes.addNorm, bg.addNorm2, capture.dispatches[base + 9].workgroups)
       }
