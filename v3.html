@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Engine v3 — Zero TVM Chat</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Engine v3</h1>
+      <span id="badge" class="badge loading">Loading...</span>
+      <span id="stats" class="stats"></span>
+    </header>
+    <div id="chat" class="chat"></div>
+    <div class="input-row">
+      <input id="inp" type="text" placeholder="Type a message..." disabled>
+      <button id="btn" disabled>Send</button>
+    </div>
+    <pre id="log" class="log"></pre>
+  </div>
+  <footer>126 lines. Zero TVM in hot path.</footer>
+  <script type="module" src="/src/chat-v3.ts"></script>
+</body>
+</html>
