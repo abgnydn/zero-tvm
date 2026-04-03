@@ -11,7 +11,7 @@
 
 import { LLMEngine, MODELS } from '../engine.js'
 import { ChatUI } from '../ui.js'
-import { patchForCapture, getCaptureResult, CapturedDispatch, CaptureResult } from '../capture.js'
+import { patchForCapture, getCaptureResult, CaptureResult } from '../capture.js'
 
 import int4MatmulSrc from './shaders/int4_matmul.wgsl?raw'
 import int4MatmulF32Src from './shaders/int4_matmul_f32.wgsl?raw'
@@ -21,6 +21,8 @@ import ropeSrc from './shaders/rope.wgsl?raw'
 import fusedFfnSrc from './shaders/fused_ffn.wgsl?raw'
 import embeddingSrc from './shaders/embedding.wgsl?raw'
 import argmaxSrc from './shaders/argmax.wgsl?raw'
+import kvAppendSrc from './shaders/kv_append.wgsl?raw'
+import attentionSrc from './shaders/attention.wgsl?raw'
 
 // ============================================================
 // Helpers
@@ -54,25 +56,16 @@ function dispatchShader(dev: GPUDevice, pipeline: GPUComputePipeline, bufs: GPUB
   dev.queue.submit([enc.finish()])
 }
 
-function runTvmDispatch(dev: GPUDevice, d: CapturedDispatch): void {
-  const enc = dev.createCommandEncoder()
-  const pass = enc.beginComputePass()
-  pass.setPipeline(d.pipeline)
-  pass.setBindGroup(0, dev.createBindGroup({
-    layout: d.pipeline.getBindGroupLayout(0),
-    entries: d.entries.map(e => ({ binding: e.binding, resource: { buffer: e.buffer, offset: e.offset, size: e.size } })),
-  }))
-  pass.dispatchWorkgroups(...d.workgroups)
-  pass.end()
-  dev.queue.submit([enc.finish()])
-}
-
 function writeU32(dev: GPUDevice, buf: GPUBuffer, offset: number, val: number): void {
   dev.queue.writeBuffer(buf, offset, new Uint32Array([val]))
 }
 
 function writeF32(dev: GPUDevice, buf: GPUBuffer, offset: number, val: number): void {
   dev.queue.writeBuffer(buf, offset, new Float32Array([val]))
+}
+
+function readU32(data: Uint8Array): number {
+  return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24)
 }
 
 // ============================================================
@@ -98,9 +91,12 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
     fusedFfn: makePipeline(dev, fusedFfnSrc, 'fused_ffn_kernel'),
     lmHead: makePipeline(dev, int4MatmulF32Src, 'int4_matmul_f32'),
     argmax: makePipeline(dev, argmaxSrc, 'argmax_kernel'),
+    kvAppend: makePipeline(dev, kvAppendSrc, 'kv_append'),
+    attention: makePipeline(dev, attentionSrc, 'attention'),
   }
 
   const tokenOut = makeBuf(dev, 4)
+  let currentPos = 0  // tracked for attention nnz_pages calculation
 
   // All per-token write targets (from dump analysis)
   // [0]  token_id (4B)
@@ -130,14 +126,6 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
   const initBuf1      = w[13]  // BUF#1082 = -1
   const initBuf2      = w[14]  // BUF#1083 = -1
   const seedBuf       = w.length > 349 ? w[349] : null
-
-  // Attention uniform buffers (nnz_pages at offset 16)
-  const attnUniformBufs: GPUBuffer[] = []
-  for (let L = 0; L < 32; L++) {
-    const d = cap.dispatches[2 + L * 10 + 3]
-    const ub = d.entries.find(e => e.buffer.size === 64)
-    if (ub) attnUniformBufs.push(ub.buffer)
-  }
 
   // Copy source for token readback
   const copySrc = cap.copy!.src
@@ -176,9 +164,66 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
         // RoPE (remap bindings)
         const u = makeUniform(dev, [1, 0, 1, 36])
         dispatchShader(dev, P.rope, [d.entries[2].buffer, d.entries[0].buffer, d.entries[4].buffer, d.entries[3].buffer, d.entries[1].buffer, u], 36)
-      } else if (step === 2 || step === 3) {
-        // KV Append + Attention: TVM
-        runTvmDispatch(dev, d)
+      } else if (step === 2) {
+        // KV Append — OUR shader
+        // TVM bindings: 0=k_data, 1=pages, 2=position_map, 3=v_data, 4=uniform
+        // Our bindings:  0=k_data, 1=v_data, 2=pages, 3=position_map, 4=uniform
+        const kvU = makeUniform(dev, [1, 0, 0, 0, 12])  // ntoken=1, num_pages=0, pages/posmap offsets=0, packGridDimX=12
+        const kvBG = dev.createBindGroup({
+          layout: P.kvAppend.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: d.entries[0].buffer, offset: d.entries[0].offset, size: d.entries[0].size } },
+            { binding: 1, resource: { buffer: d.entries[3].buffer, offset: d.entries[3].offset, size: d.entries[3].size } },
+            { binding: 2, resource: { buffer: d.entries[1].buffer, offset: d.entries[1].offset, size: d.entries[1].size } },
+            { binding: 3, resource: { buffer: d.entries[2].buffer, offset: d.entries[2].offset, size: d.entries[2].size } },
+            { binding: 4, resource: { buffer: kvU, offset: 0, size: kvU.size } },
+          ],
+        })
+        const kvEnc = dev.createCommandEncoder()
+        const kvPass = kvEnc.beginComputePass()
+        kvPass.setPipeline(P.kvAppend)
+        kvPass.setBindGroup(0, kvBG)
+        kvPass.dispatchWorkgroups(12)  // ceil(1 * 3072 / 256) = 12
+        kvPass.end()
+        dev.queue.submit([kvEnc.finish()])
+      } else if (step === 3) {
+        // Attention — OUR shader
+        // TVM bindings: 0=Q, 1=k_rope_off, 2=length_info, 3=lse, 4=output, 5=page_indptr, 6=page_values, 7=pages, 8=q_rope_pos, 9=uniform
+        // Our bindings:  0=Q, 1=page_table_indptr, 2=page_table_values, 3=pages, 4=length_info, 5=output, 6=uniform
+        const smScale = 1.0 / Math.sqrt(96)
+        const attnUBuf = dev.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+        const attnUData = new ArrayBuffer(36)
+        const attnDV = new DataView(attnUData)
+        attnDV.setInt32(0, 1, true)       // B = 1
+        attnDV.setInt32(4, 0, true)       // max_num_pages (unused by shader)
+        attnDV.setInt32(8, Math.floor(currentPos / 16) + 1, true)  // nnz_pages
+        attnDV.setInt32(12, 0, true)      // pages_elem_offset
+        attnDV.setInt32(16, 0, true)      // page_indptr_elem_offset
+        attnDV.setInt32(20, 0, true)      // page_values_elem_offset
+        attnDV.setInt32(24, 0, true)      // length_info_elem_offset
+        attnDV.setFloat32(28, smScale, true)  // sm_scale
+        attnDV.setUint32(32, 31, true)    // packGridDimX (unused)
+        dev.queue.writeBuffer(attnUBuf, 0, attnUData)
+
+        const attnBG = dev.createBindGroup({
+          layout: P.attention.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: d.entries[0].buffer, offset: d.entries[0].offset, size: d.entries[0].size } },
+            { binding: 1, resource: { buffer: d.entries[5].buffer, offset: d.entries[5].offset, size: d.entries[5].size } },
+            { binding: 2, resource: { buffer: d.entries[6].buffer, offset: d.entries[6].offset, size: d.entries[6].size } },
+            { binding: 3, resource: { buffer: d.entries[7].buffer, offset: d.entries[7].offset, size: d.entries[7].size } },
+            { binding: 4, resource: { buffer: d.entries[2].buffer, offset: d.entries[2].offset, size: d.entries[2].size } },
+            { binding: 5, resource: { buffer: d.entries[4].buffer, offset: d.entries[4].offset, size: d.entries[4].size } },
+            { binding: 6, resource: { buffer: attnUBuf, offset: 0, size: 64 } },
+          ],
+        })
+        const attnEnc = dev.createCommandEncoder()
+        const attnPass = attnEnc.beginComputePass()
+        attnPass.setPipeline(P.attention)
+        attnPass.setBindGroup(0, attnBG)
+        attnPass.dispatchWorkgroups(1, 32, 1)  // batch=1, heads=32
+        attnPass.end()
+        dev.queue.submit([attnEnc.finish()])
       } else if (step === 4) {
         // OProj
         const u = makeUniform(dev, [384, 96, 3072])
@@ -219,19 +264,9 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
   const STOP = new Set([2, 32000, 32007])
 
   function writeState(tokenId: number, pos: number): void {
+    currentPos = pos
     const nnz = Math.floor(pos / 16) + 1
-    // last_page_len: how many slots filled in the last (partial) page
-    // pos=0 → page0 slot0 → last_page_len = 0+1 = 1... but TVM uses 0-indexed
-    // At pos=32 (captured), nnz=3, length_info=[0,1,2] → last_page_len=0
-    // 33 tokens = 2 full pages + 1 → last page has 1 token? But value is 0.
-    // Actually: pos=32 means 33rd token (0-indexed). 33 = 2*16 + 1.
-    // TVM writes length_info[0]=0 which seems wrong... unless it's (pos % 16)
-    // pos=32: 32%16 = 0. That matches!
     const lastPageLen = pos % 16
-
-    // Write ALL 357 captured values first (static uniforms + initial state)
-    // This is what the working chain test does — replay everything.
-    // Then override the per-token values.
 
     writeU32(dev, tokenIdBuf.buffer, tokenIdBuf.offset, tokenId)
     writeU32(dev, posMapBuf.buffer, posMapBuf.offset, pos)
@@ -249,9 +284,6 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
 
     // KV append: ntoken offset
     dev.queue.writeBuffer(kvNtokenBuf.buffer, kvNtokenBuf.offset, new Int32Array([0, 1]))
-
-    // nnz_pages in all 32 attention uniforms
-    for (const buf of attnUniformBufs) writeU32(dev, buf, 16, nnz)
   }
 
   // Classify writes: only replay UNIFORM writes (static config), not activations
@@ -344,11 +376,12 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
   async function continueFromCapture(maxTokens: number, onToken: (id: number) => void): Promise<number[]> {
     // Replay all captured writes (restores exact state from capture)
     for (const wr of w) dev.queue.writeBuffer(wr.buffer, wr.offset, wr.data.slice().buffer)
+    currentPos = readU32(w[4]?.data ?? new Uint8Array(4))
     forwardPass()
     let tokenId = await readToken()
-    console.log(`[continueFromCapture] first token=${tokenId}`)
+    console.log(`[continueFromCapture] first token=${tokenId}, pos=${currentPos}`)
 
-    let pos = readU32(w[4]?.data ?? new Uint8Array(4)) + 1
+    let pos = currentPos + 1
     const tokens: number[] = []
 
     for (let i = 0; i < maxTokens; i++) {
@@ -400,7 +433,7 @@ async function main(): Promise<void> {
   const tokenizer = llm.getTokenizer()
   ui.setBadge('Ready')
   ui.setEnabled(true)
-  ui.setInitialMessage('Our Compiler\n279/342 dispatches = our shaders\nMsg 1: TVM captures\nMsg 2+: Our engine')
+  ui.setInitialMessage('Our Compiler\n342/342 dispatches = our shaders\nMsg 1: TVM captures\nMsg 2+: Our engine')
 
   let engine: OurEngine | null = null
   let generating = false
@@ -427,12 +460,13 @@ async function main(): Promise<void> {
         // Message 1: TVM generates first token only (to capture), then our engine takes over
         ui.appendLog('TVM generating first token (capturing)...')
 
-        // Let TVM generate just enough to capture
+        // Let TVM generate 2 tokens: prefill produces token 1, decode produces token 2
+        // We need at least 1 decode pass to capture the decode dispatch graph
         let tvmTokens = 0
         await llm.chat(text, (tok) => {
           tvmTokens++
-          if (tvmTokens <= 1) ui.appendToken(tok) // show first token from TVM
-          if (tvmTokens >= 1) throw new Error('capture done')
+          ui.appendToken(tok)
+          if (tvmTokens >= 2) throw new Error('capture done')
         }).catch(() => {}) // expected abort
 
         const cap = getCaptureResult()
@@ -440,11 +474,11 @@ async function main(): Promise<void> {
           engine = buildOurEngine(cap)
           ui.appendLog(`Our engine ready. Continuing with our engine...`)
 
-          // Continue generating with our engine (KV cache is fresh from TVM's prefill)
+          // Continue generating with our engine (KV cache has TVM's prefill + 1 decode token)
           if (tokenizer) {
             const allIds: number[] = []
             let prevText = ''
-            await engine.generate([], 500, (id) => {
+            await engine.continueFromCapture(500, (id) => {
               count++
               allIds.push(id)
               const full = tokenizer.decode(new Int32Array(allIds))
