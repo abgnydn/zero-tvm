@@ -172,9 +172,10 @@ function buildDecodeEngine(
       ]), 9216)
 
       // [1] RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
+      // rope.wgsl bindings: @0=q_out, @1=k_out, @2=v_out, @3=qkv, @4=position_map
       const ropeU = uniformBuf(device, [i32(1), i32(0), i32(1), u32(36)])
       dispatch(enc, P.rope, bg(device, P.rope, [
-        B.kOut, B.posMap, B.qOut, B.qkvOut, B.vOut, ropeU,
+        B.qOut, B.kOut, B.vOut, B.qkvOut, B.posMap, ropeU,
       ]), 36)
 
       // [2] KV append: kOut, vOut → kvPages[L]
