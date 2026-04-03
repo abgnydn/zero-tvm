@@ -242,12 +242,124 @@ export function buildPhi3Engine(capture: CaptureResult) {
   // Generate function
   // ============================================================
 
+  // Helper functions
+  const readU32 = (d: Uint8Array) => d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24)
+  const writeU32 = (v: number) => { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, v, true); return a }
+
+  // Find per-token buffers from captured writes
+  const tokenIdBuf = writes[0]?.buffer
+  const posMapBuf = (() => {
+    const ropeDisp = capture.dispatches[3] // first layer RoPE
+    return ropeDisp?.entries.find(e => e.binding === 1)?.buffer ?? null
+  })()
+  const qRopePosBuf = (() => {
+    const attnDisp = capture.dispatches[5] // first layer attention
+    return attnDisp?.entries.find(e => e.binding === 8)?.buffer ?? null
+  })()
+  const lengthInfoBuf = (() => {
+    const attnDisp = capture.dispatches[5]
+    return attnDisp?.entries.find(e => e.binding === 2)?.buffer ?? null
+  })()
+
+  /**
+   * Run one forward pass (all 342 dispatches) for a single token at a given position.
+   * This builds the KV cache entry for that position.
+   */
+  function forwardPass(tokenId: number, pos: number): void {
+    const nnzPages = Math.floor(pos / CFG.PAGE_SIZE) + 1
+
+    // Write per-token values
+    if (tokenIdBuf) dev.queue.writeBuffer(tokenIdBuf, 0, writeU32(tokenId))
+    if (posMapBuf) dev.queue.writeBuffer(posMapBuf, 0, new Int32Array([pos]))
+    if (qRopePosBuf) dev.queue.writeBuffer(qRopePosBuf, 0, new Int32Array([pos]))
+    if (lengthInfoBuf) dev.queue.writeBuffer(lengthInfoBuf, 0, new Int32Array([pos + 1]))
+
+    // Update nnz_pages in attention uniforms for all layers
+    for (let layer = 0; layer < CFG.LAYERS; layer++) {
+      const attnDisp = capture.dispatches[2 + layer * 10 + 3]
+      const attnUniform = attnDisp?.entries.find(e => e.binding === 9)?.buffer
+      if (attnUniform) dev.queue.writeBuffer(attnUniform, 16, new Int32Array([nnzPages])) // offset 16 = nnz_pages
+    }
+
+    // Preamble
+    dispatch(pipes.embed, embedBG, capture.dispatches[0].workgroups)
+    dispatch(pipes.initialNorm, initialNormBG, capture.dispatches[1].workgroups)
+
+    // 32 layers
+    for (let layer = 0; layer < CFG.LAYERS; layer++) {
+      const bg = layerBindGroups[layer]
+      const base = 2 + layer * 10
+      dispatch(pipes.qkv, bg.qkv, capture.dispatches[base + 0].workgroups)
+      dispatch(pipes.rope, bg.rope, capture.dispatches[base + 1].workgroups)
+      dispatch(pipes.kvAppend, bg.kvAppend, capture.dispatches[base + 2].workgroups)
+      dispatch(pipes.attention, bg.attention, capture.dispatches[base + 3].workgroups)
+      dispatch(pipes.oProj, bg.oProj, capture.dispatches[base + 4].workgroups)
+      dispatch(pipes.addNorm, bg.addNorm1, capture.dispatches[base + 5].workgroups)
+      if (USE_FUSED_FFN && bg.fusedFFN) {
+        dispatch(fusedFFNPipeline, bg.fusedFFN, [8192, 1, 1])
+      } else {
+        dispatch(pipes.ffnUp, bg.ffnUp, capture.dispatches[base + 6].workgroups)
+        dispatch(pipes.silu, bg.silu, capture.dispatches[base + 7].workgroups)
+      }
+      dispatch(pipes.ffnDown, bg.ffnDown, capture.dispatches[base + 8].workgroups)
+      dispatch(pipes.addNorm, bg.addNorm2, capture.dispatches[base + 9].workgroups)
+    }
+
+    // Tail (LM head + sampling)
+    for (const t of pipes.tail) dispatch(t.pipeline, t.bindGroup, t.workgroups)
+    flushDispatches()
+  }
+
+  /**
+   * Sequential prefill: process each prompt token through the full decode pipeline.
+   * Builds KV cache entries for all prompt positions.
+   */
+  async function prefill(tokenIds: number[], startPos: number): Promise<number> {
+    console.log(`[phi3] Prefilling ${tokenIds.length} tokens from pos ${startPos}...`)
+
+    // Initialize page table for the required number of pages
+    const totalPositions = startPos + tokenIds.length
+    const neededPages = Math.floor(totalPositions / CFG.PAGE_SIZE) + 1
+
+    // page_table_indptr: [0, neededPages] (sequence 0 uses pages 0..neededPages-1)
+    const pageIndptrBuf = (() => {
+      const attnDisp = capture.dispatches[5]
+      return attnDisp?.entries.find(e => e.binding === 5)?.buffer ?? null
+    })()
+    if (pageIndptrBuf) {
+      dev.queue.writeBuffer(pageIndptrBuf, 0, new Int32Array([0, neededPages]))
+    }
+
+    // page_table_values: use pages starting from offset 200 to avoid conflicting
+    // with TVM's existing page allocations (TVM uses pages 0-N from model init)
+    const PAGE_OFFSET = 200
+    const pageValuesBuf = (() => {
+      const attnDisp = capture.dispatches[5]
+      return attnDisp?.entries.find(e => e.binding === 6)?.buffer ?? null
+    })()
+    if (pageValuesBuf) {
+      const pageValues = new Int32Array(neededPages)
+      for (let i = 0; i < neededPages; i++) pageValues[i] = PAGE_OFFSET + i
+      dev.queue.writeBuffer(pageValuesBuf, 0, pageValues)
+      console.log(`[phi3] Page values: [${Array.from(pageValues).join(', ')}]`)
+    }
+
+    console.log(`[phi3] Page table: ${neededPages} pages for ${totalPositions} positions`)
+
+    let lastTokenId = 0
+    for (let i = 0; i < tokenIds.length; i++) {
+      forwardPass(tokenIds[i], startPos + i)
+      lastTokenId = await readToken()
+      if (i < 3 || i === tokenIds.length - 1) {
+        console.log(`[phi3] Prefill step ${i}: token=${tokenIds[i]} pos=${startPos + i} → output=${lastTokenId}`)
+      }
+    }
+    console.log(`[phi3] Prefill done. Last output: ${lastTokenId}`)
+    return lastTokenId
+  }
+
   async function generate(maxTokens: number, onToken?: (id: number) => void): Promise<number[]> {
     if (!copySrc) throw new Error('No copy source for token readback')
-
-    // Read initial position from captured writes
-    const readU32 = (d: Uint8Array) => d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24)
-    const writeU32 = (v: number) => { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, v, true); return a }
 
     // Pure replay first token (establishes correct activation state)
     for (const w of writes) {
@@ -340,6 +452,40 @@ export function buildPhi3Engine(capture: CaptureResult) {
     return tokens
   }
 
+  /**
+   * Full chat: prefill the prompt, then decode.
+   * ZERO TVM. Our engine does everything.
+   */
+  async function chat(promptTokens: number[], maxTokens: number, onToken?: (id: number) => void): Promise<number[]> {
+    if (!copySrc) throw new Error('No copy source for token readback')
+
+    // Prefill: process each prompt token, building KV cache
+    let tokenId = await prefill(promptTokens, 0)
+    let pos = promptTokens.length
+
+    const STOP = new Set([2, 32000, 32007])
+    const tokens: number[] = []
+
+    // First token from prefill
+    if (tokenId >= 0 && tokenId < CFG.VOCAB && !STOP.has(tokenId)) {
+      tokens.push(tokenId)
+      if (onToken) onToken(tokenId)
+    }
+
+    // Decode loop
+    for (let i = 0; i < maxTokens - 1; i++) {
+      pos++
+      forwardPass(tokenId, pos)
+      tokenId = await readToken()
+      if (tokenId < 0 || tokenId >= CFG.VOCAB) break
+      tokens.push(tokenId)
+      if (onToken) onToken(tokenId)
+      if (STOP.has(tokenId)) break
+    }
+
+    return tokens
+  }
+
   // Batched dispatch — accumulate passes, flush periodically
   let pendingEncoder: GPUCommandEncoder | null = null
   let pendingCount = 0
@@ -380,5 +526,5 @@ export function buildPhi3Engine(capture: CaptureResult) {
     return token
   }
 
-  return { generate, pipes, layerBindGroups }
+  return { generate, chat, prefill, pipes, layerBindGroups }
 }

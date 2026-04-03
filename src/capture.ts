@@ -65,9 +65,11 @@ export interface CaptureResult {
   shaders: CapturedShader[]
   pipelines: CapturedPipeline[]
   weights: CapturedWeight[]
-  dispatches: CapturedDispatch[]
-  writes: CapturedWrite[]
-  copy: CapturedCopy | null  // the copyBufferToBuffer from captured decode token
+  dispatches: CapturedDispatch[]          // decode dispatches (342)
+  writes: CapturedWrite[]                  // decode writes (357)
+  prefillDispatches: CapturedDispatch[]    // prefill dispatches
+  prefillWrites: CapturedWrite[]           // prefill writes
+  copy: CapturedCopy | null
   device: GPUDevice
 }
 
@@ -77,6 +79,8 @@ let weights: CapturedWeight[] = []
 let dispatches: CapturedDispatch[] = []
 let capturedWrites: CapturedWrite[] = []
 let capturedCopy: CapturedCopy | null = null
+let prefillDispatches: CapturedDispatch[] = []
+let prefillWrites: CapturedWrite[] = []
 let capturedDevice: GPUDevice | null = null
 
 // Dispatch capture state
@@ -87,15 +91,27 @@ let tokenBoundaryCount = 0
 // Map bind group objects to their entries
 const bgToEntries = new WeakMap<GPUBindGroup, CapturedBGEntry[]>()
 
+// Pending arrays — module scope so resetCapture can clear them
+let pendingDispatches: CapturedDispatch[] = []
+let pendingWrites: CapturedWrite[] = []
+
+// Track the last position written by TVM (from the specific position_map buffer)
+let lastPosition = 0
+let positionMapBuffer: GPUBuffer | null = null  // set once we identify it from captured writes
+export function getLastPosition(): number { return lastPosition }
+export function setPositionMapBuffer(buf: GPUBuffer): void { positionMapBuffer = buf }
+
 export function getCaptureResult(): CaptureResult | null {
   if (!capturedDevice) return null
-  return { shaders, pipelines, weights, dispatches, writes: capturedWrites, copy: capturedCopy, device: capturedDevice }
+  return { shaders, pipelines, weights, dispatches, writes: capturedWrites, prefillDispatches, prefillWrites, copy: capturedCopy, device: capturedDevice }
 }
 
 /** Reset capture to re-capture dispatches for a new message */
 export function resetCapture(): void {
   capturePhase = 'loading'
   tokenBoundaryCount = 0
+  pendingDispatches = []
+  pendingWrites = []
   dispatches = []
   capturedWrites = []
   capturedCopy = null
@@ -156,8 +172,8 @@ export function patchForCapture(device: GPUDevice): void {
     if (dataSize > 1024) {
       weights.push({ buffer, offset, size: dataSize })
     }
-    // Capture write data during decode token
-    if (capturePhase === 'capturing') {
+    // Capture write data during prefill and decode
+    if (capturePhase === 'loading' || capturePhase === 'prefill_done' || capturePhase === 'capturing') {
       let bytes: Uint8Array
       if (data instanceof ArrayBuffer) {
         const o = dataOffset ?? 0, s = size ?? (data.byteLength - o)
@@ -169,6 +185,16 @@ export function patchForCapture(device: GPUDevice): void {
         bytes = new Uint8Array(0)
       }
       pendingWrites.push({ buffer, offset, data: bytes })
+    }
+    // Track position writes to the exact position_map buffer
+    if (positionMapBuffer && buffer === positionMapBuffer && dataSize === 4 && offset === 0) {
+      let val = 0
+      if (data instanceof ArrayBuffer) {
+        val = new DataView(data, dataOffset ?? 0).getInt32(0, true)
+      } else if (ArrayBuffer.isView(data)) {
+        val = new DataView(data.buffer, data.byteOffset + (dataOffset ?? 0)).getInt32(0, true)
+      }
+      if (val >= 0) lastPosition = val
     }
     origWriteBuffer(buffer, offset, data, dataOffset, size)
   }
@@ -194,14 +220,12 @@ export function patchForCapture(device: GPUDevice): void {
     return bg
   }
 
-  // Capture dispatches + writes during first decode token
-  const pendingDispatches: CapturedDispatch[] = []
-  const pendingWrites: CapturedWrite[] = []
+  // Dispatch + write capture uses module-scope pendingDispatches/pendingWrites
 
   const origCreateEnc = device.createCommandEncoder.bind(device)
   device.createCommandEncoder = function(desc?: GPUCommandEncoderDescriptor): GPUCommandEncoder {
     const enc = origCreateEnc(desc)
-    if (capturePhase !== 'capturing') return enc
+    if (capturePhase !== 'capturing' && capturePhase !== 'loading' && capturePhase !== 'prefill_done') return enc
 
     // Capture copyBufferToBuffer
     const origCopy = enc.copyBufferToBuffer.bind(enc)
@@ -257,32 +281,32 @@ export function patchForCapture(device: GPUDevice): void {
   device.createBuffer = function(desc: GPUBufferDescriptor): GPUBuffer {
     const buf = origCreateBuf(desc)
 
-    // Prevent destruction of any buffer after capture starts
-    const realDestroy = buf.destroy.bind(buf)
-    buf.destroy = function() {
-      if (capturePhase === 'capturing' || capturePhase === 'done') return
-      return realDestroy()
-    }
+    // Never destroy — we reference these buffers in captured dispatches
+    buf.destroy = function() { return }
     if (desc.usage & GPUBufferUsage.MAP_READ) {
       const realMap = buf.mapAsync.bind(buf)
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ;(buf as any).mapAsync = function(...args: Parameters<GPUBuffer['mapAsync']>) {
-        // State machine: loading → prefill_done → capturing → done
+        // State machine: loading → prefill_capturing → prefill_done → decode_capturing → done
         if (capturePhase === 'loading') {
           tokenBoundaryCount++
           if (tokenBoundaryCount === 1) {
+            // First mapAsync = end of prefill phase
+            // Save prefill dispatches + writes
+            prefillDispatches = [...pendingDispatches]
+            prefillWrites = [...pendingWrites]
+            console.log(`[capture] Prefill: ${prefillDispatches.length} dispatches, ${prefillWrites.length} writes`)
+            pendingDispatches.length = 0
+            pendingWrites.length = 0
+            capturedCopy = null
             capturePhase = 'prefill_done'
           }
         } else if (capturePhase === 'prefill_done') {
-          capturePhase = 'capturing'
-          pendingDispatches.length = 0
-          pendingWrites.length = 0
-          capturedCopy = null
-        } else if (capturePhase === 'capturing') {
+          // First decode token captured
           dispatches = [...pendingDispatches]
           capturedWrites = [...pendingWrites]
           capturePhase = 'done'
-          console.log(`[capture] Captured ${dispatches.length} dispatches, ${capturedWrites.length} writes`)
+          console.log(`[capture] Decode: ${dispatches.length} dispatches, ${capturedWrites.length} writes`)
         }
         return realMap(...args)
       }
