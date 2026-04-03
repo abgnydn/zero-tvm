@@ -176,23 +176,34 @@ export async function loadWeights(
   }
 
   // 2. Global weights
+  // Actual MLC cache names discovered from ndarray-cache.json:
+  //   transformer.embd.q_weight / q_scale  — embedding
+  //   transformer.norm.weight               — final RMSNorm before LM head
+  //   lm_head.q_weight / q_scale            — LM head
+  //   transformer.h.N.ln.weight             — layer N input_layernorm (normGamma1)
+  //   transformer.h.N.post_attention_layernorm.weight — normGamma2
+  //   transformer.h.N.mixer.qkv_proj.*      — QKV
+  //   transformer.h.N.mixer.out_proj.*      — O proj
+  //   transformer.h.N.mlp.gate_up_proj.*    — FFN gate+up
+  //   transformer.h.N.mlp.down_proj.*       — FFN down
+
   onProgress?.('Loading embedding weights...')
   const embdWeights = await load(
+    'transformer.embd.q_weight',
     'embed_tokens.q_weight',
-    'model.embed_tokens.q_weight',
-    'transformer.wte.q_weight'
+    'model.embed_tokens.q_weight'
   )
   const embdScales = await load(
+    'transformer.embd.q_scale',
     'embed_tokens.q_scale',
-    'model.embed_tokens.q_scale',
-    'transformer.wte.q_scale'
+    'model.embed_tokens.q_scale'
   )
 
-  // Initial norm (after embedding, before transformer layers)
+  // Layer 0's input_layernorm — used as the initial norm before the first QKV
+  // (loaded again per-layer below, but needed here for the initial rmsNorm in chat.ts)
   const initNormGamma = await load(
-    'model.norm.weight',
-    'norm.weight',
-    'transformer.ln_f.weight'
+    'transformer.h.0.ln.weight',
+    'model.layers.0.input_layernorm.weight'
   )
 
   // LM head
@@ -211,42 +222,49 @@ export async function loadWeights(
 
   for (let L = 0; L < LAYERS; L++) {
     onProgress?.(`Loading layer ${L}/${LAYERS}...`)
-    const p = `model.layers.${L}`
+    const h = `transformer.h.${L}`   // actual MLC prefix
+    const p = `model.layers.${L}`    // standard HF prefix (fallback)
 
     const qkvWeights = await load(
-      `${p}.self_attn.qkv_proj.q_weight`,
-      `${p}.attention.qkv_proj.q_weight`
+      `${h}.mixer.qkv_proj.q_weight`,
+      `${p}.self_attn.qkv_proj.q_weight`
     )
     const qkvScales = await load(
-      `${p}.self_attn.qkv_proj.q_scale`,
-      `${p}.attention.qkv_proj.q_scale`
+      `${h}.mixer.qkv_proj.q_scale`,
+      `${p}.self_attn.qkv_proj.q_scale`
     )
     const oProjWeights = await load(
-      `${p}.self_attn.o_proj.q_weight`,
-      `${p}.attention.o_proj.q_weight`
+      `${h}.mixer.out_proj.q_weight`,
+      `${p}.self_attn.o_proj.q_weight`
     )
     const oProjScales = await load(
-      `${p}.self_attn.o_proj.q_scale`,
-      `${p}.attention.o_proj.q_scale`
+      `${h}.mixer.out_proj.q_scale`,
+      `${p}.self_attn.o_proj.q_scale`
     )
     const normGamma1 = await load(
-      `${p}.input_layernorm.weight`,
-      `${p}.norm_attn_norm.norm1.weight`
+      `${h}.ln.weight`,
+      `${p}.input_layernorm.weight`
     )
     const normGamma2 = await load(
-      `${p}.post_attention_layernorm.weight`,
-      `${p}.norm_attn_norm.norm2.weight`
+      `${h}.post_attention_layernorm.weight`,
+      `${p}.post_attention_layernorm.weight`
     )
     const ffnWeights = await load(
-      `${p}.mlp.gate_up_proj.q_weight`,
-      `${p}.mlp.up_proj.q_weight`  // fallback for non-fused
+      `${h}.mlp.gate_up_proj.q_weight`,
+      `${p}.mlp.gate_up_proj.q_weight`
     )
     const ffnScales = await load(
-      `${p}.mlp.gate_up_proj.q_scale`,
-      `${p}.mlp.up_proj.q_scale`
+      `${h}.mlp.gate_up_proj.q_scale`,
+      `${p}.mlp.gate_up_proj.q_scale`
     )
-    const ffnDownWeights = await load(`${p}.mlp.down_proj.q_weight`)
-    const ffnDownScales = await load(`${p}.mlp.down_proj.q_scale`)
+    const ffnDownWeights = await load(
+      `${h}.mlp.down_proj.q_weight`,
+      `${p}.mlp.down_proj.q_weight`
+    )
+    const ffnDownScales = await load(
+      `${h}.mlp.down_proj.q_scale`,
+      `${p}.mlp.down_proj.q_scale`
+    )
 
     layers.push({
       qkvWeights, qkvScales,
@@ -260,9 +278,9 @@ export async function loadWeights(
   // Final norm (applied after all 32 layers, before LM head)
   // model.norm.weight is separate from layer input_layernorm weights
   const finalNormGamma = await load(
+    'transformer.norm.weight',
     'model.norm.weight',
-    'norm.weight',
-    'transformer.ln_f.weight'
+    'norm.weight'
   )
 
   onProgress?.('All weights loaded!')
