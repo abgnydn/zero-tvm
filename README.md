@@ -109,5 +109,5 @@ If this repo is useful to your research or writing, cite it as:
 
 ```
 Gunaydin, A. B. (2026). Zero-TVM: Phi-3 in a browser on 10 WGSL shaders.
-https://github.com/<user>/zero-tvm
+https://github.com/abgnydn/zero-tvm
 ```
