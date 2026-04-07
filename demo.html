@@ -84,6 +84,7 @@
 <body>
 
 <nav>
+  <a href="/" style="color:#4caf50; font-weight:600;">&larr; zero-tvm</a>
   <a href="#hero">Overview</a>
   <a href="#timeline">Dispatch Map</a>
   <a href="#shaders">Shaders</a>
@@ -95,14 +96,14 @@
 <!-- Section 1: Hero -->
 <section id="hero">
   <h1>WebGPU Shader Interception<br>for Browser LLMs</h1>
-  <p class="subtitle">We intercepted a 3.8B parameter AI model running entirely in your browser, captured every GPU operation, decoded its architecture, and built a faster engine from scratch.</p>
+  <p class="subtitle">I intercepted a 3.8B parameter AI model running entirely in your browser, captured every GPU operation, decoded its architecture, and built a faster engine from scratch.</p>
 
   <div class="pills">
     <div class="pill"><span>85</span> GPU shaders captured</div>
     <div class="pill"><span>342</span> dispatches per token</div>
     <div class="pill"><span>728</span> GPU buffers mapped</div>
-    <div class="pill"><span>13,042</span> lines of WGSL</div>
-    <div class="pill"><span>30-50</span> tok/s decode</div>
+    <div class="pill"><span>12,962</span> lines of WGSL</div>
+    <div class="pill"><span>27-52</span> tok/s decode</div>
   </div>
 
   <details>
@@ -110,7 +111,7 @@
     <div class="content">
       <p>Large Language Models like Phi-3 generate text one word at a time. For each word, the model runs 342 GPU compute operations ("dispatches") across 32 neural network layers. Each layer does matrix multiplication, attention computation, and activation functions — all running on your GPU via WebGPU.</p>
       <p>Normally, a framework called TVM manages these operations. TVM's runtime (written in WASM) decides which GPU shader to run, writes the parameters, submits the work, and reads the result — 342 times per word.</p>
-      <p>We intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, and built our own dispatch loop that drives the GPU directly. Same shaders, same weights, same math — but without TVM's WASM overhead.</p>
+      <p>I intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, and built my own dispatch loop that drives the GPU directly. Same shaders, same weights, same math — but without TVM's WASM overhead.</p>
     </div>
   </details>
 </section>
@@ -136,7 +137,7 @@
 <!-- Section 3: Shader Gallery -->
 <section id="shaders">
   <h2>85 Captured Shaders</h2>
-  <p>We intercepted every <code>createShaderModule</code> call during model load, capturing 85 WGSL compute shaders totaling 13,042 lines. We also wrote 3 custom fused shaders.</p>
+  <p>I intercepted every <code>createShaderModule</code> call during model load, capturing 85 WGSL compute shaders totaling 12,962 lines. I also wrote 3 custom fused shaders.</p>
 
   <h3>Per-Layer Pattern (10 dispatches × 32 layers)</h3>
   <div class="shader-grid" id="layer-shaders"></div>
@@ -167,7 +168,7 @@
   <details>
     <summary>Submit batching (337x fewer submits) doesn't help on Apple Silicon</summary>
     <div class="content">
-      <p>We accumulated all 342 command buffers and submitted them as a single GPU submit — a 337x reduction. The output was correct (coherent English, proper EOS detection). But it was <strong>30% slower</strong> than TVM's 1:1 submit pattern.</p>
+      <p>I accumulated all 342 command buffers and submitted them as a single GPU submit — a 337x reduction. The output was correct (coherent English, proper EOS detection). But it was <strong>30% slower</strong> than TVM's 1:1 submit pattern.</p>
       <p>Why? Chrome's GPU driver on Apple M2 already pipelines submits. While the CPU prepares dispatch N+1, the GPU executes dispatch N. Batching breaks this pipeline — the GPU sits idle during the entire CPU preparation phase.</p>
       <pre>TVM:     CPU: [setup1][setup2][setup3]...  ← overlaps with GPU
          GPU:    [work1][work2][work3]...
@@ -184,7 +185,7 @@ Batched: CPU: [setup1][setup2]...[setup342]  ← GPU idle
       <pre>fused_dequantize + NT_matmul     — int4 dequant + matmul in one shader
 fuse_add_norm_decode             — residual add + RMSNorm in one shader
 fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
-      <p>It does NOT fuse across matmul boundaries. Our fused shaders (FFN+SiLU, RMSNorm+Matmul) cross this boundary.</p>
+      <p>It does NOT fuse across matmul boundaries. My fused shaders (FFN+SiLU, RMSNorm+Matmul) cross this boundary.</p>
     </div>
   </details>
 
@@ -201,7 +202,7 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
     <div class="content">
       <p>At ~27-48 tok/s on M2 Pro (200 GB/s memory bandwidth), the model loads ~1.8GB of weights per token:</p>
       <pre>1.8 GB / 200 GB/s = 9ms per token = ~111 tok/s theoretical maximum</pre>
-      <p>Current performance (27-48 tok/s) represents 25-43% of the theoretical bandwidth limit. The remaining gap is from compute (attention, matmul reduction) and framework overhead. Our engine reduces framework overhead but can't change the bandwidth limit.</p>
+      <p>Current performance (27-48 tok/s) represents 25-43% of the theoretical bandwidth limit. The remaining gap is from compute (attention, matmul reduction) and framework overhead. My engine reduces framework overhead but can't change the bandwidth limit.</p>
     </div>
   </details>
 
@@ -233,7 +234,7 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
 <!-- Section 6: Live Demo -->
 <section id="demo">
   <h2>Live Demo</h2>
-  <p>Chat with Phi-3-mini running entirely in your browser. First message loads the model and captures the GPU state. Subsequent messages use our engine.</p>
+  <p>Chat with Phi-3-mini running entirely in your browser. First message loads the model and captures the GPU state. Subsequent messages use my engine.</p>
   <p style="color:#666; font-size:13px;">Requires Chrome with WebGPU support. Model download: ~2GB (cached after first load).</p>
 
   <div class="demo-layout" style="margin-top:24px">
@@ -253,8 +254,12 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
 </section>
 
 <footer>
-  WebGPU Shader Interception Research &mdash; Phi-3-mini 3.8B Q4 on Apple M2 Pro, Chrome WebGPU<br>
-  Built with TypeScript + WebGPU + Vite. No frameworks.
+  <a href="/" style="color:#4caf50;">zero-tvm</a> by Ahmet Baris Gunaydin
+  &nbsp;&middot;&nbsp; <a href="https://github.com/abgnydn/zero-tvm">GitHub</a>
+  &nbsp;&middot;&nbsp; Related:
+  <a href="https://github.com/abgnydn/kernelfusion">kernelfusion</a>
+  &nbsp;&middot;&nbsp;
+  <a href="https://github.com/abgnydn/gpubench">gpubench</a>
 </footer>
 
 <script type="module" src="/src/demo.ts"></script>
