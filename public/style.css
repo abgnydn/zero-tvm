@@ -106,7 +106,7 @@ header h1 {
 }
 
 .input-row input:focus {
-  border-color: #1a73e8;
+  border-color: #4caf5088;
 }
 
 .input-row input:disabled {
@@ -114,8 +114,8 @@ header h1 {
 }
 
 .input-row button {
-  background: #1a73e8;
-  color: #fff;
+  background: #4caf50;
+  color: #000;
   border: none;
   padding: 0.75rem 1.5rem;
   border-radius: 8px;

@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WebGPU Shader Interception for Browser LLMs</title>
+  <title>Dispatch Visualization — Zero-TVM</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; line-height: 1.6; }
-    a { color: #4a9eff; text-decoration: none; }
+    a { color: #4caf50; text-decoration: none; }
     a:hover { text-decoration: underline; }
     code, pre { font-family: 'SF Mono', 'Fira Code', monospace; }
 
@@ -25,12 +25,12 @@
 
     /* Stats pills */
     .pills { display: flex; flex-wrap: wrap; gap: 12px; margin: 32px 0; }
-    .pill { background: #1a1a2e; border: 1px solid #333; border-radius: 24px; padding: 8px 20px; font-size: 14px; font-weight: 600; }
-    .pill span { color: #4a9eff; font-size: 20px; }
+    .pill { background: #111; border: 1px solid #333; border-radius: 24px; padding: 8px 20px; font-size: 14px; font-weight: 600; }
+    .pill span { color: #4caf50; font-size: 20px; }
 
     /* Dispatch timeline */
     #timeline-canvas { width: 100%; height: 200px; border: 1px solid #222; border-radius: 8px; cursor: crosshair; }
-    #timeline-tooltip { position: absolute; background: #1a1a2e; border: 1px solid #444; padding: 8px 12px; border-radius: 6px; font-size: 12px; pointer-events: none; display: none; z-index: 10; }
+    #timeline-tooltip { position: absolute; background: #111; border: 1px solid #444; padding: 8px 12px; border-radius: 6px; font-size: 12px; pointer-events: none; display: none; z-index: 10; }
     .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px; font-size: 13px; }
     .legend-item { display: flex; align-items: center; gap: 6px; }
     .legend-dot { width: 12px; height: 12px; border-radius: 3px; }
@@ -42,7 +42,7 @@
     .shader-card .name { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
     .shader-card .meta { font-size: 12px; color: #666; }
     .shader-card .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; margin-top: 8px; }
-    .badge-matmul { background: #4a9eff22; color: #4a9eff; }
+    .badge-matmul { background: #4caf5022; color: #4caf50; }
     .badge-attn { background: #ff9f4322; color: #ff9f43; }
     .badge-norm { background: #2ecc7122; color: #2ecc71; }
     .badge-act { background: #a855f722; color: #a855f7; }
@@ -64,19 +64,6 @@
     details .content { padding: 16px; font-size: 14px; }
     details pre { background: #0a0a0a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 12px; margin: 8px 0; }
 
-    /* Live demo */
-    .demo-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-    @media (max-width: 768px) { .demo-layout { grid-template-columns: 1fr; } }
-    .demo-chat { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px; min-height: 400px; display: flex; flex-direction: column; }
-    .demo-stats { background: #111; border: 1px solid #222; border-radius: 8px; padding: 16px; }
-    .speed-display { font-size: 48px; font-weight: 700; color: #4a9eff; text-align: center; margin: 24px 0; }
-    .speed-label { font-size: 14px; color: #666; text-align: center; }
-    #demo-chat-area { flex: 1; overflow-y: auto; margin-bottom: 12px; font-size: 14px; }
-    #demo-input { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #333; color: #eee; border-radius: 6px; font-size: 14px; }
-    .msg { padding: 8px 12px; margin: 4px 0; border-radius: 8px; max-width: 85%; }
-    .msg.user { background: #1a2a4a; margin-left: auto; }
-    .msg.ai { background: #1a1a2e; }
-
     /* Footer */
     footer { text-align: center; padding: 40px; color: #444; font-size: 13px; border-top: 1px solid #111; }
   </style>
@@ -90,7 +77,6 @@
   <a href="#shaders">Shaders</a>
   <a href="#buffers">Buffers</a>
   <a href="#findings">Findings</a>
-  <a href="#demo">Live Demo</a>
 </nav>
 
 <!-- Section 1: Hero -->
@@ -125,7 +111,7 @@
   <div id="timeline-tooltip"></div>
 
   <div class="legend">
-    <div class="legend-item"><div class="legend-dot" style="background:#4a9eff"></div> Matmul (int4 dequant)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#4caf50"></div> Matmul (int4 dequant)</div>
     <div class="legend-item"><div class="legend-dot" style="background:#ff9f43"></div> Attention</div>
     <div class="legend-item"><div class="legend-dot" style="background:#2ecc71"></div> Norm + Residual</div>
     <div class="legend-item"><div class="legend-dot" style="background:#a855f7"></div> Activation (RoPE, SiLU)</div>
@@ -152,7 +138,7 @@
   <p>Every buffer referenced in the 342 dispatches, classified by purpose:</p>
 
   <div class="buffer-stats">
-    <div class="buffer-stat"><div class="val" style="color:#4a9eff">270</div><div class="label">Weight buffers<br>3.8 GB</div></div>
+    <div class="buffer-stat"><div class="val" style="color:#4caf50">270</div><div class="label">Weight buffers<br>3.8 GB</div></div>
     <div class="buffer-stat"><div class="val" style="color:#2ecc71">71</div><div class="label">Activation buffers<br>424 KB</div></div>
     <div class="buffer-stat"><div class="val" style="color:#ffd54f">37</div><div class="label">KV Cache buffers<br>19 MB</div></div>
     <div class="buffer-stat"><div class="val" style="color:#a855f7">350</div><div class="label">Uniform buffers<br>7.7 KB</div></div>
@@ -193,7 +179,7 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
     <summary>GPU f16 parallel reduction is non-deterministic</summary>
     <div class="content">
       <p>Running the exact same TVM code twice with the same prompt produces different tokens after position 7-156 (depending on prompt length). The f16 parallel reduction in matmul shaders accumulates partial sums in a tree pattern — different GPU scheduling = different rounding = different result.</p>
-      <p>This is a hardware-level non-determinism on Apple M2. It means any replay-based approach (including ours) can only match TVM's output up to this natural divergence point.</p>
+      <p>This is a hardware-level non-determinism on Apple M2. It means any replay-based approach (including mine) can only match TVM's output up to this natural divergence point.</p>
     </div>
   </details>
 
@@ -231,26 +217,12 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
   </details>
 </section>
 
-<!-- Section 6: Live Demo -->
-<section id="demo">
-  <h2>Live Demo</h2>
-  <p>Chat with Phi-3-mini running entirely in your browser. First message loads the model and captures the GPU state. Subsequent messages use my engine.</p>
-  <p style="color:#666; font-size:13px;">Requires Chrome with WebGPU support. Model download: ~2GB (cached after first load).</p>
-
-  <div class="demo-layout" style="margin-top:24px">
-    <div class="demo-chat">
-      <div id="demo-chat-area"></div>
-      <input id="demo-input" placeholder="Type a message... (loads model on first send)" disabled>
-    </div>
-    <div class="demo-stats">
-      <div class="speed-display" id="demo-speed">—</div>
-      <div class="speed-label">tokens / second</div>
-      <div style="margin-top:24px; font-size:13px; color:#666;">
-        <div id="demo-status">Click input to start</div>
-        <div id="demo-log" style="margin-top:12px; max-height:200px; overflow-y:auto; font-family:monospace; font-size:11px;"></div>
-      </div>
-    </div>
-  </div>
+<!-- Try It -->
+<section id="try" style="text-align:center; padding:60px 24px;">
+  <h2 style="border:none; padding:0; margin-bottom:12px;">Try It Yourself</h2>
+  <p style="max-width:500px; margin:0 auto 24px;">Chat with Phi-3-mini running on these 10 shaders — no TVM, no compiler, no server.</p>
+  <a href="/zero-tvm.html" style="display:inline-block; background:#4caf50; color:#000; font-weight:600; font-size:1.05rem; padding:0.8rem 2.2rem; border-radius:10px; text-decoration:none;">Open Zero-TVM Chat</a>
+  <p style="color:#555; font-size:12px; margin-top:12px;">Chrome or Edge only. ~2 GB model download on first load.</p>
 </section>
 
 <footer>
