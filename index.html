@@ -56,6 +56,51 @@
     }
     .cta:hover { background: #66bb6a; }
 
+    .share-btn {
+      background: none; border: 1px solid #333; color: #888;
+      padding: 0.5rem 1.2rem; border-radius: 8px; font-size: 0.85rem;
+      cursor: pointer; transition: all 0.15s;
+    }
+    .share-btn:hover { border-color: #555; color: #ccc; }
+
+    .share-modal {
+      display: none; position: fixed; inset: 0; z-index: 1000;
+      background: rgba(0,0,0,0.75); align-items: center; justify-content: center;
+    }
+    .share-modal.open { display: flex; }
+    .share-panel {
+      background: #141414; border: 1px solid #222; border-radius: 14px;
+      padding: 1.75rem; width: 90%; max-width: 480px;
+      display: flex; flex-direction: column; gap: 0.75rem;
+    }
+    .share-panel h3 { color: #fff; font-size: 1rem; margin-bottom: 0.25rem; }
+    .share-option {
+      display: flex; align-items: center; gap: 0.75rem;
+      background: #1a1a1a; border: 1px solid #222; border-radius: 8px;
+      padding: 0.7rem 1rem; cursor: pointer; text-decoration: none;
+      transition: border-color 0.15s;
+    }
+    .share-option:hover { border-color: #4caf50; }
+    .share-option .platform {
+      font-size: 0.82rem; font-weight: 600; color: #ddd; min-width: 70px;
+    }
+    .share-option .msg {
+      font-size: 0.75rem; color: #888; line-height: 1.4;
+      overflow: hidden; text-overflow: ellipsis;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    }
+    .share-close {
+      background: none; border: none; color: #555; font-size: 1.5rem;
+      position: absolute; top: 1rem; right: 1rem; cursor: pointer;
+    }
+    .copied-toast {
+      position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%);
+      background: #4caf50; color: #000; padding: 0.5rem 1.5rem;
+      border-radius: 8px; font-size: 0.85rem; font-weight: 600;
+      opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 1001;
+    }
+    .copied-toast.show { opacity: 1; }
+
     .req {
       font-size: 0.75rem; color: #555;
     }
@@ -138,11 +183,73 @@
     <div class="links">
       <a href="https://github.com/abgnydn/zero-tvm">GitHub</a>
       <a href="https://github.com/abgnydn/zero-tvm/stargazers">&#9733; Star on GitHub</a>
+      <button class="share-btn" onclick="document.getElementById('share-modal').classList.add('open')">Share</button>
       <a href="/demo.html">Dispatch visualization</a>
       <a href="/dump.html">TVM shader dump</a>
       <a href="/compiler-chat.html">Compiler chat (milestone)</a>
     </div>
   </div>
+
+  <div id="share-modal" class="share-modal" onclick="if(event.target===this)this.classList.remove('open')">
+    <div class="share-panel">
+      <h3>Share zero-tvm</h3>
+
+      <a class="share-option" target="_blank" id="share-x">
+        <span class="platform">X / Twitter</span>
+        <span class="msg">I replaced 85 TVM-generated GPU shaders with 10 hand-written ones. Phi-3 (3.6B) runs in the browser at ~same speed. 792 lines of WGSL, 14 KB JS bundle. No compiler, no WASM, no server.</span>
+      </a>
+
+      <a class="share-option" target="_blank" id="share-linkedin">
+        <span class="platform">LinkedIn</span>
+        <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3 (3.6B params) entirely in the browser using 10 hand-written WebGPU shaders, replacing the 85 auto-generated ones from TVM/WebLLM. Same speed, 792 lines of GPU code, 14 KB JS bundle.</span>
+      </a>
+
+      <a class="share-option" target="_blank" id="share-hn">
+        <span class="platform">Hacker News</span>
+        <span class="msg">Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL shaders (replacing TVM's 85)</span>
+      </a>
+
+      <a class="share-option" target="_blank" id="share-reddit">
+        <span class="platform">Reddit</span>
+        <span class="msg">I replaced TVM's 85 auto-generated shaders with 10 hand-written WGSL shaders. Phi-3 (3.6B) runs in the browser. 792 lines of GPU code total.</span>
+      </a>
+
+      <a class="share-option" id="share-copy" style="cursor:pointer;">
+        <span class="platform">Copy link</span>
+        <span class="msg" id="share-url"></span>
+      </a>
+    </div>
+  </div>
+
+  <div class="copied-toast" id="copied-toast">Link copied</div>
+
+  <script>
+  (function() {
+    var url = window.location.origin;
+    var repo = 'https://github.com/abgnydn/zero-tvm';
+
+    var xText = 'I replaced 85 TVM-generated GPU shaders with 10 hand-written ones. Phi-3 (3.6B) runs in the browser at ~same speed.\n\n792 lines of WGSL. 14 KB JS bundle. No compiler, no WASM, no server.\n\n' + url;
+    document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(xText);
+
+    var liText = 'I built a from-scratch LLM inference engine that runs Phi-3 (3.6B params) entirely in the browser using 10 hand-written WebGPU compute shaders, replacing the 85 auto-generated ones from Apache TVM / WebLLM.\n\nSame speed (~34 tok/s on M2 Pro). 792 lines of GPU code. 14 KB JavaScript bundle. No compiler, no WASM runtime, no server.\n\nThe whole forward pass -- 32 transformer layers, paged KV cache, int4 dequant, RoPE, fused FFN, attention, argmax -- is readable end-to-end.\n\nTry it: ' + url + '\nCode: ' + repo;
+    document.getElementById('share-linkedin').href = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(url);
+
+    document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent('Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL shaders (replacing TVM\'s 85)');
+
+    document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent('I replaced TVM\'s 85 auto-generated shaders with 10 hand-written WGSL shaders. Phi-3 (3.6B) runs in the browser.');
+
+    document.getElementById('share-url').textContent = url;
+
+    document.getElementById('share-copy').addEventListener('click', function(e) {
+      e.preventDefault();
+      navigator.clipboard.writeText(url).then(function() {
+        var toast = document.getElementById('copied-toast');
+        toast.classList.add('show');
+        setTimeout(function() { toast.classList.remove('show'); }, 1500);
+      });
+    });
+  })();
+  </script>
 
   <footer>
     <a href="https://github.com/abgnydn/zero-tvm">zero-tvm</a> by Ahmet Baris Gunaydin
