@@ -1,3 +1,5 @@
+<img width="1728" height="1001" alt="image" src="https://github.com/user-attachments/assets/7643b889-b199-405e-af4d-13d5dca9095d" />
+
 # Zero-TVM
 
 **Phi-3-mini running in a browser on 10 hand-written WGSL shaders. No TVM. No WebLLM runtime. No compiler.**
