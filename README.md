@@ -111,12 +111,22 @@ src/
 
 ## Known caveats
 
-- **Phi-3-mini-4k-instruct Q4 only.** The constants in `src/compiler/compiler.ts` hard-code `D=3072`, `HEADS=32`, `HEAD_DIM=96`, `LAYERS=32`, `FFN=8192`, `VOCAB=32064`, `PAGE_SIZE=16`, `MAX_PAGES=257`. Porting to another architecture means editing `PHI3` and re-reading the shaders that bake those dimensions in as dispatch sizes.
-- **Greedy decoding only.** Sampling is a single `argmax.wgsl` dispatch. No temperature, top-k, or top-p. Adding them is a new shader or a CPU-side sampler; deliberately left out to keep the stack minimal.
-- **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts, not optimized for long-context ingest.
-- **Requires the `shader-f16` WebGPU feature.** Matmuls run in f16. The LM head uses an f32 output buffer (`int4_matmul_f32.wgsl`) so the 32064-wide argmax is stable.
-- **Buffer aliasing workaround.** WebGPU disallows read+write to the same buffer in one dispatch, so `chat.ts` ping-pongs the residual between two buffers (`B.residual` / `B.residual2`). See the comment at `src/zero-tvm/chat.ts:160`.
-- **Weights come from HuggingFace on first run.** The loader expects the [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC) repo layout (MLC's Q4f16_1 quantization, parameter names `transformer.h.N.mixer.*`). If MLC changes either, the loader needs an update.
+These are the caveats that survive the code as-shipped. The [v0.2 commit log](#) lists several earlier ones — silent context overflow, per-token uniform buffer leaks, double `queue.submit()`, redundant first-token readback — that were turned into code fixes rather than documentation. The remaining items are either inherent to the approach or deliberate scoping decisions.
+
+### Inherent
+
+- **Phi-3-mini-4k-instruct Q4 only, by shader surgery.** The constants in `src/compiler/compiler.ts` declare `D=3072`, `HEADS=32`, `HEAD_DIM=96`, `LAYERS=32`, `FFN=8192`, `VOCAB=32064`, `PAGE_SIZE=16`, `MAX_PAGES=257` — but those values are **also hard-coded as integer literals in address arithmetic inside eight of the ten shaders** (`grep '3072\|9216\|98304\|1536\|8192' src/compiler/shaders/`). Porting to Mistral, Llama, or any other architecture is not a config edit; it is a per-shader rewrite of offsets and strides.
+- **GPU memory footprint ≈ 3.6 GB.** Phi-3-mini Q4 weights are ~1.8 GB, and the paged KV cache is `32 layers × 257 pages × 196,608 B/page ≈ 1.6 GB` (see `allocKVPages` in `chat.ts`). On an M2 Pro with 16 GB unified memory this is invisible; on a 4 GB integrated GPU it will OOM during KV allocation before the first token. If you want to trade context length for memory, lower `MAX_PAGES` in `src/compiler/compiler.ts` — 128 pages = 2048-token context, ~0.8 GB KV, which fits almost anywhere.
+- **Requires the `shader-f16` WebGPU feature.** Matmuls run in f16 (see `enable f16` at the top of every `int4_matmul*.wgsl`). The LM head uses an f32 output buffer (`int4_matmul_f32.wgsl`) because "the sampling pipeline needs f32 logits" — TVM's `NT_matmul14_cast2` does the same cast. Chrome/Edge with WebGPU and `shader-f16` is required; Safari's WebGPU does not yet expose `shader-f16`.
+- **BPE tokenizer is a hand-rolled reimplementation, not `tokenizers.js`.** `src/zero-tvm/tokenizer.ts` is ~250 lines: vocab lookup, merge table, metaspace prefixing, byte fallback. It does **not** implement HuggingFace's full pre-tokenization regex pipeline or Unicode NFKC normalization. For normal English chat it matches the reference tokenizer; for emoji, unusual Unicode, or some punctuation patterns it may diverge, and the resulting token stream won't be exactly what Phi-3 was trained on. If correctness matters for your input, run the prompt through `@huggingface/tokenizers` and compare.
+- **Phi-3 chat template is baked in.** `buildChatPrompt` in `tokenizer.ts` emits `<|system|>...<|end|>\n<|user|>...<|end|>\n<|assistant|>\n`. Stop tokens are the Phi-3 set `{2, 32000, 32007}`. Port to another model → edit both.
+- **Weight loader expects MLC's Q4f16_1 layout.** [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC), including MLC's renamed parameter scheme (`transformer.h.N.mixer.*`, not `model.layers.N.*`). If MLC re-quantizes or re-names, the loader needs a patch.
+
+### Deliberate scoping
+
+- **Greedy decoding only.** Sampling is a single `argmax.wgsl` dispatch. No temperature, top-k, top-p, repetition penalty. A CPU-side sampler over the f32 logit buffer would be ~30 lines; left out to keep the minimal-stack claim honest.
+- **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts; a batched-prefill attention shader would be a meaningful speedup for long-context ingest.
+- **Residual buffer ping-pong.** WebGPU forbids read+write to the same buffer in one dispatch, so `chat.ts` swaps between `B.residual` and `B.residual2` across the `add_norm` dispatches. This isn't a bug or a workaround in the pejorative sense — it's how WebGPU requires you to write this — but it's the kind of thing a reader of `chat.ts` will notice and want explained. See `src/zero-tvm/chat.ts` around line 195.
 - **Benchmarks not yet in-tree.** See the [Benchmarks](#benchmarks) section.
 
 ## License

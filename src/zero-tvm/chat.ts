@@ -44,7 +44,6 @@ function uniformBuf(device: GPUDevice, data: (number | ArrayBuffer)[]): GPUBuffe
 
 function u32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, v, true); return a }
 function i32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setInt32(0, v, true); return a }
-function f32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, v, true); return a }
 
 function bg(device: GPUDevice, pipeline: GPUComputePipeline, bufs: GPUBuffer[]): GPUBindGroup {
   return device.createBindGroup({
@@ -115,8 +114,8 @@ function buildDecodeEngine(
     lengthInfo: makeBuf(device, 12, 'lengthInfo'),
   }
 
-  // Static uniforms
-  const qkvU  = uniformBuf(device, [u32(384), u32(96), u32(9216)])
+  // Static uniforms — matmul shapes (K_packed, scales_per_row, M)
+  const qkvU   = uniformBuf(device, [u32(384), u32(96), u32(9216)])
   const oProjU = uniformBuf(device, [u32(384), u32(96), u32(3072)])
   const ffnDnU = uniformBuf(device, [u32(1024), u32(256), u32(3072)])
   const lmHdU  = uniformBuf(device, [u32(384), u32(96), u32(PHI3.VOCAB)])
@@ -125,17 +124,59 @@ function buildDecodeEngine(
   const ffnU   = uniformBuf(device, [u32(PHI3.FFN)])
   const argmaxU = uniformBuf(device, [u32(PHI3.VOCAB)])
 
+  // Hoisted per-layer uniforms. Previously these were allocated inside the
+  // per-layer hot loop on every token, leaking ~96 uniform buffers per token.
+  // rope, kv_append: all fields are constant across tokens.
+  const ropeU  = uniformBuf(device, [i32(1), i32(0), i32(1), u32(36)])
+  const kvAppU = uniformBuf(device, [i32(1), i32(PHI3.MAX_PAGES), i32(0), i32(0), u32(12)])
+
+  // attention: same layout as before, but allocated once. Only field that
+  // changes per token is nnz_pages at byte offset 8 — we writeBuffer it.
+  const SM_SCALE = 1.0 / Math.sqrt(PHI3.HEAD_DIM)
+  const attnU = device.createBuffer({
+    size: 48,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    label: 'attnU',
+  })
+  {
+    const init = new ArrayBuffer(48)
+    const dv = new DataView(init)
+    dv.setInt32(0, 1, true)                    // batch
+    dv.setInt32(4, PHI3.MAX_PAGES, true)       // max_pages
+    // offset 8: nnz_pages — updated per token via writeBuffer
+    dv.setInt32(12, 0, true)
+    dv.setInt32(16, 0, true)
+    dv.setInt32(20, 0, true)
+    dv.setInt32(24, 0, true)
+    dv.setFloat32(28, SM_SCALE, true)          // sm_scale
+    dv.setUint32(32, 1, true)
+    device.queue.writeBuffer(attnU, 0, init)
+  }
+  const nnzPagesScratch = new Uint32Array(1)   // reused per token for writeBuffer
+
+  // Token readback buffer — allocated once, reused every decode step.
+  // Previously a new 4-byte GPUBuffer was created and destroyed per token.
+  const readBuf = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    label: 'tokenReadback',
+  })
+
   // Initialize identity page table (page i → physical page i)
   const pageVals = new Int32Array(PHI3.MAX_PAGES)
   for (let i = 0; i < PHI3.MAX_PAGES; i++) pageVals[i] = i
   device.queue.writeBuffer(B.pageValues, 0, pageVals)
 
-  // Per-layer pre-created bind groups for the attention uniform (varies per position)
-  // We create the attention uniform per-call since nnz_pages changes
-
-  const SM_SCALE = 1.0 / Math.sqrt(PHI3.HEAD_DIM)
+  const MAX_CONTEXT = PHI3.MAX_PAGES * PHI3.PAGE_SIZE
 
   async function decodeToken(tokenId: number, position: number): Promise<number> {
+    if (position < 0 || position >= MAX_CONTEXT) {
+      throw new Error(
+        `zero-tvm: context overflow — position ${position} exceeds max context ` +
+        `${MAX_CONTEXT} tokens (PHI3.MAX_PAGES=${PHI3.MAX_PAGES} × PAGE_SIZE=${PHI3.PAGE_SIZE}). ` +
+        `Shorten the prompt or raise MAX_PAGES in src/compiler/compiler.ts (costs ~${Math.round(PHI3.LAYERS * 196608 / (1024 * 1024))} MB of KV cache per page block).`
+      )
+    }
     const nnzPages = Math.floor(position / PHI3.PAGE_SIZE) + 1
 
     // --- Write per-token state ---
@@ -144,6 +185,9 @@ function buildDecodeEngine(
     device.queue.writeBuffer(B.pageIndptr, 0, new Int32Array([0, nnzPages]))
     // length_info: total tokens in sequence = position + 1
     device.queue.writeBuffer(B.lengthInfo, 0, new Int32Array([position + 1, 0, 0]))
+    // attnU.nnz_pages lives at byte offset 8 — the only field that varies per token
+    nnzPagesScratch[0] = nnzPages
+    device.queue.writeBuffer(attnU, 8, nnzPagesScratch)
 
     const enc = device.createCommandEncoder()
 
@@ -173,22 +217,16 @@ function buildDecodeEngine(
 
       // [1] RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
       // rope.wgsl bindings: @0=q_out, @1=k_out, @2=v_out, @3=qkv, @4=position_map
-      const ropeU = uniformBuf(device, [i32(1), i32(0), i32(1), u32(36)])
       dispatch(enc, P.rope, bg(device, P.rope, [
         B.qOut, B.kOut, B.vOut, B.qkvOut, B.posMap, ropeU,
       ]), 36)
 
       // [2] KV append: kOut, vOut → kvPages[L]
-      const kvAppU = uniformBuf(device, [i32(1), i32(PHI3.MAX_PAGES), i32(0), i32(0), u32(12)])
       dispatch(enc, P.kvAppend, bg(device, P.kvAppend, [
         B.kOut, B.vOut, kvPages[L], B.posMap, kvAppU,
       ]), 12)
 
-      // [3] Attention: Q + kvPages[L] → B.attnOut
-      const attnU = uniformBuf(device, [
-        i32(1), i32(PHI3.MAX_PAGES), i32(nnzPages), i32(0),
-        i32(0), i32(0), i32(0), f32(SM_SCALE), u32(1),
-      ])
+      // [3] Attention: Q + kvPages[L] → B.attnOut  (attnU.nnz_pages updated above)
       dispatch(enc, P.attention, bg(device, P.attention, [
         B.qOut, B.pageIndptr, B.pageValues, kvPages[L],
         B.lengthInfo, B.attnOut, attnU,
@@ -238,19 +276,13 @@ function buildDecodeEngine(
       B.logits, B.tokenOut, argmaxU,
     ]), 1)
 
+    // Fold the argmax readback into the same command encoder → one submit per token.
+    enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     device.queue.submit([enc.finish()])
-
-    // --- Read token ---
-    const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
-    const readEnc = device.createCommandEncoder()
-    readEnc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
-    device.queue.submit([readEnc.finish()])
 
     await readBuf.mapAsync(GPUMapMode.READ)
     const result = new DataView(readBuf.getMappedRange()).getInt32(0, true)
     readBuf.unmap()
-    readBuf.destroy()
-
     return result
   }
 
@@ -263,24 +295,14 @@ function buildDecodeEngine(
   ): Promise<number[]> {
     const tokens: number[] = []
 
-    // Prefill: process each prompt token through the decode step to populate KV cache
-    // Sequential prefill (simplest correct approach)
+    // Prefill: process each prompt token through the decode step to populate KV cache.
+    // Sequential prefill (simplest correct approach). The last call's return value
+    // is the argmax over the final prefill step's logits — that *is* the first
+    // generated token, so we use it directly instead of re-reading B.tokenOut.
+    let tokenId = 0
     for (let i = 0; i < promptIds.length; i++) {
-      await decodeToken(promptIds[i], i)
+      tokenId = await decodeToken(promptIds[i], i)
     }
-
-    // First generated token is the output of the last prefill step
-    let tokenId = await (async () => {
-      const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
-      const readEnc = device.createCommandEncoder()
-      readEnc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
-      device.queue.submit([readEnc.finish()])
-      await readBuf.mapAsync(GPUMapMode.READ)
-      const id = new DataView(readBuf.getMappedRange()).getInt32(0, true)
-      readBuf.unmap()
-      readBuf.destroy()
-      return id
-    })()
 
     // Decode loop
     let pos = promptIds.length
