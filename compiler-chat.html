@@ -9,18 +9,29 @@
 <body>
   <div class="container">
     <header>
-      <h1>Our Compiler</h1>
-      <span id="badge" class="badge loading">Loading...</span>
+      <h1>Compiler Chat</h1>
+      <span id="badge" class="badge">Waiting</span>
       <span id="stats" class="stats"></span>
     </header>
-    <div id="chat" class="chat"></div>
+    <div id="chat" class="chat">
+      <div id="start-screen" style="display:flex; flex-direction:column; align-items:center; justify-content:center; flex:1; gap:1rem; padding:2rem; text-align:center;">
+        <p style="color:#888; font-size:0.95rem; max-width:400px;">
+          Compiler-based chat: captures TVM dispatches on first message,<br>
+          then replays with my 10 WGSL shaders.
+        </p>
+        <button id="start-btn" style="background:#4caf50; color:#000; font-weight:600; font-size:1rem; padding:0.75rem 2rem; border:none; border-radius:8px; cursor:pointer;">
+          Download &amp; Start
+        </button>
+        <span style="font-size:0.72rem; color:#555;">Downloads WebLLM + Phi-3 weights (~2 GB).</span>
+      </div>
+    </div>
     <div class="input-row">
       <input id="inp" type="text" placeholder="Type a message..." disabled>
       <button id="btn" disabled>Send</button>
     </div>
     <pre id="log" class="log"></pre>
   </div>
-  <footer>342/342 dispatches = our shaders. 10 WGSL files. Zero TVM runtime. Zero TVM shaders.</footer>
+  <footer>342/342 dispatches = my shaders. 10 WGSL files. Zero TVM runtime. Zero TVM shaders.</footer>
   <script type="module" src="/src/compiler/chat-v2.ts"></script>
 </body>
 </html>

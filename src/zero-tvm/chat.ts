@@ -364,14 +364,33 @@ function addMsg(role: 'user' | 'ai'): HTMLElement {
 // ============================================================
 
 async function main(): Promise<void> {
-  setBadge('Initializing...', true)
   log('Zero-TVM Phi-3 — No WebLLM, No TVM')
   log('10 hand-written WGSL shaders + HuggingFace weights')
   log('')
 
   if (!navigator.gpu) {
-    setBadge('No WebGPU'); log('ERROR: WebGPU not supported'); return
+    setBadge('No WebGPU'); log('ERROR: WebGPU not supported')
+    const startBtn = document.getElementById('start-btn')
+    if (startBtn) startBtn.textContent = 'WebGPU not supported'
+    return
   }
+
+  // Wait for user to click "Download & Start" before fetching ~2 GB of weights
+  const startBtn = document.getElementById('start-btn') as HTMLButtonElement | null
+  if (startBtn) {
+    await new Promise<void>(resolve => {
+      startBtn.addEventListener('click', () => {
+        startBtn.disabled = true
+        startBtn.textContent = 'Starting...'
+        resolve()
+      })
+    })
+  }
+
+  const startScreen = document.getElementById('start-screen')
+  if (startScreen) startScreen.remove()
+
+  setBadge('Initializing...', true)
 
   const adapter = await navigator.gpu.requestAdapter()
   if (!adapter) {

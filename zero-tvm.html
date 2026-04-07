@@ -10,10 +10,21 @@
   <div class="container">
     <header>
       <h1>Zero TVM</h1>
-      <span id="badge" class="badge loading">Loading...</span>
+      <span id="badge" class="badge">Waiting</span>
       <span id="stats" class="stats"></span>
     </header>
-    <div id="chat" class="chat"></div>
+    <div id="chat" class="chat">
+      <div id="start-screen" style="display:flex; flex-direction:column; align-items:center; justify-content:center; flex:1; gap:1rem; padding:2rem; text-align:center;">
+        <p style="color:#888; font-size:0.95rem; max-width:400px;">
+          Phi-3-mini (3.6B) runs entirely on your GPU.<br>
+          First load downloads ~2 GB of model weights.
+        </p>
+        <button id="start-btn" style="background:#4caf50; color:#000; font-weight:600; font-size:1rem; padding:0.75rem 2rem; border:none; border-radius:8px; cursor:pointer;">
+          Download &amp; Start
+        </button>
+        <span style="font-size:0.72rem; color:#555;">Subsequent loads use browser cache.</span>
+      </div>
+    </div>
     <div class="input-row">
       <input id="inp" type="text" placeholder="Type a message..." disabled>
       <button id="btn" disabled>Send</button>

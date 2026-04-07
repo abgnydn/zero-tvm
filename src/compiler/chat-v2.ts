@@ -407,6 +407,20 @@ async function main(): Promise<void> {
   const ui = new ChatUI()
   const llm = new LLMEngine()
 
+  // Wait for user to click "Download & Start" before fetching ~2 GB of weights
+  const startBtn = document.getElementById('start-btn') as HTMLButtonElement | null
+  if (startBtn) {
+    await new Promise<void>(resolve => {
+      startBtn.addEventListener('click', () => {
+        startBtn.disabled = true
+        startBtn.textContent = 'Starting...'
+        resolve()
+      })
+    })
+    const startScreen = document.getElementById('start-screen')
+    if (startScreen) startScreen.remove()
+  }
+
   ui.appendLog('Loading model...')
 
   if (navigator.gpu) {
@@ -432,7 +446,7 @@ async function main(): Promise<void> {
   const tokenizer = llm.getTokenizer()
   ui.setBadge('Ready')
   ui.setEnabled(true)
-  ui.setInitialMessage('Our Compiler\n342/342 dispatches = our shaders\nMsg 1: TVM captures\nMsg 2+: Our engine')
+  ui.setInitialMessage('Compiler Chat\n342/342 dispatches = my shaders\nMsg 1: TVM captures\nMsg 2+: My engine')
 
   let engine: OurEngine | null = null
   let generating = false
