@@ -11,39 +11,192 @@
   <meta property="og:description" content="Chat with Phi-3-mini (3.6B) running entirely on your GPU. 10 hand-written WGSL shaders, no TVM runtime.">
   <meta property="og:image" content="/og.png">
   <meta name="twitter:card" content="summary_large_image">
-  <link rel="stylesheet" href="/style.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0a0a0a; color: #e0e0e0;
+      height: 100vh; display: flex; flex-direction: column;
+    }
+
+    /* ---- Top bar ---- */
+    .topbar {
+      display: flex; align-items: center; gap: 0.75rem;
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid #1a1a1a;
+      background: #0d0d0d;
+      flex-shrink: 0;
+    }
+    .topbar a { color: #555; text-decoration: none; font-size: 0.9rem; transition: color 0.15s; }
+    .topbar a:hover { color: #aaa; }
+    .topbar h1 { font-size: 0.95rem; font-weight: 600; color: #ddd; }
+    .badge {
+      font-size: 0.68rem; font-weight: 600; letter-spacing: 0.02em;
+      padding: 0.2rem 0.6rem; border-radius: 10px;
+      background: #1a1a1a; color: #555;
+    }
+    .badge.ready { background: #0d3320; color: #10b981; }
+    .badge.loading { background: #332b00; color: #eab308; }
+    .badge.error { background: #331111; color: #ef4444; }
+    .stats {
+      margin-left: auto;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.72rem; color: #444;
+    }
+
+    /* ---- Chat area ---- */
+    .chat-wrap {
+      flex: 1; overflow-y: auto;
+      padding: 1rem 1.25rem;
+      display: flex; flex-direction: column;
+    }
+    .chat {
+      max-width: 720px; width: 100%; margin: 0 auto;
+      display: flex; flex-direction: column; gap: 0.75rem;
+      flex: 1;
+    }
+
+    /* ---- Start screen ---- */
+    .start-screen {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; flex: 1; gap: 1.25rem; text-align: center;
+    }
+    .start-screen .title { font-size: 1.1rem; font-weight: 600; color: #ccc; }
+    .start-screen .desc { font-size: 0.85rem; color: #555; max-width: 380px; line-height: 1.6; }
+    .start-btn {
+      background: #10b981; color: #000; font-weight: 600; font-size: 0.95rem;
+      padding: 0.7rem 2rem; border: none; border-radius: 8px; cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .start-btn:hover { background: #34d399; transform: translateY(-1px); }
+    .start-btn:active { transform: translateY(0); }
+    .start-btn:disabled { background: #1a1a1a; color: #444; cursor: default; transform: none; }
+    .start-hint { font-size: 0.68rem; color: #333; }
+
+    /* ---- Progress ---- */
+    .progress-wrap {
+      display: none; flex-direction: column; align-items: center;
+      justify-content: center; flex: 1; gap: 1rem; text-align: center;
+      max-width: 420px; margin: 0 auto; width: 100%;
+    }
+    .progress-wrap.active { display: flex; }
+    .progress-status { font-size: 0.85rem; color: #888; }
+    .progress-bar-outer {
+      width: 100%; height: 4px; background: #1a1a1a; border-radius: 2px; overflow: hidden;
+    }
+    .progress-bar-inner {
+      height: 100%; width: 0%; background: #10b981; border-radius: 2px;
+      transition: width 0.15s ease-out;
+    }
+    .progress-detail {
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.7rem; color: #333;
+    }
+    .progress-log {
+      width: 100%; max-height: 120px; overflow-y: auto;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.65rem; color: #2a2a2a; text-align: left;
+      padding: 0.5rem; background: #0d0d0d; border-radius: 6px;
+      border: 1px solid #151515; white-space: pre-wrap;
+    }
+
+    /* ---- Messages ---- */
+    .msg {
+      max-width: 85%; padding: 0.7rem 1rem; border-radius: 12px;
+      font-size: 0.9rem; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word;
+    }
+    .msg.user {
+      background: #1a2a3e; align-self: flex-end;
+      border-bottom-right-radius: 4px; color: #ddd;
+    }
+    .msg.ai {
+      background: #151515; align-self: flex-start;
+      border-bottom-left-radius: 4px; color: #bbb;
+    }
+    .msg.ai.generating { border-left: 2px solid #10b981; }
+
+    /* ---- Input ---- */
+    .input-wrap {
+      border-top: 1px solid #1a1a1a; padding: 0.75rem 1.25rem;
+      background: #0d0d0d; flex-shrink: 0;
+    }
+    .input-inner {
+      max-width: 720px; margin: 0 auto;
+      display: flex; gap: 0.5rem;
+    }
+    .input-inner input {
+      flex: 1; background: #141414; border: 1px solid #222;
+      color: #ddd; padding: 0.65rem 0.9rem; border-radius: 8px;
+      font-size: 0.9rem; outline: none; transition: border-color 0.15s;
+    }
+    .input-inner input:focus { border-color: #10b98144; }
+    .input-inner input:disabled { opacity: 0.4; }
+    .input-inner button {
+      background: #10b981; color: #000; font-weight: 600;
+      border: none; padding: 0.65rem 1.25rem; border-radius: 8px;
+      font-size: 0.85rem; cursor: pointer; transition: background 0.15s;
+    }
+    .input-inner button:hover { background: #34d399; }
+    .input-inner button:disabled {
+      background: #1a1a1a; color: #333; cursor: default;
+    }
+
+    /* ---- Footer ---- */
+    footer {
+      text-align: center; padding: 0.5rem;
+      font-size: 0.65rem; color: #222; flex-shrink: 0;
+    }
+    footer a { color: #333; text-decoration: none; }
+
+    @media (max-width: 500px) {
+      .topbar { padding: 0.6rem 0.75rem; }
+      .chat-wrap { padding: 0.75rem; }
+      .input-wrap { padding: 0.6rem 0.75rem; }
+    }
+  </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <a href="/" style="color:#10b981; text-decoration:none; font-size:0.85rem; font-weight:600;">&larr;</a>
-      <h1>Zero TVM</h1>
-      <span id="badge" class="badge">Waiting</span>
-      <span id="stats" class="stats"></span>
-    </header>
+  <div class="topbar">
+    <a href="/">&larr;</a>
+    <h1>Zero TVM</h1>
+    <span id="badge" class="badge">Waiting</span>
+    <span id="stats" class="stats"></span>
+  </div>
+
+  <div class="chat-wrap">
     <div id="chat" class="chat">
-      <div id="start-screen" style="display:flex; flex-direction:column; align-items:center; justify-content:center; flex:1; gap:1rem; padding:2rem; text-align:center;">
-        <p style="color:#888; font-size:0.95rem; max-width:400px;">
-          Phi-3-mini (3.6B) runs entirely on your GPU.<br>
-          First load downloads ~2 GB of model weights.
-        </p>
-        <button id="start-btn" style="background:#10b981; color:#000; font-weight:600; font-size:1rem; padding:0.75rem 2rem; border:none; border-radius:8px; cursor:pointer;">
-          Download &amp; Start
-        </button>
-        <span style="font-size:0.72rem; color:#555;">Subsequent loads use browser cache.</span>
+      <div id="start-screen" class="start-screen">
+        <div class="title">Phi-3-mini (3.6B)</div>
+        <div class="desc">
+          Runs entirely on your GPU with 10 hand-written WGSL shaders.
+          No TVM, no compiler, no server.
+        </div>
+        <button id="start-btn" class="start-btn">Download & Start</button>
+        <div class="start-hint">~2 GB model download, cached after first load</div>
+      </div>
+
+      <div id="progress-wrap" class="progress-wrap">
+        <div id="progress-status" class="progress-status">Initializing...</div>
+        <div class="progress-bar-outer">
+          <div id="progress-bar" class="progress-bar-inner"></div>
+        </div>
+        <div id="progress-detail" class="progress-detail"></div>
+        <div id="progress-log" class="progress-log"></div>
       </div>
     </div>
-    <div class="input-row">
+  </div>
+
+  <div class="input-wrap">
+    <div class="input-inner">
       <input id="inp" type="text" placeholder="Type a message..." disabled>
       <button id="btn" disabled>Send</button>
     </div>
-    <pre id="log" class="log"></pre>
   </div>
+
   <footer>
-    <a href="/" style="color:#10b981; text-decoration:none;">zero-tvm</a> by Ahmet Baris Gunaydin
-    &nbsp;&middot;&nbsp; <a href="https://github.com/abgnydn/zero-tvm" style="color:#555; text-decoration:none;">GitHub</a>
-    &nbsp;&middot;&nbsp; 10 WGSL shaders. Zero TVM runtime.
+    <a href="/">zero-tvm</a> &middot; 10 WGSL shaders &middot; <a href="https://github.com/abgnydn/zero-tvm">GitHub</a>
   </footer>
+
   <script type="module" src="/src/zero-tvm/chat.ts"></script>
 </body>
 </html>

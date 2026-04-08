@@ -46,7 +46,16 @@ interface NDArrayCache {
 // Fetch with browser cache fallback
 // ============================================================
 
-async function fetchCached(url: string, onProgress?: (msg: string) => void): Promise<ArrayBuffer> {
+export type ProgressCallback = (msg: string) => void
+export type ByteProgressCallback = (downloaded: number, total: number, file: string) => void
+
+async function fetchCached(
+  url: string,
+  onProgress?: ProgressCallback,
+  onByteProgress?: ByteProgressCallback
+): Promise<ArrayBuffer> {
+  const fileName = url.split('/').at(-1) || url
+
   // Try every Cache API store (tvmjs may use a variety of names)
   try {
     const cacheNames = await caches.keys()
@@ -54,15 +63,40 @@ async function fetchCached(url: string, onProgress?: (msg: string) => void): Pro
       const store = await caches.open(name)
       const resp = await store.match(url)
       if (resp) {
-        onProgress?.(`[cache hit] ${url.split('/').at(-1)}`)
+        onProgress?.(`cache  ${fileName}`)
         return resp.arrayBuffer()
       }
     }
   } catch { /* no Cache API */ }
 
-  onProgress?.(`[fetch] ${url.split('/').at(-1)}`)
+  onProgress?.(`fetch  ${fileName}`)
   const resp = await fetch(url)
   if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${url}`)
+
+  // Stream with byte-level progress if possible
+  if (resp.body && onByteProgress) {
+    const total = parseInt(resp.headers.get('content-length') || '0', 10)
+    const reader = resp.body.getReader()
+    const chunks: Uint8Array[] = []
+    let downloaded = 0
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      downloaded += value.byteLength
+      onByteProgress(downloaded, total, fileName)
+    }
+
+    const result = new Uint8Array(downloaded)
+    let offset = 0
+    for (const chunk of chunks) {
+      result.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return result.buffer
+  }
+
   return resp.arrayBuffer()
 }
 
@@ -95,10 +129,11 @@ async function getShard(
   baseUrl: string,
   dataPath: string,
   shardCache: ShardCache,
-  onProgress?: (msg: string) => void
+  onProgress?: ProgressCallback,
+  onByteProgress?: ByteProgressCallback
 ): Promise<ArrayBuffer> {
   if (shardCache.has(dataPath)) return shardCache.get(dataPath)!
-  const buf = await fetchCached(baseUrl + dataPath, onProgress)
+  const buf = await fetchCached(baseUrl + dataPath, onProgress, onByteProgress)
   shardCache.set(dataPath, buf)
   return buf
 }
@@ -112,9 +147,10 @@ async function loadParam(
   baseUrl: string,
   rec: FlatRecord,
   shardCache: ShardCache,
-  onProgress?: (msg: string) => void
+  onProgress?: ProgressCallback,
+  onByteProgress?: ByteProgressCallback
 ): Promise<GPUBuffer> {
-  const shard = await getShard(baseUrl, rec.dataPath, shardCache, onProgress)
+  const shard = await getShard(baseUrl, rec.dataPath, shardCache, onProgress, onByteProgress)
   const slice = shard.slice(rec.byteOffset, rec.byteOffset + rec.nbytes)
 
   const buf = device.createBuffer({
@@ -150,7 +186,8 @@ function find(index: Map<string, FlatRecord>, ...candidates: string[]): FlatReco
 
 export async function loadWeights(
   device: GPUDevice,
-  onProgress?: (msg: string) => void
+  onProgress?: ProgressCallback,
+  onByteProgress?: ByteProgressCallback
 ): Promise<LoadedWeights> {
   const baseUrl = PHI3_MODEL_BASE
 
@@ -171,8 +208,7 @@ export async function loadWeights(
   // Helper that creates a GPUBuffer from named param
   async function load(name: string, ...alts: string[]): Promise<GPUBuffer> {
     const rec = find(index, name, ...alts)
-    onProgress?.(`Loading ${rec.name} (${(rec.nbytes / 1e6).toFixed(1)}MB)...`)
-    return loadParam(device, baseUrl, rec, shardCache, onProgress)
+    return loadParam(device, baseUrl, rec, shardCache, onProgress, onByteProgress)
   }
 
   // 2. Global weights
