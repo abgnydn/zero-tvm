@@ -2,6 +2,8 @@
 
 # Zero-TVM
 
+**[zerotvm.com](https://zerotvm.com)**
+
 **Phi-3-mini running in a browser on 10 hand-written WGSL shaders. No TVM. No WebLLM runtime. No compiler.**
 
 The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits 85 autotuned WGSL kernels and drives them from a WASM scheduler. This repo replaces that entire stack with **10 WGSL compute shaders and about 1,250 lines of TypeScript**, using the same model and the same quantized weights.
@@ -141,5 +143,5 @@ If this repo is useful to your research or writing, cite it as:
 
 ```
 Gunaydin, A. B. (2026). Zero-TVM: Phi-3 in a browser on 10 WGSL shaders.
-https://github.com/abgnydn/zero-tvm
+https://zerotvm.com | https://github.com/abgnydn/zero-tvm
 ```
