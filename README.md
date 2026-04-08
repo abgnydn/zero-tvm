@@ -12,7 +12,7 @@ The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant m
 
 ## What's actually in the box
 
-All numbers below are measured from the source and the build output in this repo. Performance numbers are intentionally omitted until they are benchmarked; see [Benchmarks](#benchmarks).
+All numbers below are measured from the source and the build output in this repo. Performance varies by GPU — throughput is displayed live in the chat UI.
 
 | | WebLLM (TVM) | Zero-TVM (this repo) |
 |---|---|---|
@@ -33,7 +33,7 @@ Every FLOP the model executes is in a file you can open. Every GPU buffer has a 
 
 Hand-written GPU kernels usually lose significantly to an autotuning compiler. The claim this repo is designed to test is: **for a decoder-only LLM of this shape, most of the compiler's complexity budget isn't buying much.** The expensive parts are matmul, attention, and int4 dequant. Everything else is plumbing. 10 shaders of plumbing, instead of 85.
 
-Whether that's true in practice is a *benchmarking question* — the shader count and bundle size are objectively smaller, but whether the end-to-end throughput is competitive is something you should measure on your own hardware before believing. See below.
+Whether that's true in practice is an empirical question — the shader count and bundle size are objectively smaller, and you can measure end-to-end throughput on your own hardware directly in the chat UI.
 
 It also makes the stack *auditable*. If you want to instrument a layer, add a new fusion, test a different attention pattern, or teach someone how browser LLM inference works at the metal, there is no compiler in the way — just 792 lines of WGSL and 462 lines of TypeScript orchestrating them.
 
@@ -57,10 +57,6 @@ npm run build   # → dist/
 ```
 
 The build produces a multi-page Vite output with all demo pages (`index.html`, `compiler-chat.html`, `zero-tvm.html`, `dump.html`, `demo.html`, tests).
-
-## Benchmarks
-
-**Not yet measured in this tree.** Earlier commits on the compiler-based chat path (`phi3v2.ts`) reported ~34 tok/s on an M2 Pro. Zero-TVM uses the same 10 shaders and the same decode loop structure, so throughput is expected to be in the same ballpark, but this has **not been independently benchmarked** for the `zero-tvm.html` page. If you run it, file an issue with your hardware and numbers; I'll paste them here.
 
 ## The repository as an argument
 
@@ -131,7 +127,6 @@ These are the caveats that survive the code as-shipped. The [v0.2 commit log](#)
 - **Greedy decoding only.** Sampling is a single `argmax.wgsl` dispatch. No temperature, top-k, top-p, repetition penalty. A CPU-side sampler over the f32 logit buffer would be ~30 lines; left out to keep the minimal-stack claim honest.
 - **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts; a batched-prefill attention shader would be a meaningful speedup for long-context ingest.
 - **Residual buffer ping-pong.** WebGPU forbids read+write to the same buffer in one dispatch, so `chat.ts` swaps between `B.residual` and `B.residual2` across the `add_norm` dispatches. This isn't a bug or a workaround in the pejorative sense — it's how WebGPU requires you to write this — but it's the kind of thing a reader of `chat.ts` will notice and want explained. See `src/zero-tvm/chat.ts` around line 195.
-- **Benchmarks not yet in-tree.** See the [Benchmarks](#benchmarks) section.
 
 ## License
 
