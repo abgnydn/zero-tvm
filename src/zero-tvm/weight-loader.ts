@@ -75,6 +75,7 @@ async function fetchCached(
   if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching ${url}`)
 
   // Stream with byte-level progress if possible
+  let arrayBuf: ArrayBuffer
   if (resp.body && onByteProgress) {
     const total = parseInt(resp.headers.get('content-length') || '0', 10)
     const reader = resp.body.getReader()
@@ -95,10 +96,18 @@ async function fetchCached(
       result.set(chunk, offset)
       offset += chunk.byteLength
     }
-    return result.buffer
+    arrayBuf = result.buffer
+  } else {
+    arrayBuf = await resp.arrayBuffer()
   }
 
-  return resp.arrayBuffer()
+  // Save to Cache API so subsequent loads resume from where we left off
+  try {
+    const store = await caches.open('zero-tvm-weights')
+    await store.put(url, new Response(arrayBuf.slice(0)))
+  } catch { /* Cache API unavailable — still works, just won't persist */ }
+
+  return arrayBuf
 }
 
 // ============================================================
