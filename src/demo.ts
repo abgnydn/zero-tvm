@@ -14,8 +14,8 @@ import argmaxWGSL from './shaders/argmax.wgsl?raw'
 // ============================================================
 
 const COLORS: Record<string, string> = {
-  matmul: '#4caf50', attention: '#ff9f43', norm: '#2ecc71',
-  activation: '#a855f7', kv: '#ffd54f', sampling: '#ff6b6b', embed: '#4caf50',
+  matmul: '#10b981', attention: '#ff9f43', norm: '#2ecc71',
+  activation: '#a855f7', kv: '#ffd54f', sampling: '#ff6b6b', embed: '#10b981',
 }
 
 interface DispatchInfo {
@@ -189,7 +189,7 @@ function renderBufferTreemap(canvas: HTMLCanvasElement): void {
   const H = rect.height
 
   const categories = [
-    { name: 'Weights', bytes: 3_870_000_000, color: '#4caf50', count: 270 },
+    { name: 'Weights', bytes: 3_870_000_000, color: '#10b981', count: 270 },
     { name: 'KV Cache', bytes: 19_000_000, color: '#ffd54f', count: 37 },
     { name: 'Activations', bytes: 424_000, color: '#2ecc71', count: 71 },
     { name: 'Uniforms', bytes: 7_708, color: '#a855f7', count: 350 },

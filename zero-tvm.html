@@ -4,12 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Zero TVM — Pure WGSL Phi-3</title>
+  <meta name="description" content="Chat with Phi-3-mini (3.6B) running entirely on your GPU. 10 hand-written WGSL shaders, no TVM runtime.">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:title" content="Zero-TVM Chat — Phi-3 in Your Browser">
+  <meta property="og:description" content="Chat with Phi-3-mini (3.6B) running entirely on your GPU. 10 hand-written WGSL shaders, no TVM runtime.">
+  <meta property="og:image" content="/og.png">
+  <meta name="twitter:card" content="summary_large_image">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <div class="container">
     <header>
-      <a href="/" style="color:#4caf50; text-decoration:none; font-size:0.85rem; font-weight:600;">&larr;</a>
+      <a href="/" style="color:#10b981; text-decoration:none; font-size:0.85rem; font-weight:600;">&larr;</a>
       <h1>Zero TVM</h1>
       <span id="badge" class="badge">Waiting</span>
       <span id="stats" class="stats"></span>
@@ -20,7 +27,7 @@
           Phi-3-mini (3.6B) runs entirely on your GPU.<br>
           First load downloads ~2 GB of model weights.
         </p>
-        <button id="start-btn" style="background:#4caf50; color:#000; font-weight:600; font-size:1rem; padding:0.75rem 2rem; border:none; border-radius:8px; cursor:pointer;">
+        <button id="start-btn" style="background:#10b981; color:#000; font-weight:600; font-size:1rem; padding:0.75rem 2rem; border:none; border-radius:8px; cursor:pointer;">
           Download &amp; Start
         </button>
         <span style="font-size:0.72rem; color:#555;">Subsequent loads use browser cache.</span>
@@ -33,7 +40,7 @@
     <pre id="log" class="log"></pre>
   </div>
   <footer>
-    <a href="/" style="color:#4caf50; text-decoration:none;">zero-tvm</a> by Ahmet Baris Gunaydin
+    <a href="/" style="color:#10b981; text-decoration:none;">zero-tvm</a> by Ahmet Baris Gunaydin
     &nbsp;&middot;&nbsp; <a href="https://github.com/abgnydn/zero-tvm" style="color:#555; text-decoration:none;">GitHub</a>
     &nbsp;&middot;&nbsp; 10 WGSL shaders. Zero TVM runtime.
   </footer>
