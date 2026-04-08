@@ -47,6 +47,7 @@ interface NDArrayCache {
 // ============================================================
 
 export type ProgressCallback = (msg: string) => void
+/** downloaded: cumulative bytes so far, total: total model bytes, file: current shard name */
 export type ByteProgressCallback = (downloaded: number, total: number, file: string) => void
 
 async function fetchCached(
@@ -142,25 +143,6 @@ async function getShard(
 // Build GPUBuffer from a flat record
 // ============================================================
 
-async function loadParam(
-  device: GPUDevice,
-  baseUrl: string,
-  rec: FlatRecord,
-  shardCache: ShardCache,
-  onProgress?: ProgressCallback,
-  onByteProgress?: ByteProgressCallback
-): Promise<GPUBuffer> {
-  const shard = await getShard(baseUrl, rec.dataPath, shardCache, onProgress, onByteProgress)
-  const slice = shard.slice(rec.byteOffset, rec.byteOffset + rec.nbytes)
-
-  const buf = device.createBuffer({
-    size: Math.max(rec.nbytes, 4),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    label: rec.name,
-  })
-  device.queue.writeBuffer(buf, 0, slice)
-  return buf
-}
 
 // ============================================================
 // Parameter name patterns for Phi-3 MLC
@@ -201,14 +183,55 @@ export async function loadWeights(
   for (const r of allRecords) index.set(r.name, r)
 
   console.log('[weight-loader] Parameters found:', [...index.keys()])
-  onProgress?.(`Found ${index.size} parameters`)
+
+  // Compute total model size from unique shard files
+  const shardSizes = new Map<string, number>()
+  for (const r of allRecords) {
+    const end = r.byteOffset + r.nbytes
+    const cur = shardSizes.get(r.dataPath) || 0
+    if (end > cur) shardSizes.set(r.dataPath, end)
+  }
+  const totalModelBytes = [...shardSizes.values()].reduce((a, b) => a + b, 0)
+  const completedShards = new Set<string>()
+
+  onProgress?.(`Found ${index.size} parameters (${(totalModelBytes / 1e9).toFixed(1)} GB)`)
 
   const shardCache: ShardCache = new Map()
+
+  // Wrap byte progress to report cumulative across all shards
+  const trackByteProgress: ByteProgressCallback | undefined = onByteProgress
+    ? (downloaded, _total, file) => {
+        // Each shard reports its own 0→total. We track cumulative by adding
+        // completed shards + current shard's partial progress.
+        let completed = 0
+        for (const s of completedShards) completed += shardSizes.get(s) || 0
+        onByteProgress!(completed + downloaded, totalModelBytes, file)
+      }
+    : undefined
+
+  // Mark shard as fully downloaded after fetch completes
+  const origGetShard = getShard
+  async function getShardTracked(
+    base: string, dataPath: string, cache: ShardCache,
+    prog?: ProgressCallback, byteProg?: ByteProgressCallback
+  ): Promise<ArrayBuffer> {
+    const buf = await origGetShard(base, dataPath, cache, prog, byteProg)
+    completedShards.add(dataPath)
+    return buf
+  }
 
   // Helper that creates a GPUBuffer from named param
   async function load(name: string, ...alts: string[]): Promise<GPUBuffer> {
     const rec = find(index, name, ...alts)
-    return loadParam(device, baseUrl, rec, shardCache, onProgress, onByteProgress)
+    const shard = await getShardTracked(baseUrl, rec.dataPath, shardCache, onProgress, trackByteProgress)
+    const slice = shard.slice(rec.byteOffset, rec.byteOffset + rec.nbytes)
+    const buf = device.createBuffer({
+      size: Math.max(rec.nbytes, 4),
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      label: rec.name,
+    })
+    device.queue.writeBuffer(buf, 0, slice)
+    return buf
   }
 
   // 2. Global weights
