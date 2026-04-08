@@ -216,7 +216,11 @@ export async function loadTokenizer(onProgress?: (msg: string) => void): Promise
       text += tok
     }
     // Replace metaspace with actual space, trim leading space
-    return text.replace(new RegExp(METASPACE, 'g'), ' ').trimStart()
+    // Convert SentencePiece hex byte tokens (<0x0A> → \n, etc.) to actual chars
+    return text
+      .replace(new RegExp(METASPACE, 'g'), ' ')
+      .replace(/<0x([0-9A-Fa-f]{2})>/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .trimStart()
   }
 
   onProgress?.('Tokenizer ready')
