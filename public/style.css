@@ -95,16 +95,21 @@ header h1 {
   color: #bbb;
 }
 
-.input-row {
-  display: flex;
-  gap: 0.5rem;
+.input-wrap {
   border-top: 1px solid #1a1a1a;
   padding: 0.75rem 1.25rem;
   background: #0d0d0d;
   flex-shrink: 0;
 }
 
-.input-row input {
+.input-inner {
+  max-width: 720px;
+  margin: 0 auto;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.input-inner input {
   flex: 1;
   background: #141414;
   border: 1px solid #222;
@@ -116,15 +121,15 @@ header h1 {
   transition: border-color 0.15s;
 }
 
-.input-row input:focus {
+.input-inner input:focus {
   border-color: #10b98144;
 }
 
-.input-row input:disabled {
+.input-inner input:disabled {
   opacity: 0.4;
 }
 
-.input-row button {
+.input-inner button {
   background: #10b981;
   color: #000;
   border: none;
@@ -136,11 +141,11 @@ header h1 {
   transition: background 0.15s;
 }
 
-.input-row button:hover {
+.input-inner button:hover {
   background: #34d399;
 }
 
-.input-row button:disabled {
+.input-inner button:disabled {
   background: #1a1a1a;
   color: #333;
   cursor: default;

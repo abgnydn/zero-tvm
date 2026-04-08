@@ -17,28 +17,6 @@
     body { height: 100vh; }
     .chat { max-height: none; min-height: 0; }
     .chat > * { max-width: 720px; margin-left: auto; margin-right: auto; }
-    .input-wrap {
-      border-top: 1px solid #1a1a1a; padding: 0.75rem 1.25rem;
-      background: #0d0d0d; flex-shrink: 0;
-    }
-    .input-inner {
-      max-width: 720px; margin: 0 auto; display: flex; gap: 0.5rem;
-    }
-    .input-inner input {
-      flex: 1; background: #141414; border: 1px solid #222;
-      color: #ddd; padding: 0.65rem 0.9rem; border-radius: 8px;
-      font-size: 0.9rem; outline: none; transition: border-color 0.15s;
-    }
-    .input-inner input:focus { border-color: #10b98144; }
-    .input-inner input:disabled { opacity: 0.4; }
-    .input-inner button {
-      background: #10b981; color: #000; font-weight: 600;
-      border: none; padding: 0.65rem 1.25rem; border-radius: 8px;
-      font-size: 0.85rem; cursor: pointer; transition: background 0.15s;
-    }
-    .input-inner button:hover { background: #34d399; }
-    .input-inner button:disabled { background: #1a1a1a; color: #333; cursor: default; }
-    /* Start screen */
     .start-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 1.25rem; text-align: center; }
     .start-screen .title { font-size: 1.1rem; font-weight: 600; color: #ccc; }
     .start-screen .desc { font-size: 0.85rem; color: #555; max-width: 380px; line-height: 1.6; }
