@@ -16,6 +16,7 @@ export default defineConfig({
         'test-shaders': resolve(__dirname, 'test-shaders.html'),
         'test-chain':   resolve(__dirname, 'test-chain.html'),
         'standalone-test': resolve(__dirname, 'standalone-test.html'),
+        validate:       resolve(__dirname, 'validate.html'),
       },
     },
     chunkSizeWarningLimit: 8000,

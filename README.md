@@ -6,7 +6,7 @@
 
 **Phi-3-mini running in a browser on 10 hand-written WGSL shaders. No TVM. No WebLLM runtime. No compiler.**
 
-The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits 85 autotuned WGSL kernels and drives them from a WASM scheduler. This repo replaces that entire stack with **10 WGSL compute shaders and about 1,250 lines of TypeScript**, using the same model and the same quantized weights.
+The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits 85 autotuned WGSL kernels and drives them from a WASM scheduler. This repo replaces that entire stack with **10 WGSL compute shaders and about 1,400 lines of TypeScript** (engine + tokenizer + weight loader), using the same model and the same quantized weights.
 
 The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
 
@@ -22,8 +22,7 @@ All numbers below are measured from the source and the build output in this repo
 | Runtime | TVM → WASM scheduler | Plain TypeScript, no runtime |
 | Tokenizer | bundled from WebLLM | BPE from scratch (`tokenizer.ts`) |
 | Weight loader | MLC's | Direct HuggingFace fetch |
-| JS bundle (index.html, excl. model weights) | **6.0 MB** / 2.1 MB gz | — |
-| JS bundle (zero-tvm.html, excl. model weights) | — | **14 kB** / 5.5 kB gz |
+| JS bundle (chat page, excl. model weights) | **5.9 MB** / 2.1 MB gz (`compiler-chat.html`) | **49 kB** / 14 kB gz (`zero-tvm.html`) |
 
 Zero-TVM issues **fewer** dispatches than TVM because it fuses operations TVM's default pipeline doesn't: `attention.wgsl` combines attention + paged-KV read, `fused_ffn.wgsl` combines gate + up + SiLU, `add_norm.wgsl` combines residual add + RMSNorm.
 
@@ -35,7 +34,7 @@ Hand-written GPU kernels usually lose significantly to an autotuning compiler. T
 
 Whether that's true in practice is an empirical question — the shader count and bundle size are objectively smaller, and you can measure end-to-end throughput on your own hardware directly in the chat UI.
 
-It also makes the stack *auditable*. If you want to instrument a layer, add a new fusion, test a different attention pattern, or teach someone how browser LLM inference works at the metal, there is no compiler in the way — just 792 lines of WGSL and 462 lines of TypeScript orchestrating them.
+It also makes the stack *auditable*. If you want to instrument a layer, add a new fusion, test a different attention pattern, or teach someone how browser LLM inference works at the metal, there is no compiler in the way — just 792 lines of WGSL and ~450 lines of TypeScript in `src/zero-tvm/engine-core.ts` orchestrating them (the 32-layer decode loop, residual ping-pong, and per-layer bind-group caching all live in one file).
 
 The closest reference point is Karpathy's [llm.c](https://github.com/karpathy/llm.c) (hand-written CUDA/C GPT-2). This is that thesis — *you don't need the giant framework* — ported to browser / WebGPU / int4 / paged KV / modern arch, for a model people actually use.
 
@@ -73,15 +72,24 @@ zero-tvm.html           → src/zero-tvm/chat.ts     (3) The result: all 342 rep
 dump.html               → src/dump-tvm.ts          Captures all 85 TVM-emitted WGSL
 shaders.html            → src/dump-shaders.ts      Browses the captured shaders
 demo.html               → src/demo.ts              Dispatch timeline visualization
-test-shaders.html       → src/compiler/test-harness.ts
+test-shaders.html       → src/compiler/test-harness.ts  Per-shader correctness vs TVM
 test-chain.html         → src/compiler/test-chain.ts
 standalone-test.html    → src/standalone-test.ts
+validate.html           → src/zero-tvm/validate.ts Multi-prompt forward-pass smoke
+                                                       test (top-10 next tokens +
+                                                       greedy continuation per prompt)
 ```
 
 ```
 src/
   zero-tvm/             THE RESULT
-    chat.ts               462 lines — full chat loop, prefill, decode, KV cache
+    engine-core.ts        ~430 lines — pure GPU pipeline: buildDecodeEngine,
+                          allocKVPages, the 32-layer decode loop. No DOM.
+                          Imported by chat.ts AND validate.ts so the chat path
+                          and the validation harness exercise the same code.
+    chat.ts               ~280 lines — chat UI + multi-turn KV-cache reuse
+                          (skips re-prefilling unchanged conversation prefixes).
+    validate.ts           ~290 lines — multi-prompt forward-pass smoke test.
     tokenizer.ts          248 lines — BPE tokenizer from scratch
     weight-loader.ts      318 lines — direct HuggingFace Phi-3-MLC fetch + parse
 
@@ -109,14 +117,38 @@ src/
 
 `RESEARCH.md` is a writeup of how the shader capture worked and what reading TVM's output revealed about its kernel set. `SHADER-ANALYSIS.md` is currently a placeholder for per-shader notes and is not yet populated.
 
+## How it's tested
+
+Two layers, intentionally separate:
+
+1. **Per-shader correctness vs TVM** — `test-shaders.html` (`src/compiler/test-harness.ts`).
+   Loads WebLLM, intercepts the WGSL device to capture every TVM dispatch from a real
+   decode step, then runs each of our 10 shaders against the matching TVM dispatch's
+   input buffers and compares the f16/f32 output buffers element-wise (`cmpF16`/`cmpF32`).
+   Each shader is reported with `maxDiff`, `avgDiff`, and exact-match percentage.
+   Catches kernel-level bugs but only exercises one prompt.
+
+2. **Live forward pass on diverse prompts** — `validate.html` (`src/zero-tvm/validate.ts`).
+   Drives the same `engine-core.ts` that the chat page uses, but instead of streaming
+   tokens to a UI it runs a battery of prompts (factual recall, arithmetic, code, instruction
+   following, open-ended) through `forwardLogits` and reports for each:
+   the top-10 next-token candidates with probabilities, the entropy of the predictive
+   distribution, and a short greedy continuation. A reader can scroll through the page
+   and verify the model behaves like Phi-3 on inputs that were never in the per-shader
+   test set. This is the smoke test that catches "the kernels pass in isolation but the
+   pipeline overfits the one prompt I memorized."
+
+Because both pages import `src/zero-tvm/engine-core.ts`, anything that drifts between
+them is impossible by construction — there is one decode loop, exercised two ways.
+
 ## Known caveats
 
-These are the caveats that survive the code as-shipped. The [v0.2 commit log](#) lists several earlier ones — silent context overflow, per-token uniform buffer leaks, double `queue.submit()`, redundant first-token readback — that were turned into code fixes rather than documentation. The remaining items are either inherent to the approach or deliberate scoping decisions.
+These are the caveats that survive the code as-shipped. Several earlier ones — silent context overflow, per-token uniform buffer leaks, double `queue.submit()`, redundant first-token readback — were turned into code fixes rather than documentation. The remaining items are either inherent to the approach or deliberate scoping decisions.
 
 ### Inherent
 
 - **Phi-3-mini-4k-instruct Q4 only, by shader surgery.** The constants in `src/compiler/compiler.ts` declare `D=3072`, `HEADS=32`, `HEAD_DIM=96`, `LAYERS=32`, `FFN=8192`, `VOCAB=32064`, `PAGE_SIZE=16`, `MAX_PAGES=257` — but those values are **also hard-coded as integer literals in address arithmetic inside eight of the ten shaders** (`grep '3072\|9216\|98304\|1536\|8192' src/compiler/shaders/`). Porting to Mistral, Llama, or any other architecture is not a config edit; it is a per-shader rewrite of offsets and strides.
-- **GPU memory footprint ≈ 3.6 GB.** Phi-3-mini Q4 weights are ~1.8 GB, and the paged KV cache is `32 layers × 257 pages × 196,608 B/page ≈ 1.6 GB` (see `allocKVPages` in `chat.ts`). On an M2 Pro with 16 GB unified memory this is invisible; on a 4 GB integrated GPU it will OOM during KV allocation before the first token. If you want to trade context length for memory, lower `MAX_PAGES` in `src/compiler/compiler.ts` — 128 pages = 2048-token context, ~0.8 GB KV, which fits almost anywhere.
+- **GPU memory footprint ≈ 3.6 GB.** Phi-3-mini Q4 weights are ~1.8 GB, and the paged KV cache is `32 layers × 257 pages × 196,608 B/page ≈ 1.6 GB` (see `allocKVPages` in `engine-core.ts`). On an M2 Pro with 16 GB unified memory this is invisible; on a 4 GB integrated GPU it will OOM during KV allocation before the first token. If you want to trade context length for memory, lower `MAX_PAGES` in `src/compiler/compiler.ts` — 128 pages = 2048-token context, ~0.8 GB KV, which fits almost anywhere.
 - **Requires the `shader-f16` WebGPU feature.** Matmuls run in f16 (see `enable f16` at the top of every `int4_matmul*.wgsl`). The LM head uses an f32 output buffer (`int4_matmul_f32.wgsl`) because "the sampling pipeline needs f32 logits" — TVM's `NT_matmul14_cast2` does the same cast. Chrome/Edge with WebGPU and `shader-f16` is required; Safari's WebGPU does not yet expose `shader-f16`.
 - **BPE tokenizer is a hand-rolled reimplementation, not `tokenizers.js`.** `src/zero-tvm/tokenizer.ts` is ~250 lines: vocab lookup, merge table, metaspace prefixing, byte fallback. It does **not** implement HuggingFace's full pre-tokenization regex pipeline or Unicode NFKC normalization. For normal English chat it matches the reference tokenizer; for emoji, unusual Unicode, or some punctuation patterns it may diverge, and the resulting token stream won't be exactly what Phi-3 was trained on. If correctness matters for your input, run the prompt through `@huggingface/tokenizers` and compare.
 - **Phi-3 chat template is baked in.** `buildChatPrompt` in `tokenizer.ts` emits `<|system|>...<|end|>\n<|user|>...<|end|>\n<|assistant|>\n`. Stop tokens are the Phi-3 set `{2, 32000, 32007}`. Port to another model → edit both.
@@ -126,7 +158,7 @@ These are the caveats that survive the code as-shipped. The [v0.2 commit log](#)
 
 - **Greedy decoding only.** Sampling is a single `argmax.wgsl` dispatch. No temperature, top-k, top-p, repetition penalty. A CPU-side sampler over the f32 logit buffer would be ~30 lines; left out to keep the minimal-stack claim honest.
 - **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts; a batched-prefill attention shader would be a meaningful speedup for long-context ingest.
-- **Residual buffer ping-pong.** WebGPU forbids read+write to the same buffer in one dispatch, so `chat.ts` swaps between `B.residual` and `B.residual2` across the `add_norm` dispatches. This isn't a bug or a workaround in the pejorative sense — it's how WebGPU requires you to write this — but it's the kind of thing a reader of `chat.ts` will notice and want explained. See `src/zero-tvm/chat.ts` around line 195.
+- **Residual buffer ping-pong.** WebGPU forbids read+write to the same buffer in one dispatch, so `engine-core.ts` swaps between `B.residual` and `B.residual2` across the `add_norm` dispatches. This isn't a bug or a workaround in the pejorative sense — it's how WebGPU requires you to write this — but it's the kind of thing a reader will notice and want explained. The two swaps per layer cancel out, which is why the per-layer bind groups can be pre-computed once and reused for every token. See the `LayerBG` block in `src/zero-tvm/engine-core.ts`.
 
 ## License
 
