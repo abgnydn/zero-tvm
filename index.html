@@ -1003,9 +1003,17 @@
       <a class="shader-card" href="dump.html" style="text-decoration:none;color:inherit;">
         <span class="shader-icon-lg">📜</span>
         <div>
-          <h4>TVM Shader Dump</h4>
-          <p>All 85 WGSL kernels TVM emits for Phi-3, captured from a live WebLLM session. 12,962 lines of generated code for comparison.</p>
+          <h4>TVM Dispatch Dump</h4>
+          <p>Pipeline catalog, dispatch DAG, uniform decoding, buffer flow — full reverse-engineering trace of WebLLM's 342-dispatch decode loop.</p>
           <span class="shader-tag">/dump.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="shaders.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">🧬</span>
+        <div>
+          <h4>TVM Shader Source</h4>
+          <p>Raw WGSL source for every one of TVM's 85 generated kernels, captured live from a running WebLLM session. 12,962 lines total.</p>
+          <span class="shader-tag">/shaders.html</span>
         </div>
       </a>
       <a class="shader-card" href="docs.html" style="text-decoration:none;color:inherit;">

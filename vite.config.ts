@@ -114,6 +114,7 @@ export default defineConfig({
         architecture:  resolve(__dirname, 'architecture.html'),
         docs:          resolve(__dirname, 'docs.html'),
         dump:          resolve(__dirname, 'dump.html'),
+        shaders:       resolve(__dirname, 'shaders.html'),
       },
     },
     chunkSizeWarningLimit: 8000,
