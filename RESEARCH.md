@@ -282,7 +282,7 @@ Eleven unique WGSL files (`int4_matmul` and `int4_matmul_f32` are two bindings o
 
 Transformers.js v4 is the right choice for most production work. Zero-TVM is not trying to replace it. The point of the contrast is that when a stack can assume a single model/precision, most of the compiler and runtime surface is optional.
 
-Speed (as of this writing): Zero-TVM decode measures ~15 tok/s on an M2 Pro (reference: [`landing.html:529`](landing.html#L529)). TVM-WebLLM on the same hardware measures 27–48 tok/s in earlier sections of this document. Zero-TVM is currently slower; Milestones 2–5 in the plan are the agenda to close that gap without expanding shader count materially.
+Speed (post-M1–M5): Zero-TVM decode measures ~40 tok/s on an M2 Pro; WebLLM on the same hardware measures ~51 tok/s (head-to-head via `webllm-bench.html` and recorded in `BENCH.md`). Zero-TVM is ~22% behind the autotuned compiler — the remaining gap is open work (batched prefill, further fusion), not a shipped claim.
 
 ## What This Repo Is NOT
 

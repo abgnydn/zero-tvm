@@ -431,15 +431,15 @@
   <h4>HTML Entry Points</h4>
   <table>
     <tr><th>File</th><th>Engine</th><th>Description</th></tr>
-    <tr><td><code>index.html</code></td><td>Pure TVM</td><td>Default chat (WebLLM only, no custom shaders)</td></tr>
-    <tr><td><code>fast-chat.html</code></td><td>Phi3Engine</td><td>TVM capture &rarr; named pipelines + fused FFN</td></tr>
-    <tr><td><code>v3.html</code></td><td>Engine v3</td><td>Capture-replay, minimal ~100 dispatch decode</td></tr>
-    <tr><td><code>compiler-chat.html</code></td><td>Compiler</td><td>279/342 own shaders, 10 WGSL files</td></tr>
+    <tr><td><code>index.html</code></td><td>Landing</td><td>Project overview, stats, shader catalog, compare table</td></tr>
+    <tr><td><code>zero-tvm.html</code></td><td>Zero-TVM</td><td>Chat demo on 10 hand-written WGSL kernels (no TVM)</td></tr>
+    <tr><td><code>validate.html</code></td><td>Zero-TVM</td><td>Multi-prompt smoke test driving <code>engine-core.ts</code></td></tr>
+    <tr><td><code>webllm-bench.html</code></td><td>WebLLM</td><td>Head-to-head harness against identical weights</td></tr>
+    <tr><td><code>compiler-chat.html</code></td><td>Compiler</td><td>TVM capture &rarr; replay via own shaders (279/342)</td></tr>
+    <tr><td><code>demo.html</code></td><td>Demo</td><td>Interactive dispatch-timeline visualization</td></tr>
     <tr><td><code>dump.html</code></td><td>Analysis</td><td>Full TVM architecture dump</td></tr>
-    <tr><td><code>shaders.html</code></td><td>Analysis</td><td>Dump all 85 TVM shader sources</td></tr>
-    <tr><td><code>demo.html</code></td><td>Demo</td><td>Interactive visualizations + live chat</td></tr>
-    <tr><td><code>test-shaders.html</code></td><td>Test</td><td>Shader correctness verification</td></tr>
-    <tr><td><code>test-chain.html</code></td><td>Test</td><td>Full chain end-to-end test</td></tr>
+    <tr><td><code>shaders.html</code></td><td>Analysis</td><td>Browse all 85 captured TVM shader sources</td></tr>
+    <tr><td><code>docs.html</code></td><td>Docs</td><td>Shader catalog, URL flags, benchmarks</td></tr>
   </table>
 </div>
 

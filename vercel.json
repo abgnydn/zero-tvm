@@ -4,9 +4,6 @@
   "outputDirectory": "dist",
   "framework": null,
   "cleanUrls": true,
-  "rewrites": [
-    { "source": "/", "destination": "/landing.html" }
-  ],
   "headers": [
     {
       "source": "/(.*)",

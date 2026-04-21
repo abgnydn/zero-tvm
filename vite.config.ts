@@ -106,7 +106,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         index:         resolve(__dirname, 'index.html'),
-        landing:       resolve(__dirname, 'landing.html'),
         'zero-tvm':    resolve(__dirname, 'zero-tvm.html'),
         'compiler-chat': resolve(__dirname, 'compiler-chat.html'),
         demo:          resolve(__dirname, 'demo.html'),

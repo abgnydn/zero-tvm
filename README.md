@@ -60,7 +60,7 @@ To build a deployable bundle:
 npm run build   # → dist/
 ```
 
-The build produces a multi-page Vite output: `index.html` (landing chat shell), `landing.html`, `zero-tvm.html` (chat demo), `compiler-chat.html`, `demo.html` (dispatch visualization), `validate.html` (multi-prompt smoke test), `webllm-bench.html` (head-to-head harness), `architecture.html`, `docs.html`.
+The build produces a multi-page Vite output: `index.html` (landing page — project overview, shader catalog, compare table), `zero-tvm.html` (chat demo), `compiler-chat.html`, `demo.html` (dispatch visualization), `validate.html` (multi-prompt smoke test), `webllm-bench.html` (head-to-head harness), `architecture.html`, `docs.html`.
 
 ### URL flags
 

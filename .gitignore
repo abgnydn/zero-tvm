@@ -2,5 +2,6 @@ node_modules/
 dist/
 .claude/
 .vercel/
+.tests-cache/
 *.log
 .DS_Store
