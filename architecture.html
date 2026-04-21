@@ -3,7 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WebGPU Fusion — Architecture</title>
+  <title>Architecture — Zero-TVM</title>
+  <meta name="description" content="How Zero-TVM runs Phi-3-mini in a browser: 32-layer decode loop, paged KV cache, fused QKV+RoPE+KV-append, 228 dispatches per token.">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="article">
+  <meta property="og:url" content="https://zerotvm.com/architecture.html">
+  <meta property="og:title" content="Architecture — Zero-TVM">
+  <meta property="og:description" content="How Zero-TVM runs Phi-3-mini in a browser: 32-layer decode loop, paged KV cache, fused QKV+RoPE+KV-append, 228 dispatches per token.">
+  <meta property="og:image" content="https://zerotvm.com/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Architecture — Zero-TVM">
+  <meta name="twitter:description" content="How Zero-TVM runs Phi-3-mini in a browser: 32-layer decode loop, paged KV cache, fused QKV+RoPE+KV-append, 228 dispatches per token.">
+  <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a0a; color: #c0c0c0; padding: 2rem; line-height: 1.5; }
