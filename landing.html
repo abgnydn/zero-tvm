@@ -510,14 +510,14 @@
 
   <h1>
     Run <span class="accent">Phi-3</span> in your browser<br>
-    with <span class="green">11 hand-written shaders</span>
+    with <span class="green">10 hand-written shaders</span>
   </h1>
 
   <p class="hero-sub">
     In <strong>February 2026</strong>, Hugging Face shipped Transformers.js v4 — a C++ WebGPU runtime built with
     Microsoft's ONNX Runtime team — as the production answer for browser LLM inference.
     In <strong>April 2026</strong>, this repo shows that for Phi-3 Mini specifically, the answer is
-    <span class="green">11 hand-written WGSL shaders</span> and a few hundred lines of TypeScript.
+    <span class="green">10 kernel roles across 27 WGSL files</span> and ~2,000 lines of TypeScript.
     No WebLLM, no TVM, no ONNX, no WASM runtime.
   </p>
 
@@ -528,12 +528,12 @@
 
   <div class="hero-stats">
     <div class="hero-stat">
-      <div class="val g">~15</div>
-      <div class="lbl">tok/s on M-series</div>
+      <div class="val g">~40</div>
+      <div class="lbl">tok/s on M2 Pro</div>
     </div>
     <div class="hero-stat">
-      <div class="val p">10</div>
-      <div class="lbl">WGSL shader files</div>
+      <div class="val p">10 / 27</div>
+      <div class="lbl">kernel roles / WGSL files</div>
     </div>
     <div class="hero-stat">
       <div class="val">3.8B</div>
@@ -561,7 +561,7 @@
     </div>
     <div class="terminal-body">
       <div><span class="t-dim">// No WebLLM. No TVM. No WASM runtime.</span></div>
-      <div><span class="t-dim">// 11 WGSL shaders. Raw WebGPU.</span></div>
+      <div><span class="t-dim">// 10 kernel roles · 27 WGSL files · raw WebGPU.</span></div>
       <br>
       <div><span class="t-green">[local]</span> <span class="t-white">ndarray-cache.json</span></div>
       <div><span class="t-green">[cache]</span> <span class="t-white">params_shard_0.bin</span> <span class="t-dim">49.3 MB</span></div>
@@ -574,7 +574,7 @@
       <div>      <span class="t-white">It was selected as the capital in 1908 as a</span></div>
       <div>      <span class="t-white">compromise between rivals Sydney and Melbourne.</span></div>
       <br>
-      <div><span class="t-dim">88 tokens · 14.7 tok/s · 100% local · zero server</span> <span class="t-cursor"></span></div>
+      <div><span class="t-dim">88 tokens · ~40 tok/s (M2 Pro) · 100% local · zero server</span> <span class="t-cursor"></span></div>
     </div>
   </div>
 </div>
@@ -607,7 +607,7 @@
         <div class="step-num">STEP 03</div>
         <div class="step-icon">⚡</div>
         <h3>GPU forward pass</h3>
-        <p>32 transformer layers on the GPU. Embedding → RMSNorm → QKV → RoPE → Paged Attention → FFN → LM Head. All WGSL.</p>
+        <p>32 transformer layers on the GPU. Embedding → RMSNorm → (QKV + RoPE + KV-append, fused) → Paged Attention → Fused FFN → LM Head. All WGSL, 228 dispatches per token.</p>
       </div>
       <div class="step-card">
         <div class="step-num">STEP 04</div>
@@ -626,9 +626,9 @@
         <div class="arch-arrow">→</div>
         <div class="arch-box highlight"><div class="icon">🔢</div><div class="name">Embedding</div><div class="sub">shader 1</div></div>
         <div class="arch-arrow">→</div>
-        <div class="arch-box highlight"><div class="icon">🔁</div><div class="name">× 32 Layers</div><div class="sub">shaders 2–9</div></div>
+        <div class="arch-box highlight"><div class="icon">🔁</div><div class="name">× 32 Layers</div><div class="sub">6 fused kernels</div></div>
         <div class="arch-arrow">→</div>
-        <div class="arch-box highlight"><div class="icon">🎯</div><div class="name">LM Head</div><div class="sub">shader 10</div></div>
+        <div class="arch-box highlight"><div class="icon">🎯</div><div class="name">LM Head + Argmax</div><div class="sub">int4 + reduce</div></div>
         <div class="arch-arrow">→</div>
         <div class="arch-box"><div class="icon">💬</div><div class="name">Token</div><div class="sub">streamed</div></div>
       </div>
@@ -642,9 +642,9 @@
 <section id="shaders" style="background: var(--surface);">
   <div class="section-inner">
     <div class="section-label">WGSL Shaders</div>
-    <h2 class="section-title">11 shaders. That's the entire engine.</h2>
+    <h2 class="section-title">10 kernel roles. 27 WGSL files.</h2>
     <p class="section-sub">
-      Every compute step is a readable WGSL file you can open and understand. No auto-generated code. No compiled blobs.
+      Every compute step is a readable WGSL file you can open and understand. No auto-generated code. No compiled blobs. The extra files are A/B variants — subgroup-reduced kernels, tiled matmuls, and an opt-in int8 KV cache path.
     </p>
 
     <div class="pill-row">
@@ -677,74 +677,74 @@
       </div>
       <div class="shader-card">
         <span class="shader-num">03</span>
-        <span class="shader-icon-lg">✖️</span>
+        <span class="shader-icon-lg">🌀</span>
         <div>
-          <h4>QKV Matmul</h4>
-          <p>Fused Q·K·V projection. Q4F16 weight dequant per group. Output: 9216-dim vector.</p>
-          <span class="shader-tag">matmul_q4f16.wgsl</span>
+          <h4>QKV + RoPE + KV-append (fused)</h4>
+          <p>Q/K/V projection, rotary embeddings, and paged-KV write in a single dispatch per layer. TVM ships these as three separate kernels.</p>
+          <span class="shader-tag">qkv_fused.wgsl</span>
         </div>
       </div>
       <div class="shader-card">
         <span class="shader-num">04</span>
-        <span class="shader-icon-lg">🌀</span>
-        <div>
-          <h4>RoPE</h4>
-          <p>Rotary position embeddings. Splits QKV, applies complex rotation per head dim pair.</p>
-          <span class="shader-tag">rope.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">05</span>
-        <span class="shader-icon-lg">💾</span>
-        <div>
-          <h4>KV Append</h4>
-          <p>Writes K and V vectors into paged KV cache at the current sequence position.</p>
-          <span class="shader-tag">kv_append.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">06</span>
         <span class="shader-icon-lg">👁️</span>
         <div>
           <h4>Paged Attention</h4>
-          <p>Multi-head attention over paged KV cache. Online softmax, scaled dot-product.</p>
+          <p>Multi-head attention over the paged KV cache. Online softmax, scaled dot-product, page-table read folded in.</p>
           <span class="shader-tag">attention.wgsl</span>
         </div>
       </div>
       <div class="shader-card">
-        <span class="shader-num">07</span>
+        <span class="shader-num">05</span>
         <span class="shader-icon-lg">✖️</span>
         <div>
-          <h4>O-Proj Matmul</h4>
-          <p>Output projection from attention. Q4F16. Collapses 3072-dim attn output.</p>
-          <span class="shader-tag">matmul_q4f16.wgsl</span>
+          <h4>Int4 Matmul (O-proj)</h4>
+          <p>Q4F16 output projection from attention. Same kernel family powers FFN-down and LM-head. Eight tile/subgroup variants for GPU portability.</p>
+          <span class="shader-tag">int4_matmul*.wgsl</span>
         </div>
       </div>
       <div class="shader-card">
-        <span class="shader-num">08</span>
+        <span class="shader-num">06</span>
         <span class="shader-icon-lg">➕</span>
         <div>
-          <h4>Fused Add + RMSNorm</h4>
-          <p>Residual add + normalize in one pass. Ping-pong buffers avoid GPU aliasing.</p>
+          <h4>Add + RMSNorm (fused)</h4>
+          <p>Residual add and normalize in one pass. Ping-pong buffers avoid GPU aliasing.</p>
           <span class="shader-tag">add_norm.wgsl</span>
         </div>
       </div>
       <div class="shader-card">
-        <span class="shader-num">09</span>
+        <span class="shader-num">07</span>
         <span class="shader-icon-lg">⚡</span>
         <div>
           <h4>Fused FFN (Gate · Up · SiLU)</h4>
-          <p>Gate and up projections with SiLU activation fused. Q4F16, 8192-dim intermediate.</p>
+          <p>Gate and up projections with SiLU activation fused. Q4F16, 8192-dim intermediate. Tiled-subgroup variant available via <code>?ffnsg=1</code>.</p>
           <span class="shader-tag">fused_ffn.wgsl</span>
         </div>
       </div>
       <div class="shader-card">
-        <span class="shader-num">10</span>
+        <span class="shader-num">08</span>
         <span class="shader-icon-lg">🎯</span>
         <div>
           <h4>LM Head + Argmax</h4>
-          <p>Projects hidden state to 32,064 vocab logits. GPU argmax selects next token.</p>
-          <span class="shader-tag">lm_head.wgsl</span>
+          <p>Projects hidden state to 32,064 vocab logits (int4 matmul), then GPU argmax selects the next token. No CPU roundtrip.</p>
+          <span class="shader-tag">argmax.wgsl + int4_matmul.wgsl</span>
+        </div>
+      </div>
+      <div class="shader-card">
+        <span class="shader-num">09</span>
+        <span class="shader-icon-lg">🧪</span>
+        <div>
+          <h4>Subgroup variants</h4>
+          <p>Subgroup-reduced versions of attention, QKV, argmax, and matmul — same math, one hardware-accelerated reduction step instead of workgroup shared memory.</p>
+          <span class="shader-tag">*_sg.wgsl (6 files)</span>
+        </div>
+      </div>
+      <div class="shader-card">
+        <span class="shader-num">10</span>
+        <span class="shader-icon-lg">💾</span>
+        <div>
+          <h4>Int8 KV cache (opt-in)</h4>
+          <p>Per-page int8 quantization of K and V with an attention kernel that dequantizes on read. Halves KV memory at a small accuracy cost. Gate with <code>?kv8=1</code>.</p>
+          <span class="shader-tag">kv_quantize_int8 + attention_int8</span>
         </div>
       </div>
     </div>
@@ -775,19 +775,19 @@
         <tbody>
           <tr>
             <td>Unique WGSL kernels</td>
-            <td class="ours">11 hand-written</td>
-            <td>85 captured (~11 on decode)</td>
+            <td class="ours">10 roles / 27 files</td>
+            <td>85 captured</td>
             <td>ORT-generated (not user-visible)</td>
           </tr>
           <tr>
             <td>Hand-written WGSL LOC</td>
-            <td class="ours">~966</td>
-            <td>0 (compiler-generated)</td>
+            <td class="ours">3,078 (incl. A/B variants)</td>
+            <td>12,962 (compiler-generated)</td>
             <td>0 (runtime-generated)</td>
           </tr>
           <tr>
             <td>Dispatches / decode token</td>
-            <td class="ours">228</td>
+            <td class="ours">228 (f16 KV) / 260 (int8 KV)</td>
             <td>342 (measured)</td>
             <td>not measured here</td>
           </tr>
@@ -798,15 +798,15 @@
             <td>C++ via ONNX Runtime</td>
           </tr>
           <tr>
-            <td>Runtime footprint (non-weight)</td>
-            <td class="ours">~14 kB TS</td>
-            <td>~50 MB WASM</td>
+            <td>JS bundle (chat page, excl. weights)</td>
+            <td class="ours">157 kB / 33 kB gz</td>
+            <td>5.9 MB / 2.1 MB gz</td>
             <td>~10 MB JS + native</td>
           </tr>
           <tr>
-            <td>Speed (Phi-3, M2 Pro)</td>
-            <td class="ours">~15 tok/s</td>
-            <td>~27–48 tok/s</td>
+            <td>Decode speed (Phi-3, M2 Pro)</td>
+            <td class="ours">~40 tok/s</td>
+            <td>~51 tok/s</td>
             <td>not measured here</td>
           </tr>
           <tr>
@@ -817,7 +817,7 @@
           </tr>
           <tr>
             <td>Readable source</td>
-            <td class="ours check">✓ 11 WGSL files</td>
+            <td class="ours check">✓ 27 WGSL files</td>
             <td class="cross">✗ Compiled blob</td>
             <td class="cross">✗ Generated ops</td>
           </tr>
@@ -841,11 +841,11 @@
     <div style="margin-top:3rem;padding:1.5rem 1.75rem;border:1px solid var(--surface);border-radius:12px;background:var(--surface);max-width:860px;">
       <h3 style="margin-top:0;margin-bottom:0.75rem;">What this repo is <em>not</em></h3>
       <ul style="margin:0;padding-left:1.25rem;line-height:1.7;color:var(--text-dim);">
-        <li><strong>Not a compiler.</strong> Nothing here emits WGSL — the 11 shaders are human-written.</li>
+        <li><strong>Not a compiler.</strong> Nothing here emits WGSL — the 27 shader files are human-written.</li>
         <li><strong>Not cross-architecture.</strong> Hard-coded to Phi-3 Mini with Q4F16_1 weights. No Llama / Qwen / Gemma path without shader work.</li>
         <li><strong>Not cross-runtime.</strong> Browser WebGPU only. No Node / Bun / Deno target.</li>
         <li><strong>Not a production replacement for Transformers.js v4.</strong> It does fewer things, on purpose.</li>
-        <li><strong>Not currently faster than WebLLM on Apple Silicon.</strong> Closing that gap is work-in-progress, not a shipped claim.</li>
+        <li><strong>Not faster than WebLLM on Apple Silicon.</strong> ~22% behind on M2 Pro (~40 vs ~51 tok/s). Closing that gap is work-in-progress, not a shipped claim.</li>
       </ul>
       <p style="margin-top:1rem;margin-bottom:0;color:var(--text);">
         It <strong>is</strong> a minimal-surface-area demonstration that for one fixed model shape, the
@@ -872,7 +872,7 @@
 <!-- ── FOOTER ── -->
 <footer>
   <p>
-    Built with WebGPU · 11 WGSL shaders · Phi-3-mini-4k-instruct Q4F16<br>
+    Built with WebGPU · 10 kernel roles · 27 WGSL files · Phi-3-mini-4k-instruct Q4F16<br>
     Weights via <a href="https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC" style="color:var(--accent);text-decoration:none;">mlc-ai on HuggingFace</a> · No server. No framework. No TVM.
   </p>
 </footer>

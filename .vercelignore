@@ -1,0 +1,11 @@
+.claude
+**/.claude
+node_modules
+tests
+.tests-cache
+**/.tests-cache
+*.log
+.DS_Store
+src/tvm-shaders
+mlc-weights
+.cache
