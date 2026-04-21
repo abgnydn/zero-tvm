@@ -38,6 +38,17 @@ header h1 {
   letter-spacing: -0.01em;
 }
 
+.back-link {
+  color: #6c63ff;
+  text-decoration: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin-right: 0.5rem;
+  transition: opacity 0.15s;
+}
+
+.back-link:hover { opacity: 0.75; }
+
 .badge {
   background: #1a472a;
   color: #4caf50;

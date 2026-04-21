@@ -100,7 +100,7 @@ export default defineConfig({
     },
   },
   build: {
-    // Deploy all user-facing entries. Dev-only pages (dump, shaders, test-*,
+    // Deploy all user-facing entries. Dev-only pages (shaders, test-*,
     // standalone-test) are intentionally excluded — they're in-repo for
     // debugging and not linked from the main site.
     rollupOptions: {
@@ -113,6 +113,7 @@ export default defineConfig({
         'webllm-bench':resolve(__dirname, 'webllm-bench.html'),
         architecture:  resolve(__dirname, 'architecture.html'),
         docs:          resolve(__dirname, 'docs.html'),
+        dump:          resolve(__dirname, 'dump.html'),
       },
     },
     chunkSizeWarningLimit: 8000,

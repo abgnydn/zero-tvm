@@ -500,6 +500,77 @@
     .pill.purple { background: #6c63ff12; color: var(--accent); border-color: #6c63ff30; }
     .pill.yellow { background: #f5c54212; color: var(--yellow); border-color: #f5c54230; }
     .pill.red    { background: #ff5f5712; color: #ff5f57;       border-color: #ff5f5730; }
+
+    /* ── SHARE MODAL ── */
+    .share-modal {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center; justify-content: center;
+      z-index: 200;
+      padding: 1rem;
+    }
+    .share-modal.open { display: flex; }
+    .share-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.5rem;
+      max-width: 480px;
+      width: 100%;
+      max-height: 85vh;
+      overflow-y: auto;
+    }
+    .share-panel h3 {
+      font-size: 1.1rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+      color: var(--text);
+    }
+    .share-option {
+      display: block;
+      padding: 0.85rem 1rem;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 0.5rem;
+      text-decoration: none;
+      color: inherit;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .share-option:hover { border-color: var(--accent); background: #6c63ff0a; }
+    .share-option .platform {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 0.25rem;
+    }
+    .share-option .msg {
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.5;
+      display: block;
+      overflow-wrap: anywhere;
+    }
+    .copied-toast {
+      position: fixed;
+      bottom: 2rem; left: 50%;
+      transform: translateX(-50%);
+      background: var(--green);
+      color: #0a0a0c;
+      padding: 0.6rem 1.25rem;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+      z-index: 300;
+    }
+    .copied-toast.show { opacity: 1; }
   </style>
 </head>
 <body>
@@ -511,6 +582,7 @@
     <li><a href="#how">How it works</a></li>
     <li><a href="#shaders">Shaders</a></li>
     <li><a href="#compare">Compare</a></li>
+    <li><a href="#tools">Tools</a></li>
     <li><a href="docs.html">Docs</a></li>
     <li><a href="zero-tvm.html" class="nav-cta">Try it →</a></li>
   </ul>
@@ -535,7 +607,8 @@
 
   <div class="hero-actions">
     <a href="zero-tvm.html" class="btn-primary">Open Chat →</a>
-    <a href="#how" class="btn-ghost">How it works</a>
+    <a href="https://github.com/abgnydn/zero-tvm" class="btn-ghost" target="_blank" rel="noopener">GitHub ↗</a>
+    <button class="btn-ghost" onclick="document.getElementById('share-modal').classList.add('open')" style="cursor:pointer;font-family:inherit;">Share</button>
   </div>
 
   <div class="hero-stats">
@@ -869,6 +942,94 @@
 
 <hr class="divider">
 
+<!-- ── MORE TOOLS ── -->
+<section id="tools">
+  <div class="section-inner">
+    <div class="section-label">Explore deeper</div>
+    <h2 class="section-title">Every page is a milestone of the argument.</h2>
+    <p class="section-sub">
+      The repo is organized so each HTML file demonstrates one claim. Open any of them to inspect the stack at a different layer.
+    </p>
+
+    <div class="shaders-grid">
+      <a class="shader-card" href="zero-tvm.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">💬</span>
+        <div>
+          <h4>Zero-TVM Chat</h4>
+          <p>The result: Phi-3-mini decoding on 10 hand-written WGSL kernels. WebLLM is never touched.</p>
+          <span class="shader-tag">/zero-tvm.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="webllm-bench.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">📊</span>
+        <div>
+          <h4>WebLLM Bench</h4>
+          <p>Head-to-head against the same Phi-3 Q4F16 weights. Measured ~51 vs ~40 tok/s on M2 Pro.</p>
+          <span class="shader-tag">/webllm-bench.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="validate.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">✅</span>
+        <div>
+          <h4>Validate</h4>
+          <p>Multi-prompt smoke test driving <code>engine-core.ts</code> end-to-end, no DOM dependencies.</p>
+          <span class="shader-tag">/validate.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="compiler-chat.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">🧩</span>
+        <div>
+          <h4>Compiler Chat</h4>
+          <p>The intermediate milestone: captures TVM dispatches, replays 279 of 342 through our shaders.</p>
+          <span class="shader-tag">/compiler-chat.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="demo.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">🎬</span>
+        <div>
+          <h4>Dispatch Visualization</h4>
+          <p>Interactive timeline of every GPU dispatch — 342 for WebLLM, 228 for Zero-TVM.</p>
+          <span class="shader-tag">/demo.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="architecture.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">🗺️</span>
+        <div>
+          <h4>Architecture</h4>
+          <p>Decode pipeline diagram, buffer layout, KV-cache paging, entry-point map.</p>
+          <span class="shader-tag">/architecture.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="dump.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">📜</span>
+        <div>
+          <h4>TVM Shader Dump</h4>
+          <p>All 85 WGSL kernels TVM emits for Phi-3, captured from a live WebLLM session. 12,962 lines of generated code for comparison.</p>
+          <span class="shader-tag">/dump.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="docs.html" style="text-decoration:none;color:inherit;">
+        <span class="shader-icon-lg">📖</span>
+        <div>
+          <h4>Docs</h4>
+          <p>Shader catalog, URL flags, BPE tokenizer, weight loader, benchmarks reference.</p>
+          <span class="shader-tag">/docs.html</span>
+        </div>
+      </a>
+      <a class="shader-card" href="https://github.com/abgnydn/zero-tvm" style="text-decoration:none;color:inherit;" target="_blank" rel="noopener">
+        <span class="shader-icon-lg">⭐</span>
+        <div>
+          <h4>Source on GitHub</h4>
+          <p>27 WGSL files and ~2,000 lines of TypeScript. Read it in one sitting.</p>
+          <span class="shader-tag">github.com/abgnydn/zero-tvm</span>
+        </div>
+      </a>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
 <!-- ── CTA ── -->
 <section class="cta-section">
   <div class="section-inner" style="display:flex;flex-direction:column;align-items:center;">
@@ -888,6 +1049,67 @@
     Weights via <a href="https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC" style="color:var(--accent);text-decoration:none;">mlc-ai on HuggingFace</a> · No server. No framework. No TVM.
   </p>
 </footer>
+
+<!-- ── SHARE MODAL ── -->
+<div id="share-modal" class="share-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="share-panel">
+    <h3>Share zero-tvm</h3>
+
+    <a class="share-option" target="_blank" rel="noopener" id="share-x">
+      <span class="platform">X / Twitter</span>
+      <span class="msg">Zero-TVM: Phi-3-mini decoding at ~40 tok/s in a browser on 10 hand-written WGSL kernels (27 files, 3,078 LOC). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 22% behind the autotuned compiler on M2 Pro — fully readable in one sitting.</span>
+    </a>
+
+    <a class="share-option" target="_blank" rel="noopener" id="share-linkedin">
+      <span class="platform">LinkedIn</span>
+      <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3-mini (3.8B params) entirely in the browser using 10 hand-written WebGPU kernel roles (27 WGSL files total). It replaces the 85 auto-generated shaders and WASM scheduler from Apache TVM / WebLLM with ~2,000 lines of TypeScript. Measured ~40 tok/s vs WebLLM's ~51 on M2 Pro — 22% behind on the same weights. The whole forward pass (32 layers, paged KV cache, int4 dequant, fused QKV+RoPE+KV-append, fused FFN, attention, argmax) is readable end-to-end.</span>
+    </a>
+
+    <a class="share-option" target="_blank" rel="noopener" id="share-hn">
+      <span class="platform">Hacker News</span>
+      <span class="msg">Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (22% behind WebLLM)</span>
+    </a>
+
+    <a class="share-option" target="_blank" rel="noopener" id="share-reddit">
+      <span class="platform">Reddit</span>
+      <span class="msg">I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini decodes at ~40 tok/s in the browser — 22% behind WebLLM on the same weights.</span>
+    </a>
+
+    <a class="share-option" id="share-copy" style="cursor:pointer;">
+      <span class="platform">Copy link</span>
+      <span class="msg" id="share-url"></span>
+    </a>
+  </div>
+</div>
+
+<div class="copied-toast" id="copied-toast">Link copied</div>
+
+<script>
+(function() {
+  var url = window.location.origin + '/';
+  var repo = 'https://github.com/abgnydn/zero-tvm';
+
+  var xText = "Zero-TVM: Phi-3-mini decoding at ~40 tok/s in a browser on 10 hand-written WGSL kernels (27 files). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 22% behind the autotuned compiler, fully readable in one sitting.\n\n" + url;
+  document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(xText);
+
+  document.getElementById('share-linkedin').href = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(url);
+
+  document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent("Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (22% behind WebLLM)");
+
+  document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent("I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini decodes at ~40 tok/s in the browser, 22% behind WebLLM on the same weights.");
+
+  document.getElementById('share-url').textContent = url;
+
+  document.getElementById('share-copy').addEventListener('click', function(e) {
+    e.preventDefault();
+    navigator.clipboard.writeText(url).then(function() {
+      var toast = document.getElementById('copied-toast');
+      toast.classList.add('show');
+      setTimeout(function() { toast.classList.remove('show'); }, 1500);
+    });
+  });
+})();
+</script>
 
 </body>
 </html>
