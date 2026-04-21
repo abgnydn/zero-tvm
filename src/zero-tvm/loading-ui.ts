@@ -134,19 +134,17 @@ export async function bootEngine(): Promise<BootResult> {
   setBadge('Downloading...', 'loading')
   let weights: LoadedWeights
   try {
-    weights = await loadWeights(
-      device,
-      (m) => log(m),
-      (downloaded, total, file) => {
-        const pct = total > 0 ? (downloaded / total) * 100 : 0
-        setProgress(
-          10 + pct * 0.8,
-          `Downloading ${file}`,
-          `${formatBytes(downloaded)} / ${formatBytes(total)}`
-        )
+    weights = await loadWeights(device, (m) => {
+      log(m)
+      // Coarse progress: our weight-loader emits "Loading layer N/32" messages.
+      const match = /Loading layer (\d+)/.exec(m)
+      if (match) {
+        const layer = parseInt(match[1], 10)
+        const pct = (layer / 32) * 100
+        setProgress(10 + pct * 0.8, `Loading layer ${layer} / 32`)
         setBadge(`${Math.round(pct)}%`, 'loading')
       }
-    )
+    })
   } catch (e) {
     setBadge('Download failed', 'error')
     setProgress(10, `Weight load error: ${e}`)

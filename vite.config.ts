@@ -100,17 +100,20 @@ export default defineConfig({
     },
   },
   build: {
-    // Deploy all user-facing entries (landing, demo, bench, docs).
-    // Archived/experimental pages (dump, v3, fast, test-*, compiler*, shaders,
-    // standalone-test, demo) are intentionally excluded.
+    // Deploy all user-facing entries. Dev-only pages (dump, shaders, test-*,
+    // standalone-test) are intentionally excluded — they're in-repo for
+    // debugging and not linked from the main site.
     rollupOptions: {
       input: {
-        index:        resolve(__dirname, 'index.html'),
-        landing:      resolve(__dirname, 'landing.html'),
-        zeroTvm:      resolve(__dirname, 'zero-tvm.html'),
-        webllmBench:  resolve(__dirname, 'webllm-bench.html'),
-        architecture: resolve(__dirname, 'architecture.html'),
-        docs:         resolve(__dirname, 'docs.html'),
+        index:         resolve(__dirname, 'index.html'),
+        landing:       resolve(__dirname, 'landing.html'),
+        'zero-tvm':    resolve(__dirname, 'zero-tvm.html'),
+        'compiler-chat': resolve(__dirname, 'compiler-chat.html'),
+        demo:          resolve(__dirname, 'demo.html'),
+        validate:      resolve(__dirname, 'validate.html'),
+        'webllm-bench':resolve(__dirname, 'webllm-bench.html'),
+        architecture:  resolve(__dirname, 'architecture.html'),
+        docs:          resolve(__dirname, 'docs.html'),
       },
     },
     chunkSizeWarningLimit: 8000,
