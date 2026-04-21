@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Docs — Zero TVM</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg:       #0a0a0c;
+      --surface:  #111114;
+      --surface2: #18181c;
+      --border:   #1e1e24;
+      --accent:   #6c63ff;
+      --green:    #00d4aa;
+      --yellow:   #f5c542;
+      --red:      #ff5f57;
+      --text:     #e8e8ec;
+      --muted:    #666672;
+      --dim:      #3a3a44;
+      --sidebar-w: 260px;
+      --topbar-h:  52px;
+      --code-bg:  #0d0d10;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    /* ── TOPBAR ── */
+    .topbar {
+      height: var(--topbar-h);
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 1.5rem;
+      gap: 1.5rem;
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+    }
+
+    .logo {
+      font-weight: 800;
+      font-size: 0.95rem;
+      letter-spacing: -0.03em;
+      color: #fff;
+      text-decoration: none;
+    }
+    .logo span { color: var(--accent); }
+
+    .topbar-sep { color: var(--border); }
+    .topbar-title { font-size: 0.82rem; color: var(--muted); }
+
+    .topbar-nav {
+      margin-left: auto;
+      display: flex;
+      gap: 1.25rem;
+      align-items: center;
+    }
+
+    .topbar-nav a {
+      font-size: 0.8rem;
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+    .topbar-nav a:hover { color: var(--text); }
+
+    .topbar-cta {
+      background: var(--accent);
+      color: #fff !important;
+      padding: 0.3rem 0.85rem;
+      border-radius: 7px;
+      font-weight: 600 !important;
+    }
+
+    /* ── LAYOUT ── */
+    .layout {
+      display: flex;
+      flex: 1;
+      padding-top: var(--topbar-h);
+    }
+
+    /* ── SIDEBAR ── */
+    aside {
+      width: var(--sidebar-w);
+      min-width: var(--sidebar-w);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      position: fixed;
+      top: var(--topbar-h);
+      bottom: 0;
+      left: 0;
+      overflow-y: auto;
+      padding: 1.5rem 0;
+    }
+
+    aside::-webkit-scrollbar { width: 4px; }
+    aside::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .sidebar-section {
+      padding: 0 1rem 1rem;
+    }
+
+    .sidebar-section-label {
+      font-size: 0.6rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 0.5rem 0.5rem 0.4rem;
+      display: block;
+    }
+
+    .sidebar-link {
+      display: block;
+      padding: 0.35rem 0.5rem;
+      font-size: 0.78rem;
+      color: var(--muted);
+      text-decoration: none;
+      border-radius: 6px;
+      transition: background 0.1s, color 0.1s;
+      border-left: 2px solid transparent;
+    }
+
+    .sidebar-link:hover { color: var(--text); background: var(--surface2); }
+    .sidebar-link.active { color: var(--accent); border-left-color: var(--accent); background: #6c63ff0d; }
+    .sidebar-link.sub { padding-left: 1.25rem; font-size: 0.73rem; }
+
+    /* ── MAIN CONTENT ── */
+    main {
+      margin-left: var(--sidebar-w);
+      flex: 1;
+      padding: 3.5rem 3rem 6rem;
+      max-width: 900px;
+    }
+
+    /* ── TYPOGRAPHY ── */
+    h1 {
+      font-size: 2rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+      line-height: 1.2;
+    }
+
+    h2 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-top: 3rem;
+      margin-bottom: 0.75rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--border);
+      scroll-margin-top: calc(var(--topbar-h) + 1rem);
+    }
+
+    h2:first-of-type { border-top: none; margin-top: 1.5rem; padding-top: 0; }
+
+    h3 {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-top: 1.75rem;
+      margin-bottom: 0.5rem;
+      color: var(--text);
+      scroll-margin-top: calc(var(--topbar-h) + 1rem);
+    }
+
+    h4 {
+      font-size: 0.88rem;
+      font-weight: 700;
+      margin-top: 1.25rem;
+      margin-bottom: 0.35rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    p {
+      font-size: 0.9rem;
+      color: #b0b0bc;
+      margin-bottom: 1rem;
+      line-height: 1.75;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    ul, ol {
+      margin: 0.5rem 0 1rem 1.5rem;
+      font-size: 0.88rem;
+      color: #b0b0bc;
+      line-height: 1.8;
+    }
+
+    li { margin-bottom: 0.2rem; }
+
+    strong { color: var(--text); font-weight: 600; }
+    em { color: var(--yellow); font-style: normal; }
+
+    /* ── LEAD / SUBTITLE ── */
+    .lead {
+      font-size: 1.05rem;
+      color: var(--muted);
+      margin-bottom: 2rem;
+      line-height: 1.7;
+    }
+
+    /* ── PILL BADGES ── */
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      font-size: 0.65rem;
+      font-weight: 600;
+      border: 1px solid;
+      vertical-align: middle;
+    }
+    .pill.green  { background: #00d4aa12; color: var(--green);  border-color: #00d4aa30; }
+    .pill.purple { background: #6c63ff12; color: var(--accent); border-color: #6c63ff30; }
+    .pill.yellow { background: #f5c54212; color: var(--yellow); border-color: #f5c54230; }
+    .pill.red    { background: #ff5f5712; color: var(--red);    border-color: #ff5f5730; }
+
+    /* ── CODE ── */
+    code {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.8em;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 0.1em 0.4em;
+      border-radius: 4px;
+      color: #c8c8e0;
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin: 1rem 0 1.5rem;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.78rem;
+      line-height: 1.65;
+    }
+
+    pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: inherit;
+      color: #c8c8e0;
+    }
+
+    /* syntax highlight classes */
+    .kw  { color: #c792ea; }
+    .fn  { color: #82aaff; }
+    .str { color: #c3e88d; }
+    .num { color: #f78c6c; }
+    .cm  { color: #546e7a; font-style: italic; }
+    .ty  { color: #ffcb6b; }
+    .op  { color: #89ddff; }
+
+    /* ── PRE HEADER (filename label) ── */
+    .code-block { margin: 1rem 0 1.5rem; }
+    .code-label {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+      padding: 0.4rem 1rem;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.7rem;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .code-block pre { margin: 0; border-radius: 0 0 8px 8px; }
+
+    /* ── CALLOUTS ── */
+    .callout {
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      margin: 1.25rem 0;
+      font-size: 0.85rem;
+      line-height: 1.65;
+      border-left: 3px solid;
+    }
+    .callout p { margin: 0; color: inherit; font-size: inherit; }
+    .callout.info    { background: #6c63ff0d; border-color: var(--accent); color: #a0a0d0; }
+    .callout.tip     { background: #00d4aa0d; border-color: var(--green);  color: #80c8bc; }
+    .callout.warning { background: #f5c5420d; border-color: var(--yellow); color: #c0a060; }
+    .callout.danger  { background: #ff5f570d; border-color: var(--red);    color: #c08080; }
+
+    .callout-title { font-weight: 700; margin-bottom: 0.3rem; color: inherit; }
+
+    /* ── TABLES ── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      margin: 1rem 0 1.5rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    th {
+      background: var(--surface2);
+      padding: 0.65rem 1rem;
+      text-align: left;
+      font-weight: 600;
+      color: var(--text);
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 0.6rem 1rem;
+      color: #b0b0bc;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #ffffff03; }
+
+    /* ── SHADER CARD ── */
+    .shader-doc-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      margin: 1.25rem 0;
+    }
+
+    .shader-doc-card h4 {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: var(--text);
+      text-transform: none;
+      letter-spacing: 0;
+      margin-top: 0;
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+    }
+
+    .shader-doc-card p { font-size: 0.82rem; color: var(--muted); margin: 0.4rem 0 0; }
+
+    .binding-table { margin: 0.75rem 0 0; }
+    .binding-table th, .binding-table td { padding: 0.4rem 0.75rem; font-size: 0.75rem; }
+
+    /* ── STEP FLOW ── */
+    .step-flow { display: flex; flex-direction: column; gap: 0; margin: 1rem 0 1.5rem; }
+
+    .step-row {
+      display: flex;
+      gap: 1rem;
+      align-items: flex-start;
+    }
+
+    .step-line {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .step-dot {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.68rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .step-line-seg {
+      width: 2px;
+      flex: 1;
+      background: var(--border);
+      margin: 4px 0;
+      min-height: 20px;
+    }
+
+    .step-content { padding: 0.05rem 0 1.25rem; }
+    .step-content h5 { font-size: 0.88rem; font-weight: 700; color: var(--text); margin-bottom: 0.25rem; }
+    .step-content p { font-size: 0.8rem; color: var(--muted); margin: 0; }
+
+    /* ── DIVIDER ── */
+    hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+
+    /* ── SCROLL MARGIN ── */
+    [id] { scroll-margin-top: calc(var(--topbar-h) + 1.5rem); }
+  </style>
+</head>
+<body>
+
+<!-- ── TOPBAR ── -->
+<div class="topbar">
+  <a href="landing.html" class="logo">Zero<span>TVM</span></a>
+  <span class="topbar-sep">/</span>
+  <span class="topbar-title">Documentation</span>
+  <nav class="topbar-nav">
+    <a href="landing.html">Home</a>
+    <a href="zero-tvm.html" class="topbar-cta">Open Chat →</a>
+  </nav>
+</div>
+
+<div class="layout">
+
+<!-- ── SIDEBAR ── -->
+<aside>
+  <div class="sidebar-section">
+    <span class="sidebar-section-label">Getting Started</span>
+    <a href="#intro" class="sidebar-link active">Introduction</a>
+    <a href="#quickstart" class="sidebar-link">Quick start</a>
+    <a href="#how-it-works" class="sidebar-link">How it works</a>
+  </div>
+
+  <div class="sidebar-section">
+    <span class="sidebar-section-label">Architecture</span>
+    <a href="#overview" class="sidebar-link">Overview</a>
+    <a href="#weight-loader" class="sidebar-link">Weight loader</a>
+    <a href="#tokenizer" class="sidebar-link">Tokenizer</a>
+    <a href="#kv-cache" class="sidebar-link">KV cache</a>
+    <a href="#decode-loop" class="sidebar-link">Decode loop</a>
+    <a href="#ping-pong" class="sidebar-link">Ping-pong buffers</a>
+  </div>
+
+  <div class="sidebar-section">
+    <span class="sidebar-section-label">WGSL Shaders</span>
+    <a href="#shaders" class="sidebar-link">Overview</a>
+    <a href="#shader-embedding" class="sidebar-link sub">1 · Embedding</a>
+    <a href="#shader-rmsnorm" class="sidebar-link sub">2 · RMSNorm</a>
+    <a href="#shader-qkv" class="sidebar-link sub">3 · QKV Matmul</a>
+    <a href="#shader-rope" class="sidebar-link sub">4 · RoPE</a>
+    <a href="#shader-kvappend" class="sidebar-link sub">5 · KV Append</a>
+    <a href="#shader-attention" class="sidebar-link sub">6 · Attention</a>
+    <a href="#shader-oproj" class="sidebar-link sub">7 · O-Proj</a>
+    <a href="#shader-addnorm" class="sidebar-link sub">8 · Add + Norm</a>
+    <a href="#shader-ffn" class="sidebar-link sub">9 · Fused FFN</a>
+    <a href="#shader-lmhead" class="sidebar-link sub">10 · LM Head</a>
+  </div>
+
+  <div class="sidebar-section">
+    <span class="sidebar-section-label">Model</span>
+    <a href="#phi3" class="sidebar-link">Phi-3 constants</a>
+    <a href="#quantization" class="sidebar-link">Q4F16 format</a>
+    <a href="#weights" class="sidebar-link">Weight naming</a>
+  </div>
+
+  <div class="sidebar-section">
+    <span class="sidebar-section-label">Extending</span>
+    <a href="#porting" class="sidebar-link">Port to Phi-4 / Qwen3</a>
+    <a href="#local-weights" class="sidebar-link">Local weight serving</a>
+    <a href="#debugging" class="sidebar-link">Debugging tips</a>
+  </div>
+
+  <div class="sidebar-section">
+    <span class="sidebar-section-label">Reference</span>
+    <a href="#bugs-fixed" class="sidebar-link">Bugs we fixed</a>
+    <a href="#vs-webllm" class="sidebar-link">vs WebLLM</a>
+  </div>
+</aside>
+
+<!-- ── MAIN ── -->
+<main>
+
+<!-- INTRO -->
+<div id="intro">
+  <h1>Zero TVM Documentation</h1>
+  <p class="lead">
+    A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
+    11 hand-written WGSL shaders, a BPE tokenizer, and raw WebGPU.
+  </p>
+
+  <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
+    <span class="pill green">WebGPU</span>
+    <span class="pill purple">11 WGSL shaders</span>
+    <span class="pill yellow">Q4F16</span>
+    <span class="pill green">Phi-3-mini 3.8B</span>
+    <span class="pill purple">Paged KV Cache</span>
+    <span class="pill green">0 dependencies</span>
+  </div>
+
+  <p>
+    This project implements the full Phi-3-mini-4k-instruct transformer forward pass using only
+    WebGPU compute shaders written by hand in WGSL. Weights are loaded directly from HuggingFace
+    in MLC Q4F16_1 format (or from the browser Cache API if WebLLM was used previously).
+    The tokenizer is implemented in pure TypeScript — no SentencePiece WASM.
+  </p>
+
+  <div class="callout tip">
+    <div class="callout-title">Why?</div>
+    <p>WebLLM and transformers.js both work, but they're black boxes — TVM compiles kernels you never see.
+    This project exists to show that you can understand <em>every single step</em> of a modern transformer
+    inference pipeline, written at the GPU level, in a browser tab.</p>
+  </div>
+</div>
+
+<!-- QUICKSTART -->
+<h2 id="quickstart">Quick start</h2>
+
+<p>No install. Just open the chat page. Weights load from your browser cache (if you've used WebLLM before) or download fresh from HuggingFace (~2.1 GB).</p>
+
+<div class="step-flow">
+  <div class="step-row">
+    <div class="step-line"><div class="step-dot">1</div><div class="step-line-seg"></div></div>
+    <div class="step-content">
+      <h5>Open the chat</h5>
+      <p>Navigate to <code>zero-tvm.html</code>. WebGPU initializes automatically. Requires Chrome 113+, Edge 113+, or Safari 18+.</p>
+    </div>
+  </div>
+  <div class="step-row">
+    <div class="step-line"><div class="step-dot">2</div><div class="step-line-seg"></div></div>
+    <div class="step-content">
+      <h5>Wait for weights</h5>
+      <p>First load downloads ~2.1 GB. Subsequent loads are instant from browser Cache API. Progress shown per shard in the log panel.</p>
+    </div>
+  </div>
+  <div class="step-row">
+    <div class="step-line"><div class="step-dot">3</div><div class="step-line-seg"></div></div>
+    <div class="step-content">
+      <h5>Chat</h5>
+      <p>Phi-3-mini runs at ~15 tok/s on Apple Silicon. Your conversation never leaves the browser. No API calls during inference.</p>
+    </div>
+  </div>
+  <div class="step-row">
+    <div class="step-line"><div class="step-dot">4</div></div>
+    <div class="step-content">
+      <h5>(Optional) Cache weights locally</h5>
+      <p>Run <code>node scripts/download-weights.mjs</code> once to save all 83 shards to <code>public/weights/</code>. Subsequent loads are served from localhost at full disk speed.</p>
+    </div>
+  </div>
+</div>
+
+<div class="callout warning">
+  <div class="callout-title">GPU requirement</div>
+  <p>Requires a GPU with <code>shader-f16</code> WebGPU feature (f16 arithmetic). Most M-series Macs and recent NVIDIA/AMD GPUs support this. Intel integrated graphics may not.</p>
+</div>
+
+<!-- HOW IT WORKS -->
+<h2 id="how-it-works">How it works</h2>
+
+<p>The engine has three phases per generated token:</p>
+
+<ol>
+  <li><strong>Prefill</strong> — process each prompt token sequentially, building up the KV cache</li>
+  <li><strong>First decode</strong> — the last prefill step produces the first generated token</li>
+  <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
+</ol>
+
+<p>Each forward pass dispatches <strong>10 shader pipelines</strong> through 32 transformer layers (≈ 330 dispatches per token), then reads one i32 token ID back from the GPU.</p>
+
+<!-- ARCHITECTURE -->
+<h2 id="overview">Architecture overview</h2>
+
+<p>Four source files make up the engine:</p>
+
+<table>
+  <thead><tr><th>File</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>src/zero-tvm/chat.ts</code></td><td>Main decode engine + UI. Allocates buffers, builds bind groups, runs the decode loop.</td></tr>
+    <tr><td><code>src/zero-tvm/weight-loader.ts</code></td><td>Fetches ndarray-cache.json, downloads shards, uploads to GPU buffers.</td></tr>
+    <tr><td><code>src/zero-tvm/tokenizer.ts</code></td><td>BPE tokenizer: encode text → token IDs, decode IDs → text.</td></tr>
+    <tr><td><code>src/compiler/compiler.ts</code></td><td>Compiles all 11 WGSL shaders into <code>GPUComputePipeline</code> objects.</td></tr>
+  </tbody>
+</table>
+
+<!-- WEIGHT LOADER -->
+<h2 id="weight-loader">Weight loader</h2>
+
+<p>
+  Weights are stored in MLC's <strong>ndarray-cache.json</strong> format — an index file listing every parameter,
+  which shard binary it lives in, its byte offset, and byte size.
+  The loader reads this index then fetches each referenced shard.
+</p>
+
+<h3>Fetch priority</h3>
+<ol>
+  <li><strong>Browser Cache API</strong> — if a prior WebLLM session cached the shards, they load instantly</li>
+  <li><strong>HuggingFace</strong> — direct HTTPS fetch from <code>huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC</code></li>
+</ol>
+
+<div class="callout danger">
+  <div class="callout-title">Version mismatch pitfall</div>
+  <p>Do not mix a locally-downloaded <code>ndarray-cache.json</code> with shards from the browser cache.
+  The byte offsets in the index must match the shards exactly. If you download the index fresh but use
+  cached shards from an older model version, all weight slices will be wrong → zero logits → <code>&lt;unk&gt;</code> output.</p>
+</div>
+
+<h3>Parameter naming (MLC format)</h3>
+<p>MLC uses non-standard parameter names. The actual names in the cache:</p>
+
+<table>
+  <thead><tr><th>MLC name</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>transformer.embd.q_weight</code></td><td>Embedding weights (uint32 packed int4)</td></tr>
+    <tr><td><code>transformer.embd.q_scale</code></td><td>Embedding scales (f16)</td></tr>
+    <tr><td><code>transformer.norm.weight</code></td><td>Final RMSNorm gamma (after all layers)</td></tr>
+    <tr><td><code>lm_head.q_weight</code></td><td>LM head weights</td></tr>
+    <tr><td><code>transformer.h.N.ln.weight</code></td><td>Layer N input_layernorm (normGamma1)</td></tr>
+    <tr><td><code>transformer.h.N.post_attention_layernorm.weight</code></td><td>Layer N post-attention norm (normGamma2)</td></tr>
+    <tr><td><code>transformer.h.N.mixer.qkv_proj.q_weight</code></td><td>Layer N QKV projection weights</td></tr>
+    <tr><td><code>transformer.h.N.mixer.out_proj.q_weight</code></td><td>Layer N output projection weights</td></tr>
+    <tr><td><code>transformer.h.N.mlp.gate_up_proj.q_weight</code></td><td>Layer N FFN gate+up weights</td></tr>
+    <tr><td><code>transformer.h.N.mlp.down_proj.q_weight</code></td><td>Layer N FFN down weights</td></tr>
+  </tbody>
+</table>
+
+<!-- TOKENIZER -->
+<h2 id="tokenizer">Tokenizer</h2>
+
+<p>
+  A hand-written BPE tokenizer in TypeScript. No SentencePiece WASM, no HuggingFace tokenizers bundle.
+  Reads <code>tokenizer.json</code> directly.
+</p>
+
+<h3>Key steps</h3>
+<ul>
+  <li><strong>Pre-tokenization</strong> — Metaspace: spaces become <code>▁</code>, words are split on whitespace</li>
+  <li><strong>BPE encoding</strong> — merge pairs by rank from the merge table in tokenizer.json</li>
+  <li><strong>Special tokens</strong> — <code>&lt;|system|&gt;</code>, <code>&lt;|user|&gt;</code>, <code>&lt;|assistant|&gt;</code>, <code>&lt;|end|&gt;</code></li>
+  <li><strong>Chat template</strong> — Phi-3 format applied by <code>buildChatPrompt()</code></li>
+</ul>
+
+<h3>Phi-3 chat template</h3>
+<div class="code-block">
+  <div class="code-label">📄 prompt format</div>
+  <pre><code>&lt;|system|&gt;
+You are a helpful assistant.&lt;|end|&gt;
+&lt;|user|&gt;
+What is the capital of Australia?&lt;|end|&gt;
+&lt;|assistant|&gt;</code></pre>
+</div>
+
+<p>Stop tokens: <code>2</code> (EOS), <code>32000</code> (<code>&lt;|end|&gt;</code>), <code>32007</code> (<code>&lt;|endoftext|&gt;</code>).</p>
+
+<!-- KV CACHE -->
+<h2 id="kv-cache">KV cache</h2>
+
+<p>
+  Uses a <strong>paged KV cache</strong> — the same approach as vLLM and PagedAttention.
+  Memory is divided into fixed-size pages (16 slots each). A page table maps logical positions to physical pages.
+</p>
+
+<table>
+  <thead><tr><th>Parameter</th><th>Value</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>PAGE_SIZE</code></td><td>16</td><td>slots per page</td></tr>
+    <tr><td><code>MAX_PAGES</code></td><td>257</td><td>≈ 4096 context tokens</td></tr>
+    <tr><td>Bytes per page</td><td>196,608</td><td>32 heads × 16 slots × 96 dims × 2 (K+V) × 2 bytes</td></tr>
+    <tr><td>Total KV buffer</td><td>~50 MB per layer</td><td>32 layers = ~1.6 GB</td></tr>
+  </tbody>
+</table>
+
+<p>Each layer has its own <code>GPUBuffer</code> for KV pages. The page table is a simple identity mapping (page i → physical page i) for single-sequence inference.</p>
+
+<!-- DECODE LOOP -->
+<h2 id="decode-loop">Decode loop</h2>
+
+<p>Each call to <code>decodeToken(tokenId, position)</code> submits one command encoder with the full forward pass:</p>
+
+<div class="code-block">
+  <div class="code-label">src/zero-tvm/chat.ts · decodeToken()</div>
+  <pre><code><span class="cm">// Per-token GPU state written via writeBuffer</span>
+B.inputIds   ← [tokenId]          <span class="cm">// i32</span>
+B.posMap     ← [position]         <span class="cm">// i32</span>
+B.pageIndptr ← [0, nnzPages]      <span class="cm">// page range</span>
+B.lengthInfo ← [position+1, 0, 0] <span class="cm">// seq length</span>
+
+<span class="cm">// Forward pass (one command encoder)</span>
+embedding(B.residual)             <span class="cm">// token → hidden state</span>
+rmsNorm(B.hidden1, B.residual)    <span class="cm">// initial norm</span>
+
+<span class="kw">for</span> L <span class="op">in</span> <span class="num">0</span>..<span class="num">32</span>:
+  qkvMatmul(B.qkvOut, B.hidden1)
+  rope(B.qOut, B.kOut, B.vOut, B.qkvOut)
+  kvAppend(kvPages[L], B.kOut, B.vOut)
+  attention(B.attnOut, B.qOut, kvPages[L])
+  oProjMatmul(B.hidden2, B.attnOut)
+  addNorm(B.hidden2, resIn → B.hidden1, resOut)  <span class="cm">// ping-pong</span>
+  fusedFfn(B.ffnOut, B.hidden1)
+  ffnDownMatmul(B.hidden2, B.ffnOut)
+  addNorm(B.hidden2, resIn → B.hidden1, resOut)  <span class="cm">// ping-pong</span>
+
+lmHead(B.logits, B.hidden1)
+argmax(B.tokenOut, B.logits)      <span class="cm">// → next token ID</span></code></pre>
+</div>
+
+<!-- PING-PONG -->
+<h2 id="ping-pong">Ping-pong residual buffers</h2>
+
+<p>
+  WebGPU's validation rules forbid binding the same buffer as both <code>read</code> and <code>read_write</code>
+  in the same dispatch. The add_norm shader needs to <em>read</em> the old residual and <em>write</em> the new one.
+</p>
+
+<p>Solution: two residual buffers that alternate each dispatch.</p>
+
+<div class="code-block">
+  <div class="code-label">ping-pong pattern</div>
+  <pre><code><span class="kw">let</span> resIn  = B.residual   <span class="cm">// ping (starts with embedding)</span>
+<span class="kw">let</span> resOut = B.residual2  <span class="cm">// pong (uninitialized)</span>
+
+<span class="cm">// Each add_norm:</span>
+dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
+[resIn, resOut] = [resOut, resIn]  <span class="cm">// swap — O(1), no GPU copy</span></code></pre>
+</div>
+
+<div class="callout info">
+  <p>The swap is just two JavaScript variable reassignments — no GPU buffer copy. Both buffers always exist on the GPU; we just change which one we tell the bind group to read vs write.</p>
+</div>
+
+<!-- SHADERS -->
+<h2 id="shaders">WGSL Shaders</h2>
+
+<p>All shaders live in <code>src/compiler/shaders/</code>. Each is a self-contained <code>.wgsl</code> file. The compiler compiles them all at startup into <code>GPUComputePipeline</code> objects.</p>
+
+<p>Binding convention: <code>@group(0)</code> always. Binding indices are <strong>zero-based</strong> and match the order you pass buffers to <code>bg(device, pipeline, [...bufs])</code>.</p>
+
+<hr>
+
+<!-- SHADER 1 -->
+<div id="shader-embedding">
+  <div class="shader-doc-card">
+    <h4>🔤 1 · Embedding <span class="pill purple">embedding.wgsl</span></h4>
+    <p>Token ID lookup with Q4F16 dequantization. Each output element is dequantized from a packed int4 value: <code>(nibble - 7) × scale</code>.</p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>output hidden state</td></tr>
+        <tr><td><code>@1</code></td><td><code>read i32[]</code></td><td>input token IDs</td></tr>
+        <tr><td><code>@2</code></td><td><code>read f16[]</code></td><td>scales (group_size=32)</td></tr>
+        <tr><td><code>@3</code></td><td><code>read u32[]</code></td><td>packed weights (8 int4 per u32)</td></tr>
+        <tr><td><code>@4</code></td><td><code>uniform</code></td><td><code>{ seq_len, packGridDimX }</code></td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 12 workgroups × 256 threads = 3072 output elements (D=3072)</p>
+  </div>
+</div>
+
+<!-- SHADER 2 -->
+<div id="shader-rmsnorm">
+  <div class="shader-doc-card">
+    <h4>📐 2 · RMSNorm <span class="pill purple">rms_norm.wgsl</span></h4>
+    <p>Root mean square layer normalization. Computes <code>x / sqrt(mean(x²) + ε) × gamma</code>. Uses 256-thread tree reduction in workgroup shared memory.</p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>normalized output</td></tr>
+        <tr><td><code>@1</code></td><td><code>read f16[]</code></td><td>input</td></tr>
+        <tr><td><code>@2</code></td><td><code>read f16[]</code></td><td>gamma weights</td></tr>
+        <tr><td><code>@3</code></td><td><code>uniform</code></td><td><code>{ packGridDimX }</code></td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 workgroup (one token, D=3072)</p>
+  </div>
+</div>
+
+<!-- SHADER 3 -->
+<div id="shader-qkv">
+  <div class="shader-doc-card">
+    <h4>✖️ 3 · QKV Matmul <span class="pill purple">matmul_q4f16.wgsl</span></h4>
+    <p>Projects hidden state [1, 3072] → [1, 9216] (Q+K+V concatenated). Weights are Q4F16: 9216 output rows × 384 u32 columns (each u32 = 8 int4 values = 32 elements, matching group_size=32).</p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>output [9216]</td></tr>
+        <tr><td><code>@1</code></td><td><code>read f16[]</code></td><td>input [3072]</td></tr>
+        <tr><td><code>@2</code></td><td><code>read f16[]</code></td><td>scales [9216 × 96]</td></tr>
+        <tr><td><code>@3</code></td><td><code>read u32[]</code></td><td>packed weights [9216 × 384]</td></tr>
+        <tr><td><code>@4</code></td><td><code>uniform</code></td><td><code>{ K_groups=384, scale_stride=96, N=9216 }</code></td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 9216 workgroups (one per output element)</p>
+  </div>
+</div>
+
+<!-- SHADER 4 -->
+<div id="shader-rope">
+  <div class="shader-doc-card">
+    <h4>🌀 4 · RoPE <span class="pill purple">rope.wgsl</span></h4>
+    <p>Rotary position embeddings. Splits QKV → Q [3072], K [3072], V [3072]. Applies complex rotation to Q and K based on position. V is copied unchanged.</p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>q_out [3072]</td></tr>
+        <tr><td><code>@1</code></td><td><code>read_write f16[]</code></td><td>k_out [3072]</td></tr>
+        <tr><td><code>@2</code></td><td><code>read_write f16[]</code></td><td>v_out [3072]</td></tr>
+        <tr><td><code>@3</code></td><td><code>read f16[]</code></td><td>qkv input [9216]</td></tr>
+        <tr><td><code>@4</code></td><td><code>read i32[]</code></td><td>position map</td></tr>
+        <tr><td><code>@5</code></td><td><code>uniform</code></td><td>RoPE config</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger" style="margin-top:0.75rem;">
+      <div class="callout-title">Critical binding order</div>
+      <p>The binding order <strong>must</strong> be <code>[q_out, k_out, v_out, qkv, posMap, uniform]</code>. Swapping these caused the garbage-output bug during development.</p>
+    </div>
+    <p><strong>Dispatch:</strong> 36 workgroups × 256 threads = 9216 = 3 × 3072</p>
+  </div>
+</div>
+
+<!-- SHADER 5 -->
+<div id="shader-kvappend">
+  <div class="shader-doc-card">
+    <h4>💾 5 · KV Append <span class="pill purple">kv_append.wgsl</span></h4>
+    <p>Writes the current K and V vectors into the paged KV cache at the correct slot for the current position.</p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read f16[]</code></td><td>k_out [3072]</td></tr>
+        <tr><td><code>@1</code></td><td><code>read f16[]</code></td><td>v_out [3072]</td></tr>
+        <tr><td><code>@2</code></td><td><code>read_write f16[]</code></td><td>KV pages buffer</td></tr>
+        <tr><td><code>@3</code></td><td><code>read i32[]</code></td><td>position map</td></tr>
+        <tr><td><code>@4</code></td><td><code>uniform</code></td><td>page config</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 12 workgroups (HEADS=32, HEAD_DIM=96 → 12 groups)</p>
+  </div>
+</div>
+
+<!-- SHADER 6 -->
+<div id="shader-attention">
+  <div class="shader-doc-card">
+    <h4>👁️ 6 · Paged Attention <span class="pill purple">attention.wgsl</span></h4>
+    <p>Multi-head attention over the full KV cache. Reads K and V from pages, computes scaled dot-product attention with online softmax. Each workgroup handles one attention head.</p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read f16[]</code></td><td>Q [3072]</td></tr>
+        <tr><td><code>@1</code></td><td><code>read i32[]</code></td><td>page indptr</td></tr>
+        <tr><td><code>@2</code></td><td><code>read i32[]</code></td><td>page values (page table)</td></tr>
+        <tr><td><code>@3</code></td><td><code>read f16[]</code></td><td>KV pages</td></tr>
+        <tr><td><code>@4</code></td><td><code>read i32[]</code></td><td>length info</td></tr>
+        <tr><td><code>@5</code></td><td><code>read_write f16[]</code></td><td>attn output [3072]</td></tr>
+        <tr><td><code>@6</code></td><td><code>uniform</code></td><td>attention config (scale, pages)</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 × HEADS workgroups (1 × 32)</p>
+  </div>
+</div>
+
+<!-- SHADER 7 -->
+<div id="shader-oproj">
+  <div class="shader-doc-card">
+    <h4>✖️ 7 · O-Proj Matmul <span class="pill purple">matmul_q4f16.wgsl</span></h4>
+    <p>Same shader as QKV matmul, different dimensions. Projects attention output [3072] → [3072] with a Q4F16 weight matrix.</p>
+    <table class="binding-table">
+      <thead><tr><th>Uniform field</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>K_groups</code></td><td>384 (3072 / 8 per u32)</td></tr>
+        <tr><td><code>scale_stride</code></td><td>96</td></tr>
+        <tr><td><code>N</code></td><td>3072</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 3072 workgroups</p>
+  </div>
+</div>
+
+<!-- SHADER 8 -->
+<div id="shader-addnorm">
+  <div class="shader-doc-card">
+    <h4>➕ 8 · Fused Add + RMSNorm <span class="pill purple">add_norm.wgsl</span></h4>
+    <p>Residual add + RMSNorm in one pass. Computes <code>residual_out = A + B</code>, then <code>output = RMSNorm(residual_out) × gamma</code>. Used twice per layer (post-attention and post-FFN).</p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read f16[]</code></td><td>A — the new contribution (OProj or FFN-down output)</td></tr>
+        <tr><td><code>@1</code></td><td><code>read f16[]</code></td><td>B — the running residual (resIn)</td></tr>
+        <tr><td><code>@2</code></td><td><code>read f16[]</code></td><td>gamma — normalization weights</td></tr>
+        <tr><td><code>@3</code></td><td><code>read_write f16[]</code></td><td>normalized output (B.hidden1)</td></tr>
+        <tr><td><code>@4</code></td><td><code>read_write f16[]</code></td><td>new residual (resOut — ping-pong)</td></tr>
+        <tr><td><code>@5</code></td><td><code>uniform</code></td><td><code>{ packGridDimX }</code></td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 workgroup · 256 threads · 12 elements each = 3072</p>
+  </div>
+</div>
+
+<!-- SHADER 9 -->
+<div id="shader-ffn">
+  <div class="shader-doc-card">
+    <h4>⚡ 9 · Fused FFN (Gate · Up · SiLU) <span class="pill purple">fused_ffn.wgsl</span></h4>
+    <p>
+      Fused gate projection + up projection + SiLU activation in one kernel.
+      Computes <code>output[i] = silu(gate[i]) × up[i]</code> where gate and up come from the same weight matrix (fused gate_up_proj).
+    </p>
+    <table class="binding-table">
+      <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>output [FFN=8192]</td></tr>
+        <tr><td><code>@1</code></td><td><code>read f16[]</code></td><td>input [3072]</td></tr>
+        <tr><td><code>@2</code></td><td><code>read f16[]</code></td><td>scales</td></tr>
+        <tr><td><code>@3</code></td><td><code>read u32[]</code></td><td>packed weights (gate+up, 16384 rows × 384 cols)</td></tr>
+        <tr><td><code>@4</code></td><td><code>uniform</code></td><td><code>{ FFN_dim }</code></td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 8192 workgroups (one per output element after SiLU)</p>
+  </div>
+</div>
+
+<!-- SHADER 10 -->
+<div id="shader-lmhead">
+  <div class="shader-doc-card">
+    <h4>🎯 10 · LM Head + Argmax <span class="pill purple">lm_head.wgsl</span></h4>
+    <p>
+      Projects final hidden state [3072] → logits [32064] using Q4F16 weight matrix.
+      A separate argmax shader then reduces the logit buffer to a single token ID.
+    </p>
+    <table class="binding-table">
+      <thead><tr><th>Uniform field</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>K_groups</code></td><td>384</td></tr>
+        <tr><td><code>scale_stride</code></td><td>96</td></tr>
+        <tr><td><code>N</code></td><td>32064 (vocab size)</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 32064 workgroups (one per vocab token)</p>
+  </div>
+</div>
+
+<!-- PHI-3 CONSTANTS -->
+<h2 id="phi3">Phi-3 model constants</h2>
+
+<div class="code-block">
+  <div class="code-label">src/compiler/compiler.ts</div>
+  <pre><code><span class="kw">export const</span> PHI3 = {
+  D:        <span class="num">3072</span>,   <span class="cm">// hidden dimension</span>
+  HEADS:    <span class="num">32</span>,     <span class="cm">// attention heads</span>
+  HEAD_DIM: <span class="num">96</span>,     <span class="cm">// D / HEADS</span>
+  LAYERS:   <span class="num">32</span>,     <span class="cm">// transformer layers</span>
+  FFN:      <span class="num">8192</span>,   <span class="cm">// FFN intermediate dimension</span>
+  VOCAB:    <span class="num">32064</span>,  <span class="cm">// vocabulary size</span>
+  PAGE_SIZE:<span class="num">16</span>,     <span class="cm">// KV cache slots per page</span>
+  MAX_PAGES:<span class="num">257</span>,    <span class="cm">// max pages (≈ 4096 context)</span>
+}</code></pre>
+</div>
+
+<!-- Q4F16 -->
+<h2 id="quantization">Q4F16 quantization format</h2>
+
+<p>
+  MLC's Q4F16_1 format packs 8 int4 values into each <code>uint32</code>.
+  Scales are stored as <code>float16</code> with <code>group_size=32</code> — one scale per 32 weights.
+</p>
+
+<div class="code-block">
+  <div class="code-label">Dequantization formula (from embedding.wgsl)</div>
+  <pre><code><span class="cm">// Extract nibble for element i within a u32</span>
+<span class="kw">let</span> nibble = (packed_u32 >> (i * <span class="num">4</span>)) & <span class="num">0xF</span>;
+
+<span class="cm">// Dequantize: center around 0, multiply by scale</span>
+<span class="kw">let</span> value = <span class="ty">f16</span>(i32(nibble) - <span class="num">7</span>) * scale;</code></pre>
+</div>
+
+<p>Weight shapes in Q4F16 (for Phi-3-mini):</p>
+
+<table>
+  <thead><tr><th>Parameter</th><th>q_weight shape (u32)</th><th>q_scale shape (f16)</th></tr></thead>
+  <tbody>
+    <tr><td>Embedding</td><td>[32064, 384]</td><td>[32064, 96]</td></tr>
+    <tr><td>QKV proj (per layer)</td><td>[9216, 384]</td><td>[9216, 96]</td></tr>
+    <tr><td>O proj (per layer)</td><td>[3072, 384]</td><td>[3072, 96]</td></tr>
+    <tr><td>Gate+Up FFN (per layer)</td><td>[16384, 384]</td><td>[16384, 96]</td></tr>
+    <tr><td>Down FFN (per layer)</td><td>[3072, 1024]</td><td>[3072, 256]</td></tr>
+    <tr><td>LM head</td><td>[32064, 384]</td><td>[32064, 96]</td></tr>
+  </tbody>
+</table>
+
+<!-- PORTING -->
+<h2 id="porting">Port to Phi-4-mini or Qwen3</h2>
+
+<p>Both are available as MLC Q4F16 packages. The steps to port:</p>
+
+<ol>
+  <li><strong>Update <code>PHI3</code> constants</strong> in <code>compiler.ts</code> — D, HEADS, HEAD_DIM, LAYERS, FFN, VOCAB</li>
+  <li><strong>Check parameter names</strong> — fetch <code>ndarray-cache.json</code> and log all keys. Update <code>weight-loader.ts</code> candidates to match</li>
+  <li><strong>Check for GQA</strong> — if KV heads ≠ Q heads (grouped-query attention), the attention shader needs a small change to repeat KV heads</li>
+  <li><strong>Update chat template</strong> — each model has its own special tokens and prompt format</li>
+  <li><strong>Update HuggingFace base URL</strong> — change <code>PHI3_MODEL_BASE</code> in <code>weight-loader.ts</code></li>
+</ol>
+
+<div class="callout tip">
+  <div class="callout-title">Phi-4-mini is the easiest port</div>
+  <p>Same family as Phi-3. MLC package is already available at <code>mlc-ai/Phi-4-mini-instruct-q4f16_1-MLC</code>. Parameter naming is likely identical or very similar.</p>
+</div>
+
+<!-- LOCAL WEIGHTS -->
+<h2 id="local-weights">Local weight serving</h2>
+
+<p>Run the download script once to save all shards locally. Subsequent page loads are instant (served from localhost, no network).</p>
+
+<div class="code-block">
+  <div class="code-label">terminal</div>
+  <pre><code>node scripts/download-weights.mjs
+
+<span class="cm"># Downloads to: public/weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/</span>
+<span class="cm"># Served at:    /weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/</span>
+<span class="cm"># Size:         ~2.1 GB</span></code></pre>
+</div>
+
+<div class="callout danger">
+  <div class="callout-title">Keep index + shards in sync</div>
+  <p>Always download everything together. Never mix a freshly-downloaded <code>ndarray-cache.json</code> with old cached shards — the byte offsets will not match and all weights will be corrupted.</p>
+</div>
+
+<!-- DEBUGGING -->
+<h2 id="debugging">Debugging tips</h2>
+
+<h3>All output is <code>&lt;unk&gt;</code></h3>
+<ul>
+  <li>Weight version mismatch — <code>ndarray-cache.json</code> offsets don't match shard content</li>
+  <li>Buffer aliasing — <code>add_norm</code> dispatched with same buffer as both <code>@1</code> and <code>@4</code></li>
+  <li>Wrong rope binding order — check <code>@0=q_out, @1=k_out, @2=v_out, @3=qkv, @4=posMap</code></li>
+</ul>
+
+<h3>Garbage / repetitive output</h3>
+<ul>
+  <li>Rope bindings are in the wrong order (this was our bug — garbage like <code>-,unlintzegesenma</code>)</li>
+  <li>Wrong uniform values for a shader (K_groups, N, etc.)</li>
+</ul>
+
+<h3>WebGPU validation error about aliasing</h3>
+<ul>
+  <li>Same buffer bound as <code>read_write</code> and <code>read</code> in one dispatch</li>
+  <li>Fix: use ping-pong buffers. Never bind <code>B.residual</code> as both <code>@1</code> and <code>@4</code> to <code>add_norm</code></li>
+</ul>
+
+<h3>Model not loading (<code>Weight not found</code>)</h3>
+<ul>
+  <li>Log all available keys: the weight loader prints them to console on load</li>
+  <li>MLC names differ from HuggingFace standard names (<code>transformer.h.N.mixer.*</code> not <code>model.layers.N.self_attn.*</code>)</li>
+</ul>
+
+<!-- BUGS FIXED -->
+<h2 id="bugs-fixed">Bugs we fixed (and how)</h2>
+
+<table>
+  <thead><tr><th>Bug</th><th>Symptom</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Wrong MLC param names</td>
+      <td><code>Weight not found</code> error on load</td>
+      <td>Logged all 325 param names from console, updated candidates to <code>transformer.h.*</code> prefix</td>
+    </tr>
+    <tr>
+      <td>Buffer aliasing in add_norm</td>
+      <td><code>&lt;unk&gt;</code> × 500 at 314 tok/s + WebGPU validation error</td>
+      <td>Added <code>B.residual2</code> (pong buffer), ping-pong with JS variable swap</td>
+    </tr>
+    <tr>
+      <td>Wrong rope binding order</td>
+      <td>Garbage: <code>-,unlintzegesenma\dOCĆalloqueIAL</code> repeated</td>
+      <td>Read rope.wgsl — bindings are <code>@0=q_out @1=k_out @2=v_out @3=qkv @4=posMap</code></td>
+    </tr>
+    <tr>
+      <td>Mixed ndarray-cache.json version</td>
+      <td><code>&lt;unk&gt;</code> after downloading index locally but using old cached shards</td>
+      <td>Always fetch index and shards from the same source atomically</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- VS WEBLLM -->
+<h2 id="vs-webllm">vs WebLLM</h2>
+
+<table>
+  <thead><tr><th></th><th>Zero TVM</th><th>WebLLM</th></tr></thead>
+  <tbody>
+    <tr><td>Speed (Phi-3)</td><td>~15 tok/s</td><td>~71 tok/s</td></tr>
+    <tr><td>Why slower</td><td>Naive matmul (one output row per workgroup)</td><td>TVM auto-tunes tiled matmul + shared memory</td></tr>
+    <tr><td>Framework overhead</td><td>0 MB</td><td>~50 MB WASM runtime</td></tr>
+    <tr><td>Shader source</td><td>10 readable .wgsl files</td><td>Auto-generated, compiled blob</td></tr>
+    <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
+    <tr><td>Can you improve the kernels?</td><td>✓ Yes — open the .wgsl</td><td>✗ No — regenerate with TVM</td></tr>
+  </tbody>
+</table>
+
+<p>The speed gap is entirely in the matmul kernels. Adding shared-memory tiling to the matmul WGSL would bring performance much closer to WebLLM. The architecture and correctness are already there.</p>
+
+</main>
+</div>
+
+<script>
+// Highlight active sidebar link on scroll
+const links = document.querySelectorAll('.sidebar-link[href^="#"]')
+const observer = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    if (entry.isIntersecting) {
+      const id = entry.target.id
+      links.forEach(l => {
+        l.classList.toggle('active', l.getAttribute('href') === '#' + id)
+      })
+    }
+  }
+}, { rootMargin: '-60px 0px -60% 0px' })
+
+document.querySelectorAll('[id]').forEach(el => observer.observe(el))
+</script>
+
+</body>
+</html>

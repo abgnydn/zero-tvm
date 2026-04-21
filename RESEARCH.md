@@ -213,3 +213,153 @@ npx vite --port 5180
 # __dumpLayerShaders()    — view all 11 decode shaders
 # __capturedShaders       — full shader/pipeline data
 ```
+
+---
+
+# Zero-TVM: The Minimal Counter-Implementation
+
+**Date:** 2026-04-20
+
+Where the sections above interrogated TVM's compiled runtime from the outside, Zero-TVM answers a narrower question from the other direction:
+
+> For **one specific model** (Phi-3 Mini, Q4F16_1) on **one specific runtime** (the browser, via WebGPU), how much of the compiler / runtime stack is actually load-bearing?
+
+The answer this repo ships: 11 hand-written WGSL shaders ([`src/compiler/shaders/`](src/compiler/shaders/)), ~14 kB of TypeScript runtime ([`src/compiler/runtime.ts`](src/compiler/runtime.ts) + [`src/zero-tvm/`](src/zero-tvm/)), and no ML framework runtime in the hot path. Decode uses 228 dispatches/token on this repo's forward pass, versus the 342 dispatches/token measured from TVM-WebLLM running the same Q4 weights.
+
+## Timing Context
+
+In **February 2026**, Hugging Face shipped Transformers.js v4 — a C++ WebGPU runtime co-developed with Microsoft's ONNX Runtime team — as the production answer for browser LLM inference. It covers ~200 architectures, ships a substantial JS + native bundle, and is the right choice when you want "run any model in the browser."
+
+In **April 2026**, this repo takes the opposite bet: for Phi-3 Mini specifically, the correct implementation is 10 WGSL files and a few hundred lines of TypeScript. The argument is the llm.c / nanoGPT argument applied to the browser: most of the stack isn't load-bearing for one model.
+
+## Why Fewer Dispatches Matter: Maczan's Overhead Numbers
+
+Maczan, J. (2026). *Characterizing WebGPU Dispatch Overhead for LLM Inference Across Four GPU Vendors, Three Backends, and Three Browsers.* arXiv:2604.02344.
+
+Key measurements from that paper:
+
+- **Vulkan:** 24–36 µs per dispatch
+- **Metal:** 32–71 µs per dispatch
+- **~95 µs total per-operation overhead** once CPU/JS plumbing is included
+- Naive microbenchmarks that dispatch one op in a tight loop **overestimate peak throughput by ~20×** because they measure a warm cache / pipelined case that never occurs in a real forward pass
+
+Maczan measured the cost. Zero-TVM is one demonstration of the corresponding remedy: fewer, fatter kernels.
+
+**Worked back-of-envelope for this repo on Metal:** `(342 − 228) × 32 µs ≈ 3.6 ms` saved per token from kernel-count alone. The decode path fuses QKV projection, RoPE, and KV-cache append into a single shader ([`qkv_fused.wgsl`](src/compiler/shaders/qkv_fused.wgsl)), so each layer costs 7 dispatches instead of 9.
+
+The per-decode dispatch table for this repo ([`src/zero-tvm/chat.ts`](src/zero-tvm/chat.ts)):
+
+| Component | Dispatches | Shader file |
+|-----------|-----------:|-------------|
+| Embedding | 1 | `embedding.wgsl` |
+| Initial RMSNorm | 1 | `rms_norm.wgsl` |
+| **Per layer (×32):** | | |
+| Fused QKV proj + RoPE + KV append | 1 | `qkv_fused.wgsl` |
+| Paged attention | 1 | `attention.wgsl` |
+| O projection | 1 | `int4_matmul.wgsl` |
+| AddNorm #1 | 1 | `add_norm.wgsl` |
+| Fused FFN (gate+up+SiLU) | 1 | `fused_ffn.wgsl` |
+| FFN down | 1 | `int4_matmul.wgsl` |
+| AddNorm #2 | 1 | `add_norm.wgsl` |
+| Final RMSNorm | 1 | `rms_norm.wgsl` |
+| LM head | 1 | `int4_matmul_f32.wgsl` |
+| Argmax | 1 | `argmax.wgsl` |
+| **Total** | **228** | |
+
+Eleven unique WGSL files (`int4_matmul` and `int4_matmul_f32` are two bindings of the same kernel shape, one f16-out, one f32-out for stable argmax; `qkv_fused` is the decode-path fusion; `rope.wgsl` and `kv_append.wgsl` are retained for prefill and parity testing).
+
+## Three-Way Comparison (April 2026)
+
+| | **Zero-TVM** (this repo) | **TVM / WebLLM** | **Transformers.js v4 + ORT-WebGPU** |
+|---|---|---|---|
+| Unique WGSL kernels | 11 | 85 captured; ~11 active on decode path | ONNX Runtime-generated (not user-visible) |
+| Total hand-written WGSL LOC | ~966 | 0 (compiler-generated, 13,042 lines captured) | 0 (runtime-generated) |
+| Dispatches / decode token | 228 | 342 (measured) | not measured here |
+| Runtime language | TypeScript | Apache TVM WASM runtime | C++ via ONNX Runtime WebGPU EP |
+| Approx. runtime footprint (non-weight) | ~14 kB TS | ~50 MB WASM | ~10 MB JS + native runtime |
+| Model scope | Phi-3 Mini (Q4F16_1) only | ~20 models via MLC compilation | ~200 architectures |
+| Designed for | "readable in one sitting" | general browser LLM production | general browser LLM production |
+
+Transformers.js v4 is the right choice for most production work. Zero-TVM is not trying to replace it. The point of the contrast is that when a stack can assume a single model/precision, most of the compiler and runtime surface is optional.
+
+Speed (as of this writing): Zero-TVM decode measures ~15 tok/s on an M2 Pro (reference: [`landing.html:529`](landing.html#L529)). TVM-WebLLM on the same hardware measures 27–48 tok/s in earlier sections of this document. Zero-TVM is currently slower; Milestones 2–5 in the plan are the agenda to close that gap without expanding shader count materially.
+
+## What This Repo Is NOT
+
+- **Not a compiler.** Nothing here emits WGSL. The 11 shaders are human-written.
+- **Not cross-architecture.** Hard-coded to Phi-3 Mini with Q4F16_1 weights. No Llama / Qwen / Gemma path without shader work.
+- **Not cross-runtime.** Browser WebGPU only. No Node / Bun / Deno target.
+- **Not a production replacement for Transformers.js v4.** It does fewer things, on purpose.
+- **Not currently faster than WebLLM on Apple silicon.** That's the subject of Milestones 2–5.
+
+It IS a minimal-surface-area demonstration that for one fixed model shape, the compiler/runtime complexity is not required to do browser LLM inference end-to-end.
+
+## Experimental: int8 KV Cache
+
+An opt-in int8 KV cache path is checked in but not enabled by default. It adds three shaders — [`qkv_fused_scratch.wgsl`](src/compiler/shaders/qkv_fused_scratch.wgsl), [`kv_quantize_int8.wgsl`](src/compiler/shaders/kv_quantize_int8.wgsl), [`attention_int8.wgsl`](src/compiler/shaders/attention_int8.wgsl) — and flips the per-layer decode path to write K,V into a scratch f16 slot, quantize that slot to int8 with a per-(head, slot, K|V) f16 scale, and dequant on read inside the attention shader.
+
+Trade-off: one extra dispatch per layer (32 → 260 total/token), KV memory halved from ~1.6 GB to ~800 MB for the 4K context. Toggle is `USE_INT8_KV` in [`src/zero-tvm/chat.ts`](src/zero-tvm/chat.ts). The code compiles and the math is self-consistent, but it has not been validated for output parity against the f16 baseline on real hardware — do not flip it for production use without running your own correctness check.
+
+## Planned: Multi-Token Batched Forward
+
+**Motivation.** Decode is memory-bandwidth bound: each forward reads ~1.86 GB
+of weights. Two user-visible problems follow from the current
+one-token-at-a-time engine:
+
+1. **Prefill is slow.** A 200-token prompt fires 200 sequential forwards =
+   372 GB of weight reads. At ~80 GB/s effective bandwidth on M1 that's ~4.7 s
+   before the first generated token appears, despite each forward being well
+   pipelined by the GPU command chain.
+2. **Speculative decoding can't help.** Prompt-lookup spec decoding wants to
+   verify N candidates in parallel, but sequential N-token forwards pay
+   N × weight bytes — with typical accept rates (~1.5–2) that's **slower**
+   than plain decode on this hardware. Spec decoding only wins if the N
+   forwards share a single weight read — i.e. M-dim batching at the kernel
+   level.
+
+**Proposal.** Generalise every activation buffer and every compute shader
+from `[D]` / `[1, K] × [K, N]` to `[M, D]` / `[M, K] × [K, N]`, where M is
+the batch dim in the query axis. Weights stay `[K, N]` (or packed int4 of
+same shape) — they are read once per tile and reused across all M rows.
+
+**Shader changes** (keeping current f16-KV path; int8-KV can follow):
+
+| shader | change |
+|---|---|
+| `embedding.wgsl` | lookup M token ids, write `[M, D]` |
+| `rms_norm.wgsl` | per-row norm across M rows |
+| `qkv_fused*.wgsl` | matmul yields `[M, QKV_DIM]`; RoPE reads per-row position; writes M new slots to KV pages |
+| `attention.wgsl` / `_sg` | each of M queries attends to its own history slice; naturally a grid of (M, HEADS) workgroups |
+| `int4_matmul*.wgsl` | GEMM `[M, K] × [K, N]` instead of GEMV — the key shape change. Each output WG tiles both M and N rows |
+| `fused_ffn*.wgsl` | gate/up GEMM `[M, D] × [D, FFN]`; per-row SiLU and elementwise multiply |
+| `add_norm.wgsl` | per-row residual add + norm across M rows |
+| `argmax*.wgsl` | per-row argmax → M token ids |
+| LM head matmul | already uses the same int4 GEMV kernel — gets M-dim automatically when the matmul is generalised |
+
+**Engine changes** (`src/zero-tvm/chat.ts`):
+
+- Activation buffer size → `PIPELINE_DEPTH × M × D × 2` bytes (dynamic M up
+  to some `M_MAX`, e.g. 8 for prefill chunks + spec decode).
+- `submitStep` takes `tokenIds: Int32Array` and `positions: Int32Array` of
+  length M; writes both to their respective uniforms.
+- Prefill path: chunk the prompt into groups of `M_MAX`, submit one batched
+  forward per chunk, only read back the last argmax of the last chunk.
+- Decode path: still M=1 by default, plus an opt-in spec-decode mode that
+  runs M=4 or M=5 with candidates from a prompt-lookup lookback.
+
+**Expected wins** (on M1, against the current 42 tok/s / ~4 s prefill):
+
+- Prefill for a 200-token prompt: ~4.7 s → ~0.3 s (batched = 1 weight read
+  instead of 200; activation work scales linearly but is tiny vs weights).
+- Decode with working spec decoding + 2× accept rate: ~42 → ~70 tok/s.
+- Decode with 3× accept rate (repetitive prompts): ~42 → ~95 tok/s.
+
+**Risk**. This is a ~10-shader rewrite with new bind layouts and a new
+engine path. Correctness risk is non-trivial — attention masking per-row
+is the subtlest piece. Landing strategy: gate the whole batched path behind
+a URL flag, keep the current M=1 engine untouched, ship one shader at a
+time, A/B test each with the existing tooling.
+
+## Parallel Work: bitnet.js
+
+[qwatts-dev/bitnet.js](https://github.com/qwatts-dev/bitnet.js) pursues a very similar philosophy — no TVM, no WASM runtime, hand-written WGSL — but targets BitNet b1.58 ternary weights rather than standard int4. Different architectural bet (ternary vs int4), same llm.c-style argument about surface area. Worth knowing about when evaluating whether "hand-written WGSL for one model family" is a niche or a pattern.

@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebGPU Fusion — Architecture</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0a0a0a; color: #c0c0c0; padding: 2rem; line-height: 1.5; }
+    h1 { color: #fff; font-size: 1.4rem; margin-bottom: 0.5rem; }
+    h2 { color: #4fc3f7; font-size: 1.1rem; margin: 2rem 0 1rem; border-bottom: 1px solid #222; padding-bottom: 0.5rem; }
+    h3 { color: #81c784; font-size: 0.95rem; margin: 1.5rem 0 0.75rem; }
+    .subtitle { color: #666; font-size: 0.8rem; margin-bottom: 2rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin: 1rem 0; }
+    .card { background: #111; border: 1px solid #222; border-radius: 8px; padding: 1rem; }
+    .card.highlight { border-color: #4fc3f7; }
+    .card.ours { border-color: #81c784; }
+    .card.tvm { border-color: #ff8a65; }
+    .card.fused { border-color: #ce93d8; }
+    .card h4 { font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .card.highlight h4 { color: #4fc3f7; }
+    .card.ours h4 { color: #81c784; }
+    .card.tvm h4 { color: #ff8a65; }
+    .card.fused h4 { color: #ce93d8; }
+    .card p, .card li { font-size: 0.75rem; color: #999; }
+    .card ul { padding-left: 1.2rem; }
+    .card code { background: #1a1a1a; padding: 0.1rem 0.3rem; border-radius: 3px; color: #e0e0e0; font-size: 0.7rem; }
+
+    /* Pipeline diagram */
+    .pipeline { display: flex; flex-direction: column; gap: 2px; margin: 1rem 0; }
+    .pipeline-row { display: flex; align-items: center; gap: 4px; }
+    .step { padding: 0.35rem 0.6rem; border-radius: 4px; font-size: 0.65rem; font-weight: 600; white-space: nowrap; }
+    .step.ours { background: #1b3a1b; color: #81c784; border: 1px solid #2e7d32; }
+    .step.tvm { background: #3a2a1a; color: #ff8a65; border: 1px solid #bf360c; }
+    .step.fused { background: #2a1a3a; color: #ce93d8; border: 1px solid #6a1b9a; }
+    .step.skip { background: #1a1a1a; color: #555; border: 1px solid #333; text-decoration: line-through; }
+    .arrow { color: #333; font-size: 0.7rem; }
+    .layer-label { color: #555; font-size: 0.6rem; min-width: 60px; }
+
+    /* File tree */
+    .tree { font-size: 0.7rem; line-height: 1.8; }
+    .tree .dir { color: #4fc3f7; }
+    .tree .file { color: #999; }
+    .tree .file.key { color: #81c784; }
+    .tree .indent { display: inline-block; width: 1.2rem; }
+
+    /* Stats */
+    .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin: 1rem 0; }
+    .stat { background: #111; border: 1px solid #222; border-radius: 8px; padding: 1rem; text-align: center; }
+    .stat .val { font-size: 1.5rem; font-weight: 700; color: #fff; }
+    .stat .label { font-size: 0.65rem; color: #666; margin-top: 0.25rem; }
+    .stat.green .val { color: #81c784; }
+    .stat.blue .val { color: #4fc3f7; }
+    .stat.orange .val { color: #ff8a65; }
+    .stat.purple .val { color: #ce93d8; }
+
+    /* Approach comparison */
+    .approaches { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin: 1rem 0; }
+    .approach { background: #111; border: 1px solid #222; border-radius: 8px; padding: 1.25rem; }
+    .approach h4 { font-size: 0.85rem; margin-bottom: 0.75rem; }
+    .approach .tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.6rem; font-weight: 600; margin-bottom: 0.5rem; }
+    .approach .tag.active { background: #1b3a1b; color: #81c784; }
+    .approach .tag.hybrid { background: #1a2a3a; color: #4fc3f7; }
+    .approach .tag.full { background: #2a1a3a; color: #ce93d8; }
+    .approach p { font-size: 0.7rem; color: #888; margin-bottom: 0.5rem; }
+    .approach .files { font-size: 0.65rem; color: #555; }
+
+    /* Data flow */
+    .flow { display: flex; align-items: center; gap: 0.5rem; margin: 0.75rem 0; flex-wrap: wrap; }
+    .flow-box { padding: 0.4rem 0.8rem; border-radius: 6px; font-size: 0.7rem; font-weight: 600; }
+    .flow-box.ext { background: #1a1a2a; color: #7986cb; border: 1px solid #303f9f; }
+    .flow-box.cap { background: #1a2a3a; color: #4fc3f7; border: 1px solid #0277bd; }
+    .flow-box.eng { background: #1b3a1b; color: #81c784; border: 1px solid #2e7d32; }
+    .flow-box.gpu { background: #2a1a3a; color: #ce93d8; border: 1px solid #6a1b9a; }
+    .flow-arrow { color: #444; font-size: 1rem; }
+
+    /* Legend */
+    .legend { display: flex; gap: 1.5rem; margin: 1rem 0; flex-wrap: wrap; }
+    .legend-item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.7rem; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+    .legend-dot.ours { background: #81c784; }
+    .legend-dot.tvm { background: #ff8a65; }
+    .legend-dot.fused { background: #ce93d8; }
+    .legend-dot.skip { background: #555; }
+
+    .note { font-size: 0.7rem; color: #555; font-style: italic; margin: 0.5rem 0; }
+    .sep { border: none; border-top: 1px solid #1a1a1a; margin: 2rem 0; }
+    .full-width { grid-column: 1 / -1; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.7rem; margin: 0.5rem 0; }
+    th { text-align: left; color: #666; padding: 0.4rem; border-bottom: 1px solid #222; font-weight: 600; }
+    td { padding: 0.4rem; border-bottom: 1px solid #1a1a1a; color: #999; }
+    td code { background: #1a1a1a; padding: 0.1rem 0.3rem; border-radius: 3px; color: #e0e0e0; }
+  </style>
+</head>
+<body>
+
+<h1>WebGPU Fusion Architecture</h1>
+<p class="subtitle">Phi-3 Mini 4K (3.8B, Q4) running 100% in-browser via WebGPU. Reverse-engineered from TVM.</p>
+
+<!-- Stats -->
+<div class="stats-grid">
+  <div class="stat green"><div class="val">279</div><div class="label">Our Dispatches (per token)</div></div>
+  <div class="stat orange"><div class="val">63</div><div class="label">TVM Dispatches (KV+Attn)</div></div>
+  <div class="stat blue"><div class="val">10</div><div class="label">Custom WGSL Shaders</div></div>
+  <div class="stat purple"><div class="val">85</div><div class="label">TVM Shaders (captured)</div></div>
+</div>
+
+<hr class="sep">
+
+<!-- Three Approaches -->
+<h2>Three Inference Approaches</h2>
+
+<div class="approaches">
+  <div class="approach">
+    <span class="tag hybrid">HYBRID</span>
+    <h4 style="color:#4fc3f7">Engine v3 (Capture-Replay)</h4>
+    <p>Msg 1: TVM generates + captures full dispatch graph. Msg 2+: replays captured pipelines with 6 per-token value updates. ~100 dispatches vs TVM's 342.</p>
+    <div class="files">
+      <code>engine-v3.ts</code> <code>chat-v3.ts</code> <code>v3.html</code>
+    </div>
+  </div>
+
+  <div class="approach" style="border-color:#81c784">
+    <span class="tag active">COMPILER</span>
+    <h4 style="color:#81c784">Compiler Engine (228/342 Own)</h4>
+    <p>Replaces 228 of 342 dispatches with our 11 hand-written WGSL shaders (post-M4 QKV+RoPE+KV-append fusion). Only attention + LM-head reduction fall back to TVM-style paths. Full prefill + decode.</p>
+    <div class="files">
+      <code>compiler/</code> <code>compiler-chat.html</code>
+    </div>
+  </div>
+
+  <div class="approach">
+    <span class="tag full">FULL</span>
+    <h4 style="color:#ce93d8">Phi3Engine (Named Pipelines)</h4>
+    <p>Maps each step to named TVM pipelines (qkv, rope, attention...) with per-layer bind groups. Fused FFN enabled. Supports own prefill + decode via chat().</p>
+    <div class="files">
+      <code>phi3.ts</code> <code>fast-chat.ts</code>
+    </div>
+  </div>
+</div>
+
+<hr class="sep">
+
+<!-- Data Flow -->
+<h2>Data Flow: Model Load to Chat</h2>
+
+<div class="flow">
+  <div class="flow-box ext">WebLLM<br><span style="font-size:0.6rem;color:#666">@mlc-ai/web-llm</span></div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-box ext">TVM Runtime<br><span style="font-size:0.6rem;color:#666">loads Q4 weights</span></div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-box cap">capture.ts<br><span style="font-size:0.6rem;color:#666">intercepts WebGPU</span></div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-box cap">CaptureResult<br><span style="font-size:0.6rem;color:#666">shaders, dispatches, writes, buffers</span></div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-box eng">Our Engine<br><span style="font-size:0.6rem;color:#666">builds pipelines + bind groups</span></div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-box gpu">WebGPU<br><span style="font-size:0.6rem;color:#666">zero TVM in hot path</span></div>
+</div>
+
+<div class="grid" style="margin-top:1rem">
+  <div class="card highlight">
+    <h4>capture.ts — WebGPU Interceptor</h4>
+    <p>Monkey-patches <code>GPUDevice</code> to record everything TVM does:</p>
+    <ul>
+      <li>All <code>createShaderModule</code> calls (85 shaders)</li>
+      <li>All <code>createComputePipeline</code> calls (85 pipelines)</li>
+      <li>All <code>createBindGroup</code> calls (entries map)</li>
+      <li>All <code>dispatchWorkgroups</code> calls (342 decode, 343 prefill)</li>
+      <li>All <code>writeBuffer</code> calls (357 decode writes)</li>
+      <li>The <code>copyBufferToBuffer</code> for token readback</li>
+    </ul>
+    <p style="margin-top:0.5rem">State machine: <code>loading</code> &rarr; <code>prefill_done</code> &rarr; <code>done</code></p>
+    <p>Separates prefill vs decode dispatches at the <code>mapAsync</code> boundary.</p>
+  </div>
+
+  <div class="card">
+    <h4>CaptureResult</h4>
+    <table>
+      <tr><th>Field</th><th>Count</th><th>Description</th></tr>
+      <tr><td><code>shaders</code></td><td>85</td><td>WGSL source code + module</td></tr>
+      <tr><td><code>pipelines</code></td><td>85</td><td>entry point + pipeline object</td></tr>
+      <tr><td><code>dispatches</code></td><td>342</td><td>Decode: pipeline + bind group entries + workgroups</td></tr>
+      <tr><td><code>prefillDispatches</code></td><td>343</td><td>Prefill: same structure</td></tr>
+      <tr><td><code>writes</code></td><td>357</td><td>Decode buffer writes (buffer + offset + data)</td></tr>
+      <tr><td><code>copy</code></td><td>1</td><td>Token readback: src buffer + offset</td></tr>
+      <tr><td><code>weights</code></td><td>~200</td><td>Large buffer writes (>1KB) during load</td></tr>
+    </table>
+  </div>
+</div>
+
+<hr class="sep">
+
+<!-- Model Architecture -->
+<h2>Phi-3 Mini Architecture (Per Token)</h2>
+
+<div class="grid">
+  <div class="card full-width">
+    <h4>Decode Pipeline: 342 Dispatches (32 Layers x 10 + 2 Preamble + 20 Tail)</h4>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot ours"></div> Our shader (279)</div>
+      <div class="legend-item"><div class="legend-dot tvm"></div> TVM kernel (63)</div>
+      <div class="legend-item"><div class="legend-dot fused"></div> Fused (saves 1 dispatch/layer)</div>
+      <div class="legend-item"><div class="legend-dot skip"></div> Skipped (replaced)</div>
+    </div>
+
+    <!-- Preamble -->
+    <h3>Preamble (2 dispatches)</h3>
+    <div class="pipeline">
+      <div class="pipeline-row">
+        <span class="layer-label">embed</span>
+        <span class="step ours">Embedding Lookup</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step ours">RMS Norm</span>
+      </div>
+    </div>
+
+    <!-- Layer -->
+    <h3>Per Layer x 32 (10 dispatches each = 320 total)</h3>
+    <div class="pipeline">
+      <div class="pipeline-row">
+        <span class="layer-label">attention</span>
+        <span class="step ours">QKV Matmul</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step ours">RoPE</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step tvm">KV Append</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step tvm">Paged Attention</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step ours">O Proj Matmul</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step ours">Add + RMSNorm</span>
+      </div>
+      <div class="pipeline-row" style="margin-top:4px">
+        <span class="layer-label">FFN</span>
+        <span class="step fused">Fused Gate+Up+SiLU</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step skip">SiLU (skipped)</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step ours">FFN Down Matmul</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step ours">Add + RMSNorm</span>
+      </div>
+    </div>
+
+    <!-- Tail -->
+    <h3>Tail (20 dispatches)</h3>
+    <div class="pipeline">
+      <div class="pipeline-row">
+        <span class="layer-label">sampling</span>
+        <span class="step ours">LM Head Matmul (f32)</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step ours">Argmax</span>
+        <span class="arrow">&rarr;</span>
+        <span class="step skip" style="text-decoration:none;color:#555">18x TVM sampling (replaced by argmax)</span>
+      </div>
+    </div>
+    <p class="note">Compiler engine: 279 our dispatches + 63 TVM (2 per layer for KV append + attention, skipped 19 sampling). Fused FFN saves 32 dispatches.</p>
+  </div>
+</div>
+
+<hr class="sep">
+
+<!-- Per-Layer Detail -->
+<h2>Per-Layer Dispatch Map (Layer N, base = 2 + N*10)</h2>
+
+<table>
+  <tr><th>Step</th><th>Index</th><th>Kernel</th><th>Owner</th><th>Workgroups</th><th>Description</th></tr>
+  <tr><td>0</td><td>base+0</td><td><code>int4_matmul</code></td><td style="color:#81c784">Ours</td><td>9216</td><td>QKV projection: D=3072 &rarr; 3*D=9216 (Q,K,V concatenated)</td></tr>
+  <tr><td>1</td><td>base+1</td><td><code>rope_kernel</code></td><td style="color:#81c784">Ours</td><td>36</td><td>Rotary position embedding on Q,K</td></tr>
+  <tr><td>2</td><td>base+2</td><td><code>kv_cache_transpose_append</code></td><td style="color:#ff8a65">TVM</td><td>varies</td><td>Append K,V to paged cache (transpose layout)</td></tr>
+  <tr><td>3</td><td>base+3</td><td><code>batch_decode_paged_kv</code></td><td style="color:#ff8a65">TVM</td><td>varies</td><td>Paged KV attention with sliding window</td></tr>
+  <tr><td>4</td><td>base+4</td><td><code>int4_matmul</code></td><td style="color:#81c784">Ours</td><td>3072</td><td>Output projection: head_dim*heads &rarr; D</td></tr>
+  <tr><td>5</td><td>base+5</td><td><code>add_norm</code></td><td style="color:#81c784">Ours</td><td>1</td><td>Residual add + RMSNorm (pre-FFN)</td></tr>
+  <tr><td>6</td><td>base+6</td><td><code>fused_ffn_kernel</code></td><td style="color:#ce93d8">Fused</td><td>8192</td><td>Gate+Up int4 matmul + SiLU in ONE dispatch</td></tr>
+  <tr><td>7</td><td>base+7</td><td><del style="color:#555">split_silu_multiply</del></td><td style="color:#555">Skip</td><td>-</td><td>Replaced by fused FFN above</td></tr>
+  <tr><td>8</td><td>base+8</td><td><code>int4_matmul</code></td><td style="color:#81c784">Ours</td><td>3072</td><td>FFN down projection: 8192 &rarr; 3072</td></tr>
+  <tr><td>9</td><td>base+9</td><td><code>add_norm</code></td><td style="color:#81c784">Ours</td><td>1</td><td>Residual add + RMSNorm (post-FFN)</td></tr>
+</table>
+
+<hr class="sep">
+
+<!-- Custom Shaders -->
+<h2>Our 10 Custom WGSL Shaders</h2>
+
+<div class="grid">
+  <div class="card ours">
+    <h4>int4_matmul.wgsl</h4>
+    <p>Dequantize int4 weights + matrix multiply. 64 threads, 6 chunks, tree reduction. Zero-point 7, 32-group scales. f16 accumulation.</p>
+    <p><code>D_PACKED = D/8</code> packed u32s per row</p>
+  </div>
+  <div class="card ours">
+    <h4>int4_matmul_f32.wgsl</h4>
+    <p>Same as int4_matmul but accumulates in f32. Used for LM head (32064 outputs) where f16 precision causes sampling errors.</p>
+  </div>
+  <div class="card fused">
+    <h4>fused_ffn.wgsl</h4>
+    <p>Fuses gate+up matmul + SiLU into ONE dispatch. Dual dot product (gate row i, up row i+8192), shared memory input cache (3072 f16 = 6KB), f32 sigmoid.</p>
+    <p>Replaces 2 TVM dispatches &rarr; saves 32 dispatches/token</p>
+  </div>
+  <div class="card ours">
+    <h4>rms_norm.wgsl</h4>
+    <p>RMSNorm: <code>x * rsqrt(mean(x^2) + eps) * weight</code>. Single workgroup, D=3072 elements. Used for initial norm.</p>
+  </div>
+  <div class="card ours">
+    <h4>add_norm.wgsl</h4>
+    <p>Fused residual add + RMSNorm. <code>y = norm(residual + x) * weight</code>. Saves a dispatch vs separate add+norm.</p>
+  </div>
+  <div class="card ours">
+    <h4>rope.wgsl</h4>
+    <p>Rotary Position Embedding. Applies cos/sin rotation to Q,K heads based on position. 36 workgroups for 32+4 heads.</p>
+  </div>
+  <div class="card ours">
+    <h4>embedding.wgsl</h4>
+    <p>Token embedding lookup from dequantized int4 embedding table. Maps token ID &rarr; D=3072 hidden state.</p>
+  </div>
+  <div class="card ours">
+    <h4>argmax.wgsl</h4>
+    <p>Simple argmax over 32064 logits. Replaces TVM's 19-dispatch sampling pipeline (top-p, temperature, etc.) with greedy decoding.</p>
+  </div>
+  <div class="card ours">
+    <h4>attention.wgsl</h4>
+    <p>Multi-head attention with paged KV cache. (Compiler engine only — main engines use TVM's optimized kernel.)</p>
+  </div>
+  <div class="card ours">
+    <h4>kv_append.wgsl</h4>
+    <p>Append K,V to paged cache. (Compiler engine only — main engines use TVM's transpose-append kernel.)</p>
+  </div>
+</div>
+
+<hr class="sep">
+
+<!-- Buffer Landscape -->
+<h2>Buffer Landscape (Decode Token)</h2>
+
+<div class="grid">
+  <div class="card">
+    <h4>6 Per-Token Writes</h4>
+    <table>
+      <tr><th>Write</th><th>Buffer</th><th>Value</th></tr>
+      <tr><td><code>w[0]</code></td><td>token_id</td><td>Current token ID (u32)</td></tr>
+      <tr><td><code>w[4]</code></td><td>position_map</td><td>Position for RoPE (u32)</td></tr>
+      <tr><td><code>w[8]</code></td><td>seq_counter</td><td>Sequence index (u32)</td></tr>
+      <tr><td><code>w[11]</code></td><td>q_rope_position</td><td>RoPE position (u32)</td></tr>
+      <tr><td><code>w[12]</code></td><td>length_info</td><td>Sequence length (u32)</td></tr>
+      <tr><td><code>w[349]</code></td><td>seed</td><td>Sampling RNG seed (f32)</td></tr>
+    </table>
+    <p class="note">Plus: nnz_pages at offset 16 in 32 attention uniform buffers</p>
+  </div>
+
+  <div class="card">
+    <h4>Activation Ping-Pong</h4>
+    <p>3 scratch buffers cycle through layers:</p>
+    <table>
+      <tr><th>Buffer</th><th>Size</th><th>Role</th></tr>
+      <tr><td>BUF#730</td><td>6KB</td><td>Hidden state (3072 f16)</td></tr>
+      <tr><td>BUF#731</td><td>32KB</td><td>FFN intermediate (16384 f16)</td></tr>
+      <tr><td>BUF#732</td><td>18KB</td><td>QKV output (9216 f16)</td></tr>
+    </table>
+    <p class="note">Same buffers reused across all 32 layers. Weight buffers are per-layer (~50MB total for Q4).</p>
+  </div>
+</div>
+
+<hr class="sep">
+
+<!-- File Structure -->
+<h2>File Structure</h2>
+
+<div class="grid">
+  <div class="card">
+    <h4>Core Engine</h4>
+    <div class="tree">
+      <span class="dir">src/</span><br>
+      <span class="indent"></span><span class="file key">capture.ts</span> — WebGPU interceptor (state machine)<br>
+      <span class="indent"></span><span class="file key">engine.ts</span> — WebLLM wrapper (model loading, tokenizer)<br>
+      <span class="indent"></span><span class="file key">phi3.ts</span> — Phi3Engine (named pipelines, fused FFN)<br>
+      <span class="indent"></span><span class="file key">engine-v3.ts</span> — Minimal replay engine (~170 lines)<br>
+      <span class="indent"></span><span class="file">ui.ts</span> — Chat UI component<br>
+      <span class="indent"></span><span class="file">fast-chat.ts</span> — Phi3Engine chat page<br>
+      <span class="indent"></span><span class="file">chat-v3.ts</span> — Engine v3 chat page<br>
+      <span class="indent"></span><span class="file">main.ts</span> — Default TVM chat page<br>
+      <span class="indent"></span><span class="file">dump-tvm.ts</span> — Architecture analysis tool<br>
+      <span class="indent"></span><span class="file">dump-shaders.ts</span> — Shader extraction tool<br>
+      <span class="indent"></span><span class="dir">shaders/</span> — Fused shaders for phi3 engine<br>
+      <span class="indent"></span><span class="indent"></span><span class="file key">fused-ffn.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">argmax.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">fused-norm-matmul.wgsl</span><br>
+    </div>
+  </div>
+
+  <div class="card">
+    <h4>Compiler Engine</h4>
+    <div class="tree">
+      <span class="dir">src/compiler/</span><br>
+      <span class="indent"></span><span class="file key">compiler.ts</span> — Pipeline + bind group builder<br>
+      <span class="indent"></span><span class="file key">runtime.ts</span> — Full transformer forward pass<br>
+      <span class="indent"></span><span class="file key">chat-v2.ts</span> — Chat with 279/342 own shaders<br>
+      <span class="indent"></span><span class="file">chat.ts</span> — Earlier chat version<br>
+      <span class="indent"></span><span class="file">model.ts</span> — Model config + weight loading<br>
+      <span class="indent"></span><span class="file">test-harness.ts</span> — Shader correctness tests<br>
+      <span class="indent"></span><span class="file">test-chain.ts</span> — Full chain verification<br>
+      <span class="indent"></span><span class="dir">shaders/</span> — 10 custom WGSL kernels<br>
+      <span class="indent"></span><span class="indent"></span><span class="file key">int4_matmul.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file key">fused_ffn.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">rms_norm.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">add_norm.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">rope.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">attention.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">kv_append.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">embedding.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">int4_matmul_f32.wgsl</span><br>
+      <span class="indent"></span><span class="indent"></span><span class="file">argmax.wgsl</span><br>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:1rem">
+  <h4>HTML Entry Points</h4>
+  <table>
+    <tr><th>File</th><th>Engine</th><th>Description</th></tr>
+    <tr><td><code>index.html</code></td><td>Pure TVM</td><td>Default chat (WebLLM only, no custom shaders)</td></tr>
+    <tr><td><code>fast-chat.html</code></td><td>Phi3Engine</td><td>TVM capture &rarr; named pipelines + fused FFN</td></tr>
+    <tr><td><code>v3.html</code></td><td>Engine v3</td><td>Capture-replay, minimal ~100 dispatch decode</td></tr>
+    <tr><td><code>compiler-chat.html</code></td><td>Compiler</td><td>279/342 own shaders, 10 WGSL files</td></tr>
+    <tr><td><code>dump.html</code></td><td>Analysis</td><td>Full TVM architecture dump</td></tr>
+    <tr><td><code>shaders.html</code></td><td>Analysis</td><td>Dump all 85 TVM shader sources</td></tr>
+    <tr><td><code>demo.html</code></td><td>Demo</td><td>Interactive visualizations + live chat</td></tr>
+    <tr><td><code>test-shaders.html</code></td><td>Test</td><td>Shader correctness verification</td></tr>
+    <tr><td><code>test-chain.html</code></td><td>Test</td><td>Full chain end-to-end test</td></tr>
+  </table>
+</div>
+
+<hr class="sep">
+
+<!-- Model Config -->
+<h2>Model Constants</h2>
+
+<div class="stats-grid">
+  <div class="stat"><div class="val">3072</div><div class="label">Hidden dim (D)</div></div>
+  <div class="stat"><div class="val">32</div><div class="label">Attention heads</div></div>
+  <div class="stat"><div class="val">96</div><div class="label">Head dim (D/heads)</div></div>
+  <div class="stat"><div class="val">32</div><div class="label">Transformer layers</div></div>
+</div>
+<div class="stats-grid" style="margin-top:0.5rem">
+  <div class="stat"><div class="val">8192</div><div class="label">FFN intermediate dim</div></div>
+  <div class="stat"><div class="val">32064</div><div class="label">Vocabulary size</div></div>
+  <div class="stat"><div class="val">16</div><div class="label">KV cache page size</div></div>
+  <div class="stat"><div class="val">4096</div><div class="label">Max sequence length</div></div>
+</div>
+
+<div style="text-align:center; margin-top:3rem; padding:1rem; color:#333; font-size:0.7rem;">
+  webgpu-fusion-webllm &mdash; Reverse-engineered WebGPU LLM inference
+</div>
+
+</body>
+</html>
