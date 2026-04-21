@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Validate — Zero-TVM</title>
+  <meta name="description" content="Multi-prompt validation harness for the Zero-TVM forward pass.">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:url" content="https://zerotvm.com/validate.html">
+  <meta property="og:title" content="Validate — Zero-TVM">
+  <meta property="og:description" content="Multi-prompt validation harness for the Zero-TVM forward pass.">
+  <meta property="og:image" content="https://zerotvm.com/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    body { height: 100vh; }
+    .chat { max-height: none; min-height: 0; padding: 1.25rem; }
+    .start-screen {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; flex: 1; gap: 1.25rem; text-align: center;
+    }
+    .start-screen .title { font-size: 1.1rem; font-weight: 600; color: #ccc; }
+    .start-screen .desc { font-size: 0.85rem; color: #555; max-width: 480px; line-height: 1.6; }
+    .start-btn {
+      background: #10b981; color: #000; font-weight: 600; font-size: 0.95rem;
+      padding: 0.7rem 2rem; border: none; border-radius: 8px; cursor: pointer;
+    }
+    .start-btn:hover { background: #34d399; }
+    .start-btn:disabled { background: #1a1a1a; color: #444; cursor: default; }
+    .start-hint { font-size: 0.68rem; color: #333; }
+
+    /* Shared loading UI — same markup chat.ts uses, so loading-ui.ts can drive
+       both pages. */
+    .progress-wrap {
+      display: none; flex-direction: column; align-items: center;
+      justify-content: center; flex: 1; gap: 1rem; text-align: center;
+      max-width: 420px; margin: 0 auto; width: 100%;
+    }
+    .progress-wrap.active { display: flex; }
+    .progress-status { font-size: 0.85rem; color: #888; }
+    .progress-bar-outer {
+      width: 100%; height: 4px; background: #1a1a1a; border-radius: 2px; overflow: hidden;
+    }
+    .progress-bar-inner {
+      height: 100%; width: 0%; background: #10b981; border-radius: 2px;
+      transition: width 0.15s ease-out;
+    }
+    .progress-detail {
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.7rem; color: #333;
+    }
+    .progress-log {
+      width: 100%; max-height: 120px; overflow-y: auto;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.65rem; color: #2a2a2a; text-align: left;
+      padding: 0.5rem; background: #0d0d0d; border-radius: 6px;
+      border: 1px solid #151515; white-space: pre-wrap;
+    }
+    .badge.ready { background: #0d3320; color: #10b981; }
+    .badge.error { background: #331111; color: #ef4444; }
+
+    #results-wrap { display: none; flex-direction: column; gap: 1.5rem; max-width: 760px; margin: 0 auto; width: 100%; }
+    #results-wrap.active { display: flex; }
+
+    .prompt-result {
+      background: #0d0d0d;
+      border: 1px solid #1a1a1a;
+      border-radius: 10px;
+      padding: 1rem 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .prompt-label {
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.7rem;
+      color: #10b981;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .prompt-text {
+      font-size: 0.9rem;
+      color: #ddd;
+      font-weight: 500;
+    }
+    .prompt-meta {
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.65rem;
+      color: #555;
+    }
+    .prompt-section {
+      font-size: 0.65rem;
+      color: #666;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      margin-top: 0.4rem;
+    }
+    pre.topk, pre.continuation {
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.72rem;
+      color: #aaa;
+      background: #060606;
+      border: 1px solid #151515;
+      border-radius: 6px;
+      padding: 0.6rem 0.8rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+    }
+    pre.continuation { color: #9fdcb6; }
+    .prompt-error {
+      color: #ef4444;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.75rem;
+    }
+
+    #status {
+      margin-left: auto;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+      font-size: 0.7rem;
+      color: #666;
+    }
+  </style>
+  <script defer src="/_vercel/insights/script.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <a href="/">&larr;</a>
+      <h1>Validate</h1>
+      <span id="badge" class="badge">Waiting</span>
+      <span id="status" class="stats">Idle</span>
+    </header>
+    <div id="chat" class="chat">
+      <div id="start-screen" class="start-screen">
+        <div class="title">Zero-TVM Validation Harness</div>
+        <div class="desc">
+          Runs the full Zero-TVM forward pass on a battery of diverse prompts and
+          shows the top-10 next tokens + a short greedy continuation for each.
+          Pair this with the per-shader test page (<code>test-shaders.html</code>)
+          to convince yourself the live chat path generalizes beyond a single
+          memorized prompt.
+        </div>
+        <button id="start-btn" class="start-btn">Run Validation</button>
+        <div class="start-hint">~2 GB Phi-3 weights download on first run, cached after</div>
+      </div>
+      <div id="progress-wrap" class="progress-wrap">
+        <div id="progress-status" class="progress-status">Initializing...</div>
+        <div class="progress-bar-outer">
+          <div id="progress-bar" class="progress-bar-inner"></div>
+        </div>
+        <div id="progress-detail" class="progress-detail"></div>
+        <div id="progress-log" class="progress-log"></div>
+      </div>
+      <div id="results-wrap"></div>
+    </div>
+  </div>
+  <footer>
+    <a href="/">zero-tvm</a> &middot; multi-prompt forward-pass validation &middot; <a href="https://github.com/abgnydn/zero-tvm">GitHub</a>
+  </footer>
+  <script type="module" src="/src/zero-tvm/validate.ts"></script>
+</body>
+</html>

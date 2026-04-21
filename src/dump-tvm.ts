@@ -843,4 +843,11 @@ function dumpUniformDeepDive(cap: CaptureResult): void {
   }
 }
 
-run().catch(e => log(`FATAL: ${e}`))
+run().catch(e => {
+  log(`FATAL: ${e}`)
+  if (String(e).includes('Cache')) {
+    log('')
+    log('This is a WebLLM/tvmjs caching error — usually a transient network issue.')
+    log('Try: reload the page, or clear site data and retry.')
+  }
+})

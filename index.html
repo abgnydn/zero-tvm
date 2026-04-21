@@ -3,42 +3,346 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Private AI Chat — Powered by Kernel Fusion</title>
+  <title>Zero-TVM — Phi-3 on 10 WGSL Shaders</title>
+  <meta name="description" content="A 3.6B-parameter LLM running entirely on your GPU via WebGPU. 10 hand-written WGSL shaders replacing 85 TVM-generated ones. No compiler, no WASM, no server.">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://zerotvm.com/">
+  <meta property="og:title" content="Zero-TVM — Phi-3 on 10 WGSL Shaders">
+  <meta property="og:description" content="A 3.6B-parameter LLM running entirely on your GPU via WebGPU. 10 hand-written WGSL shaders replacing 85 TVM-generated ones.">
+  <meta property="og:image" content="https://zerotvm.com/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Zero-TVM — Phi-3 on 10 WGSL Shaders">
+  <meta name="twitter:description" content="A 3.6B-parameter LLM running entirely on your GPU via WebGPU. 10 hand-written WGSL shaders replacing 85 TVM-generated ones.">
+  <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
-    header { padding: 1rem 2rem; background: #111; border-bottom: 1px solid #222; display: flex; align-items: center; gap: 1rem; }
-    header h1 { font-size: 1.2rem; color: #fff; }
-    .badge { background: #1a472a; color: #4caf50; padding: 0.25rem 0.75rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
-    .badge.loading { background: #3a3a00; color: #ffd54f; }
-    #stats { margin-left: auto; font-size: 0.8rem; color: #666; font-family: monospace; }
-    #log { padding: 0.5rem 2rem; font-family: monospace; font-size: 0.6rem; color: #444; background: #0d0d0d; max-height: 60px; overflow-y: auto; border-bottom: 1px solid #1a1a1a; }
-    #chat { flex: 1; overflow-y: auto; padding: 1rem 2rem; }
-    .msg { margin-bottom: 1rem; max-width: 80%; padding: 0.75rem 1rem; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; font-size: 0.95rem; }
-    .msg.user { background: #1a3a5c; margin-left: auto; border-bottom-right-radius: 4px; }
-    .msg.ai { background: #1a1a1a; border-bottom-left-radius: 4px; }
-    #bar { padding: 1rem 2rem; background: #111; border-top: 1px solid #222; display: flex; gap: 0.75rem; }
-    #bar input { flex: 1; background: #1a1a1a; border: 1px solid #333; color: #fff; padding: 0.75rem 1rem; border-radius: 8px; font-size: 1rem; outline: none; }
-    #bar input:focus { border-color: #1a73e8; }
-    #bar input:disabled { opacity: 0.5; }
-    #bar button { background: #1a73e8; color: #fff; border: none; padding: 0.75rem 1.5rem; border-radius: 8px; font-size: 1rem; cursor: pointer; }
-    #bar button:disabled { background: #333; cursor: not-allowed; }
-    .note { text-align: center; padding: 0.5rem; font-size: 0.7rem; color: #444; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0a0a0a; color: #c8c8c8;
+      min-height: 100vh;
+    }
+
+    .page {
+      max-width: 680px; margin: 0 auto;
+      padding: 6rem 1.5rem 4rem;
+      display: flex; flex-direction: column; align-items: center; gap: 3rem;
+    }
+
+    /* ---- Hero ---- */
+    .hero { text-align: center; }
+
+    h1 {
+      font-size: 2.8rem; font-weight: 700; color: #fff;
+      letter-spacing: -0.04em; line-height: 1.1;
+      margin-bottom: 1.25rem;
+    }
+    h1 span { color: #10b981; }
+
+    .subtitle {
+      font-size: 1rem; line-height: 1.75; color: #888; max-width: 520px;
+      margin: 0 auto;
+    }
+
+    /* ---- Stat cards ---- */
+    .numbers {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;
+      width: 100%;
+    }
+    .num-card {
+      background: #111; border: 1px solid #1a1a1a; border-radius: 12px;
+      padding: 1.5rem 1rem; text-align: center;
+      position: relative; overflow: hidden;
+    }
+    .num-card::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0;
+      height: 2px; background: linear-gradient(90deg, transparent, #10b98166, transparent);
+    }
+    .num-card .big {
+      font-size: 2.2rem; font-weight: 700; color: #fff;
+      font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    }
+    .num-card .big small { font-size: 0.45em; color: #555; }
+    .num-card .label {
+      font-size: 0.7rem; color: #555; margin-top: 0.4rem;
+      text-transform: uppercase; letter-spacing: 0.08em;
+    }
+
+    /* ---- CTA ---- */
+    .cta-section {
+      display: flex; flex-direction: column; align-items: center; gap: 0.75rem;
+    }
+    .cta {
+      display: inline-block;
+      background: #10b981; color: #000; font-weight: 600;
+      font-size: 1.05rem;
+      padding: 0.85rem 2.8rem; border-radius: 10px;
+      text-decoration: none;
+      transition: background 0.15s, transform 0.1s;
+    }
+    .cta:hover { background: #34d399; transform: translateY(-1px); }
+    .cta:active { transform: translateY(0); }
+
+    .req {
+      font-size: 0.72rem; color: #444; text-align: center; line-height: 1.6;
+    }
+    .req code {
+      font-size: 0.68rem; background: #161616; padding: 2px 5px;
+      border-radius: 3px; color: #666; font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    }
+
+    /* ---- Comparison ---- */
+    .comparison-wrap {
+      width: 100%;
+      background: #111; border: 1px solid #1a1a1a; border-radius: 12px;
+      overflow: hidden;
+    }
+    .comparison-header {
+      padding: 1rem 1.25rem 0.5rem;
+      font-size: 0.7rem; color: #444; text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .comparison {
+      width: 100%; border-collapse: collapse; font-size: 0.85rem;
+    }
+    .comparison th {
+      text-align: left; color: #555; font-weight: 500;
+      padding: 0.6rem 1.25rem;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    .comparison td {
+      padding: 0.6rem 1.25rem;
+      border-bottom: 1px solid #131313;
+      color: #777;
+    }
+    .comparison tr:last-child td { border-bottom: none; }
+    .comparison td:last-child { color: #10b981; font-weight: 600; }
+
+    /* ---- Links ---- */
+    .primary-links {
+      display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;
+      justify-content: center;
+    }
+    .gh-link {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      background: #151515; border: 1px solid #222; border-radius: 8px;
+      padding: 0.55rem 1.1rem; font-size: 0.82rem; color: #ccc;
+      text-decoration: none; transition: border-color 0.15s;
+    }
+    .gh-link:hover { border-color: #444; color: #fff; }
+    .gh-link svg { width: 16px; height: 16px; fill: currentColor; }
+
+    .share-btn {
+      background: none; border: 1px solid #222; color: #777;
+      padding: 0.55rem 1.1rem; border-radius: 8px; font-size: 0.82rem;
+      cursor: pointer; transition: all 0.15s;
+    }
+    .share-btn:hover { border-color: #444; color: #ccc; }
+
+    .secondary-links {
+      display: flex; gap: 1.75rem; flex-wrap: wrap; justify-content: center;
+    }
+    .secondary-links a {
+      font-size: 0.78rem; color: #444; text-decoration: none;
+      transition: color 0.15s;
+    }
+    .secondary-links a:hover { color: #888; }
+
+    /* ---- Divider ---- */
+    .divider {
+      width: 40px; height: 1px; background: #222;
+    }
+
+    /* ---- Share Modal ---- */
+    .share-modal {
+      display: none; position: fixed; inset: 0; z-index: 1000;
+      background: rgba(0,0,0,0.7); backdrop-filter: blur(4px);
+      align-items: center; justify-content: center;
+    }
+    .share-modal.open { display: flex; }
+    .share-panel {
+      background: #141414; border: 1px solid #222; border-radius: 14px;
+      padding: 1.75rem; width: 90%; max-width: 460px;
+      display: flex; flex-direction: column; gap: 0.6rem;
+    }
+    .share-panel h3 { color: #fff; font-size: 0.95rem; margin-bottom: 0.35rem; }
+    .share-option {
+      display: flex; align-items: center; gap: 0.75rem;
+      background: #1a1a1a; border: 1px solid #1f1f1f; border-radius: 8px;
+      padding: 0.65rem 1rem; cursor: pointer; text-decoration: none;
+      transition: border-color 0.15s;
+    }
+    .share-option:hover { border-color: #10b981; }
+    .share-option .platform {
+      font-size: 0.78rem; font-weight: 600; color: #ddd; min-width: 70px;
+    }
+    .share-option .msg {
+      font-size: 0.72rem; color: #666; line-height: 1.4;
+      overflow: hidden; text-overflow: ellipsis;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    }
+
+    .copied-toast {
+      position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%);
+      background: #10b981; color: #000; padding: 0.5rem 1.5rem;
+      border-radius: 8px; font-size: 0.82rem; font-weight: 600;
+      opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 1001;
+    }
+    .copied-toast.show { opacity: 1; }
+
+    /* ---- Footer ---- */
+    footer {
+      text-align: center; padding: 2.5rem 1rem;
+      font-size: 0.68rem; color: #2a2a2a;
+    }
+    footer a { color: #333; text-decoration: none; }
+    footer a:hover { color: #555; }
+
+    /* ---- Responsive ---- */
+    @media (max-width: 500px) {
+      .page { padding: 3rem 1rem 3rem; gap: 2rem; }
+      h1 { font-size: 2rem; }
+      .num-card .big { font-size: 1.6rem; }
+      .numbers { gap: 0.5rem; }
+    }
   </style>
+  <script defer src="/_vercel/insights/script.js"></script>
 </head>
 <body>
-  <header>
-    <h1>Private AI Chat</h1>
-    <span class="badge loading" id="badge">Loading...</span>
-    <span id="stats"></span>
-  </header>
-  <div id="log"></div>
-  <div id="chat"><div class="msg ai">Downloading model to your browser...</div></div>
-  <div id="bar">
-    <input id="inp" placeholder="Type a message..." disabled>
-    <button id="btn" disabled>Send</button>
+  <div class="page">
+    <div class="hero">
+      <h1>Phi-3 in your browser.<br><span>10 shaders. Zero TVM.</span></h1>
+      <p class="subtitle">
+        A 3.6B-parameter LLM running entirely on your GPU via WebGPU.
+        No compiler, no WASM runtime, no server.
+        Just 10 hand-written WGSL compute shaders and 792 lines of GPU code,
+        replacing the 85 auto-generated shaders that TVM/WebLLM normally need.
+      </p>
+    </div>
+
+    <div class="numbers">
+      <div class="num-card">
+        <div class="big">10</div>
+        <div class="label">WGSL shaders</div>
+      </div>
+      <div class="num-card">
+        <div class="big">792</div>
+        <div class="label">lines of GPU code</div>
+      </div>
+      <div class="num-card">
+        <div class="big">14<small>KB</small></div>
+        <div class="label">JS bundle</div>
+      </div>
+    </div>
+
+    <div class="cta-section">
+      <a class="cta" href="/zero-tvm.html">Try it yourself</a>
+      <p class="req">
+        Chrome or Edge only — all 10 shaders use <code>enable f16</code> which Safari and Firefox don't support yet.
+        <br>~2 GB model download on first load, cached after that.
+      </p>
+    </div>
+
+    <div class="comparison-wrap">
+      <div class="comparison-header">How it compares</div>
+      <table class="comparison">
+        <tr><th></th><th>WebLLM (TVM)</th><th>This project</th></tr>
+        <tr><td>Unique shaders</td><td>85</td><td>10</td></tr>
+        <tr><td>WGSL lines</td><td>12,962</td><td>792</td></tr>
+        <tr><td>JS bundle (gzipped)</td><td>2.1 MB</td><td>14 KB</td></tr>
+        <tr><td>Runtime</td><td>TVM + WASM</td><td>TypeScript</td></tr>
+      </table>
+    </div>
+
+    <div class="primary-links">
+      <a class="gh-link" href="https://github.com/abgnydn/zero-tvm">
+        <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+      <a class="gh-link" href="https://github.com/abgnydn/zero-tvm/stargazers">
+        <svg viewBox="0 0 16 16"><path d="M8 .25a.75.75 0 01.673.418l1.882 3.815 4.21.612a.75.75 0 01.416 1.279l-3.046 2.97.719 4.192a.75.75 0 01-1.088.791L8 12.347l-3.766 1.98a.75.75 0 01-1.088-.79l.72-4.194L.818 6.374a.75.75 0 01.416-1.28l4.21-.611L7.327.668A.75.75 0 018 .25z"/></svg>
+        Star
+      </a>
+      <button class="share-btn" onclick="document.getElementById('share-modal').classList.add('open')">Share</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="secondary-links">
+      <a href="/demo.html">Dispatch visualization</a>
+      <a href="/dump.html">TVM shader dump</a>
+      <a href="/compiler-chat.html">Compiler chat</a>
+    </div>
   </div>
-  <div class="note">100% local GPU inference via WebGPU. Zero server requests during chat.</div>
-  <script type="module" src="/src/main.ts"></script>
+
+  <div id="share-modal" class="share-modal" onclick="if(event.target===this)this.classList.remove('open')">
+    <div class="share-panel">
+      <h3>Share zero-tvm</h3>
+
+      <a class="share-option" target="_blank" id="share-x">
+        <span class="platform">X / Twitter</span>
+        <span class="msg">I replaced 85 TVM-generated GPU shaders with 10 hand-written ones. Phi-3 (3.6B) runs in the browser at ~same speed. 792 lines of WGSL, 14 KB JS bundle. No compiler, no WASM, no server.</span>
+      </a>
+
+      <a class="share-option" target="_blank" id="share-linkedin">
+        <span class="platform">LinkedIn</span>
+        <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3 (3.6B params) entirely in the browser using 10 hand-written WebGPU shaders, replacing the 85 auto-generated ones from TVM/WebLLM. Same speed, 792 lines of GPU code, 14 KB JS bundle.</span>
+      </a>
+
+      <a class="share-option" target="_blank" id="share-hn">
+        <span class="platform">Hacker News</span>
+        <span class="msg">Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL shaders (replacing TVM's 85)</span>
+      </a>
+
+      <a class="share-option" target="_blank" id="share-reddit">
+        <span class="platform">Reddit</span>
+        <span class="msg">I replaced TVM's 85 auto-generated shaders with 10 hand-written WGSL shaders. Phi-3 (3.6B) runs in the browser. 792 lines of GPU code total.</span>
+      </a>
+
+      <a class="share-option" id="share-copy" style="cursor:pointer;">
+        <span class="platform">Copy link</span>
+        <span class="msg" id="share-url"></span>
+      </a>
+    </div>
+  </div>
+
+  <div class="copied-toast" id="copied-toast">Link copied</div>
+
+  <script>
+  (function() {
+    var url = window.location.origin;
+    var repo = 'https://github.com/abgnydn/zero-tvm';
+
+    var xText = 'I replaced 85 TVM-generated GPU shaders with 10 hand-written ones. Phi-3 (3.6B) runs in the browser at ~same speed.\n\n792 lines of WGSL. 14 KB JS bundle. No compiler, no WASM, no server.\n\n' + url;
+    document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(xText);
+
+    var liText = 'I built a from-scratch LLM inference engine that runs Phi-3 (3.6B params) entirely in the browser using 10 hand-written WebGPU compute shaders, replacing the 85 auto-generated ones from Apache TVM / WebLLM.\n\nSame speed (~34 tok/s on M2 Pro). 792 lines of GPU code. 14 KB JavaScript bundle. No compiler, no WASM runtime, no server.\n\nThe whole forward pass -- 32 transformer layers, paged KV cache, int4 dequant, RoPE, fused FFN, attention, argmax -- is readable end-to-end.\n\nTry it: ' + url + '\nCode: ' + repo;
+    document.getElementById('share-linkedin').href = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(url);
+
+    document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent('Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL shaders (replacing TVM\'s 85)');
+
+    document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent('I replaced TVM\'s 85 auto-generated shaders with 10 hand-written WGSL shaders. Phi-3 (3.6B) runs in the browser.');
+
+    document.getElementById('share-url').textContent = url;
+
+    document.getElementById('share-copy').addEventListener('click', function(e) {
+      e.preventDefault();
+      navigator.clipboard.writeText(url).then(function() {
+        var toast = document.getElementById('copied-toast');
+        toast.classList.add('show');
+        setTimeout(function() { toast.classList.remove('show'); }, 1500);
+      });
+    });
+  })();
+  </script>
+
+  <footer>
+    <a href="https://github.com/abgnydn/zero-tvm">zero-tvm</a> by Ahmet Baris Gunaydin
+    &nbsp;&middot;&nbsp;
+    <a href="https://github.com/abgnydn/kernelfusion">kernelfusion</a>
+    &nbsp;&middot;&nbsp;
+    <a href="https://github.com/abgnydn/gpubench">gpubench</a>
+  </footer>
 </body>
 </html>

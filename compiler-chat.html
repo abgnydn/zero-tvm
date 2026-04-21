@@ -3,24 +3,62 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Our Compiler — 342/342 Own Shaders</title>
+  <title>Compiler Chat — Zero-TVM</title>
+  <meta name="description" content="Compiler-based chat: captures TVM dispatches, then replays with 10 hand-written WGSL shaders.">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:url" content="https://zerotvm.com/compiler-chat.html">
+  <meta property="og:title" content="Compiler Chat — Zero-TVM">
+  <meta property="og:description" content="Compiler-based chat: captures TVM dispatches, then replays with 10 hand-written WGSL shaders.">
+  <meta property="og:image" content="https://zerotvm.com/og.png">
+  <meta name="twitter:card" content="summary_large_image">
   <link rel="stylesheet" href="/style.css">
+  <style>
+    body { height: 100vh; }
+    .chat { max-height: none; min-height: 0; }
+    .chat > * { max-width: 720px; margin-left: auto; margin-right: auto; }
+    .start-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 1.25rem; text-align: center; }
+    .start-screen .title { font-size: 1.1rem; font-weight: 600; color: #ccc; }
+    .start-screen .desc { font-size: 0.85rem; color: #555; max-width: 380px; line-height: 1.6; }
+    .start-btn {
+      background: #10b981; color: #000; font-weight: 600; font-size: 0.95rem;
+      padding: 0.7rem 2rem; border: none; border-radius: 8px; cursor: pointer;
+    }
+    .start-btn:hover { background: #34d399; }
+    .start-btn:disabled { background: #1a1a1a; color: #444; cursor: default; }
+    .start-hint { font-size: 0.68rem; color: #333; }
+  </style>
+  <script defer src="/_vercel/insights/script.js"></script>
 </head>
 <body>
   <div class="container">
     <header>
-      <h1>Our Compiler</h1>
-      <span id="badge" class="badge loading">Loading...</span>
+      <a href="/">&larr;</a>
+      <h1>Compiler Chat</h1>
+      <span id="badge" class="badge">Waiting</span>
       <span id="stats" class="stats"></span>
     </header>
-    <div id="chat" class="chat"></div>
-    <div class="input-row">
-      <input id="inp" type="text" placeholder="Type a message..." disabled>
-      <button id="btn" disabled>Send</button>
+    <div id="chat" class="chat">
+      <div id="start-screen" class="start-screen">
+        <div class="title">Compiler Chat</div>
+        <div class="desc">
+          Captures TVM dispatches on first message, then replays with 10 hand-written WGSL shaders.
+        </div>
+        <button id="start-btn" class="start-btn">Download & Start</button>
+        <div class="start-hint">Downloads WebLLM + Phi-3 weights (~2 GB)</div>
+      </div>
+    </div>
+    <div class="input-wrap">
+      <div class="input-inner">
+        <input id="inp" type="text" placeholder="Type a message..." disabled>
+        <button id="btn" disabled>Send</button>
+      </div>
     </div>
     <pre id="log" class="log"></pre>
   </div>
-  <footer>342/342 dispatches = our shaders. 10 WGSL files. Zero TVM runtime. Zero TVM shaders.</footer>
+  <footer>
+    <a href="/">zero-tvm</a> &middot; 342/342 dispatches = my shaders &middot; <a href="https://github.com/abgnydn/zero-tvm">GitHub</a>
+  </footer>
   <script type="module" src="/src/compiler/chat-v2.ts"></script>
 </body>
 </html>

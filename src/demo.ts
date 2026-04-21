@@ -2,8 +2,6 @@
  * Demo page — interactive visualizations + live chat demo.
  */
 
-import { LLMEngine, MODELS } from './engine.js'
-import { patchForCapture, getCaptureResult } from './capture.js'
 // @ts-ignore
 import fusedFFNWGSL from './shaders/fused-ffn.wgsl?raw'
 // @ts-ignore
@@ -16,8 +14,8 @@ import argmaxWGSL from './shaders/argmax.wgsl?raw'
 // ============================================================
 
 const COLORS: Record<string, string> = {
-  matmul: '#4a9eff', attention: '#ff9f43', norm: '#2ecc71',
-  activation: '#a855f7', kv: '#ffd54f', sampling: '#ff6b6b', embed: '#4a9eff',
+  matmul: '#10b981', attention: '#ff9f43', norm: '#2ecc71',
+  activation: '#a855f7', kv: '#ffd54f', sampling: '#ff6b6b', embed: '#10b981',
 }
 
 interface DispatchInfo {
@@ -191,7 +189,7 @@ function renderBufferTreemap(canvas: HTMLCanvasElement): void {
   const H = rect.height
 
   const categories = [
-    { name: 'Weights', bytes: 3_870_000_000, color: '#4a9eff', count: 270 },
+    { name: 'Weights', bytes: 3_870_000_000, color: '#10b981', count: 270 },
     { name: 'KV Cache', bytes: 19_000_000, color: '#ffd54f', count: 37 },
     { name: 'Activations', bytes: 424_000, color: '#2ecc71', count: 71 },
     { name: 'Uniforms', bytes: 7_708, color: '#a855f7', count: 350 },
@@ -232,100 +230,6 @@ function formatBytes(b: number): string {
 }
 
 // ============================================================
-// Live Demo
-// ============================================================
-
-async function initLiveDemo(): Promise<void> {
-  const input = document.getElementById('demo-input') as HTMLInputElement
-  const chatArea = document.getElementById('demo-chat-area')!
-  const speedEl = document.getElementById('demo-speed')!
-  const statusEl = document.getElementById('demo-status')!
-  const logEl = document.getElementById('demo-log')!
-
-  const log = (msg: string) => { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight }
-
-  if (!navigator.gpu) {
-    statusEl.textContent = 'WebGPU not available. Use Chrome 113+ with WebGPU enabled.'
-    return
-  }
-
-  input.disabled = false
-  input.placeholder = 'Type a message to load model and chat...'
-  statusEl.textContent = 'Ready — model loads on first message (~2GB download)'
-
-  let engine: LLMEngine | null = null
-  let generating = false
-
-  input.addEventListener('keydown', async (e) => {
-    if (e.key !== 'Enter' || generating) return
-    const text = input.value.trim()
-    if (!text) return
-    input.value = ''
-
-    generating = true
-    input.disabled = true
-
-    // Add user message
-    const userMsg = document.createElement('div')
-    userMsg.className = 'msg user'
-    userMsg.textContent = text
-    chatArea.appendChild(userMsg)
-
-    // Add AI message
-    const aiMsg = document.createElement('div')
-    aiMsg.className = 'msg ai'
-    chatArea.appendChild(aiMsg)
-
-    if (!engine) {
-      statusEl.textContent = 'Loading model...'
-      engine = new LLMEngine()
-
-      // Patch for capture
-      const origRA = navigator.gpu.requestAdapter.bind(navigator.gpu)
-      navigator.gpu.requestAdapter = async function(...args: Parameters<GPU['requestAdapter']>) {
-        const adapter = await origRA(...args)
-        if (!adapter) return adapter
-        const origRD = adapter.requestDevice.bind(adapter)
-        adapter.requestDevice = async function(...dArgs: Parameters<GPUAdapter['requestDevice']>) {
-          const device = await origRD(...dArgs)
-          patchForCapture(device)
-          return device
-        }
-        return adapter
-      }
-
-      await engine.load(MODELS.PHI3_MINI_Q4, (msg) => { log(msg); statusEl.textContent = msg })
-      statusEl.textContent = 'Model loaded'
-
-      const cap = getCaptureResult()
-      if (cap) log(`Captured: ${cap.shaders.length} shaders, ${cap.pipelines.length} pipelines`)
-    }
-
-    // Generate
-    const t0 = performance.now()
-    let count = 0
-    statusEl.textContent = 'Generating...'
-
-    try {
-      await engine.chat(text, (tok) => {
-        count++
-        aiMsg.textContent += tok
-        chatArea.scrollTop = chatArea.scrollHeight
-        const elapsed = (performance.now() - t0) / 1000
-        speedEl.textContent = (count / elapsed).toFixed(1)
-      })
-    } catch (e) {
-      aiMsg.textContent += ` [Error: ${e}]`
-    }
-
-    statusEl.textContent = `Generated ${count} tokens`
-    generating = false
-    input.disabled = false
-    input.focus()
-  })
-}
-
-// ============================================================
 // Init
 // ============================================================
 
@@ -344,8 +248,6 @@ function main(): void {
   renderBufferTreemap(bufferCanvas)
   window.addEventListener('resize', () => renderBufferTreemap(bufferCanvas))
 
-  // Live demo
-  initLiveDemo()
 }
 
 main()

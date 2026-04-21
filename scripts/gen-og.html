@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 1200px; height: 630px; background: #0a0a0a; display: flex; flex-direction: column; align-items: center; justify-content: center; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; gap: 2rem; }
+  h1 { font-size: 72px; font-weight: 700; color: #fff; text-align: center; line-height: 1.15; letter-spacing: -2px; }
+  h1 span { color: #10b981; }
+  p { font-size: 26px; color: #666; }
+  .nums { display: flex; gap: 1.5rem; margin-top: 1rem; }
+  .num { background: #111; border: 1px solid #1a1a1a; border-radius: 10px; padding: 1rem 2rem; text-align: center; min-width: 140px; }
+  .num .v { font-size: 32px; font-weight: 700; color: #fff; font-family: ui-monospace, monospace; }
+  .num .l { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+</style>
+</head>
+<body>
+  <h1>Phi-3 in your browser.<br><span>10 shaders. Zero TVM.</span></h1>
+  <p>3.6B-parameter LLM running entirely on your GPU via WebGPU</p>
+  <div class="nums">
+    <div class="num"><div class="v">10</div><div class="l">Shaders</div></div>
+    <div class="num"><div class="v">792</div><div class="l">WGSL lines</div></div>
+    <div class="num"><div class="v">14KB</div><div class="l">JS bundle</div></div>
+  </div>
+</body>
+</html>

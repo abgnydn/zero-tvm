@@ -757,18 +757,6 @@ function buildDecodeEngine(
 
 const $ = (id: string) => document.getElementById(id)!
 
-function log(msg: string) {
-  const el = $('log') as HTMLPreElement
-  el.textContent += msg + '\n'
-  el.scrollTop = el.scrollHeight
-}
-
-function setBadge(text: string, loading = false) {
-  const badge = $('badge')
-  badge.textContent = text
-  badge.className = loading ? 'badge loading' : 'badge'
-}
-
 function setStats(text: string) {
   $('stats').textContent = text
 }
@@ -782,11 +770,13 @@ function setEnabled(on: boolean) {
 }
 
 function addMsg(role: 'user' | 'ai'): HTMLElement {
+  const chatWrap = document.querySelector('.chat-wrap')!
   const chat = $('chat')
   const div = document.createElement('div')
   div.className = `msg ${role}`
+  if (role === 'ai') div.classList.add('generating')
   chat.appendChild(div)
-  chat.scrollTop = chat.scrollHeight
+  chatWrap.scrollTop = chatWrap.scrollHeight
   return div
 }
 
@@ -896,6 +886,17 @@ async function main(): Promise<void> {
     { role: 'system', content: 'You are a helpful assistant.' },
   ]
   let generating = false
+  // Tracks the full token sequence (prompt + generated) that the KV cache
+  // currently reflects. Used to skip re-prefilling the conversation prefix
+  // on multi-turn sends — slots [0, lcp) are already valid in KV pages.
+  let kvCacheTokens: number[] = []
+
+  function longestCommonPrefix(a: number[], b: number[]): number {
+    const n = Math.min(a.length, b.length)
+    let i = 0
+    while (i < n && a[i] === b[i]) i++
+    return i
+  }
 
   async function send(): Promise<void> {
     if (generating) return
@@ -914,20 +915,29 @@ async function main(): Promise<void> {
     history.push({ role: 'user', content: text })
 
     const promptIds = buildChatPrompt(history, tokenizer)
-    log(`Prompt: ${promptIds.length} tokens`)
+    // KV slots already correct for any matching prefix — start prefill from
+    // the first divergent token. For the typical chat flow this skips ~all of
+    // the prior conversation on each turn.
+    const startPos = longestCommonPrefix(kvCacheTokens, promptIds)
 
+    const chatWrap = document.querySelector('.chat-wrap')!
     const t0 = performance.now()
     let count = 0
     const allIds: number[] = []
     let prevText = ''
 
+    setBadge('Generating...', 'loading')
+
     try {
-      await engine.generate(promptIds, 500, (id) => {
+      await engine.generate(promptIds, startPos, 500, (id) => {
         count++
         allIds.push(id)
         const full = tokenizer.decode(allIds)
         const delta = full.slice(prevText.length)
-        if (delta) { aiEl.textContent += delta; $('chat').scrollTop = $('chat').scrollHeight }
+        if (delta) {
+          aiEl.textContent += delta
+          chatWrap.scrollTop = chatWrap.scrollHeight
+        }
         prevText = full
         const elapsed = (performance.now() - t0) / 1000
         setStats(`${count} tok | ${(count / elapsed).toFixed(1)} tok/s`)
@@ -935,11 +945,20 @@ async function main(): Promise<void> {
 
       const fullResponse = tokenizer.decode(allIds)
       history.push({ role: 'assistant', content: fullResponse })
+
+      // The KV cache now reflects [prompt + generated tokens]. Recording this
+      // lets the next turn skip re-prefilling everything that hasn't changed.
+      kvCacheTokens = promptIds.concat(allIds)
     } catch (e) {
       aiEl.textContent += `\n[Error: ${e}]`
-      log(`Error: ${e}`)
+      // Generation failed mid-stream — KV cache state is undefined. Reset
+      // tracking so the next turn does a full prefill from scratch.
+      kvCacheTokens = []
+      engine.resetKVTracking()
     }
 
+    aiEl.classList.remove('generating')
+    setBadge('Ready', 'ready')
     generating = false
     setEnabled(true)
   }
