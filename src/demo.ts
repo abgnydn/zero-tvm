@@ -3,11 +3,25 @@
  */
 
 // @ts-ignore
-import fusedFFNWGSL from './shaders/fused-ffn.wgsl?raw'
+import embeddingWGSL from './compiler/shaders/embedding.wgsl?raw'
 // @ts-ignore
-import fusedNormMatmulWGSL from './shaders/fused-norm-matmul.wgsl?raw'
+import rmsNormWGSL from './compiler/shaders/rms_norm.wgsl?raw'
 // @ts-ignore
-import argmaxWGSL from './shaders/argmax.wgsl?raw'
+import qkvFusedWGSL from './compiler/shaders/qkv_fused.wgsl?raw'
+// @ts-ignore
+import attentionWGSL from './compiler/shaders/attention.wgsl?raw'
+// @ts-ignore
+import int4MatmulWGSL from './compiler/shaders/int4_matmul.wgsl?raw'
+// @ts-ignore
+import fusedFFNWGSL from './compiler/shaders/fused_ffn.wgsl?raw'
+// @ts-ignore
+import addNormWGSL from './compiler/shaders/add_norm.wgsl?raw'
+// @ts-ignore
+import kvAppendWGSL from './compiler/shaders/kv_append.wgsl?raw'
+// @ts-ignore
+import ropeWGSL from './compiler/shaders/rope.wgsl?raw'
+// @ts-ignore
+import argmaxWGSL from './compiler/shaders/argmax.wgsl?raw'
 
 // ============================================================
 // Dispatch Timeline Visualization
@@ -135,9 +149,16 @@ function renderShaderGallery(): void {
   ]
 
   const customShaders = [
-    { name: 'Fused FFN + SiLU', lines: fusedFFNWGSL.split('\n').length, cat: 'custom', code: fusedFFNWGSL, desc: 'Combines gate+up matmul + SiLU into one dispatch. 8192 workgroups instead of 16416.' },
-    { name: 'Fused RMSNorm + Matmul', lines: fusedNormMatmulWGSL.split('\n').length, cat: 'custom', code: fusedNormMatmulWGSL, desc: 'Normalizes input in shared memory, then runs int4 matmul. Eliminates intermediate buffer.' },
-    { name: 'Argmax Sampler', lines: argmaxWGSL.split('\n').length, cat: 'custom', code: argmaxWGSL, desc: 'Replaces 19 TVM sampling dispatches with 1 parallel reduction.' },
+    { name: 'Embedding', lines: embeddingWGSL.split('\n').length, cat: 'custom', code: embeddingWGSL, desc: 'Token-id → f16 row lookup from the 32064 × 3072 embedding matrix.' },
+    { name: 'RMSNorm', lines: rmsNormWGSL.split('\n').length, cat: 'custom', code: rmsNormWGSL, desc: 'Single-workgroup parallel reduction for the 3072-dim hidden state.' },
+    { name: 'QKV + RoPE + KV-append (fused)', lines: qkvFusedWGSL.split('\n').length, cat: 'custom', code: qkvFusedWGSL, desc: 'Decode-path fusion. Replaces 3 dispatches per layer (int4 matmul + RoPE + KV append) with 1. Writes K/V directly into the paged cache.' },
+    { name: 'Paged Attention', lines: attentionWGSL.split('\n').length, cat: 'custom', code: attentionWGSL, desc: 'Decode attention against a paged KV cache. One workgroup per head, online-softmax reduction in shared memory.' },
+    { name: 'int4 Matmul (output + LM head)', lines: int4MatmulWGSL.split('\n').length, cat: 'custom', code: int4MatmulWGSL, desc: 'Dequantize-on-the-fly int4 × f16 matmul. Used for the output projection and the 32064-vocab LM head.' },
+    { name: 'Fused FFN (gate+up+SiLU+mul+down)', lines: fusedFFNWGSL.split('\n').length, cat: 'custom', code: fusedFFNWGSL, desc: 'SwiGLU FFN in a single dispatch: gate proj + up proj + SiLU(gate) * up + down proj, hidden state kept in shared memory across the two matmul stages.' },
+    { name: 'Add + RMSNorm (fused)', lines: addNormWGSL.split('\n').length, cat: 'custom', code: addNormWGSL, desc: 'Residual add + RMSNorm fused — same structure as TVM\'s fuse_add_norm_decode.' },
+    { name: 'KV Append (prefill)', lines: kvAppendWGSL.split('\n').length, cat: 'custom', code: kvAppendWGSL, desc: 'Standalone KV-cache write used on the prefill path (decode path folds this into qkv_fused).' },
+    { name: 'RoPE (prefill)', lines: ropeWGSL.split('\n').length, cat: 'custom', code: ropeWGSL, desc: 'Standalone rotary embedding for the prefill path. Decode path fuses RoPE into qkv_fused.' },
+    { name: 'Argmax Sampler', lines: argmaxWGSL.split('\n').length, cat: 'custom', code: argmaxWGSL, desc: 'Parallel-reduction argmax over the 32064 logits. Replaces TVM\'s ~20-dispatch sampling chain with one dispatch (greedy only).' },
   ]
 
   const badgeClass: Record<string, string> = {

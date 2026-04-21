@@ -4,12 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Dispatch Visualization — Zero-TVM</title>
-  <meta name="description" content="Interactive visualization of 342 GPU dispatches, 85 captured shaders, and 728 buffers from intercepting Phi-3 running in a browser via WebGPU.">
+  <meta name="description" content="Interactive visualization of WebLLM's 342 GPU dispatches, 85 captured shaders, and 728 buffers from intercepting Phi-3-mini in a browser via WebGPU — the reverse-engineering trace that fed the 10-kernel Zero-TVM rewrite.">
   <meta name="theme-color" content="#0a0a0a">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:url" content="https://zerotvm.com/demo.html">
   <meta property="og:title" content="Dispatch Visualization — Zero-TVM">
-  <meta property="og:description" content="Interactive visualization of 342 GPU dispatches, 85 captured shaders, and 728 buffers from intercepting Phi-3 in a browser.">
+  <meta property="og:description" content="Reverse-engineering trace of WebLLM's 342 GPU dispatches on Phi-3-mini, feeding the 10-kernel Zero-TVM rewrite (228 dispatches, ~40 tok/s on M2 Pro).">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
   <style>
@@ -91,14 +91,14 @@
 <!-- Section 1: Hero -->
 <section id="hero">
   <h1>WebGPU Shader Interception<br>for Browser LLMs</h1>
-  <p class="subtitle">I intercepted a 3.8B parameter AI model running entirely in your browser, captured every GPU operation, decoded its architecture, and built a faster engine from scratch.</p>
+  <p class="subtitle">I intercepted a 3.8B parameter AI model running in your browser, captured every GPU operation, decoded its architecture, and rewrote the hot path in 10 hand-written WGSL kernels — 228 dispatches per token at ~40 tok/s on M2 Pro, 22% behind WebLLM's TVM-autotuned 85 kernels on identical weights.</p>
 
   <div class="pills">
-    <div class="pill"><span>85</span> GPU shaders captured</div>
-    <div class="pill"><span>342</span> dispatches per token</div>
+    <div class="pill"><span>85 → 10</span> TVM shaders → kernel roles</div>
+    <div class="pill"><span>342 → 228</span> dispatches per token</div>
     <div class="pill"><span>728</span> GPU buffers mapped</div>
-    <div class="pill"><span>12,962</span> lines of WGSL</div>
-    <div class="pill"><span>27-52</span> tok/s decode</div>
+    <div class="pill"><span>12,962 → 3,078</span> LOC WGSL</div>
+    <div class="pill"><span>~40</span> tok/s decode (M2 Pro)</div>
   </div>
 
   <details>
@@ -106,7 +106,7 @@
     <div class="content">
       <p>Large Language Models like Phi-3 generate text one word at a time. For each word, the model runs 342 GPU compute operations ("dispatches") across 32 neural network layers. Each layer does matrix multiplication, attention computation, and activation functions — all running on your GPU via WebGPU.</p>
       <p>Normally, a framework called TVM manages these operations. TVM's runtime (written in WASM) decides which GPU shader to run, writes the parameters, submits the work, and reads the result — 342 times per word.</p>
-      <p>I intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, and built my own dispatch loop that drives the GPU directly. Same shaders, same weights, same math — but without TVM's WASM overhead.</p>
+      <p>I intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, then threw away the 85 TVM shaders and wrote 10 of my own (27 WGSL files, 3,078 LOC) that drive the GPU directly. Same weights, same math — 228 dispatches per token instead of 342, fully readable in one sitting, 22% slower than TVM's autotuned kernels on M2 Pro.</p>
     </div>
   </details>
 </section>
@@ -131,13 +131,13 @@
 
 <!-- Section 3: Shader Gallery -->
 <section id="shaders">
-  <h2>85 Captured Shaders</h2>
-  <p>I intercepted every <code>createShaderModule</code> call during model load, capturing 85 WGSL compute shaders totaling 12,962 lines. I also wrote 3 custom fused shaders.</p>
+  <h2>85 Captured Shaders → 10 Kernel Roles</h2>
+  <p>I intercepted every <code>createShaderModule</code> call during model load, capturing 85 TVM-generated WGSL compute shaders totaling 12,962 lines. Then I rewrote the hot path: 10 hand-written kernel roles across 27 WGSL files, 3,078 LOC total.</p>
 
-  <h3>Per-Layer Pattern (10 dispatches × 32 layers)</h3>
+  <h3>TVM's Per-Layer Pattern (10 dispatches × 32 layers)</h3>
   <div class="shader-grid" id="layer-shaders"></div>
 
-  <h3 style="margin-top:32px">Custom Fused Shaders</h3>
+  <h3 style="margin-top:32px">Zero-TVM's 10 Kernel Roles</h3>
   <div class="shader-grid" id="custom-shaders"></div>
 </section>
 
@@ -195,9 +195,9 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
   <details>
     <summary>The memory bandwidth wall</summary>
     <div class="content">
-      <p>At ~27-48 tok/s on M2 Pro (200 GB/s memory bandwidth), the model loads ~1.8GB of weights per token:</p>
-      <pre>1.8 GB / 200 GB/s = 9ms per token = ~111 tok/s theoretical maximum</pre>
-      <p>Current performance (27-48 tok/s) represents 25-43% of the theoretical bandwidth limit. The remaining gap is from compute (attention, matmul reduction) and framework overhead. My engine reduces framework overhead but can't change the bandwidth limit.</p>
+      <p>At ~40 tok/s on M2 Pro (200 GB/s memory bandwidth), the model loads ~1.8 GB of weights per token:</p>
+      <pre>1.8 GB / 200 GB/s = 9 ms per token = ~111 tok/s theoretical maximum</pre>
+      <p>Zero-TVM at ~40 tok/s hits ~36% of that bandwidth ceiling; WebLLM at ~51 tok/s hits ~46%. The gap between us and WebLLM is compute (their matmul tiling, attention reduction, subgroup use) — not dispatch overhead, which we already win. Neither engine can change the bandwidth limit.</p>
     </div>
   </details>
 
@@ -229,7 +229,7 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
 <!-- Try It -->
 <section id="try" style="text-align:center; padding:60px 24px;">
   <h2 style="border:none; padding:0; margin-bottom:12px;">Try It Yourself</h2>
-  <p style="max-width:500px; margin:0 auto 24px;">Chat with Phi-3-mini running on these 10 shaders — no TVM, no compiler, no server.</p>
+  <p style="max-width:500px; margin:0 auto 24px;">Chat with Phi-3-mini running on the 10 hand-written kernels — no TVM runtime, no compiler, no server.</p>
   <a href="/zero-tvm.html" style="display:inline-block; background:#10b981; color:#000; font-weight:600; font-size:1.05rem; padding:0.8rem 2.2rem; border-radius:10px; text-decoration:none;">Open Zero-TVM Chat</a>
   <p style="color:#555; font-size:12px; margin-top:12px;">Chrome or Edge only. ~2 GB model download on first load.</p>
 </section>
