@@ -70,6 +70,10 @@ export interface Tokenizer {
 
 // The metaspace character (▁, U+2581) is used as space prefix in SentencePiece
 const METASPACE = '\u2581'
+// Hoisted so decode() doesn't build a RegExp per call (streaming chat decodes
+// the full id array per generated token).
+const METASPACE_RE = new RegExp(METASPACE, 'g')
+const BYTE_FALLBACK_RE = /^<0x([0-9A-Fa-f]{2})>$/
 
 export async function loadTokenizer(onProgress?: (msg: string) => void): Promise<Tokenizer> {
   onProgress?.('Loading tokenizer.json...')
@@ -96,6 +100,22 @@ export async function loadTokenizer(onProgress?: (msg: string) => void): Promise
 
   const bosId = vocab['<s>'] ?? 1
   const eosId = vocab['</s>'] ?? 2
+
+  // Precomputed decode tables — built once at load time so the streaming
+  // decode() hot loop is branchless per id:
+  //   byteFallback[id] = byte value  (0..255) for <0xHH> tokens, else undefined
+  //   controlIds       = ids whose surface form is a chat-template marker
+  //                      (`<s>`, `</s>`, `<pad>`, `<|...|>`), filtered from output.
+  const byteFallback = new Map<number, number>()
+  const controlIds = new Set<number>()
+  for (let id = 0; id < idToToken.length; id++) {
+    const tok = idToToken[id]
+    if (!tok) continue
+    const m = BYTE_FALLBACK_RE.exec(tok)
+    if (m) { byteFallback.set(id, parseInt(m[1], 16)); continue }
+    if (tok === '<s>' || tok === '</s>' || tok === '<pad>') { controlIds.add(id); continue }
+    if (tok.startsWith('<|') && tok.endsWith('|>')) controlIds.add(id)
+  }
 
   // --------------------------------------------------------
   // BPE core: given a list of symbols, apply merges until no more apply
@@ -203,20 +223,35 @@ export async function loadTokenizer(onProgress?: (msg: string) => void): Promise
   // --------------------------------------------------------
   // Decode: token IDs → text
   //
-  // Simply look up each ID in idToToken, replace ▁ with space.
+  // Phi-3 (SentencePiece) uses byte-fallback tokens of the form <0xHH> for
+  // raw bytes (newline 0x0A, UTF-8 continuation bytes for characters that
+  // weren't learned as merges, etc.). We buffer consecutive byte tokens and
+  // flush them as a UTF-8 string — emitting them individually would produce
+  // literal `<0x0A>` in the output and corrupt multi-byte codepoints.
+  //
+  // `byteFallback` and `controlIds` are precomputed above so the hot loop is
+  // two map lookups per id (no regex, no string prefix checks).
   // --------------------------------------------------------
+  const utf8Decoder = new TextDecoder('utf-8', { fatal: false })
   function decode(ids: number[] | Int32Array): string {
     let text = ''
+    let pendingBytes: number[] = []
+    const flush = () => {
+      if (pendingBytes.length === 0) return
+      text += utf8Decoder.decode(Uint8Array.from(pendingBytes))
+      pendingBytes = []
+    }
     for (const id of ids) {
-      if (id < 0) continue
+      if (id < 0 || controlIds.has(id)) { flush(); continue }
+      const byte = byteFallback.get(id)
+      if (byte !== undefined) { pendingBytes.push(byte); continue }
       const tok = idToToken[id]
       if (!tok) continue
-      // Skip BOS/EOS/PAD in output
-      if (tok === '<s>' || tok === '</s>' || tok === '<pad>') continue
+      flush()
       text += tok
     }
-    // Replace metaspace with actual space, trim leading space
-    return text.replace(new RegExp(METASPACE, 'g'), ' ').trimStart()
+    flush()
+    return text.replace(METASPACE_RE, ' ').trimStart()
   }
 
   onProgress?.('Tokenizer ready')
