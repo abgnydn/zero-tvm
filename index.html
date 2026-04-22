@@ -16,6 +16,50 @@
   <meta name="twitter:title" content="Zero-TVM — Phi-3 in your browser on 10 hand-written shaders">
   <meta name="twitter:description" content="Phi-3-mini decoding at ~40 tok/s via 10 kernel roles / 27 WGSL files and ~2,000 lines of TypeScript. 22% behind WebLLM's autotuned stack, fully readable in one sitting.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
+  <link rel="canonical" href="https://zerotvm.com/">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://zerotvm.com#app",
+        "name": "Zero-TVM",
+        "url": "https://zerotvm.com",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Any (WebGPU browser, Chrome or Edge)",
+        "description": "Phi-3-mini decoding at ~40 tok/s in the browser via 10 kernel roles / 27 WGSL files and ~2,000 lines of TypeScript. No TVM, no WebLLM runtime.",
+        "author": { "@id": "https://zerotvm.com#author" },
+        "isPartOf": {
+          "@type": "CreativeWork",
+          "name": "Kernel-fusion research line",
+          "url": "https://kernelfusion.dev"
+        }
+      },
+      {
+        "@type": "Person",
+        "@id": "https://zerotvm.com#author",
+        "name": "Ahmet Baris Gunaydin",
+        "url": "https://zerotvm.com",
+        "sameAs": [
+          "https://kernelfusion.dev",
+          "https://gpubench.dev",
+          "https://zerotvm.com",
+          "https://webgpu-dna.vercel.app",
+          "https://github.com/abgnydn",
+          "https://www.linkedin.com/in/abgnydn/"
+        ]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://zerotvm.com#site",
+        "url": "https://zerotvm.com",
+        "name": "Zero-TVM",
+        "publisher": { "@id": "https://zerotvm.com#author" }
+      }
+    ]
+  }
+  </script>
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -462,6 +506,60 @@
 
     .cta-section p { font-size: 1rem; color: var(--muted); max-width: 480px; margin: 0 auto 2rem; line-height: 1.7; }
 
+    /* ── RELATED ── */
+    .related-section {
+      padding: 4rem 1.5rem;
+    }
+
+    .related-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+      margin-top: 2rem;
+    }
+
+    .related-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem 1.4rem;
+      text-decoration: none;
+      color: inherit;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      transition: border-color 0.15s, transform 0.1s;
+    }
+
+    .related-card:hover { border-color: #6c63ff55; transform: translateY(-2px); }
+
+    .related-tag {
+      display: inline-block;
+      background: #6c63ff14;
+      color: var(--accent);
+      font-size: 0.6rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      align-self: flex-start;
+    }
+
+    .related-card h4 { font-size: 1rem; font-weight: 700; color: var(--text); }
+    .related-card p  { font-size: 0.78rem; color: var(--muted); line-height: 1.55; }
+
+    .related-cta {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--green);
+      margin-top: auto;
+    }
+
+    @media (max-width: 760px) {
+      .related-grid { grid-template-columns: 1fr; }
+    }
+
     /* ── FOOTER ── */
     footer {
       padding: 2.5rem 1.5rem;
@@ -470,6 +568,23 @@
     }
 
     footer p { font-size: 0.75rem; color: var(--muted); line-height: 1.8; }
+
+    .footer-links {
+      display: flex;
+      gap: 1.25rem;
+      flex-wrap: wrap;
+      justify-content: center;
+      margin-top: 0.75rem;
+      font-size: 0.72rem;
+    }
+
+    .footer-links a {
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+
+    .footer-links a:hover { color: var(--text); }
 
     /* ── MISC ── */
     .divider {
@@ -583,6 +698,7 @@
     <li><a href="#shaders">Shaders</a></li>
     <li><a href="#compare">Compare</a></li>
     <li><a href="#tools">Tools</a></li>
+    <li><a href="#related">Related</a></li>
     <li><a href="docs.html">Docs</a></li>
     <li><a href="zero-tvm.html" class="nav-cta">Try it →</a></li>
   </ul>
@@ -1038,6 +1154,41 @@
 
 <hr class="divider">
 
+<!-- ── RELATED WORK ── -->
+<section id="related" class="related-section">
+  <div class="section-inner">
+    <div class="section-label">Related work</div>
+    <h2 style="font-size:clamp(1.5rem,2.5vw,2rem);font-weight:800;letter-spacing:-0.03em;margin-bottom:0.5rem;">Companion projects</h2>
+    <p style="font-size:0.92rem;color:var(--muted);max-width:640px;line-height:1.7;">
+      Zero-TVM sits inside a broader line of work on GPU-resident compute in the browser. The research hub, the open
+      benchmark suite, and one applied project live at the sites below.
+    </p>
+
+    <div class="related-grid">
+      <a class="related-card" href="https://kernelfusion.dev" target="_blank" rel="noopener">
+        <span class="related-tag">Research</span>
+        <h4>kernelfusion.dev</h4>
+        <p>The research hub. Two preprints, open SDK (<code style="background:#0001;padding:1px 4px;border-radius:3px;">@wgpu-fusion/core</code>), 487 devices tested — up to 4,081× on Apple Silicon.</p>
+        <span class="related-cta">Read the papers →</span>
+      </a>
+      <a class="related-card" href="https://gpubench.dev" target="_blank" rel="noopener">
+        <span class="related-tag">Benchmarks</span>
+        <h4>gpubench.dev</h4>
+        <p>&ldquo;How fast is your GPU in the browser?&rdquo; Open WebGPU compute benchmarks on real devices — Rastrigin, N-body, Monte Carlo Pi, RL environments.</p>
+        <span class="related-cta">Benchmark your GPU →</span>
+      </a>
+      <a class="related-card" href="https://webgpu-dna.vercel.app" target="_blank" rel="noopener">
+        <span class="related-tag">Radiobiology</span>
+        <h4>webgpu-dna</h4>
+        <p>Geant4-DNA electron track-structure Monte Carlo in the browser. Same one-dispatch, full-history pattern applied to radiobiology physics.</p>
+        <span class="related-cta">See the simulation →</span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<hr class="divider">
+
 <!-- ── CTA ── -->
 <section class="cta-section">
   <div class="section-inner" style="display:flex;flex-direction:column;align-items:center;">
@@ -1056,6 +1207,12 @@
     Built with WebGPU · 10 kernel roles · 27 WGSL files · Phi-3-mini-4k-instruct Q4F16<br>
     Weights via <a href="https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC" style="color:var(--accent);text-decoration:none;">mlc-ai on HuggingFace</a> · No server. No framework. No TVM.
   </p>
+  <div class="footer-links">
+    <a href="https://kernelfusion.dev" target="_blank" rel="noopener">kernelfusion.dev</a>
+    <a href="https://gpubench.dev" target="_blank" rel="noopener">gpubench.dev</a>
+    <a href="https://webgpu-dna.vercel.app" target="_blank" rel="noopener">webgpu-dna</a>
+    <a href="https://github.com/abgnydn/zero-tvm" target="_blank" rel="noopener">GitHub</a>
+  </div>
 </footer>
 
 <!-- ── SHARE MODAL ── -->
