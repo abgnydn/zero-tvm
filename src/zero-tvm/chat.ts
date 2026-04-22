@@ -831,8 +831,178 @@ function wireScrollFab() {
   update()
 }
 
-const ICON_COPY  = '<svg class="icon" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>'
-const ICON_CHECK = '<svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>'
+const ICON_COPY    = '<svg class="icon" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>'
+const ICON_CHECK   = '<svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>'
+const ICON_REFRESH = '<svg class="icon" viewBox="0 0 24 24"><path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>'
+
+/** Wire a copy button that shows a 1.5s "Copied" confirmation on success. */
+function wireCopyButton(btn: HTMLButtonElement, getText: () => string): void {
+  btn.innerHTML = `${ICON_COPY}<span>Copy</span>`
+  btn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(getText())
+      btn.classList.add('copied')
+      btn.innerHTML = `${ICON_CHECK}<span>Copied</span>`
+      setTimeout(() => {
+        btn.classList.remove('copied')
+        btn.innerHTML = `${ICON_COPY}<span>Copy</span>`
+      }, 1500)
+    } catch { /* no-op */ }
+  })
+}
+
+// ---------- Minimal markdown renderer ----------
+// Phi-3 emits headings, numbered/bulleted lists, fenced code blocks, inline
+// code and bold. A hand-rolled parser keeps the bundle small; it runs on each
+// streamed token via requestAnimationFrame (see AiMsgHandle.render).
+function renderInline(text: string, into: Node): void {
+  // Tokens: `code`, **bold**, *italic*, [text](url). Longest-match ordered.
+  const re = /(```)|(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\n]+\*)|\[([^\]]+)\]\(([^)\s]+)\)/g
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    if (m[1]) { continue /* ``` inline is unusual; leave it */ }
+    if (m.index > last) into.appendChild(document.createTextNode(text.slice(last, m.index)))
+    if (m[2]) {
+      const c = document.createElement('code'); c.textContent = m[2].slice(1, -1); into.appendChild(c)
+    } else if (m[3]) {
+      const b = document.createElement('strong'); b.textContent = m[3].slice(2, -2); into.appendChild(b)
+    } else if (m[4]) {
+      const em = document.createElement('em'); em.textContent = m[4].slice(1, -1); into.appendChild(em)
+    } else if (m[5] && m[6]) {
+      const a = document.createElement('a')
+      a.href = m[6]; a.textContent = m[5]
+      a.target = '_blank'; a.rel = 'noopener noreferrer'
+      into.appendChild(a)
+    }
+    last = m.index + m[0].length
+  }
+  if (last < text.length) into.appendChild(document.createTextNode(text.slice(last)))
+}
+
+function makeCodeBlock(code: string, lang: string): HTMLElement {
+  const wrap = document.createElement('div')
+  wrap.className = 'code-block'
+  const head = document.createElement('div')
+  head.className = 'code-head'
+  const langEl = document.createElement('span')
+  langEl.className = 'code-lang'
+  langEl.textContent = lang || 'code'
+  head.appendChild(langEl)
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'code-copy'
+  wireCopyButton(btn, () => code)
+  head.appendChild(btn)
+  wrap.appendChild(head)
+  const pre = document.createElement('pre')
+  const codeEl = document.createElement('code')
+  if (lang) codeEl.className = `lang-${lang}`
+  codeEl.textContent = code
+  pre.appendChild(codeEl)
+  wrap.appendChild(pre)
+  return wrap
+}
+
+function renderMarkdown(src: string): DocumentFragment {
+  const frag = document.createDocumentFragment()
+  const lines = src.split('\n')
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    // Skip pure-blank lines between blocks.
+    if (line.trim() === '') { i++; continue }
+
+    // Fenced code block
+    const fence = /^\s*```(.*)$/.exec(line)
+    if (fence) {
+      const lang = fence[1].trim()
+      i++
+      const buf: string[] = []
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { buf.push(lines[i]); i++ }
+      if (i < lines.length) i++ // consume closing fence
+      frag.appendChild(makeCodeBlock(buf.join('\n'), lang))
+      continue
+    }
+
+    // Horizontal rule
+    if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
+      frag.appendChild(document.createElement('hr'))
+      i++
+      continue
+    }
+
+    // Heading
+    const hm = /^(#{1,6})\s+(.*)$/.exec(line)
+    if (hm) {
+      const level = Math.min(6, hm[1].length)
+      const h = document.createElement(`h${level}`) as HTMLElement
+      renderInline(hm[2].trim(), h)
+      frag.appendChild(h)
+      i++
+      continue
+    }
+
+    // Blockquote
+    if (/^\s*>\s?/.test(line)) {
+      const bq = document.createElement('blockquote')
+      const buf: string[] = []
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        buf.push(lines[i].replace(/^\s*>\s?/, ''))
+        i++
+      }
+      renderInline(buf.join(' '), bq)
+      frag.appendChild(bq)
+      continue
+    }
+
+    // Unordered list
+    if (/^\s*[-*]\s+/.test(line)) {
+      const ul = document.createElement('ul')
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        const li = document.createElement('li')
+        renderInline(lines[i].replace(/^\s*[-*]\s+/, ''), li)
+        ul.appendChild(li)
+        i++
+      }
+      frag.appendChild(ul)
+      continue
+    }
+
+    // Ordered list
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const ol = document.createElement('ol')
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        const li = document.createElement('li')
+        renderInline(lines[i].replace(/^\s*\d+\.\s+/, ''), li)
+        ol.appendChild(li)
+        i++
+      }
+      frag.appendChild(ol)
+      continue
+    }
+
+    // Paragraph — absorb contiguous non-blank, non-block lines.
+    const para: string[] = []
+    while (i < lines.length && lines[i].trim() !== '' &&
+           !/^\s*```/.test(lines[i]) &&
+           !/^#{1,6}\s+/.test(lines[i]) &&
+           !/^\s*>\s?/.test(lines[i]) &&
+           !/^\s*[-*]\s+/.test(lines[i]) &&
+           !/^\s*\d+\.\s+/.test(lines[i])) {
+      para.push(lines[i])
+      i++
+    }
+    if (para.length > 0) {
+      const p = document.createElement('p')
+      renderInline(para.join(' '), p)
+      frag.appendChild(p)
+    }
+  }
+  return frag
+}
+
+// ---------- Message construction ----------
 
 function addUserMsg(text: string): void {
   hideWelcome()
@@ -846,12 +1016,28 @@ function addUserMsg(text: string): void {
   scrollToBottom(true)
 }
 
-function addAiMsg(): { wrap: HTMLElement; body: HTMLElement; cursor: HTMLElement } {
+interface AiMsgHandle {
+  wrap: HTMLElement
+  body: HTMLElement
+  cursor: HTMLElement
+  /** Replace the role tag with a thinking indicator (before first token). */
+  showThinking(): void
+  /** Re-render the full text (Markdown) into body on next animation frame. */
+  render(text: string): void
+  /** Remove cursor, add copy + stats + regenerate actions, stop streaming. */
+  finish(opts: { fullText: string; tokens: number; tokPerS: number; onRegenerate?: () => void }): void
+}
+
+function addAiMsg(): AiMsgHandle {
   hideWelcome()
   const wrap = document.createElement('div')
   wrap.className = 'msg ai'
   wrap.innerHTML = `
-    <div class="role"><span class="role-dot">Z</span>Phi-3</div>
+    <div class="role">
+      <span class="role-dot">Z</span>
+      <span class="role-name">Phi-3-mini</span>
+      <span class="model-tag">q4f16_1</span>
+    </div>
     <div class="body"></div>
     <div class="actions"></div>
   `
@@ -861,29 +1047,62 @@ function addAiMsg(): { wrap: HTMLElement; body: HTMLElement; cursor: HTMLElement
   body.appendChild(cursor)
   $('messages')?.appendChild(wrap)
   scrollToBottom(true)
-  return { wrap, body, cursor }
-}
 
-function finishAiMsg(wrap: HTMLElement, cursor: HTMLElement, fullText: string) {
-  cursor.remove()
-  const actions = wrap.querySelector('.actions') as HTMLElement | null
-  if (!actions) return
-  const btn = document.createElement('button')
-  btn.type = 'button'
-  btn.className = 'action-btn'
-  btn.innerHTML = `${ICON_COPY}<span>Copy</span>`
-  btn.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(fullText)
-      btn.classList.add('copied')
-      btn.innerHTML = `${ICON_CHECK}<span>Copied</span>`
-      setTimeout(() => {
-        btn.classList.remove('copied')
-        btn.innerHTML = `${ICON_COPY}<span>Copy</span>`
-      }, 1500)
-    } catch { /* no-op */ }
-  })
-  actions.appendChild(btn)
+  let rafPending = false
+  let latestText = ''
+  const doRender = () => {
+    rafPending = false
+    const frag = renderMarkdown(latestText)
+    body.replaceChildren(frag, cursor)
+    scrollToBottom(false)
+  }
+
+  return {
+    wrap, body, cursor,
+    showThinking() {
+      // Replace the empty body (just cursor) with a thinking indicator.
+      body.replaceChildren()
+      const t = document.createElement('span')
+      t.className = 'thinking'
+      t.innerHTML = '<span></span><span></span><span></span>'
+      body.appendChild(t)
+    },
+    render(text: string) {
+      latestText = text
+      if (!rafPending) {
+        rafPending = true
+        requestAnimationFrame(doRender)
+      }
+    },
+    finish({ fullText, tokens, tokPerS, onRegenerate }) {
+      // Ensure final markdown render without cursor.
+      const frag = renderMarkdown(fullText)
+      body.replaceChildren(frag)
+      const actions = wrap.querySelector('.actions') as HTMLElement | null
+      if (!actions) return
+      actions.replaceChildren()
+
+      const copy = document.createElement('button')
+      copy.type = 'button'
+      copy.className = 'action-btn'
+      wireCopyButton(copy, () => fullText)
+      actions.appendChild(copy)
+
+      if (onRegenerate) {
+        const regen = document.createElement('button')
+        regen.type = 'button'
+        regen.className = 'action-btn'
+        regen.innerHTML = `${ICON_REFRESH}<span>Regenerate</span>`
+        regen.addEventListener('click', onRegenerate)
+        actions.appendChild(regen)
+      }
+
+      const stats = document.createElement('span')
+      stats.className = 'msg-stats'
+      stats.textContent = `${tokens} tok · ${tokPerS.toFixed(1)} tok/s`
+      actions.appendChild(stats)
+    },
+  }
 }
 
 // ============================================================
@@ -1050,13 +1269,17 @@ async function main(): Promise<void> {
   const inp      = $('inp') as HTMLTextAreaElement | null
   const sendBtn  = $('btn') as HTMLButtonElement | null
   const stopBtn  = $('stop-btn') as HTMLButtonElement | null
+  const newBtn   = $('new-chat-btn') as HTMLButtonElement | null
   const suggest  = $('suggest-grid')
+  const ctxHint  = $('ctx-hint')
+  const welcome  = $('welcome')
   if (!form || !inp || !sendBtn || !stopBtn) {
     console.error('[zero-tvm] chat UI elements missing'); return
   }
 
+  const SYSTEM_PROMPT = 'You are a helpful, concise assistant. Use Markdown (numbered lists, **bold**, and fenced ```code``` blocks with a language tag) when it clarifies the answer.'
   const history: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'system', content: SYSTEM_PROMPT },
   ]
   let generating = false
   let stopRequested = false
@@ -1066,20 +1289,45 @@ async function main(): Promise<void> {
     sendBtn.disabled = generating || inp.value.trim().length === 0
   }
   function setBusy(busy: boolean) {
-    if (!inp || !sendBtn || !stopBtn) return
+    if (!inp || !sendBtn || !stopBtn || !newBtn) return
     generating = busy
     sendBtn.hidden = busy
     stopBtn.hidden = !busy
     stopBtn.disabled = !busy
     inp.disabled = busy
+    newBtn.disabled = busy
     inp.placeholder = busy ? 'Generating…' : 'Ask Phi-3 anything…'
+  }
+
+  function updateCtxHint(nTokens?: number) {
+    if (!ctxHint) return
+    if (!nTokens) {
+      ctxHint.textContent = 'Zero TVM · 10 WGSL kernels · 228 dispatches/token'
+    } else {
+      const pct = Math.round((nTokens / PHI3.MAX_SEQ) * 100)
+      ctxHint.textContent = `Context ${nTokens} / ${PHI3.MAX_SEQ} tokens (${pct}%) · 228 dispatches/token`
+    }
+  }
+
+  function resetChat() {
+    if (generating) return
+    history.length = 0
+    history.push({ role: 'system', content: SYSTEM_PROMPT })
+    const msgs = $('messages')
+    if (msgs) msgs.replaceChildren()
+    welcome?.classList.remove('hidden')
+    setStats('')
+    updateCtxHint()
+    inp?.focus()
   }
 
   // Initial enabled state
   inp.disabled = false
   inp.placeholder = 'Ask Phi-3 anything…'
+  newBtn && (newBtn.disabled = false)
   autoGrow(inp)
   updateSendEnabled()
+  updateCtxHint()
   wireScrollFab()
   inp.focus()
 
@@ -1098,6 +1346,7 @@ async function main(): Promise<void> {
     stopRequested = true
     stopBtn.disabled = true
   })
+  newBtn?.addEventListener('click', resetChat)
   suggest?.addEventListener('click', (e) => {
     const target = (e.target as HTMLElement).closest('.suggest') as HTMLElement | null
     if (!target) return
@@ -1108,58 +1357,82 @@ async function main(): Promise<void> {
     form.requestSubmit()
   })
 
+  async function runGeneration(ai: AiMsgHandle, promptIds: number[]): Promise<string> {
+    log(`Prompt: ${promptIds.length} tokens`)
+    updateCtxHint(promptIds.length)
+    ai.showThinking()
+    const t0 = performance.now()
+    let count = 0
+    let firstToken = true
+    const allIds: number[] = []
+    let fullResponse = ''
+
+    try {
+      await engine.generate(promptIds, 500, (id) => {
+        if (stopRequested) throw new Error('__stopped__')
+        if (firstToken) {
+          // Swap thinking indicator for the real body on first token.
+          ai.body.replaceChildren(ai.cursor)
+          firstToken = false
+        }
+        count++
+        allIds.push(id)
+        fullResponse = tokenizer.decode(allIds)
+        ai.render(fullResponse)
+        const elapsed = (performance.now() - t0) / 1000
+        setStats(`${count} tok · ${(count / elapsed).toFixed(1)} tok/s`)
+      })
+    } catch (e) {
+      if (e instanceof Error && e.message === '__stopped__') {
+        fullResponse = tokenizer.decode(allIds)
+      } else {
+        fullResponse += `\n\n_[Error: ${e}]_`
+        log(`Error: ${e}`)
+      }
+    }
+    const totalSec = (performance.now() - t0) / 1000
+    const tokPerS = count / Math.max(totalSec, 0.001)
+    ai.finish({
+      fullText: fullResponse,
+      tokens: count,
+      tokPerS,
+      onRegenerate: () => { void regenerate() },
+    })
+    // Reflect the true KV position count (prompt + generated) in the context hint.
+    updateCtxHint(promptIds.length + count)
+    return fullResponse
+  }
+
+  /** Shared bracketing around a single decode turn: busy flags, prefill
+   * tokenization, run, commit response to history, re-enable UI. */
+  async function runTurn(): Promise<void> {
+    setBusy(true); stopRequested = false
+    const ai = addAiMsg()
+    const promptIds = buildChatPrompt(history, tokenizer)
+    const fullResponse = await runGeneration(ai, promptIds)
+    history.push({ role: 'assistant', content: fullResponse })
+    setBusy(false); stopRequested = false
+    updateSendEnabled()
+    inp?.focus()
+  }
+
   async function send(): Promise<void> {
     if (generating || !inp) return
     const text = inp.value.trim()
     if (!text) return
     inp.value = ''
     autoGrow(inp)
-
-    setBusy(true); stopRequested = false
     addUserMsg(text)
-    const ai = addAiMsg()
     history.push({ role: 'user', content: text })
+    await runTurn()
+  }
 
-    const promptIds = buildChatPrompt(history, tokenizer)
-    log(`Prompt: ${promptIds.length} tokens`)
-
-    const t0 = performance.now()
-    let count = 0
-    const allIds: number[] = []
-    let prevText = ''
-    let fullResponse = ''
-
-    try {
-      await engine.generate(promptIds, 500, (id) => {
-        if (stopRequested) throw new Error('__stopped__')
-        count++
-        allIds.push(id)
-        const full = tokenizer.decode(allIds)
-        const delta = full.slice(prevText.length)
-        if (delta) {
-          ai.cursor.insertAdjacentText('beforebegin', delta)
-          scrollToBottom(false)
-        }
-        prevText = full
-        fullResponse = full
-        const elapsed = (performance.now() - t0) / 1000
-        setStats(`${count} tok · ${(count / elapsed).toFixed(1)} tok/s`)
-      })
-      history.push({ role: 'assistant', content: fullResponse })
-    } catch (e) {
-      if (e instanceof Error && e.message === '__stopped__') {
-        fullResponse = tokenizer.decode(allIds)
-        history.push({ role: 'assistant', content: fullResponse })
-      } else {
-        ai.cursor.insertAdjacentText('beforebegin', `\n[Error: ${e}]`)
-        log(`Error: ${e}`)
-      }
-    }
-
-    finishAiMsg(ai.wrap, ai.cursor, fullResponse)
-    setBusy(false); stopRequested = false
-    updateSendEnabled()
-    inp.focus()
+  async function regenerate(): Promise<void> {
+    if (generating) return
+    if (history.length === 0 || history[history.length - 1].role !== 'assistant') return
+    history.pop()
+    $('messages')?.querySelector('.msg.ai:last-child')?.remove()
+    await runTurn()
   }
 
   // Benchmark harness: `await window.bench(nTokens=128, nRuns=3)`.
