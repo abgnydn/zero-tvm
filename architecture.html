@@ -137,7 +137,7 @@
   <div class="approach" style="border-color:#81c784">
     <span class="tag active">COMPILER</span>
     <h4 style="color:#81c784">Compiler Engine (228/342 Own)</h4>
-    <p>Replaces 228 of 342 dispatches with our 11 hand-written WGSL shaders (post-M4 QKV+RoPE+KV-append fusion). Only attention + LM-head reduction fall back to TVM-style paths. Full prefill + decode.</p>
+    <p>Replaces 228 of 342 dispatches with our 10 hand-written WGSL kernel roles (27 .wgsl files counting tiled/subgroup variants; post-M4 QKV+RoPE+KV-append fusion). Only attention + LM-head reduction fall back to TVM-style paths. Full prefill + decode.</p>
     <div class="files">
       <code>compiler/</code> <code>compiler-chat.html</code>
     </div>

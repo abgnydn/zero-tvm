@@ -2,7 +2,8 @@
  * ZERO-TVM CHAT — Phi-3 inference. No WebLLM. No TVM.
  *
  * Loads weights from browser cache (cached by a prior WebLLM session)
- * or fetches from HuggingFace. Uses our 11 WGSL shaders only.
+ * or fetches from HuggingFace. Uses 10 hand-written WGSL kernel roles
+ * (across 27 .wgsl files counting tiled/subgroup variants).
  *
  * Correct buffer layout:
  *   B.residual  — persistent running residual (updated in-place by add_norm)
@@ -752,42 +753,165 @@ function buildDecodeEngine(
 }
 
 // ============================================================
-// Simple UI helpers
+// UI helpers
 // ============================================================
 
-const $ = (id: string) => document.getElementById(id)!
+const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
+  document.getElementById(id) as T | null
 
 function log(msg: string) {
-  const el = $('log') as HTMLPreElement
+  const el = document.getElementById('progress-log') as HTMLPreElement | null
+  if (!el) { console.log(msg); return }
   el.textContent += msg + '\n'
   el.scrollTop = el.scrollHeight
 }
 
-function setBadge(text: string, loading = false) {
+type BadgeState = 'idle' | 'loading' | 'ready' | 'error'
+function setBadge(text: string, state: BadgeState = 'idle') {
   const badge = $('badge')
-  badge.textContent = text
-  badge.className = loading ? 'badge loading' : 'badge'
+  const txt = $('badge-text')
+  if (txt) txt.textContent = text
+  else if (badge) badge.textContent = text
+  if (badge) badge.className = `badge ${state}`
 }
 
 function setStats(text: string) {
-  $('stats').textContent = text
+  const el = $('stats')
+  if (el) el.textContent = text
 }
 
-function setEnabled(on: boolean) {
-  const inp = $('inp') as HTMLInputElement
-  const btn = $('btn') as HTMLButtonElement
-  inp.disabled = !on
-  btn.disabled = !on
-  if (on) inp.focus()
+function setProgress(pct: number, status?: string, detail?: string) {
+  const bar = $('progress-bar')
+  if (bar) bar.style.width = `${Math.min(100, Math.max(0, pct))}%`
+  if (status !== undefined) {
+    const s = $('progress-status'); if (s) s.textContent = status
+  }
+  const d = $('progress-detail')
+  if (d) d.textContent = detail ?? `${Math.round(pct)}%`
 }
 
-function addMsg(role: 'user' | 'ai'): HTMLElement {
-  const chat = $('chat')
-  const div = document.createElement('div')
-  div.className = `msg ${role}`
-  chat.appendChild(div)
-  chat.scrollTop = chat.scrollHeight
-  return div
+function showLoadingOverlay() { $('loading-overlay')?.classList.add('active') }
+function hideLoadingOverlay() { $('loading-overlay')?.classList.remove('active') }
+function showLoadingError(msg: string) {
+  const el = $('loading-error')
+  if (!el) return
+  el.textContent = msg
+  el.classList.add('visible')
+}
+
+function hideWelcome() {
+  const w = $('welcome')
+  if (w && !w.classList.contains('hidden')) w.classList.add('hidden')
+}
+
+function autoGrow(ta: HTMLTextAreaElement) {
+  ta.style.height = 'auto'
+  ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
+}
+
+function scrollToBottom(force = false) {
+  const main = $('chat-main')
+  if (!main) return
+  const distance = main.scrollHeight - main.scrollTop - main.clientHeight
+  if (force || distance < 120) main.scrollTop = main.scrollHeight
+}
+
+let scrollFabWired = false
+function wireScrollFab() {
+  if (scrollFabWired) return
+  const main = $('chat-main'); const fab = $('scroll-fab')
+  if (!main || !fab) return
+  scrollFabWired = true
+  const update = () => {
+    const distance = main.scrollHeight - main.scrollTop - main.clientHeight
+    fab.classList.toggle('visible', distance > 140)
+  }
+  main.addEventListener('scroll', update, { passive: true })
+  fab.addEventListener('click', () => scrollToBottom(true))
+  update()
+}
+
+const ICON_COPY  = '<svg class="icon" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>'
+const ICON_CHECK = '<svg class="icon" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>'
+
+function addUserMsg(text: string): void {
+  hideWelcome()
+  const wrap = document.createElement('div')
+  wrap.className = 'msg user'
+  const bubble = document.createElement('div')
+  bubble.className = 'bubble'
+  bubble.textContent = text
+  wrap.appendChild(bubble)
+  $('messages')?.appendChild(wrap)
+  scrollToBottom(true)
+}
+
+function addAiMsg(): { wrap: HTMLElement; body: HTMLElement; cursor: HTMLElement } {
+  hideWelcome()
+  const wrap = document.createElement('div')
+  wrap.className = 'msg ai'
+  wrap.innerHTML = `
+    <div class="role"><span class="role-dot">Z</span>Phi-3</div>
+    <div class="body"></div>
+    <div class="actions"></div>
+  `
+  const body = wrap.querySelector('.body') as HTMLElement
+  const cursor = document.createElement('span')
+  cursor.className = 'cursor'
+  body.appendChild(cursor)
+  $('messages')?.appendChild(wrap)
+  scrollToBottom(true)
+  return { wrap, body, cursor }
+}
+
+function finishAiMsg(wrap: HTMLElement, cursor: HTMLElement, fullText: string) {
+  cursor.remove()
+  const actions = wrap.querySelector('.actions') as HTMLElement | null
+  if (!actions) return
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'action-btn'
+  btn.innerHTML = `${ICON_COPY}<span>Copy</span>`
+  btn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(fullText)
+      btn.classList.add('copied')
+      btn.innerHTML = `${ICON_CHECK}<span>Copied</span>`
+      setTimeout(() => {
+        btn.classList.remove('copied')
+        btn.innerHTML = `${ICON_COPY}<span>Copy</span>`
+      }, 1500)
+    } catch { /* no-op */ }
+  })
+  actions.appendChild(btn)
+}
+
+// ============================================================
+// Bootstrap — show pre-download dialog, then run main() on confirm
+// ============================================================
+
+function bootstrap() {
+  const dialog = $('start-dialog') as HTMLDialogElement | null
+  const startBtn = $('start-btn') as HTMLButtonElement | null
+  if (dialog && typeof dialog.showModal === 'function' && !dialog.open) {
+    dialog.showModal()
+  }
+  startBtn?.addEventListener('click', () => {
+    if (dialog?.open) dialog.close()
+    showLoadingOverlay()
+    main().catch(e => {
+      console.error(e)
+      showLoadingError(`${e instanceof Error ? e.message : e}`)
+      setBadge('Error', 'error')
+      log(`FATAL: ${e}`)
+    })
+  })
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootstrap)
+} else {
+  bootstrap()
 }
 
 // ============================================================
@@ -795,18 +919,25 @@ function addMsg(role: 'user' | 'ai'): HTMLElement {
 // ============================================================
 
 async function main(): Promise<void> {
-  setBadge('Initializing...', true)
+  setBadge('Initializing…', 'loading')
+  setProgress(2, 'Requesting GPU access…')
   log('Zero-TVM Phi-3 — No WebLLM, No TVM')
-  log('11 hand-written WGSL shaders + HuggingFace weights')
+  log('10 hand-written WGSL kernel roles across 27 files')
   log('')
 
   if (!navigator.gpu) {
-    setBadge('No WebGPU'); log('ERROR: WebGPU not supported'); return
+    setBadge('No WebGPU', 'error')
+    showLoadingError('WebGPU is not available in this browser. Try Chrome 113+ or Edge 113+.')
+    log('ERROR: WebGPU not supported')
+    return
   }
 
   const adapter = await navigator.gpu.requestAdapter()
   if (!adapter) {
-    setBadge('No GPU adapter'); log('ERROR: No GPU adapter'); return
+    setBadge('No GPU adapter', 'error')
+    showLoadingError('No GPU adapter found.')
+    log('ERROR: No GPU adapter')
+    return
   }
 
   const wantFeatures: GPUFeatureName[] = ['shader-f16' as GPUFeatureName]
@@ -815,8 +946,17 @@ async function main(): Promise<void> {
   if (adapter.features.has('timestamp-query' as GPUFeatureName)) {
     wantFeatures.push('timestamp-query' as GPUFeatureName)
   }
-  const device = await adapter.requestDevice({ requiredFeatures: wantFeatures })
+  let device: GPUDevice
+  try {
+    device = await adapter.requestDevice({ requiredFeatures: wantFeatures })
+  } catch (e) {
+    setBadge('shader-f16 missing', 'error')
+    showLoadingError(`GPU request failed: ${e}. shader-f16 is required — Chrome/Edge 113+.`)
+    log(`ERROR: ${e}`)
+    return
+  }
   log(`GPU ready — features: ${wantFeatures.join(', ')}`)
+  setProgress(5, 'Probing GPU subgroups…')
   // Our _sg shaders assume subgroup size == 32 (full 32-thread workgroup in
   // one subgroup). Apple M-series and most shipping WebGPU subgroup backends
   // report 32; the JS limit is unreliable across Chromium versions so we
@@ -852,65 +992,132 @@ async function main(): Promise<void> {
   }
 
   // Tokenizer
-  setBadge('Loading tokenizer...', true)
+  setBadge('Loading tokenizer…', 'loading')
+  setProgress(8, 'Loading tokenizer…')
   let tokenizer: Tokenizer
   try {
     tokenizer = await loadTokenizer((msg) => log(msg))
   } catch (e) {
-    setBadge('Tokenizer failed'); log(`ERROR: ${e}`); return
+    setBadge('Tokenizer failed', 'error')
+    showLoadingError(`Tokenizer load failed: ${e}`)
+    log(`ERROR: ${e}`)
+    return
   }
 
   // Weights
-  setBadge('Loading weights...', true)
+  setBadge('Downloading…', 'loading')
+  setProgress(10, 'Loading model weights…')
   log('')
-  log('Loading weights (checks browser cache first)...')
+  log('Loading weights (checks browser cache first)…')
   let weights: LoadedWeights
   try {
     weights = await loadWeights(device, (msg) => {
       log(msg)
-      if (msg.startsWith('Loading layer')) setBadge(msg, true)
+      const m = /Loading layer (\d+)/.exec(msg)
+      if (m) {
+        const layer = parseInt(m[1], 10)
+        const pct = (layer / PHI3.LAYERS) * 100
+        setProgress(10 + pct * 0.82, `Loading layer ${layer} / ${PHI3.LAYERS}`, `${Math.round(pct)}%`)
+        setBadge(`${Math.round(pct)}%`, 'loading')
+      }
     })
   } catch (e) {
-    setBadge('Weight load failed')
+    setBadge('Download failed', 'error')
+    showLoadingError(`Weight load failed: ${e}`)
     log(`ERROR loading weights: ${e}`)
-    log('')
-    log('Tip: Visit compiler-chat.html first to cache the model via WebLLM.')
     return
   }
 
   // KV cache: int8 halves memory at the cost of one extra dispatch per layer.
-  log(USE_INT8_KV ? 'Allocating int8 KV cache (~800 MB)...' : 'Allocating KV cache (~1.6 GB)...')
+  setProgress(94, 'Allocating KV cache…')
+  log(USE_INT8_KV ? 'Allocating int8 KV cache (~800 MB)…' : 'Allocating KV cache (~1.6 GB)…')
   const kvPages = USE_INT8_KV ? [] : allocKVPages(device)
   const kvInt8 = USE_INT8_KV ? allocKVPagesInt8(device) : null
 
   // Build engine
-  log('Building decode engine...')
+  setProgress(98, 'Compiling shaders…')
+  log('Building decode engine…')
   const engine = buildDecodeEngine(device, weights, kvPages, kvInt8, { sgSizeOk })
 
+  setProgress(100, 'Ready')
   log('')
-  log('Ready. Zero TVM. 11 WGSL shaders.')
-  setBadge('Ready — Zero TVM')
-  setEnabled(true)
+  log('Ready. Zero TVM. 10 WGSL kernel roles.')
+  setBadge('Ready', 'ready')
+  hideLoadingOverlay()
+
+  // ─────────── Wire chat UI ───────────
+  const form     = $('composer') as HTMLFormElement | null
+  const inp      = $('inp') as HTMLTextAreaElement | null
+  const sendBtn  = $('btn') as HTMLButtonElement | null
+  const stopBtn  = $('stop-btn') as HTMLButtonElement | null
+  const suggest  = $('suggest-grid')
+  if (!form || !inp || !sendBtn || !stopBtn) {
+    console.error('[zero-tvm] chat UI elements missing'); return
+  }
 
   const history: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
     { role: 'system', content: 'You are a helpful assistant.' },
   ]
   let generating = false
+  let stopRequested = false
+
+  function updateSendEnabled() {
+    if (!inp || !sendBtn) return
+    sendBtn.disabled = generating || inp.value.trim().length === 0
+  }
+  function setBusy(busy: boolean) {
+    if (!inp || !sendBtn || !stopBtn) return
+    generating = busy
+    sendBtn.hidden = busy
+    stopBtn.hidden = !busy
+    stopBtn.disabled = !busy
+    inp.disabled = busy
+    inp.placeholder = busy ? 'Generating…' : 'Ask Phi-3 anything…'
+  }
+
+  // Initial enabled state
+  inp.disabled = false
+  inp.placeholder = 'Ask Phi-3 anything…'
+  autoGrow(inp)
+  updateSendEnabled()
+  wireScrollFab()
+  inp.focus()
+
+  inp.addEventListener('input', () => { autoGrow(inp); updateSendEnabled() })
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      if (!sendBtn.disabled) form.requestSubmit()
+    }
+  })
+  form.addEventListener('submit', (e) => {
+    e.preventDefault()
+    if (!sendBtn.disabled) void send()
+  })
+  stopBtn.addEventListener('click', () => {
+    stopRequested = true
+    stopBtn.disabled = true
+  })
+  suggest?.addEventListener('click', (e) => {
+    const target = (e.target as HTMLElement).closest('.suggest') as HTMLElement | null
+    if (!target) return
+    const prompt = target.dataset.prompt
+    if (!prompt) return
+    inp.value = prompt
+    autoGrow(inp); updateSendEnabled()
+    form.requestSubmit()
+  })
 
   async function send(): Promise<void> {
-    if (generating) return
-    const inp = $('inp') as HTMLInputElement
+    if (generating || !inp) return
     const text = inp.value.trim()
     if (!text) return
     inp.value = ''
+    autoGrow(inp)
 
-    generating = true
-    setEnabled(false)
-
-    const userEl = addMsg('user')
-    userEl.textContent = text
-    const aiEl = addMsg('ai')
-
+    setBusy(true); stopRequested = false
+    addUserMsg(text)
+    const ai = addAiMsg()
     history.push({ role: 'user', content: text })
 
     const promptIds = buildChatPrompt(history, tokenizer)
@@ -920,34 +1127,40 @@ async function main(): Promise<void> {
     let count = 0
     const allIds: number[] = []
     let prevText = ''
+    let fullResponse = ''
 
     try {
       await engine.generate(promptIds, 500, (id) => {
+        if (stopRequested) throw new Error('__stopped__')
         count++
         allIds.push(id)
         const full = tokenizer.decode(allIds)
         const delta = full.slice(prevText.length)
-        if (delta) { aiEl.textContent += delta; $('chat').scrollTop = $('chat').scrollHeight }
+        if (delta) {
+          ai.cursor.insertAdjacentText('beforebegin', delta)
+          scrollToBottom(false)
+        }
         prevText = full
+        fullResponse = full
         const elapsed = (performance.now() - t0) / 1000
-        setStats(`${count} tok | ${(count / elapsed).toFixed(1)} tok/s`)
+        setStats(`${count} tok · ${(count / elapsed).toFixed(1)} tok/s`)
       })
-
-      const fullResponse = tokenizer.decode(allIds)
       history.push({ role: 'assistant', content: fullResponse })
     } catch (e) {
-      aiEl.textContent += `\n[Error: ${e}]`
-      log(`Error: ${e}`)
+      if (e instanceof Error && e.message === '__stopped__') {
+        fullResponse = tokenizer.decode(allIds)
+        history.push({ role: 'assistant', content: fullResponse })
+      } else {
+        ai.cursor.insertAdjacentText('beforebegin', `\n[Error: ${e}]`)
+        log(`Error: ${e}`)
+      }
     }
 
-    generating = false
-    setEnabled(true)
+    finishAiMsg(ai.wrap, ai.cursor, fullResponse)
+    setBusy(false); stopRequested = false
+    updateSendEnabled()
+    inp.focus()
   }
-
-  $('btn').addEventListener('click', send)
-  ;($('inp') as HTMLInputElement).addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
-  })
 
   // Benchmark harness: `await window.bench(nTokens=128, nRuns=3)`.
   // Uses a fixed one-turn prompt and runs `nRuns + 1` decodes; the first is
@@ -956,8 +1169,7 @@ async function main(): Promise<void> {
   ;(window as Window & typeof globalThis & { bench?: unknown }).bench =
     async (nTokens: number = 128, nRuns: number = 3, profile: boolean = false): Promise<unknown> => {
       if (generating) { console.warn('[bench] decode already in flight — skipping'); return null }
-      generating = true
-      setEnabled(false)
+      setBusy(true)
       try {
         const benchPrompt = 'Write a four-sentence explanation of how photosynthesis works.'
         const benchHist: Array<{ role: 'system' | 'user'; content: string }> = [
@@ -1003,8 +1215,8 @@ async function main(): Promise<void> {
         console.log(`[bench] summary: median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s`)
         return summary
       } finally {
-        generating = false
-        setEnabled(true)
+        setBusy(false)
+        updateSendEnabled()
       }
     }
   ;(window as Window & typeof globalThis & { benchBatched?: unknown }).benchBatched =
@@ -1019,8 +1231,7 @@ async function main(): Promise<void> {
   ;(window as Window & typeof globalThis & { specSim?: unknown }).specSim =
     async (nTokens: number = 160, N: number = 3, K: number = 3): Promise<unknown> => {
       if (generating) { console.warn('[specSim] decode in flight — skipping'); return null }
-      generating = true
-      setEnabled(false)
+      setBusy(true)
       try {
         const prompts: Array<{ name: string; messages: Array<{ role: 'system' | 'user'; content: string }> }> = [
           {
@@ -1074,13 +1285,11 @@ async function main(): Promise<void> {
         })))
         return results
       } finally {
-        generating = false
-        setEnabled(true)
+        setBusy(false)
+        updateSendEnabled()
       }
     }
   console.log('[bench] harness ready — call `await bench(128, 3)` or `await bench(0, 0, true)` for per-kernel profile')
   console.log('[bench] batched primitive: `await benchBatched(4, 500)` — ffnDown weight-reuse falsifiability test')
   console.log('[bench] PLD acceptance sim: `await specSim(160, 3, 3)` — measures spec-decode upside without GPU changes')
 }
-
-main().catch((e) => { console.error(e); log(`FATAL: ${e}`) })

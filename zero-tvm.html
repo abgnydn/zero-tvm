@@ -16,24 +16,699 @@
   <meta name="twitter:title" content="Zero-TVM Chat — Phi-3-mini on 10 hand-written WGSL shaders">
   <meta name="twitter:description" content="Live browser chat with Phi-3-mini decoding at ~40 tok/s on raw WebGPU. No WebLLM, no TVM, no WASM — 10 kernel roles across 27 WGSL files.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
-  <link rel="stylesheet" href="/style.css">
+  <style>
+    :root {
+      --bg:        #0a0a0c;
+      --panel:     #111114;
+      --panel-2:   #16161b;
+      --border:    #1e1e26;
+      --border-2:  #2a2a34;
+      --text:      #e8e8ec;
+      --text-dim:  #a0a0aa;
+      --muted:     #6b6b78;
+      --accent:    #10b981;
+      --accent-2:  #34d399;
+      --accent-tint: rgba(16, 185, 129, 0.12);
+      --user-bubble: #1a1a22;
+      --danger:    #ef4444;
+      --radius:    12px;
+      --composer-max: 760px;
+      --msg-max:     760px;
+      --font: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
+      --mono: 'SF Mono', ui-monospace, 'Fira Code', 'Menlo', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 15px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
+    }
+
+    button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-2); }
+
+    .icon { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* ─────────── Layout ─────────── */
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      height: 100vh;
+      max-height: 100dvh;
+    }
+
+    /* ─────────── Header ─────────── */
+    .app-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.65rem 1rem;
+      border-bottom: 1px solid var(--border);
+      background: rgba(10, 10, 12, 0.85);
+      backdrop-filter: blur(10px);
+      position: relative;
+      z-index: 10;
+    }
+    .back-link {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      color: var(--text-dim);
+      transition: background 0.15s, color 0.15s;
+    }
+    .back-link:hover { background: var(--panel-2); color: var(--text); }
+    .model-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .model-info h1 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .model-sub {
+      font-size: 0.72rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .header-spacer { flex: 1; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 500;
+      background: var(--panel-2);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+    .badge.loading { color: #fbbf24; background: rgba(251, 191, 36, 0.08); border-color: rgba(251, 191, 36, 0.24); }
+    .badge.loading .dot { background: #fbbf24; animation: pulse 1.4s infinite; }
+    .badge.ready   { color: var(--accent); background: var(--accent-tint); border-color: rgba(16, 185, 129, 0.3); }
+    .badge.ready .dot { background: var(--accent); }
+    .badge.error   { color: var(--danger); background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.25); }
+    .badge.error .dot { background: var(--danger); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    .stats {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    /* ─────────── Chat area ─────────── */
+    .chat-main {
+      overflow-y: auto;
+      scroll-behavior: smooth;
+      position: relative;
+    }
+    .chat-main::-webkit-scrollbar { width: 8px; }
+    .chat-main::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+    .chat-main::-webkit-scrollbar-track { background: transparent; }
+
+    .chat-inner {
+      max-width: var(--msg-max);
+      margin: 0 auto;
+      padding: 1.5rem 1rem 2rem;
+    }
+
+    /* ─────────── Welcome state ─────────── */
+    .welcome {
+      padding: 2rem 1rem 3rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1.25rem;
+      text-align: center;
+    }
+    .welcome.hidden { display: none; }
+    .welcome-logo {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      color: #000;
+      letter-spacing: -0.04em;
+      font-size: 1.1rem;
+    }
+    .welcome-title {
+      font-size: 1.35rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+    .welcome-sub {
+      color: var(--text-dim);
+      font-size: 0.88rem;
+      max-width: 460px;
+    }
+    .suggest-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.6rem;
+      margin-top: 0.75rem;
+      width: 100%;
+    }
+    .suggest {
+      text-align: left;
+      padding: 0.75rem 0.9rem;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text-dim);
+      font-size: 0.82rem;
+      transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .suggest:hover { background: var(--panel-2); border-color: var(--border-2); color: var(--text); }
+    .suggest .suggest-title { color: var(--text); font-weight: 500; display: block; margin-bottom: 2px; }
+
+    /* ─────────── Messages ─────────── */
+    .msg { margin-bottom: 1.5rem; animation: fade-in 0.2s ease; }
+    @keyframes fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+    .msg.user {
+      display: flex;
+      justify-content: flex-end;
+    }
+    .msg.user .bubble {
+      max-width: 85%;
+      background: var(--user-bubble);
+      border: 1px solid var(--border);
+      padding: 0.7rem 0.95rem;
+      border-radius: 16px 16px 4px 16px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+
+    .msg.ai .role {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+    }
+    .msg.ai .role-dot {
+      width: 18px; height: 18px; border-radius: 6px;
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 0.58rem; font-weight: 800; color: #000;
+      letter-spacing: -0.05em;
+    }
+    .msg.ai .body {
+      color: var(--text);
+      word-wrap: break-word;
+    }
+    .msg.ai .body p { margin-bottom: 0.6rem; }
+    .msg.ai .body p:last-child { margin-bottom: 0; }
+    .msg.ai .body code {
+      font-family: var(--mono);
+      font-size: 0.85em;
+      background: var(--panel-2);
+      padding: 1px 5px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .msg.ai .body pre {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.7rem 0.85rem;
+      overflow-x: auto;
+      margin: 0.6rem 0;
+    }
+    .msg.ai .body pre code {
+      background: none; border: none; padding: 0;
+      font-size: 0.82rem; line-height: 1.5;
+    }
+    .msg.ai .body strong { color: #fff; font-weight: 600; }
+    .msg.ai .cursor {
+      display: inline-block;
+      width: 2px;
+      height: 1em;
+      background: var(--accent);
+      margin-left: 2px;
+      vertical-align: text-bottom;
+      animation: blink 1s steps(2) infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+
+    .msg .actions {
+      display: flex;
+      gap: 0.35rem;
+      margin-top: 0.5rem;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .msg:hover .actions { opacity: 1; }
+    .msg.ai .actions { margin-left: -0.35rem; }
+    .msg.user .actions { justify-content: flex-end; }
+    .action-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      color: var(--muted);
+      transition: background 0.15s, color 0.15s;
+    }
+    .action-btn:hover { background: var(--panel-2); color: var(--text); }
+    .action-btn.copied { color: var(--accent); }
+    .action-btn .icon { width: 13px; height: 13px; }
+
+    /* ─────────── Scroll-to-bottom FAB ─────────── */
+    .scroll-fab {
+      position: absolute;
+      bottom: 1rem;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--panel-2);
+      border: 1px solid var(--border-2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-dim);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s, transform 0.2s;
+      z-index: 5;
+    }
+    .scroll-fab.visible { opacity: 1; pointer-events: auto; }
+    .scroll-fab:hover { background: var(--panel); color: var(--text); }
+
+    /* ─────────── Composer ─────────── */
+    .composer-wrap {
+      padding: 0.75rem 1rem 1rem;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .composer {
+      max-width: var(--composer-max);
+      margin: 0 auto;
+      display: flex;
+      align-items: flex-end;
+      gap: 0.5rem;
+      background: var(--panel);
+      border: 1px solid var(--border-2);
+      border-radius: 14px;
+      padding: 0.5rem 0.5rem 0.5rem 0.9rem;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .composer:focus-within {
+      border-color: var(--border-2);
+      background: var(--panel-2);
+    }
+    .composer textarea {
+      flex: 1;
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font: inherit;
+      resize: none;
+      padding: 0.4rem 0;
+      max-height: 200px;
+      line-height: 1.5;
+    }
+    .composer textarea::placeholder { color: var(--muted); }
+    .composer textarea:disabled { cursor: not-allowed; }
+
+    .composer-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      transition: background 0.15s, color 0.15s, opacity 0.15s;
+      flex-shrink: 0;
+    }
+    .composer-btn[hidden] { display: none; }
+    .composer-btn[data-variant="send"] {
+      background: var(--accent);
+      color: #000;
+    }
+    .composer-btn[data-variant="send"]:hover:not(:disabled) { background: var(--accent-2); }
+    .composer-btn[data-variant="send"]:disabled {
+      background: var(--border);
+      color: var(--muted);
+      cursor: not-allowed;
+    }
+    .composer-btn[data-variant="stop"] {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border-2);
+    }
+    .composer-btn[data-variant="stop"]:hover { background: #222228; }
+
+    .composer-hint {
+      max-width: var(--composer-max);
+      margin: 0.4rem auto 0;
+      text-align: center;
+      font-size: 0.68rem;
+      color: var(--muted);
+    }
+    .composer-hint kbd {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: var(--mono);
+      font-size: 0.62rem;
+    }
+
+    /* ─────────── Start dialog (pre-download gate) ─────────── */
+    dialog {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border-2);
+      border-radius: 16px;
+      padding: 0;
+      max-width: 460px;
+      width: calc(100vw - 2rem);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    dialog::backdrop {
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(6px);
+    }
+
+    .dialog-hero {
+      padding: 1.75rem 1.5rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      text-align: center;
+    }
+    .dialog-logo {
+      width: 52px; height: 52px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      color: #000;
+      font-size: 1.15rem;
+      letter-spacing: -0.05em;
+      margin-bottom: 0.9rem;
+    }
+    .dialog-title {
+      font-size: 1.15rem;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      margin-bottom: 0.3rem;
+    }
+    .dialog-sub {
+      color: var(--text-dim);
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+
+    .dialog-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      padding: 1rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .dstat { text-align: center; padding: 0 0.5rem; }
+    .dstat .val { font-weight: 600; font-size: 0.95rem; letter-spacing: -0.01em; }
+    .dstat .lab { font-size: 0.66rem; color: var(--muted); margin-top: 3px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    .dialog-notes {
+      padding: 0.9rem 1.25rem;
+      color: var(--text-dim);
+      font-size: 0.78rem;
+      line-height: 1.6;
+      border-bottom: 1px solid var(--border);
+    }
+    .dialog-notes ul { margin: 0; padding-left: 1.1rem; }
+    .dialog-notes li { margin-bottom: 0.2rem; }
+    .dialog-notes li:last-child { margin-bottom: 0; }
+
+    .dialog-actions {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.85rem 1rem;
+    }
+    .dialog-btn {
+      flex: 1;
+      padding: 0.65rem 1rem;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.88rem;
+      transition: background 0.15s, color 0.15s, opacity 0.15s;
+      border: 1px solid transparent;
+    }
+    .dialog-btn[data-variant="cancel"] {
+      background: transparent;
+      color: var(--text-dim);
+      border-color: var(--border);
+    }
+    .dialog-btn[data-variant="cancel"]:hover { background: var(--panel-2); color: var(--text); }
+    .dialog-btn[data-variant="primary"] {
+      background: var(--accent);
+      color: #000;
+    }
+    .dialog-btn[data-variant="primary"]:hover:not(:disabled) { background: var(--accent-2); }
+    .dialog-btn[data-variant="primary"]:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* ─────────── Loading overlay ─────────── */
+    .loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(10, 10, 12, 0.92);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 90;
+      padding: 1rem;
+    }
+    .loading-overlay.active { display: flex; }
+
+    .loading-card {
+      background: var(--panel);
+      border: 1px solid var(--border-2);
+      border-radius: 16px;
+      padding: 1.75rem 1.5rem 1.25rem;
+      max-width: 440px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    .loading-title {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 0.2rem;
+    }
+    .loading-status {
+      color: var(--text-dim);
+      font-size: 0.82rem;
+      margin-bottom: 1rem;
+      min-height: 1.2em;
+    }
+    .progress-track {
+      height: 6px;
+      background: var(--panel-2);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--accent), #8b5cf6);
+      border-radius: 999px;
+      transition: width 0.25s ease;
+    }
+    .progress-detail {
+      color: var(--muted);
+      font-size: 0.72rem;
+      margin-top: 0.5rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .loading-log-details {
+      margin-top: 0.85rem;
+    }
+    .loading-log-details summary {
+      font-size: 0.74rem;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .loading-log-details summary::-webkit-details-marker { display: none; }
+    .loading-log-details summary:hover { color: var(--text-dim); }
+    .loading-log-details summary::before { content: '▸'; transition: transform 0.15s; font-size: 0.65rem; }
+    .loading-log-details[open] summary::before { transform: rotate(90deg); }
+    .loading-log {
+      margin-top: 0.5rem;
+      max-height: 140px;
+      overflow-y: auto;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem 0.65rem;
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    .loading-log::-webkit-scrollbar { width: 6px; }
+    .loading-log::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 3px; }
+
+    .loading-error {
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      color: #fca5a5;
+      padding: 0.65rem 0.8rem;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      margin-top: 0.85rem;
+      display: none;
+    }
+    .loading-error.visible { display: block; }
+
+    /* ─────────── Responsive ─────────── */
+    @media (max-width: 640px) {
+      .app-header { padding: 0.55rem 0.75rem; }
+      .model-info h1 { font-size: 0.9rem; }
+      .model-sub { font-size: 0.68rem; }
+      .chat-inner { padding: 1rem 0.75rem 1.25rem; }
+      .composer-wrap { padding: 0.55rem 0.75rem 0.75rem; }
+      .welcome { padding: 1.25rem 0.5rem 1.5rem; }
+      .welcome-title { font-size: 1.15rem; }
+      .suggest-grid { grid-template-columns: 1fr; }
+      .badge { padding: 3px 8px; font-size: 0.68rem; }
+      .stats { display: none; }
+    }
+  </style>
 </head>
 <body>
-  <div class="container">
-    <header>
-      <a href="/" class="back-link">← zerotvm.com</a>
-      <h1>Zero TVM</h1>
-      <span id="badge" class="badge loading">Loading...</span>
-      <span id="stats" class="stats"></span>
-    </header>
-    <div id="chat" class="chat"></div>
-    <div class="input-row">
-      <input id="inp" type="text" placeholder="Type a message..." disabled>
-      <button id="btn" disabled>Send</button>
+  <!-- ─────────── Pre-download gate ─────────── -->
+  <dialog id="start-dialog">
+    <div class="dialog-hero">
+      <div class="dialog-logo">Z</div>
+      <div class="dialog-title">Phi-3-mini on raw WebGPU</div>
+      <div class="dialog-sub">Runs entirely in your browser on 10 hand-written WGSL kernels. No server, no API calls, no data leaves this tab.</div>
     </div>
-    <pre id="log" class="log"></pre>
+    <div class="dialog-stats">
+      <div class="dstat"><div class="val">~2 GB</div><div class="lab">weights</div></div>
+      <div class="dstat"><div class="val">~40 t/s</div><div class="lab">M2 Pro</div></div>
+      <div class="dstat"><div class="val">f16</div><div class="lab">WebGPU</div></div>
+    </div>
+    <div class="dialog-notes">
+      <ul>
+        <li>Cached after first load — next visit starts in seconds</li>
+        <li>Chrome 113+ / Edge 113+ with shader-f16 required</li>
+        <li>Progress and detailed log shown while downloading</li>
+      </ul>
+    </div>
+    <div class="dialog-actions">
+      <a class="dialog-btn" data-variant="cancel" href="/">Not now</a>
+      <button class="dialog-btn" data-variant="primary" id="start-btn">Download &amp; start →</button>
+    </div>
+  </dialog>
+
+  <!-- ─────────── Loading overlay ─────────── -->
+  <div class="loading-overlay" id="loading-overlay">
+    <div class="loading-card">
+      <div class="loading-title" id="loading-title">Preparing Zero-TVM</div>
+      <div class="loading-status" id="progress-status">Starting…</div>
+      <div class="progress-track"><div class="progress-fill" id="progress-bar"></div></div>
+      <div class="progress-detail" id="progress-detail">0%</div>
+      <details class="loading-log-details">
+        <summary>Details</summary>
+        <pre class="loading-log" id="progress-log"></pre>
+      </details>
+      <div class="loading-error" id="loading-error"></div>
+    </div>
   </div>
-  <footer>Zero WebLLM. Zero TVM. 11 WGSL shaders. Weights from HuggingFace cache.</footer>
+
+  <!-- ─────────── App shell ─────────── -->
+  <div class="app">
+    <header class="app-header">
+      <a href="/" class="back-link" title="Back to zerotvm.com" aria-label="Back to zerotvm.com">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+      </a>
+      <div class="model-info">
+        <h1>Phi-3-mini</h1>
+        <div class="model-sub">10 WGSL kernels · paged KV · WebGPU</div>
+      </div>
+      <div class="header-spacer"></div>
+      <span class="stats" id="stats"></span>
+      <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">Waiting</span></span>
+    </header>
+
+    <main class="chat-main" id="chat-main">
+      <div class="chat-inner">
+        <div class="welcome" id="welcome">
+          <div class="welcome-logo">Z</div>
+          <div class="welcome-title">Chat with Phi-3-mini</div>
+          <div class="welcome-sub">Running locally on your GPU through 10 hand-written WGSL kernels. Ask anything — the model has a 4 K context window and streams tokens as they're decoded.</div>
+          <div class="suggest-grid" id="suggest-grid">
+            <button class="suggest" data-prompt="Explain WebGPU compute shaders in 3 sentences.">
+              <span class="suggest-title">Explain WebGPU</span>
+              compute shaders in 3 sentences
+            </button>
+            <button class="suggest" data-prompt="Write a haiku about hand-written GPU kernels.">
+              <span class="suggest-title">Write a haiku</span>
+              about hand-written GPU kernels
+            </button>
+            <button class="suggest" data-prompt="Summarize the transformer decode loop.">
+              <span class="suggest-title">Summarize</span>
+              the transformer decode loop
+            </button>
+            <button class="suggest" data-prompt="Give me four things to ask a small LLM that a big one would answer better.">
+              <span class="suggest-title">Honest comparison</span>
+              where a 3.8B model falls short
+            </button>
+          </div>
+        </div>
+        <div id="messages"></div>
+      </div>
+      <button class="scroll-fab" id="scroll-fab" title="Scroll to bottom" aria-label="Scroll to bottom">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+      </button>
+    </main>
+
+    <div class="composer-wrap">
+      <form class="composer" id="composer">
+        <textarea id="inp" rows="1" placeholder="Waiting for model…" disabled></textarea>
+        <button class="composer-btn" data-variant="send" id="btn" type="submit" disabled aria-label="Send">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>
+        </button>
+        <button class="composer-btn" data-variant="stop" id="stop-btn" type="button" hidden aria-label="Stop">
+          <svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+        </button>
+      </form>
+      <div class="composer-hint"><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for new line · <span style="color:var(--text-dim)">Zero TVM · 10 WGSL kernels · 228 dispatches/token</span></div>
+    </div>
+  </div>
   <script type="module" src="/src/zero-tvm/chat.ts"></script>
 </body>
 </html>
