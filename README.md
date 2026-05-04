@@ -2,6 +2,11 @@
 
 # Zero-TVM
 
+[![CI](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml/badge.svg)](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Live](https://img.shields.io/badge/live-zerotvm.com-6ea8ff)](https://zerotvm.com)
+[![Bench](https://img.shields.io/badge/bench-vs%20WebLLM-orange)](./BENCH.md)
+
 **[zerotvm.com](https://zerotvm.com)**
 
 **Phi-3-mini running in a browser on hand-written WGSL shaders. No TVM. No WebLLM runtime. No compiler.**
