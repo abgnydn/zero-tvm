@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zero-TVM — Phi-3 in your browser on 10 hand-written shaders</title>
-  <meta name="description" content="Phi-3-mini decoding at ~40 tok/s via 10 kernel roles / 27 WGSL files and ~2,000 lines of TypeScript. No TVM, no WebLLM runtime, no compiler — readable end-to-end.">
+  <title>Zero-TVM — Phi-3 in your browser · 10 kernels across 27 WGSL files</title>
+  <meta name="description" content="Phi-3-mini decoding via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime, readable end-to-end.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zerotvm.com/">
-  <meta property="og:title" content="Zero-TVM — Phi-3 in your browser on 10 hand-written shaders">
-  <meta property="og:description" content="Phi-3-mini decoding at ~40 tok/s via 10 kernel roles / 27 WGSL files and ~2,000 lines of TypeScript. 22% behind WebLLM's autotuned stack, fully readable in one sitting.">
+  <meta property="og:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 27 WGSL files">
+  <meta property="og:description" content="Phi-3-mini decoding via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Zero-TVM — Phi-3 in your browser on 10 hand-written shaders">
-  <meta name="twitter:description" content="Phi-3-mini decoding at ~40 tok/s via 10 kernel roles / 27 WGSL files and ~2,000 lines of TypeScript. 22% behind WebLLM's autotuned stack, fully readable in one sitting.">
+  <meta name="twitter:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 27 WGSL files">
+  <meta name="twitter:description" content="Phi-3-mini decoding via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <link rel="canonical" href="https://zerotvm.com/">
   <script type="application/ld+json">
@@ -28,7 +28,7 @@
         "url": "https://zerotvm.com",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Any (WebGPU browser, Chrome or Edge)",
-        "description": "Phi-3-mini decoding at ~40 tok/s in the browser via 10 kernel roles / 27 WGSL files and ~2,000 lines of TypeScript. No TVM, no WebLLM runtime.",
+        "description": "Phi-3-mini decoding in the browser via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime.",
         "author": { "@id": "https://zerotvm.com#author" },
         "isPartOf": {
           "@type": "CreativeWork",
@@ -42,10 +42,16 @@
         "name": "Ahmet Baris Gunaydin",
         "url": "https://zerotvm.com",
         "sameAs": [
+          "https://barisgunaydin.com",
           "https://kernelfusion.dev",
           "https://gpubench.dev",
           "https://zerotvm.com",
-          "https://webgpu-dna.vercel.app",
+          "https://webgpudna.com",
+          "https://neuropulse.live",
+          "https://webgpu-q.vercel.app",
+          "https://markview.ai",
+          "https://safenpm.dev",
+          "https://fused-lora.pages.dev",
           "https://github.com/abgnydn",
           "https://www.linkedin.com/in/abgnydn/"
         ]
@@ -513,7 +519,7 @@
 
     .related-grid {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(2, 1fr);
       gap: 1rem;
       margin-top: 2rem;
     }
@@ -710,7 +716,7 @@
 
   <h1>
     Run <span class="accent">Phi-3</span> in your browser<br>
-    with <span class="green">10 hand-written shaders</span>
+    with <span class="green">10 kernels / 27 WGSL files</span>
   </h1>
 
   <p class="hero-sub">
@@ -1168,7 +1174,7 @@
       <a class="related-card" href="https://kernelfusion.dev" target="_blank" rel="noopener">
         <span class="related-tag">Research</span>
         <h4>kernelfusion.dev</h4>
-        <p>The research hub. Two preprints, open SDK (<code style="background:#0001;padding:1px 4px;border-radius:3px;">@wgpu-fusion/core</code>), 487 devices tested — up to 4,081× on Apple Silicon.</p>
+        <p>The research hub. Two preprints, open SDK (<code style="background:#0001;padding:1px 4px;border-radius:3px;">@wgpu-fusion/core</code>), 592 devices tested — up to 2,865× on Apple Silicon.</p>
         <span class="related-cta">Read the papers →</span>
       </a>
       <a class="related-card" href="https://gpubench.dev" target="_blank" rel="noopener">
@@ -1177,11 +1183,23 @@
         <p>&ldquo;How fast is your GPU in the browser?&rdquo; Open WebGPU compute benchmarks on real devices — Rastrigin, N-body, Monte Carlo Pi, RL environments.</p>
         <span class="related-cta">Benchmark your GPU →</span>
       </a>
-      <a class="related-card" href="https://webgpu-dna.vercel.app" target="_blank" rel="noopener">
+      <a class="related-card" href="https://webgpudna.com" target="_blank" rel="noopener">
         <span class="related-tag">Radiobiology</span>
         <h4>webgpu-dna</h4>
         <p>Geant4-DNA electron track-structure Monte Carlo in the browser. Same one-dispatch, full-history pattern applied to radiobiology physics.</p>
         <span class="related-cta">See the simulation →</span>
+      </a>
+      <a class="related-card" href="https://neuropulse.live" target="_blank" rel="noopener">
+        <span class="related-tag">Visualization</span>
+        <h4>neuropulse.live</h4>
+        <p>Same Phi-3-mini forward pass, visualised tensor by tensor. Every glow is a live WebGPU activation read-back — 3.8B parameters, zero server, zero API key.</p>
+        <span class="related-cta">Watch it think →</span>
+      </a>
+      <a class="related-card" href="https://webgpu-q.vercel.app" target="_blank" rel="noopener">
+        <span class="related-tag">Quantum</span>
+        <h4>webgpu-q</h4>
+        <p>Full-featured quantum circuit simulator in a single browser tab. Statevector + MPS engines on commodity hardware via WebGPU compute — same one-dispatch pattern as Zero-TVM, applied to quantum circuits at 70+ qubits.</p>
+        <span class="related-cta">Open the simulator →</span>
       </a>
     </div>
   </div>
@@ -1208,10 +1226,13 @@
     Weights via <a href="https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC" style="color:var(--accent);text-decoration:none;">mlc-ai on HuggingFace</a> · No server. No framework. No TVM.
   </p>
   <div class="footer-links">
+    <a href="https://github.com/abgnydn/zero-tvm" target="_blank" rel="noopener" style="color:var(--accent)">★ Star on GitHub</a>
+    <a href="https://www.linkedin.com/in/abgnydn/" target="_blank" rel="noopener">Follow on LinkedIn</a>
+    <a href="https://barisgunaydin.com" target="_blank" rel="noopener">barisgunaydin.com</a>
     <a href="https://kernelfusion.dev" target="_blank" rel="noopener">kernelfusion.dev</a>
     <a href="https://gpubench.dev" target="_blank" rel="noopener">gpubench.dev</a>
-    <a href="https://webgpu-dna.vercel.app" target="_blank" rel="noopener">webgpu-dna</a>
-    <a href="https://github.com/abgnydn/zero-tvm" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://webgpudna.com" target="_blank" rel="noopener">webgpu-dna</a>
+    <a href="https://neuropulse.live" target="_blank" rel="noopener">neuropulse.live</a>
   </div>
 </footer>
 
