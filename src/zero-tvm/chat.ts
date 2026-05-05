@@ -790,7 +790,6 @@ function setProgress(pct: number, status?: string, detail?: string) {
   if (d) d.textContent = detail ?? `${Math.round(pct)}%`
 }
 
-function showLoadingOverlay() { $('loading-overlay')?.classList.add('active') }
 function hideLoadingOverlay() { $('loading-overlay')?.classList.remove('active') }
 function showLoadingError(msg: string) {
   const el = $('loading-error')
@@ -1106,31 +1105,64 @@ function addAiMsg(): AiMsgHandle {
 }
 
 // ============================================================
-// Bootstrap — show pre-download dialog, then run main() on confirm
+// Boot helpers — SW registration, cache probe, download-gate UI
+// (replaces the legacy <dialog>-based bootstrap; SW gives a single
+// shared weight cache across /zero-tvm chat + compiler-chat + webllm-bench)
 // ============================================================
 
-function bootstrap() {
-  const dialog = $('start-dialog') as HTMLDialogElement | null
-  const startBtn = $('start-btn') as HTMLButtonElement | null
-  if (dialog && typeof dialog.showModal === 'function' && !dialog.open) {
-    dialog.showModal()
+async function registerWeightsSW(): Promise<void> {
+  if (!('serviceWorker' in navigator)) return
+  try {
+    await navigator.serviceWorker.register('/weights-cache-sw.js', { scope: '/' })
+    // Wait for the active SW so first weight fetch is intercepted (and
+    // shared with WebLLM in compiler-chat.html / webllm-bench.html).
+    await navigator.serviceWorker.ready
+  } catch (e) {
+    // Best-effort — chat still works, just no shared cache.
+    console.warn('[zero-tvm] weight-cache SW registration failed:', e)
   }
-  startBtn?.addEventListener('click', () => {
-    if (dialog?.open) dialog.close()
-    showLoadingOverlay()
-    main().catch(e => {
-      console.error(e)
-      showLoadingError(`${e instanceof Error ? e.message : e}`)
-      setBadge('Error', 'error')
-      log(`FATAL: ${e}`)
-    })
-  })
 }
 
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', bootstrap)
-} else {
-  bootstrap()
+async function hasWeightsCached(): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
+  try {
+    const root = await navigator.storage.getDirectory()
+    const dir = await root.getDirectoryHandle('zero-tvm-weights')
+    // ndarray-cache.json is the smallest sentinel — its presence means at
+    // least the manifest has been fetched (and shards followed in-session).
+    await dir.getFileHandle('ndarray-cache.json')
+    return true
+  } catch {
+    return false
+  }
+}
+
+function showDownloadGate(): Promise<void> {
+  return new Promise((resolve) => {
+    const chat = document.getElementById('chat')
+    if (!chat) { resolve(); return }
+    // Same #start-screen / #start-btn IDs as compiler-chat.html so existing
+    // e2e harness (which clicks #start-btn) works on both pages uniformly.
+    chat.innerHTML = `
+      <div id="start-screen" class="start-screen" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;gap:1.25rem;text-align:center;padding:2rem">
+        <div class="title" style="font-size:1.1rem;font-weight:600;color:#ccc">Phi-3-mini, in your browser</div>
+        <div class="desc" style="font-size:0.85rem;color:#888;max-width:440px;line-height:1.6">
+          First load downloads ~1.8 GB of Phi-3-mini-q4f16_1 weights and caches them
+          locally (OPFS). Every subsequent visit — including the WebLLM comparison
+          page — is instant; weights are served from the same shared browser cache.
+        </div>
+        <button id="start-btn" class="start-btn" style="background:#10b981;color:#000;font-weight:600;font-size:0.95rem;padding:0.7rem 2rem;border:none;border-radius:8px;cursor:pointer">Download &amp; Start</button>
+        <div class="start-hint" style="font-size:0.68rem;color:#444">Phi-3-mini-4k-instruct-q4f16_1 · ~1.8 GB · cached after first load</div>
+      </div>`
+    setBadge('Waiting')
+    const btn = document.getElementById('start-btn') as HTMLButtonElement | null
+    btn?.addEventListener('click', () => {
+      btn.disabled = true
+      btn.textContent = 'Starting...'
+      chat.innerHTML = ''
+      resolve()
+    }, { once: true })
+  })
 }
 
 // ============================================================
@@ -1566,3 +1598,14 @@ async function main(): Promise<void> {
   console.log('[bench] batched primitive: `await benchBatched(4, 500)` — ffnDown weight-reuse falsifiability test')
   console.log('[bench] PLD acceptance sim: `await specSim(160, 3, 3)` — measures spec-decode upside without GPU changes')
 }
+async function boot(): Promise<void> {
+  // Register the weight-cache SW first so it intercepts the very first
+  // network fetch (from main()'s loadWeights call) — and any future
+  // fetch from WebLLM in compiler-chat / webllm-bench.
+  await registerWeightsSW()
+  // Skip the gate when weights are already in OPFS — returning visitors
+  // (or visitors who started from compiler-chat) should boot straight in.
+  if (!(await hasWeightsCached())) await showDownloadGate()
+  await main()
+}
+boot().catch((e) => { console.error(e); log(`FATAL: ${e}`) })

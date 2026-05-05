@@ -403,13 +403,43 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
 // Chat UI
 // ============================================================
 
+async function registerWeightsSW(): Promise<void> {
+  if (!('serviceWorker' in navigator)) return
+  try {
+    await navigator.serviceWorker.register('/weights-cache-sw.js', { scope: '/' })
+    await navigator.serviceWorker.ready
+  } catch (e) {
+    console.warn('[compiler-chat] weight-cache SW registration failed:', e)
+  }
+}
+
+async function hasSharedWeightsCached(): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
+  try {
+    const root = await navigator.storage.getDirectory()
+    const dir = await root.getDirectoryHandle('zero-tvm-weights')
+    await dir.getFileHandle('ndarray-cache.json')
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function main(): Promise<void> {
   const ui = new ChatUI()
   const llm = new LLMEngine()
 
-  // Wait for user to click "Download & Start" before fetching ~2 GB of weights
+  // Register the shared weight-cache SW first. WebLLM's fetches to the
+  // Phi-3 mirror are intercepted and served from / written to the same
+  // OPFS dir zero-tvm.html uses, so visiting both pages downloads once.
+  await registerWeightsSW()
+
+  // Wait for user to click "Download & Start" before fetching ~2 GB of weights.
+  // If the shared cache already has weights (e.g. the visitor came from
+  // zero-tvm.html), skip the gate — load is instant.
   const startBtn = document.getElementById('start-btn') as HTMLButtonElement | null
-  if (startBtn) {
+  const cached = await hasSharedWeightsCached()
+  if (startBtn && !cached) {
     await new Promise<void>(resolve => {
       startBtn.addEventListener('click', () => {
         startBtn.disabled = true
@@ -417,6 +447,10 @@ async function main(): Promise<void> {
         resolve()
       })
     })
+    const startScreen = document.getElementById('start-screen')
+    if (startScreen) startScreen.remove()
+  } else if (cached) {
+    // Cached path — drop the gate immediately.
     const startScreen = document.getElementById('start-screen')
     if (startScreen) startScreen.remove()
   }

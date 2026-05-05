@@ -131,17 +131,27 @@ export async function newPage(path: string): Promise<Page> {
     if (m.type() === 'error') console.error(`[console.error] ${m.text()}`)
   })
   await page.goto(`${BASE}${path}`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
-  // Both pages have a #start-btn in static HTML — wait for it so test code
-  // doesn't race the page parser.
-  await page.waitForSelector('#start-btn', { timeout: 10_000 })
+  // The download gate's #start-btn appears either statically (compiler-chat,
+  // validate) or injected by chat.ts after the SW + OPFS-sentinel probe.
+  // When OPFS already has the weight manifest (returning visitor / cache-shared
+  // path) chat.ts skips the gate entirely — wait briefly and don't fail if
+  // it never shows up.
+  try {
+    await page.waitForSelector('#start-btn', { timeout: 8_000 })
+  } catch {
+    // No gate — auto-boot (cached) path. bootAndWaitReady handles both.
+  }
   return page
 }
 
-/** Click the "Download & Start" / "Run Validation" button and wait for the
- * shared loading-ui badge to flip to Ready. The first call may take minutes
- * (weight download); subsequent calls finish quickly. */
+/** Click the "Download & Start" / "Run Validation" button if the gate is
+ * present, then wait for the shared loading-ui badge to flip to Ready. The
+ * first call may take minutes (weight download); subsequent calls finish
+ * quickly. Tolerates the cache-shared / cached-skip path where the gate is
+ * never injected. */
 export async function bootAndWaitReady(page: Page, timeoutMs: number): Promise<void> {
-  await page.click('#start-btn')
+  const hasGate = await page.$('#start-btn')
+  if (hasGate) await page.click('#start-btn')
   await page.waitForFunction(
     () => document.getElementById('badge')?.textContent === 'Ready',
     { timeout: timeoutMs, polling: 500 }

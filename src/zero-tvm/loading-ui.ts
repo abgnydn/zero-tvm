@@ -157,7 +157,7 @@ export async function bootEngine(): Promise<BootResult> {
   const kvPages = allocKVPages(device)
   setProgress(96, 'Compiling shaders...')
 
-  log('Compiling 10 WGSL shaders')
+  log('Compiling 27 WGSL files (10 kernel roles)')
   const engine = buildDecodeEngine(device, weights, kvPages)
 
   // Pipeline warmup. createComputePipeline only registers shaders — Chrome's
@@ -175,7 +175,7 @@ export async function bootEngine(): Promise<BootResult> {
   log(`Warmup forward: ${Math.round(performance.now() - warmupT0)} ms`)
 
   setProgress(100, 'Ready')
-  log('Ready. Zero TVM. 10 WGSL shaders.')
+  log('Ready. Zero TVM. 10 kernels across 27 WGSL files.')
   setBadge('Ready', 'ready')
 
   return { ok: true, device, tokenizer, weights, engine }
