@@ -42,3 +42,40 @@ those by hand from the printed checklist.
 ```json
 { "ztDecode": 42.14, "webllmDecode": 51.5, "hardware": "M2 Pro, 19-core", "date": "2026-06-23" }
 ```
+
+## Run it on a cloud GPU (no Mac)
+
+You don't need a local machine — any NVIDIA GPU instance works (RunPod, Lambda,
+Modal, a GPU CI runner, …). `bench/Dockerfile` boots headless Chrome on the
+container's GPU, primes the weights, runs both engines, and prints
+`results.json`:
+
+```bash
+docker build -f bench/Dockerfile -t zerotvm-bench .
+docker run --gpus all --rm zerotvm-bench
+```
+
+Needs the NVIDIA Container Toolkit (so the container sees the driver's Vulkan
+ICD) and outbound `huggingface.co`. Copy the printed JSON into
+`bench/results.json` locally and run `npm run bench:sync -- --write` (no GPU) to
+update the docs. Caveat: a cloud NVIDIA GPU is a different baseline than the
+M2 Pro in BENCH.md — absolute tok/s will differ; the Zero-TVM-vs-WebLLM **gap**
+is the portable number. `cloud-bench.sh` auto-labels the run with the GPU name.
+
+### As a GPU CI job
+
+On a GPU-enabled runner (needs `workflow` scope to add):
+
+```yaml
+  bench:
+    runs-on: [self-hosted, gpu]   # or a GPU cloud runner
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f bench/Dockerfile -t zerotvm-bench .
+      - run: docker run --gpus all --rm -v ${{ github.workspace }}/out:/app/bench zerotvm-bench
+      # then commit out/results.json and run `npm run bench:sync -- --write`
+```
+
+> The kernel-correctness suite (`npm run test:kernels`) needs **no** GPU — it
+> runs on Mesa lavapipe in any container. Only this throughput bench needs a
+> real adapter.

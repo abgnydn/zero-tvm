@@ -26,6 +26,10 @@ const N_TOKENS = Number(process.env.BENCH_TOKENS ?? 128)
 const N_RUNS = Number(process.env.BENCH_RUNS ?? 5)
 const HARDWARE = process.env.BENCH_HW ?? 'unknown GPU'
 const READY_MS = 12 * 60 * 1000 // first run downloads ~2 GB
+// headless:false matches the e2e harness (most reliable on a desktop GPU under
+// a display/Xvfb). In a container on a real GPU, BENCH_HEADLESS=new skips Xvfb.
+const HEADLESS =
+  process.env.BENCH_HEADLESS === 'new' ? 'new' : process.env.BENCH_HEADLESS === 'true'
 
 async function waitForUrl(url, timeoutMs) {
   const start = Date.now()
@@ -67,8 +71,9 @@ let ok = false
 try {
   await waitForUrl(`${BASE}/zero-tvm.html`, 30_000)
   browser = await puppeteer.launch({
-    headless: false,
+    headless: HEADLESS,
     args: [
+      '--no-sandbox', // required when running as root in a container
       '--enable-unsafe-webgpu',
       '--enable-features=Vulkan',
       '--enable-dawn-features=allow_unsafe_apis',

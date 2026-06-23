@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+.tests-cache
+.vercel
+*.log
+bench/results.json
