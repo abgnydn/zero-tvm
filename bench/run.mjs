@@ -70,13 +70,21 @@ let browser
 let ok = false
 try {
   await waitForUrl(`${BASE}/zero-tvm.html`, 30_000)
+  // Headless Linux + a real NVIDIA GPU (container / Colab) needs ANGLE-over-
+  // Vulkan with no display surface — per Chrome's headless-GPU docs
+  // (developer.chrome.com/docs/web-platform/webgpu/colab-headless). The desktop
+  // path (headless:false, e.g. macOS/Metal) keeps the simpler flag set.
+  const gpuArgs =
+    HEADLESS === 'new'
+      ? ['--use-angle=vulkan', '--enable-features=Vulkan', '--disable-vulkan-surface']
+      : ['--enable-features=Vulkan']
   browser = await puppeteer.launch({
     headless: HEADLESS,
     args: [
       '--no-sandbox', // required when running as root in a container
       '--enable-unsafe-webgpu',
-      '--enable-features=Vulkan',
       '--enable-dawn-features=allow_unsafe_apis',
+      ...gpuArgs,
     ],
     protocolTimeout: READY_MS,
   })
