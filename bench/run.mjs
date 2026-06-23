@@ -47,8 +47,41 @@ async function waitForUrl(url, timeoutMs) {
   throw new Error(`timed out waiting for ${url}`)
 }
 
+function attachDiagnostics(page, label) {
+  page.on('pageerror', (e) => console.error(`[${label}:pageerror] ${e.message}`))
+  page.on('console', (m) => {
+    const t = m.text()
+    if (
+      m.type() === 'error' ||
+      /\[bench\]|median=|\[summary\]|webgpu|adapter|gpu|f16|weight|shader|error|fail/i.test(t)
+    )
+      console.log(`[${label}] ${t}`)
+  })
+}
+
 async function bootReady(page, path) {
-  await page.goto(`${BASE}${path}`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+  await page.goto(`${BASE}${path}`, { waitUntil: 'domcontentloaded', timeout: 60_000 })
+
+  // Up-front WebGPU sanity: is an adapter (with shader-f16) actually there?
+  const gpu = await page
+    .evaluate(async () => {
+      if (!('gpu' in navigator)) return { gpu: false }
+      try {
+        const a = await navigator.gpu.requestAdapter()
+        if (!a) return { gpu: true, adapter: null }
+        return {
+          gpu: true,
+          adapter: true,
+          f16: !!a.features?.has('shader-f16'),
+          info: a.info ? a.info.vendor + ' / ' + (a.info.description || a.info.architecture) : null,
+        }
+      } catch (e) {
+        return { gpu: true, error: String(e) }
+      }
+    })
+    .catch((e) => ({ evalError: String(e) }))
+  console.log(`[webgpu] ${JSON.stringify(gpu)}`)
+
   // Click the download gate if present; cached-skip path won't show it.
   try {
     await page.waitForSelector('#start-btn', { timeout: 8_000 })
@@ -56,10 +89,23 @@ async function bootReady(page, path) {
   } catch {
     /* auto-boot */
   }
-  await page.waitForFunction(() => document.getElementById('badge')?.textContent === 'Ready', {
-    timeout: READY_MS,
-    polling: 500,
-  })
+
+  // Poll the badge; log every transition, bail fast on an error state.
+  const start = Date.now()
+  let last = ''
+  while (Date.now() - start < READY_MS) {
+    const badge = await page
+      .evaluate(() => document.getElementById('badge')?.textContent || '')
+      .catch(() => '')
+    if (badge && badge !== last) {
+      console.log(`[boot] badge: ${badge}`)
+      last = badge
+    }
+    if (badge === 'Ready') return
+    if (/error|fail/i.test(badge)) throw new Error(`boot failed — badge="${badge}"`)
+    await new Promise((r) => setTimeout(r, 1500))
+  }
+  throw new Error(`boot timed out — last badge="${last}"`)
 }
 
 let viteLog = ''
@@ -99,18 +145,14 @@ try {
 
   // 1) Zero-TVM decode median via the engine's built-in bench().
   const ztPage = await browser.newPage()
-  ztPage.on('console', (m) => {
-    if (/^\[bench\]/.test(m.text())) console.log(m.text())
-  })
+  attachDiagnostics(ztPage, 'zt')
   await bootReady(ztPage, '/zero-tvm.html')
   const zt = await ztPage.evaluate((n, runs) => window.bench(n, runs), N_TOKENS, N_RUNS)
   console.log(`→ Zero-TVM median: ${zt.median.toFixed(2)} tok/s`)
 
   // 2) WebLLM decode median — webllm-bench.html runs on start and sets window.webllmResult.
   const wlPage = await browser.newPage()
-  wlPage.on('console', (m) => {
-    if (/median=|\[summary\]/.test(m.text())) console.log(m.text())
-  })
+  attachDiagnostics(wlPage, 'wl')
   await bootReady(wlPage, '/webllm-bench.html')
   const wl = await wlPage
     .waitForFunction(() => window.webllmResult, { timeout: READY_MS, polling: 1000 })
