@@ -10,14 +10,29 @@ if ! vulkaninfo --summary 2>/dev/null | grep -E "deviceName|driverName|apiVersio
   exit 1
 fi
 
-# Label the run with the actual GPU unless the caller set BENCH_HW.
-export BENCH_HW="${BENCH_HW:-$(vulkaninfo --summary 2>/dev/null | awk -F'= ' '/deviceName/{print $2; exit}')}"
+# Label the run with the actual GPU, and bail on a CPU software rasterizer
+# (llvmpipe / lavapipe / SwiftShader) — its throughput numbers are meaningless.
+DEVICE="$(vulkaninfo --summary 2>/dev/null | awk -F'= ' '/deviceName/{print $2; exit}')"
+case "$DEVICE" in
+  *llvmpipe*|*lavapipe*|*SwiftShader*|*softpipe*)
+    echo "!! Vulkan device is '$DEVICE' — a CPU software rasterizer, not a real GPU."
+    echo "!! Throughput here is meaningless. This is the usual Colab outcome (CUDA-only,"
+    echo "!! no GL/Vulkan userspace), so the bench is aborting instead of reporting junk."
+    echo "!! Use a host where you control GPU capabilities — e.g. Vast.ai with"
+    echo "!! NVIDIA_DRIVER_CAPABILITIES=all."
+    exit 1 ;;
+esac
+export BENCH_HW="${BENCH_HW:-$DEVICE}"
 echo "== Bench hardware: ${BENCH_HW:-unknown} =="
 
 # Prime the MLC weight mirror Vite serves at /local-weights (both Zero-TVM and
 # WebLLM load from there). Skips the download if it's already cached.
 echo "== Fetching Phi-3-mini q4f16_1 weights (~2 GB, first run only) =="
-huggingface-cli download mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC >/dev/null
+if command -v hf >/dev/null 2>&1; then
+  hf download mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC >/dev/null
+else
+  huggingface-cli download mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC >/dev/null
+fi
 
 echo "== Running npm run bench =="
 npm run bench

@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libpango-1.0-0 libcairo2 libatspi2.0-0 fonts-liberation \
   && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
   && apt-get install -y --no-install-recommends nodejs \
-  && pip3 install --no-cache-dir -U "huggingface_hub[cli]" \
+  && pip3 install --no-cache-dir -U huggingface_hub \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
