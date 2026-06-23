@@ -1,9 +1,7 @@
 node_modules/
 dist/
 .claude/
-.vercel/
 .tests-cache/
 bench/results.json
 *.log
 .DS_Store
-.vercel
