@@ -21,7 +21,10 @@ import puppeteer from 'puppeteer'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PORT = 5191
-const BASE = `http://localhost:${PORT}`
+// 127.0.0.1, not "localhost": on Linux (Colab/containers) localhost can resolve
+// to IPv6 ::1 while Vite binds IPv4, so fetch/Chrome can't reach the dev server.
+const HOST = '127.0.0.1'
+const BASE = `http://${HOST}:${PORT}`
 const N_TOKENS = Number(process.env.BENCH_TOKENS ?? 128)
 const N_RUNS = Number(process.env.BENCH_RUNS ?? 5)
 const HARDWARE = process.env.BENCH_HW ?? 'unknown GPU'
@@ -59,17 +62,22 @@ async function bootReady(page, path) {
   })
 }
 
+let viteLog = ''
 const vite = spawn(
   resolve(ROOT, 'node_modules/.bin/vite'),
-  ['--port', String(PORT), '--strictPort'],
+  ['--port', String(PORT), '--strictPort', '--host', HOST],
   { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
 )
-vite.stderr.on('data', (b) => process.stderr.write(`[vite] ${b}`))
+vite.stdout.on('data', (b) => { viteLog += b })
+vite.stderr.on('data', (b) => { viteLog += b; process.stderr.write(`[vite] ${b}`) })
 
 let browser
 let ok = false
 try {
-  await waitForUrl(`${BASE}/zero-tvm.html`, 30_000)
+  await waitForUrl(`${BASE}/zero-tvm.html`, 120_000).catch((e) => {
+    console.error('\n[vite never became reachable] recent vite output:\n' + viteLog.slice(-2000))
+    throw e
+  })
   // Headless Linux + a real NVIDIA GPU (container / Colab) needs ANGLE-over-
   // Vulkan with no display surface — per Chrome's headless-GPU docs
   // (developer.chrome.com/docs/web-platform/webgpu/colab-headless). The desktop
