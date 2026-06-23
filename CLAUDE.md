@@ -20,21 +20,38 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
 - `docs.html`, `architecture.html`, `demo.html`, `dump.html`,
   `shaders.html`, `validate.html`, `webllm-bench.html` — docs, shader
   viewers, benchmark runner.
-- `src/zero-tvm/` — the hand-written engine (tokenizer, weight loader,
-  inference loop).
-- `src/shaders/` — the 27 WGSL files, grouped by role (int4 matmul,
-  RoPE, RMSNorm, attention, fused FFN, etc.).
-- `src/compiler/` — WebLLM/TVM comparison harness — NOT our kernels;
-  it imports `@mlc-ai/web-llm` for the head-to-head.
-- `src/tvm-shaders/` — dumped TVM output for apples-to-apples
-  inspection against `src/shaders/`.
-- `src/webllm-bench/` — the head-to-head benchmarker.
+- `src/zero-tvm/` — the hand-written engine. `zero-tvm.html` loads
+  `chat.ts`, which pulls in `tokenizer.ts`, `weight-loader.ts`,
+  `spec-sim.ts`, and the pipeline builder `compile()` from
+  `src/compiler/compiler.ts`. NOTE: the decode loop is forked —
+  `chat.ts` carries its own `buildDecodeEngine`, and a second copy
+  lives in `engine-core.ts` (used by `validate.html` + the dump/dev
+  tools). Keep edits to the inner loop in sync across both.
+- `src/compiler/` — despite the name, this is where OUR kernels live.
+  `compiler.ts` is the hand-written pipeline builder: `compile()`
+  creates every GPU pipeline, buffer, and bind group itself (no
+  codegen, no TVM). `src/compiler/shaders/` holds the 27 WGSL files
+  (10 roles + tiled/subgroup/int8/f32 variants). The WebLLM/TVM
+  reference path is `chat-v2.ts` (the `compiler-chat` page), which is
+  the only file here that imports `@mlc-ai/web-llm`.
+- `src/shaders/` — 3 *unwired* "max-fusion" experiments
+  (`fused-norm-matmul`, `fused-ffn`, `argmax`). Documented in
+  `architecture.html` but NOT imported by the engine, which still uses
+  the `src/compiler/shaders/` versions.
+- `src/tvm-shaders/` — 85 dumped TVM shaders, for apples-to-apples
+  inspection against `src/compiler/shaders/`.
+- `src/webllm-bench/` — the head-to-head benchmarker (imports
+  `@mlc-ai/web-llm`).
+- `src/{engine,phi3v2,standalone,capture,ui,main}.ts` — an older engine
+  generation + TVM-capture tooling. Not in the Vite build graph and not
+  imported by the shipped pages (`capture.ts`/`dump-tvm.ts` back the
+  RESEARCH.md interception work).
 - `sites.json` — synced from `~/sites-shared/sites.ts` (consumed by the
   sibling-link renderer in the HTML pages).
 
-Most pages embed JSON-LD with the `Person` + `sameAs` block. All eight
-pages share the "Related work" grid and the "More by Ahmet" footer —
-update these by hand until sites-shared HTML partials land.
+`index.html` embeds the JSON-LD `Person` + `sameAs` block and the
+"Related work" grid; the "More by Ahmet" footer is repeated (non-identical)
+across ~5 pages. Update by hand until sites-shared HTML partials land.
 
 ## Commands
 
@@ -59,9 +76,17 @@ taglines, and the `sameAs` identity list there.
 
 ## Known gaps
 
-- **No ESLint.** Previously `package.json` had `lint: tsc --noEmit` which
-  was a landmine (running "lint" actually typechecked). Renamed to
-  `typecheck` in the scripts-normalization pass. ESLint config is a
-  future addition.
-- The JSON-LD + "Related work" grid + footer are duplicated across 8+
-  HTML files. Will migrate to sites-shared HTML partials.
+- **No ESLint.** `package.json`'s `lint` was renamed to `typecheck`, but
+  `.github/workflows/ci.yml` still calls `npm run lint` (CI red). Editing the
+  workflow needs `workflow` OAuth scope, unavailable to the bot, so
+  `package.json` re-adds a `lint` → `typecheck` alias as a stopgap to keep CI
+  green. Proper fix: point ci.yml at `npm run typecheck` and drop the alias.
+  ESLint config is still a future addition.
+- The "More by Ahmet" footer is repeated (and has drifted out of sync)
+  across ~5 HTML pages. The JSON-LD `Person` block and "Related work" grid
+  live only in `index.html`. Will migrate to sites-shared HTML partials.
+- **Forked decode loop.** `buildDecodeEngine` exists in both `chat.ts`
+  (shipped) and `engine-core.ts` (validate + dev tools). De-dupe pending.
+- **Dead top-level modules.** `src/{engine,phi3v2,standalone,capture,ui,
+  main}.ts` are unreferenced by the build; some are research/capture
+  tooling. Prune or relocate under a `tools/` dir.
