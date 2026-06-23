@@ -76,11 +76,12 @@ taglines, and the `sameAs` identity list there.
 
 ## Known gaps
 
-- **No ESLint.** Previously `package.json` had `lint: tsc --noEmit` which
-  was a landmine (running "lint" actually typechecked). Renamed to
-  `typecheck` in the scripts-normalization pass — `.github/workflows/ci.yml`
-  was left calling the deleted `npm run lint` (CI red until fixed) and now
-  calls `npm run typecheck`. ESLint config is still a future addition.
+- **No ESLint.** `package.json`'s `lint` was renamed to `typecheck`, but
+  `.github/workflows/ci.yml` still calls `npm run lint` (CI red). Editing the
+  workflow needs `workflow` OAuth scope, unavailable to the bot, so
+  `package.json` re-adds a `lint` → `typecheck` alias as a stopgap to keep CI
+  green. Proper fix: point ci.yml at `npm run typecheck` and drop the alias.
+  ESLint config is still a future addition.
 - The "More by Ahmet" footer is repeated (and has drifted out of sync)
   across ~5 HTML pages. The JSON-LD `Person` block and "Related work" grid
   live only in `index.html`. Will migrate to sites-shared HTML partials.
