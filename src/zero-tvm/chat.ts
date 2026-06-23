@@ -1183,7 +1183,7 @@ async function main(): Promise<void> {
     return
   }
 
-  const adapter = await navigator.gpu.requestAdapter()
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
   if (!adapter) {
     setBadge('No GPU adapter', 'error')
     showLoadingError('No GPU adapter found.')

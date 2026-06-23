@@ -99,7 +99,7 @@ export async function bootEngine(): Promise<BootResult> {
   setBadge('Initializing...', 'loading')
   setProgress(0, 'Requesting GPU access...')
 
-  const adapter = await navigator.gpu.requestAdapter()
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
   if (!adapter) {
     setBadge('No GPU', 'error')
     setProgress(0, 'No GPU adapter found')
