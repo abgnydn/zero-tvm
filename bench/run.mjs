@@ -66,17 +66,23 @@ async function bootReady(page, path) {
   const gpu = await page
     .evaluate(async () => {
       if (!('gpu' in navigator)) return { gpu: false }
-      try {
-        const a = await navigator.gpu.requestAdapter()
-        if (!a) return { gpu: true, adapter: null }
-        return {
-          gpu: true,
-          adapter: true,
-          f16: !!a.features?.has('shader-f16'),
-          info: a.info ? a.info.vendor + ' / ' + (a.info.description || a.info.architecture) : null,
+      const probe = async (opts) => {
+        try {
+          const a = await navigator.gpu.requestAdapter(opts)
+          if (!a) return { ok: false }
+          return {
+            ok: true,
+            f16: !!a.features?.has('shader-f16'),
+            info: a.info ? a.info.vendor + '/' + (a.info.description || a.info.architecture) : null,
+          }
+        } catch (e) {
+          return { err: String(e) }
         }
-      } catch (e) {
-        return { gpu: true, error: String(e) }
+      }
+      return {
+        gpu: true,
+        default: await probe(),
+        highPerf: await probe({ powerPreference: 'high-performance' }),
       }
     })
     .catch((e) => ({ evalError: String(e) }))
@@ -130,14 +136,16 @@ try {
   // path (headless:false, e.g. macOS/Metal) keeps the simpler flag set.
   const gpuArgs =
     HEADLESS === 'new'
-      ? ['--use-angle=vulkan', '--enable-features=Vulkan', '--disable-vulkan-surface']
+      ? ['--use-angle=vulkan', '--enable-features=Vulkan', '--disable-vulkan-surface', '--ignore-gpu-blocklist']
       : ['--enable-features=Vulkan']
   browser = await puppeteer.launch({
     headless: HEADLESS,
     args: [
       '--no-sandbox', // required when running as root in a container
       '--enable-unsafe-webgpu',
-      '--enable-dawn-features=allow_unsafe_apis',
+      // disable_adapter_blocklist: Dawn (Chrome's WebGPU) blocklists some NVIDIA
+      // drivers by default, so requestAdapter() returns null on a real T4.
+      '--enable-dawn-features=allow_unsafe_apis,disable_adapter_blocklist',
       ...gpuArgs,
     ],
     protocolTimeout: READY_MS,
