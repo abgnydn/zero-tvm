@@ -43,10 +43,11 @@ export function buffer(device, data, usage) {
 }
 
 /**
- * Bind `buffers` to bindings 0..n-1 (in array order), dispatch the pipeline,
- * then copy `readBytes` out of `buffers[readIndex]` and return the raw bytes.
+ * Bind `buffers` to bindings 0..n-1 (in array order), dispatch the pipeline
+ * once, then copy out each requested buffer. `reads` is [{ index, bytes }];
+ * returns an array of ArrayBuffers in the same order.
  */
-export async function runCompute(device, pipeline, buffers, workgroups, readIndex, readBytes) {
+export async function runComputeReads(device, pipeline, buffers, workgroups, reads) {
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: buffers.map((b, i) => ({ binding: i, resource: { buffer: b } })),
@@ -57,11 +58,21 @@ export async function runCompute(device, pipeline, buffers, workgroups, readInde
   pass.setBindGroup(0, bindGroup)
   pass.dispatchWorkgroups(workgroups[0], workgroups[1] ?? 1, workgroups[2] ?? 1)
   pass.end()
-  const readback = device.createBuffer({ size: readBytes, usage: BU.COPY_DST | BU.MAP_READ })
-  enc.copyBufferToBuffer(buffers[readIndex], 0, readback, 0, readBytes)
+  const outs = reads.map(({ bytes }) =>
+    device.createBuffer({ size: bytes, usage: BU.COPY_DST | BU.MAP_READ }),
+  )
+  reads.forEach(({ index, bytes }, i) => enc.copyBufferToBuffer(buffers[index], 0, outs[i], 0, bytes))
   device.queue.submit([enc.finish()])
-  await readback.mapAsync(MM.READ)
-  return readback.getMappedRange().slice(0)
+  await Promise.all(outs.map((b) => b.mapAsync(MM.READ)))
+  return outs.map((b) => b.getMappedRange().slice(0))
+}
+
+/** Single-buffer convenience wrapper around runComputeReads. */
+export async function runCompute(device, pipeline, buffers, workgroups, readIndex, readBytes) {
+  const [bytes] = await runComputeReads(device, pipeline, buffers, workgroups, [
+    { index: readIndex, bytes: readBytes },
+  ])
+  return bytes
 }
 
 export function pipelineFor(device, wgsl, entryPoint) {

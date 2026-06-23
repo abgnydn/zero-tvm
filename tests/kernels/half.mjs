@@ -70,3 +70,9 @@ export const f16Array = (arr) => Uint16Array.from(arr, f32ToF16Bits)
 
 /** Uint16Array of f16 bits -> number[]. */
 export const fromF16Array = (u16) => Array.from(u16, f16BitsToF32)
+
+// f16-rounded arithmetic, for kernels that accumulate in f16 (e.g. fused_ffn).
+export const f16add = (a, b) => toF16(a + b)
+export const f16mul = (a, b) => toF16(a * b)
+/** Single-rounding fused multiply-add, matching WGSL fma() in f16. */
+export const f16fma = (a, b, c) => toF16(a * b + c)

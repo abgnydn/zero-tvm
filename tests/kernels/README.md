@@ -9,8 +9,16 @@ correctness was only checkable by hand via `test-shaders.html`.
 npm run test:kernels
 ```
 
-Currently covers `int4_matmul`, `rms_norm`, and `argmax`. Add a kernel by
-writing one `testX(device)` function in `run.mjs` and listing it in `TESTS`.
+Covers 8 of the 10 kernel roles: `int4_matmul`, `rms_norm`, `argmax`,
+`embedding`, `rope`, `add_norm`, `kv_append`, and `fused_ffn`. Each reference
+is an independent JS reimplementation (not derived from the WGSL), and
+`fused_ffn`'s reference mirrors the kernel's f16 accumulation structure so the
+tolerance can stay tight.
+
+Still uncovered: `qkv_fused` and paged `attention` — they carry enough KV-cache
+/ softmax state that they're better exercised end-to-end (`npm test`) than in
+isolation. Add a kernel by writing one `testX(device)` function in `run.mjs`
+and listing it in `TESTS`.
 
 ## WebGPU without a GPU (CI / this sandbox)
 
