@@ -116,12 +116,12 @@ async function main() {
   log(`[summary] WebLLM on ${MODEL_ID}`)
   log(`  median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s`)
   log('')
-  log(`[comparison] Zero-TVM (this repo) median: 42.14 tok/s on Phi-3-mini q4f16_1 (M2 Pro, 19-core)`)
-  const ztvm = 42.14
+  const ztvm = 42.14 // bench:zt — Zero-TVM decode median (tok/s), updated by `npm run bench`
+  log(`[comparison] Zero-TVM (this repo) median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (M2 Pro, 19-core)`)
   const delta = ((median - ztvm) / ztvm) * 100
   log(`  → Zero-TVM is ${delta < 0 ? '+' : '-'}${Math.abs(delta).toFixed(1)}% ${delta < 0 ? 'faster' : 'slower'} than WebLLM on this machine`)
 
-  setStats(`WebLLM ${median.toFixed(1)} tok/s · Zero-TVM 42.14 tok/s`)
+  setStats(`WebLLM ${median.toFixed(1)} tok/s · Zero-TVM ${ztvm} tok/s`)
 
   ;(window as Window & typeof globalThis & { webllmResult?: unknown }).webllmResult = {
     model: MODEL_ID,

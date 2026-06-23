@@ -8,7 +8,7 @@ generated, measured on Apple M-series with `bench(128, 3)` in devtools.
 | Config                                   | tok/s (median) | ms/token | GPU compute ms |
 |-----------------------------------------:|---------------:|---------:|---------------:|
 | scalar FFN (baseline)                    |          22.01 |     45.5 |           37.7 |
-| **tiled+subgroup FFN (current)**         |      **42.14** | **23.8** |       **20.2** |
+| **tiled+subgroup FFN (current)**         |      **<!--bench:zt-->42.14<!--/bench:zt-->** | **23.8** |       **20.2** |
 
 **End-to-end: ~1.91×** from porting the 4-row tiled subgroup strategy to
 `fused_ffn.wgsl` (the kernel that was 67.7% of GPU time).
@@ -25,10 +25,10 @@ greedy decoding (temperature=0). Only the inference engine differs.
 
 | Engine                        | decode tok/s | end-to-end tok/s |
 |------------------------------:|-------------:|-----------------:|
-| WebLLM 0.2.80 (`tensor-cache`) |   **51.5**  |            48.22 |
-| Zero-TVM (this repo)          |   **42.14**  |                — |
+| WebLLM 0.2.80 (`tensor-cache`) |   **<!--bench:webllm-->51.5<!--/bench:webllm-->**  |            48.22 |
+| Zero-TVM (this repo)          |   **<!--bench:zt-->42.14<!--/bench:zt-->**  |                — |
 
-**WebLLM is ~22% faster on decode** on this machine with our own weights.
+**WebLLM is ~<!--bench:gap-->22<!--/bench:gap-->% faster on decode** on this machine with our own weights.
 That's the real number, not a projection. The gap is the optimization budget.
 
 Entry point: `webllm-bench.html` + `src/webllm-bench/main.ts` — wires a custom
