@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Zero-TVM: Phi-3-mini in the browser on hand-written WGSL kernels"
+abstract: >-
+  A browser-native Phi-3-mini inference engine built on 10 hand-written WGSL
+  kernel roles (27 files) and ~2,000 lines of TypeScript, replacing WebLLM /
+  MLC-LLM's TVM-compiled 85-kernel stack while reaching ~80% of its decode
+  speed on identical quantized weights.
+type: software
+authors:
+  - family-names: Gunaydin
+    given-names: Ahmet Baris
+    email: hi@barisgunaydin.com
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # <- add your ORCID
+license: MIT
+repository-code: "https://github.com/abgnydn/zero-tvm"
+url: "https://zerotvm.com"
+version: 0.1.0
+date-released: "2026-06-25"
+keywords:
+  - webgpu
+  - wgsl
+  - llm
+  - phi-3
+  - inference
+  - browser
+  - from-scratch
+  - mlc-llm
+# After the first Zenodo release, add the concept DOI here so the citation
+# resolves to a persistent identifier:
+# identifiers:
+#   - type: doi
+#     value: "10.5281/zenodo.XXXXXXX"
+#     description: "Concept DOI (all versions)"

@@ -1,0 +1,24 @@
+{
+  "title": "Zero-TVM: Phi-3-mini in the browser on hand-written WGSL kernels",
+  "description": "A browser-native Phi-3-mini inference engine built on 10 hand-written WGSL kernel roles (27 files) and ~2,000 lines of TypeScript, replacing WebLLM / MLC-LLM's TVM-compiled 85-kernel stack while reaching ~80% of its decode speed on identical quantized weights.",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "creators": [
+    { "name": "Gunaydin, Ahmet Baris" }
+  ],
+  "keywords": [
+    "webgpu",
+    "wgsl",
+    "llm",
+    "phi-3",
+    "inference",
+    "browser",
+    "mlc-llm",
+    "tvm"
+  ],
+  "related_identifiers": [
+    { "relation": "isSupplementTo", "scheme": "url", "identifier": "https://github.com/abgnydn/zero-tvm" },
+    { "relation": "isIdenticalTo", "scheme": "url", "identifier": "https://zerotvm.com" }
+  ]
+}
