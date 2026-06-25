@@ -4,6 +4,7 @@
   "upload_type": "software",
   "access_right": "open",
   "license": "MIT",
+  "language": "eng",
   "creators": [
     { "name": "Gunaydin, Ahmet Baris" }
   ],
@@ -17,8 +18,5 @@
     "mlc-llm",
     "tvm"
   ],
-  "related_identifiers": [
-    { "relation": "isSupplementTo", "scheme": "url", "identifier": "https://github.com/abgnydn/zero-tvm" },
-    { "relation": "isIdenticalTo", "scheme": "url", "identifier": "https://zerotvm.com" }
-  ]
+  "notes": "Live demo: https://zerotvm.com — Source and methodology: https://github.com/abgnydn/zero-tvm"
 }
