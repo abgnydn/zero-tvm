@@ -251,9 +251,12 @@ MIT. See [LICENSE](LICENSE).
 
 ## Citation
 
-If this repo is useful to your research or writing, cite it as:
+This repo ships a [`CITATION.cff`](CITATION.cff), so GitHub's "Cite this
+repository" button renders APA / BibTeX automatically. Each tagged release is
+archived to [Zenodo](https://zenodo.org) with a versioned DOI (badge goes here
+once minted).
 
 ```
-Gunaydin, A. B. (2026). Zero-TVM: Phi-3 in a browser on hand-written WGSL shaders.
-https://zerotvm.com | https://github.com/abgnydn/zero-tvm
+Gunaydin, A. B. (2026). Zero-TVM: Phi-3-mini in the browser on hand-written
+WGSL kernels. https://zerotvm.com | https://github.com/abgnydn/zero-tvm
 ```
