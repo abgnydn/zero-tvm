@@ -84,15 +84,15 @@ Open DevTools and `window.specSim(160, 3, 3)` runs the CPU-side prompt-lookup sp
 The directory layout is the narrative arc of the project. Each page is a milestone.
 
 ```
-index.html              → src/main.ts              (1) Baseline: WebLLM, untouched
-compiler-chat.html      → src/compiler/chat-v2.ts  (2) Intermediate: WebLLM captures
+index.html              (landing page — essay, shader catalog, compare table)
+compiler-chat.html      → src/compiler/chat-v2.ts  (1) WebLLM reference: captures
                                                        dispatches, our shaders replay
                                                        279 of 342 of them
-zero-tvm.html           → src/zero-tvm/chat.ts     (3) The result: all dispatches
+zero-tvm.html           → src/zero-tvm/chat.ts     (2) The result: all dispatches
                                                        replaced, WebLLM never touched
 validate.html           → src/zero-tvm/validate.ts Multi-prompt smoke test driving
                                                        src/zero-tvm/engine-core.ts
-webllm-bench.html       → src/webllm-bench/main.ts (4) Honesty check: WebLLM driven
+webllm-bench.html       → src/webllm-bench/main.ts (3) Honesty check: WebLLM driven
                                                        against the same local weights
                                                        for a fair head-to-head
 
@@ -173,7 +173,7 @@ src/
 
 ## How it's tested
 
-Two layers, intentionally separate:
+Three layers, intentionally separate:
 
 1. **Per-shader correctness vs TVM** — `test-shaders.html` (`src/compiler/test-harness.ts`).
    Loads WebLLM, intercepts the WGSL device to capture every TVM dispatch from a real
@@ -190,6 +190,13 @@ Two layers, intentionally separate:
    continuation. A reader can scroll through the page and verify the model behaves
    like Phi-3 on inputs that were never in the per-shader test set.
 
+3. **Automated kernel correctness (headless, CI-ready)** — `npm run test:kernels`
+   (`tests/kernels/`). Runs the real WGSL kernels from `src/compiler/shaders/`
+   against independent CPU references — 8 of the 10 roles, exact or within f16
+   tolerance. Uses the Dawn-native WebGPU binding on Mesa lavapipe, so it needs
+   no GPU and runs in CI; on a machine with a GPU it uses the real adapter. This
+   is the automated net the per-shader browser harness (layer 1) never had.
+
 `zero-tvm.html` currently runs a parallel decode implementation in `chat.ts` with
 the progressive-streaming / fused-QKV / int8-KV work layered on top. Its correctness
 is covered by the per-shader tests (same kernels) and by the subjective chat UX,
@@ -204,6 +211,11 @@ Measured on M2 Pro, Chrome 120+, Phi-3-mini-4k-instruct q4f16_1, steady-state de
 |---|---|
 | WebLLM v0.2.80 (MLC-LLM, same weights) | **~51** |
 | Zero-TVM (this repo, f16 KV, default shaders) | **~40** |
+
+Reproduce on any WebGPU GPU with `npm run bench` — it drives both engines on
+identical weights and regenerates the numbers in BENCH.md. It also runs headless
+on a cloud GPU (Colab notebook + Docker image in [`bench/`](bench/)) for machines
+without a local one.
 
 That's ~22% behind the autotuned compiler on an identical workload. See
 [BENCH.md](BENCH.md) for the full protocol, the raw numbers, and three optimization
