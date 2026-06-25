@@ -6,6 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Live](https://img.shields.io/badge/live-zerotvm.com-6ea8ff)](https://zerotvm.com)
 [![Bench](https://img.shields.io/badge/bench-vs%20WebLLM-orange)](./BENCH.md)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20838918.svg)](https://doi.org/10.5281/zenodo.20838918)
 
 **[zerotvm.com](https://zerotvm.com)**
 
@@ -252,9 +253,10 @@ MIT. See [LICENSE](LICENSE).
 ## Citation
 
 This repo ships a [`CITATION.cff`](CITATION.cff), so GitHub's "Cite this
-repository" button renders APA / BibTeX automatically. Each tagged release is
-archived to [Zenodo](https://zenodo.org) with a versioned DOI (badge goes here
-once minted).
+repository" button renders APA / BibTeX automatically. Each release is archived
+to [Zenodo](https://zenodo.org) — cite the concept DOI
+[10.5281/zenodo.20838918](https://doi.org/10.5281/zenodo.20838918) for all
+versions.
 
 ```
 Gunaydin, A. B. (2026). Zero-TVM: Phi-3-mini in the browser on hand-written

@@ -26,9 +26,7 @@ keywords:
   - browser
   - from-scratch
   - mlc-llm
-# After the first Zenodo release, add the concept DOI here so the citation
-# resolves to a persistent identifier:
-# identifiers:
-#   - type: doi
-#     value: "10.5281/zenodo.XXXXXXX"
-#     description: "Concept DOI (all versions)"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.20838918"
+    description: "Concept DOI (all versions)"
