@@ -1,4 +1,4 @@
-<img width="1707" height="992" alt="image" src="https://github.com/user-attachments/assets/045c4815-3c6c-4c6b-b0d3-d227da7e2e96" />
+<img alt="Zero-TVM — run Phi-3 in the browser on 10 hand-written WGSL kernels (zerotvm.com)" src="docs/hero.png" />
 
 # Zero-TVM
 
