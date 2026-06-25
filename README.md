@@ -9,27 +9,23 @@
 
 **[zerotvm.com](https://zerotvm.com)**
 
-**Phi-3-mini running in a browser on hand-written WGSL shaders. No TVM. No WebLLM runtime. No compiler.**
-
-The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits 85 autotuned WGSL kernels and drives them from a WASM scheduler. This repo replaces that entire stack with **10 kernel roles (27 WGSL implementations, counting subgroup/tiled/int8 variants) and about 2,000 lines of TypeScript** (engine + tokenizer + weight loader), using the same model and the same quantized weights.
-
-The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
-
-## What's actually in the box
-
-All numbers below are measured from the source and the build output in this repo. Performance varies by GPU — throughput is displayed live in the chat UI. A head-to-head vs WebLLM on identical hardware/weights is recorded in [BENCH.md](BENCH.md).
+**Phi-3-mini (3.8B) running in the browser on 10 hand-written WGSL kernels — ~80% of WebLLM's decode speed, with no TVM, no compiler, and no WASM runtime.**
 
 | | WebLLM (TVM) | Zero-TVM (this repo) |
 |---|---|---|
-| Unique WGSL kernels | **85** | **10 roles / 27 files** |
-| Total WGSL lines | **12,962** (generated) | **3,078** (hand-written, incl. A/B variants) |
+| Decode speed (M2 Pro, same weights) | **~51 tok/s** | **~40 tok/s** |
+| Unique WGSL kernels | **85** (autotuned) | **10 roles / 27 files** |
+| Total WGSL lines | **12,962** (generated) | **3,078** (hand-written) |
 | Dispatches per decode step | **342** | **228** (f16 KV) / **260** (int8 KV) |
-| Runtime | TVM → WASM scheduler | Plain TypeScript, no runtime |
+| Runtime | TVM → WASM scheduler | Plain TypeScript, none |
 | Tokenizer | bundled from WebLLM | BPE from scratch (`tokenizer.ts`) |
-| Weight loader | MLC's | Direct HuggingFace fetch + OPFS cache |
-| JS bundle (chat page, excl. model weights) | **5.9 MB** / 2.1 MB gz (`compiler-chat.html`) | **157 kB** / 33 kB gz (`zero-tvm.html`) |
+| JS bundle (chat page, excl. weights) | **5.9 MB** / 2.1 MB gz | **157 kB** / 33 kB gz |
 
-Zero-TVM issues **fewer** dispatches than TVM because it fuses operations TVM's default pipeline doesn't:
+Same model, same quantized weights. [WebLLM / MLC-LLM](https://webllm.mlc.ai/) — the standard way to run a browser LLM — ships an Apache-TVM pipeline that emits 85 autotuned WGSL kernels driven from a WASM scheduler. This repo replaces that whole stack with **10 kernel roles (27 WGSL files, counting subgroup/tiled/int8 variants) and ~2,000 lines of TypeScript** (engine + tokenizer + weight loader) — and lands within ~20% of it. The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
+
+## What's actually in the box
+
+Numbers above are measured from the source and build output in this repo; throughput varies by GPU, shows live in the chat UI, and the full head-to-head (methodology + raw runs) is in [BENCH.md](BENCH.md). Zero-TVM issues **fewer** dispatches than TVM because it fuses operations TVM's default pipeline doesn't:
 
 - `qkv_fused.wgsl` — Q/K/V projection + RoPE + paged-KV append, one dispatch per layer (was 3 in earlier revisions and in TVM's emission).
 - `attention.wgsl` — paged attention combined with the page-table read.
