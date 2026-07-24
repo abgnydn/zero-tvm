@@ -126,6 +126,9 @@ fn attention_int8(
       workgroupBarrier();
 
       let s : f32 = score_reduce[0] * podArgs.sm_scale;
+      // All threads must finish reading score_reduce[0] before the next slot
+      // iteration overwrites score_reduce[tid] (see attention.wgsl).
+      workgroupBarrier();
 
       let m_prev : f32 = m;
       m = max(m, s);

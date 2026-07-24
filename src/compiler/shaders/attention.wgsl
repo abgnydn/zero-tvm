@@ -99,6 +99,10 @@ fn attention(
       workgroupBarrier();
 
       let s : f32 = score_reduce[0] * podArgs.sm_scale;
+      // All threads must finish reading score_reduce[0] before the next slot
+      // iteration overwrites score_reduce[tid]. On Metal a 32-thread WG is one
+      // lockstep SIMD group, which hides this; 8-wide subgroups (lavapipe) race.
+      workgroupBarrier();
 
       // Online softmax update
       let m_prev : f32 = m;
