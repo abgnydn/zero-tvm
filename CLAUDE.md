@@ -20,17 +20,21 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
 - `docs.html`, `architecture.html`, `demo.html`, `dump.html`,
   `shaders.html`, `validate.html`, `webllm-bench.html` — docs, shader
   viewers, benchmark runner.
-- `src/zero-tvm/` — the hand-written engine. `zero-tvm.html` loads
-  `chat.ts`, which pulls in `tokenizer.ts`, `weight-loader.ts`,
-  `spec-sim.ts`, and the pipeline builder `compile()` from
-  `src/compiler/compiler.ts`. NOTE: the decode loop is forked —
-  `chat.ts` carries its own `buildDecodeEngine`, and a second copy
-  lives in `engine-core.ts` (used by `validate.html` + the dump/dev
-  tools). Keep edits to the inner loop in sync across both.
+- `src/zero-tvm/` — the hand-written engine. There is ONE decode loop:
+  `engine-core.ts`'s `buildDecodeEngine(device, weights, kv, opts)`,
+  driven by BOTH pages. `validate.html` (via `loading-ui.ts`'s
+  `bootEngine`) runs the default unfused/scalar config with blocking
+  `generate`/`forwardLogits`; `zero-tvm.html`'s `chat.ts` is a thin
+  page module that boots the fused config with URL-flag shader
+  variants (`variants.ts`, e.g. `?sg=0`, `?matmul=`, `?kv8=1`) and
+  streams via `generatePipelined`. Support modules: `tokenizer.ts`,
+  `weight-loader.ts`, `spec-sim.ts`, `markdown.ts` (chat's renderer),
+  `bench-console.ts` (window.bench/benchBatched/specSim harnesses).
 - `src/compiler/` — despite the name, this is where OUR kernels live.
   `compiler.ts` is the hand-written pipeline builder: `compile()`
-  creates every GPU pipeline, buffer, and bind group itself (no
-  codegen, no TVM). `src/compiler/shaders/` holds the 27 WGSL files
+  creates every GPU compute pipeline (no codegen, no TVM); activation
+  buffers and bind groups are owned by `engine-core.ts`.
+  `src/compiler/shaders/` holds the 27 WGSL files
   (10 roles + tiled/subgroup/int8/f32 variants). The WebLLM/TVM
   reference path is `chat-v2.ts` (the `compiler-chat` page), which is
   the only file here that imports `@mlc-ai/web-llm`.
@@ -42,10 +46,10 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
   inspection against `src/compiler/shaders/`.
 - `src/webllm-bench/` — the head-to-head benchmarker (imports
   `@mlc-ai/web-llm`).
-- `src/{engine,phi3v2,standalone-test,capture,ui}.ts` — an older engine
-  generation + TVM-capture tooling. Not in the Vite build graph and not
-  imported by the shipped pages (`capture.ts`/`dump-tvm.ts` back the
-  RESEARCH.md interception work).
+- `src/{engine,capture,ui}.ts` — an older engine generation +
+  TVM-capture tooling. Not in the Vite build graph and not imported by
+  the shipped pages (`capture.ts`/`dump-tvm.ts` back the RESEARCH.md
+  interception work).
 - `sites.json` — synced from `~/sites-shared/sites.ts` (consumed by the
   sibling-link renderer in the HTML pages).
 
@@ -83,8 +87,6 @@ taglines, and the `sameAs` identity list there.
 - The "More by Ahmet" footer is repeated (and has drifted out of sync)
   across ~5 HTML pages. The JSON-LD `Person` block and "Related work" grid
   live only in `index.html`. Will migrate to sites-shared HTML partials.
-- **Forked decode loop.** `buildDecodeEngine` exists in both `chat.ts`
-  (shipped) and `engine-core.ts` (validate + dev tools). De-dupe pending.
-- **Dead top-level modules.** `src/{engine,phi3v2,standalone-test,capture,
-  ui}.ts` are unreferenced by the build; some are research/capture
-  tooling. Prune or relocate under a `tools/` dir.
+- **Dead top-level modules.** `src/{engine,capture,ui}.ts` are
+  unreferenced by the build; some are research/capture tooling. Prune
+  or relocate under a `tools/` dir.

@@ -37,7 +37,7 @@ Counting note: "10 kernel roles" counts the default f16-KV decode path. By file
 basename there are 11 prefixes — the eleventh, `kv_quantize_int8.wgsl`, only
 runs on the opt-in `?kv8=1` int8-KV path.
 
-Every FLOP the model executes is in a file you can open. Every GPU buffer has a human label. Every dispatch is annotated in `src/zero-tvm/chat.ts` (the experimental path) and `src/zero-tvm/engine-core.ts` (the reference path).
+Every FLOP the model executes is in a file you can open. Every GPU buffer has a human label. Every dispatch is annotated in `src/zero-tvm/engine-core.ts` — the single decode engine that both the chat page and the validation page drive.
 
 ## Why this might be interesting
 
@@ -102,21 +102,27 @@ dump.html               → src/dump-tvm.ts          Captures all 85 TVM-emitted
 shaders.html            → src/dump-shaders.ts      Browses the captured shaders
 test-shaders.html       → src/compiler/test-harness.ts  Per-shader correctness vs TVM
 test-chain.html         → src/compiler/test-chain.ts
-standalone-test.html    → src/standalone-test.ts
 ```
 
 ```
 src/
   zero-tvm/             THE RESULT
-    engine-core.ts        ~450 lines — pure GPU pipeline: buildDecodeEngine,
-                          allocKVPages, the 32-layer decode loop. No DOM.
-                          Used by validate.ts (and by chat.ts's ancestor before
-                          the progressive-streaming refactor).
-    chat.ts               ~1,700 lines — the experimental path: progressive
-                          weight streaming with OPFS cache, fused QKV+RoPE+KV
-                          dispatch, opt-in int8 KV cache, URL-flag A/B harness.
-                          Currently a monolith rather than a thin UI on top of
-                          engine-core.ts; unifying the two is on the roadmap.
+    engine-core.ts        ~1,000 lines — THE decode engine: buildDecodeEngine,
+                          allocKVPages/allocKVPagesInt8, the 32-layer decode
+                          loop. No DOM. Parameterized by mode: unfused
+                          reference path (validate, 9 dispatches/layer) or
+                          fused QKV+RoPE+KV-append (chat, 7/layer; 8 with int8
+                          KV), plus two generate styles — blocking
+                          generate/forwardLogits and the pipelined readback
+                          ring (generatePipelined). Driven by BOTH chat.ts
+                          and validate.ts.
+    chat.ts               ~500 lines — thin chat page: DOM state, boot wiring
+                          (via loading-ui's bootEngine), streaming render.
+    variants.ts           ~160 lines — URL-flag A/B harness (?sg/?matmul=/
+                          ?kv8=1 …) and variant→pipeline resolution.
+    markdown.ts           ~170 lines — minimal streaming Markdown renderer.
+    bench-console.ts      ~160 lines — window.bench / benchBatched / specSim
+                          devtools harnesses for the chat page.
     spec-sim.ts           120 lines — CPU-side prompt-lookup speculative-decoding
                           acceptance simulator. Used to falsify a speed-up
                           experiment before building shaders.
@@ -124,7 +130,8 @@ src/
     weight-loader.ts      ~300 lines — direct HuggingFace Phi-3-MLC fetch,
                           OPFS cache, layer-ordered streaming
     validate.ts           ~320 lines — multi-prompt forward-pass smoke test
-    loading-ui.ts         ~180 lines — shared progress-bar UI for validate
+    loading-ui.ts         ~280 lines — shared progress-bar UI + bootEngine
+                          flow used by both chat and validate
 
   webllm-bench/
     main.ts               Head-to-head harness: WebLLM v0.2.80 wired against
@@ -202,11 +209,11 @@ Three layers, intentionally separate:
    no GPU and runs in CI; on a machine with a GPU it uses the real adapter. This
    is the automated net the per-shader browser harness (layer 1) never had.
 
-`zero-tvm.html` currently runs a parallel decode implementation in `chat.ts` with
-the progressive-streaming / fused-QKV / int8-KV work layered on top. Its correctness
-is covered by the per-shader tests (same kernels) and by the subjective chat UX,
-but it doesn't yet share `engine-core.ts` with `validate.html`. Unifying them is
-tracked as technical debt rather than hidden.
+`zero-tvm.html` and `validate.html` share the same decode engine
+(`engine-core.ts`); the chat page runs it in the fused / variant-selected /
+pipelined configuration while validate runs the unfused scalar reference with
+blocking per-token readback, so a validate pass exercises the same kernels,
+buffers, and bind-group layout the chat page ships.
 
 ## Performance
 
@@ -253,7 +260,7 @@ These are the caveats that survive the code as-shipped. Several earlier ones —
 
 - **Greedy decoding only.** Sampling is a single `argmax.wgsl` dispatch. No temperature, top-k, top-p, repetition penalty. A CPU-side sampler over the f32 logit buffer would be ~30 lines; left out to keep the minimal-stack claim honest.
 - **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts; the `int4_matmul_batched_m4` generator variant is the shader for a batched-prefill attention path but is not yet wired into the decode loop.
-- **Two decode implementations.** `engine-core.ts` is the reference (used by `validate.html`); `chat.ts` is the experimental monolith with the progressive-streaming / fused-QKV / int8-KV work (used by `zero-tvm.html`). Both correct, not yet unified.
+- **One decode engine, two configurations.** `engine-core.ts` is the single `buildDecodeEngine`; `validate.html` runs it unfused/scalar with blocking per-token readback (deterministic positions, logits access), `zero-tvm.html` runs it fused with URL-flag shader variants and the pipelined readback ring. The per-layer QKV stage and the readback style are the only mode-dependent parts.
 - **Residual buffer ping-pong.** WebGPU forbids read+write to the same buffer in one dispatch, so the decode loops swap between `B.residual` and `B.residual2` across the `add_norm` dispatches. The two swaps per layer cancel out, which is why the per-layer bind groups can be pre-computed once and reused for every token.
 
 ## License
