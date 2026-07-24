@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   check:
-    name: typecheck · build
+    name: typecheck · unit · build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +25,33 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run lint   # alias for `tsc --noEmit`
+        env:
+          # No browser needed in this job — skip Puppeteer's ~150MB Chrome download.
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+      - run: npm run lint   # tsc --noEmit for src + tests/config (tsconfig.tests.json)
+      # Tokenizer unit tests are fully offline: fixtures.json + tokenizer.json
+      # are committed under tests/tokenizer/.
+      - run: npm run test:unit
       - run: npm run build
-      # Unit tests use Puppeteer + WebGPU which Ubuntu runners don't expose;
-      # run locally with `npm test`.
+      # e2e tests use Puppeteer + WebGPU which Ubuntu runners don't expose;
+      # run locally with `npm run test:e2e`.
+
+  kernels:
+    name: kernel correctness (lavapipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # Mesa's lavapipe: a CPU Vulkan device with shader-f16, so the real WGSL
+      # kernels run without a GPU (see tests/kernels/README.md). Subgroup
+      # variants SKIP loudly if lavapipe lacks the feature/lane width.
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - run: npm ci
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+      - run: npm run test:kernels
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json

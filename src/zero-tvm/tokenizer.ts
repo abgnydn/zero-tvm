@@ -4,10 +4,32 @@
  * Implements BPE encode + decode for Phi-3 Mini (SentencePiece-style).
  * Loads tokenizer.json from browser cache or HuggingFace directly.
  *
- * Phi-3 Mini uses:
- *   - Pre-tokenizer: Metaspace (▁ replaces leading space)
- *   - Model: BPE
- *   - Added tokens: <s>=1, </s>=2, <|system|>=32006, <|user|>=32010, etc.
+ * Phi-3 Mini ships a Llama-style SentencePiece-as-BPE tokenizer with
+ * `legacy: false` in tokenizer_config.json. The reference pipeline
+ * (HuggingFace LlamaTokenizer, non-legacy path) is:
+ *
+ *   1. Prepend a literal "▁" to the whole raw text, after replacing any
+ *      pre-existing "▁" characters with " ".
+ *   2. Split around added (special) tokens. Tokens with rstrip=true (`</s>`
+ *      and every <|...|> marker) swallow ALL whitespace that follows them —
+ *      this is why the chat template's "\n" after <|user|> etc. does NOT
+ *      produce a <0x0A> token.
+ *   3. Per text section: replace every " " with "▁" (Metaspace,
+ *      prepend_scheme "first" — only section 0 gets a prefix, and step 1
+ *      already provided it). No word splitting — BPE runs over the whole
+ *      section, so "    " can merge into "▁▁▁▁"-style tokens and \n / \t
+ *      survive intact.
+ *   4. BPE with byte_fallback: symbols with no vocab entry are emitted as
+ *      <0xHH> byte tokens (newline = <0x0A>, emoji = 4 byte tokens, ...).
+ *   5. If the first token came out as a bare "▁" and the second is an added
+ *      token, drop the "▁" (upstream legacy=false quirk).
+ *
+ * Decode mirrors the shipped decoder chain: Replace "▁" → " ", ByteFallback,
+ * Fuse, then Strip exactly ONE leading space.
+ *
+ * Correctness is pinned by tests/tokenizer/tokenizer.test.ts against
+ * fixtures generated with the HuggingFace reference implementation
+ * (scripts/gen-tokenizer-fixtures.mjs).
  */
 
 import { PHI3_MODEL_BASE } from './weight-loader.js'
@@ -16,7 +38,7 @@ import { PHI3_MODEL_BASE } from './weight-loader.js'
 // tokenizer.json types (subset we need)
 // ============================================================
 
-interface TokenizerJSON {
+export interface TokenizerJSON {
   model: {
     type: string
     vocab: Record<string, number>
@@ -35,7 +57,7 @@ interface TokenizerJSON {
     type: string
     prepend_scheme?: string
     replacement?: string
-  }
+  } | null
 }
 
 // ============================================================
@@ -69,17 +91,19 @@ export interface Tokenizer {
 }
 
 // The metaspace character (▁, U+2581) is used as space prefix in SentencePiece
-const METASPACE = '\u2581'
+const METASPACE = '▁'
 // Hoisted so decode() doesn't build a RegExp per call (streaming chat decodes
 // the full id array per generated token).
 const METASPACE_RE = new RegExp(METASPACE, 'g')
 const BYTE_FALLBACK_RE = /^<0x([0-9A-Fa-f]{2})>$/
+const utf8Encoder = new TextEncoder()
 
-export async function loadTokenizer(onProgress?: (msg: string) => void): Promise<Tokenizer> {
-  onProgress?.('Loading tokenizer.json...')
-  const url = PHI3_MODEL_BASE + 'tokenizer.json'
-  const json: TokenizerJSON = JSON.parse(await fetchText(url))
-
+/**
+ * Build a Tokenizer from a parsed tokenizer.json. Pure and synchronous so
+ * unit tests can construct it from a committed vocab file; the browser path
+ * (loadTokenizer) fetches the same JSON the app ships and delegates here.
+ */
+export function createTokenizer(json: TokenizerJSON): Tokenizer {
   const vocab = json.model.vocab   // token_str → id
   const merges = json.model.merges  // ["tok1 tok2", ...]
 
@@ -94,12 +118,32 @@ export async function loadTokenizer(onProgress?: (msg: string) => void): Promise
   const mergeRank = new Map<string, number>()
   for (let i = 0; i < merges.length; i++) mergeRank.set(merges[i], i)
 
-  // Build added tokens set for fast lookup during encode
-  const addedTokens = new Map<string, number>()
-  for (const at of json.added_tokens ?? []) addedTokens.set(at.content, at.id)
+  // Added tokens: content → {id, lstrip, rstrip} for encode-time splitting.
+  const addedTokens = new Map<string, { id: number; lstrip: boolean; rstrip: boolean }>()
+  const addedTokenIds = new Set<number>()
+  for (const at of json.added_tokens ?? []) {
+    addedTokens.set(at.content, { id: at.id, lstrip: at.lstrip, rstrip: at.rstrip })
+    addedTokenIds.add(at.id)
+  }
+
+  // Special-token split regex, built ONCE (used to be rebuilt per encode()
+  // call). Longest match first so e.g. <|placeholder1|> beats <|user|>.
+  const specialPattern = [...addedTokens.keys()]
+    .sort((a, b) => b.length - a.length)
+    .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|')
+  const specialSplitRe = specialPattern ? new RegExp(`(${specialPattern})`) : null
 
   const bosId = vocab['<s>'] ?? 1
   const eosId = vocab['</s>'] ?? 2
+
+  // Byte-fallback lookup: byte value → <0xHH> token id.
+  const unkId = vocab['<unk>'] ?? 0
+  const byteToId = new Int32Array(256).fill(unkId)
+  for (let b = 0; b < 256; b++) {
+    const id = vocab[`<0x${b.toString(16).toUpperCase().padStart(2, '0')}>`]
+    if (id !== undefined) byteToId[b] = id
+  }
 
   // Precomputed decode tables — built once at load time so the streaming
   // decode() hot loop is branchless per id:
@@ -147,74 +191,68 @@ export async function loadTokenizer(onProgress?: (msg: string) => void): Promise
   }
 
   // --------------------------------------------------------
-  // Encode: text → token IDs
-  //
-  // Algorithm:
-  // 1. Scan for added (special) tokens first
-  // 2. For remaining text: add metaspace prefix, split into chars, BPE
-  // 3. Map each BPE token → vocab ID
+  // Encode: text → token IDs (see the pipeline description at the top of
+  // this file; every step below is pinned by the fixture tests).
   // --------------------------------------------------------
+  const metaspaceId = vocab[METASPACE]
+
   function encode(text: string): number[] {
+    if (text.length === 0) return []
+
+    // Step 1: SPM non-legacy prefix — literal ▁ on the raw text, existing
+    // ▁ chars downgraded to plain spaces.
+    const full = METASPACE + text.replaceAll(METASPACE, ' ')
+
+    // Step 2: with a capture group, split() alternates text and separator
+    // parts: even indices are plain text, odd indices are special tokens.
+    const parts = specialSplitRe ? full.split(specialSplitRe) : [full]
+
+    // lstrip/rstrip: special tokens eat whitespace off their neighbors.
+    for (let i = 1; i < parts.length; i += 2) {
+      const at = addedTokens.get(parts[i])
+      if (!at) continue
+      if (at.lstrip && i > 0) parts[i - 1] = parts[i - 1].trimEnd()
+      if (at.rstrip && i < parts.length - 1) parts[i + 1] = parts[i + 1].trimStart()
+    }
+
     const result: number[] = []
-
-    // Split text around special tokens (longest match first)
-    const specialPattern = [...addedTokens.keys()]
-      .sort((a, b) => b.length - a.length)
-      .map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .join('|')
-
-    const parts = specialPattern
-      ? text.split(new RegExp(`(${specialPattern})`))
-      : [text]
-
-    for (const part of parts) {
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
       if (!part) continue
 
-      // Check if it's a special token
-      const specialId = addedTokens.get(part)
-      if (specialId !== undefined) {
-        result.push(specialId)
-        continue
-      }
-
-      // Normal text: split into words (preserving whitespace structure)
-      // Metaspace pre-tokenizer: add ▁ before each word
-      const words = part.split(/(\s+)/)
-      let isFirst = true
-
-      for (const word of words) {
-        if (!word) continue
-
-        if (/^\s+$/.test(word)) {
-          // Whitespace handled by adding ▁ prefix to next word
-          isFirst = false
+      if (i % 2 === 1) {
+        const special = addedTokens.get(part)
+        if (special !== undefined) {
+          result.push(special.id)
           continue
         }
+      }
 
-        // Add ▁ prefix (Metaspace: space becomes ▁ at start of word)
-        const prefixed = (isFirst && result.length === 0 ? '' : METASPACE) + word
-        isFirst = false
+      // Step 3: Metaspace — replace spaces only. Newlines/tabs are NOT
+      // spaces; they pass through to byte-fallback.
+      const normalized = part.replaceAll(' ', METASPACE)
 
-        // Convert to individual chars for BPE
-        const chars = [...prefixed]  // Unicode-aware split
-
-        // Apply BPE
-        const merged = bpe(chars)
-
-        // Map merged tokens to IDs
-        for (const tok of merged) {
-          const id = vocab[tok]
-          if (id !== undefined) {
-            result.push(id)
-          } else {
-            // Unknown token: try byte fallback
-            for (const ch of [...tok]) {
-              const byteId = vocab[ch] ?? vocab['<unk>'] ?? 0
-              result.push(byteId)
-            }
+      // Step 4: BPE over the whole section (Unicode-aware char split),
+      // then map symbols → ids with byte fallback.
+      for (const tok of bpe([...normalized])) {
+        const id = vocab[tok]
+        if (id !== undefined) {
+          result.push(id)
+        } else {
+          // Byte fallback: emit <0xHH> ids for each UTF-8 byte. Unmerged
+          // symbols are always single chars, so this only ever sees chars
+          // that have no vocab entry (\n, \t, exotic codepoints, ...).
+          for (const byte of utf8Encoder.encode(tok)) {
+            result.push(byteToId[byte])
           }
         }
       }
+    }
+
+    // Step 5: drop the lone leading ▁ the prefix created when the text
+    // begins with a special token ("▁<|user|>..." → "<|user|>...").
+    if (result.length > 1 && result[0] === metaspaceId && addedTokenIds.has(result[1])) {
+      result.shift()
     }
 
     return result
@@ -231,6 +269,10 @@ export async function loadTokenizer(onProgress?: (msg: string) => void): Promise
   //
   // `byteFallback` and `controlIds` are precomputed above so the hot loop is
   // two map lookups per id (no regex, no string prefix checks).
+  //
+  // The tail matches the reference decoder chain: Replace ▁ → " ", then
+  // Strip exactly ONE leading space (the one the normalizer prepended) —
+  // NOT trimStart(), which would destroy intentional leading whitespace.
   // --------------------------------------------------------
   const utf8Decoder = new TextDecoder('utf-8', { fatal: false })
   function decode(ids: number[] | Int32Array): string {
@@ -251,11 +293,20 @@ export async function loadTokenizer(onProgress?: (msg: string) => void): Promise
       text += tok
     }
     flush()
-    return text.replace(METASPACE_RE, ' ').trimStart()
+    text = text.replace(METASPACE_RE, ' ')
+    return text.startsWith(' ') ? text.slice(1) : text
   }
 
-  onProgress?.('Tokenizer ready')
   return { encode, decode, bosId, eosId }
+}
+
+export async function loadTokenizer(onProgress?: (msg: string) => void): Promise<Tokenizer> {
+  onProgress?.('Loading tokenizer.json...')
+  const url = PHI3_MODEL_BASE + 'tokenizer.json'
+  const json: TokenizerJSON = JSON.parse(await fetchText(url))
+  const tokenizer = createTokenizer(json)
+  onProgress?.('Tokenizer ready')
+  return tokenizer
 }
 
 // ============================================================

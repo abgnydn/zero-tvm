@@ -19,20 +19,22 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
     "lint": "npm run typecheck",
-    "test": "vitest run",
-    "test:e2e": "vitest run",
+    "test": "npm run test:unit",
+    "test:unit": "vitest run tests/tokenizer",
+    "test:e2e": "vitest run tests/e2e",
     "test:kernels": "node tests/kernels/run.mjs",
+    "gen:tokenizer-fixtures": "node scripts/gen-tokenizer-fixtures.mjs",
     "bench": "node bench/run.mjs",
     "bench:sync": "node bench/sync-docs.mjs",
     "check": "npm run typecheck && npm run test"
   },
-  "dependencies": {
-    "@mlc-ai/web-llm": "^0.2.80"
-  },
   "devDependencies": {
+    "@huggingface/transformers": "^3.4.0",
     "@kmamal/gpu": "^0.2.1",
+    "@mlc-ai/web-llm": "^0.2.80",
+    "@types/node": "^22.13.0",
     "@webgpu/types": "^0.1.69",
     "puppeteer": "^24.40.0",
     "typescript": "^5.9.3",

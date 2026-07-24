@@ -126,7 +126,10 @@ export async function newPage(path: string): Promise<Page> {
   const page = await browser.newPage()
   // Surface page-side errors so a crash inside the engine isn't silently
   // swallowed by puppeteer.
-  page.on('pageerror', (e) => console.error(`[pageerror] ${e.message}\n${e.stack}`))
+  page.on('pageerror', (e) => {
+    const err = e instanceof Error ? e : new Error(String(e))
+    console.error(`[pageerror] ${err.message}\n${err.stack}`)
+  })
   page.on('console', (m) => {
     if (m.type() === 'error') console.error(`[console.error] ${m.text()}`)
   })

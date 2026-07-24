@@ -9,16 +9,24 @@ correctness was only checkable by hand via `test-shaders.html`.
 npm run test:kernels
 ```
 
-Covers 8 of the 10 kernel roles: `int4_matmul`, `rms_norm`, `argmax`,
-`embedding`, `rope`, `add_norm`, `kv_append`, and `fused_ffn`. Each reference
-is an independent JS reimplementation (not derived from the WGSL), and
-`fused_ffn`'s reference mirrors the kernel's f16 accumulation structure so the
-tolerance can stay tight.
+Covers all 10 kernel roles: `int4_matmul`, `rms_norm`, `argmax`, `embedding`,
+`rope`, `add_norm`, `kv_append`, `fused_ffn`, paged `attention` (shuffled
+page table vs a CPU softmax-attention reference), and `qkv_fused` (QKV matmul
++ RoPE + paged KV append vs a CPU reference). Each reference is an
+independent JS reimplementation (not derived from the WGSL).
 
-Still uncovered: `qkv_fused` and paged `attention` — they carry enough KV-cache
-/ softmax state that they're better exercised end-to-end (`npm test`) than in
-isolation. Add a kernel by writing one `testX(device)` function in `run.mjs`
-and listing it in `TESTS`.
+The shipped subgroup variants are covered too: `int4_matmul_sg`, `argmax_sg`,
+`attention_sg`, `qkv_fused_sg`, and `fused_ffn_tiled_sg`. These require the
+WebGPU `subgroups` feature and (for all but `argmax_sg`) subgroup size >= 32
+— the same gate chat.ts applies. The suite probes the adapter's actual
+subgroup size on-device; when the requirement isn't met (lavapipe in CI may
+lack it) each gated test prints a loud `SKIP <name> <reason>` line rather
+than passing silently. On a real GPU (e.g. Apple Metal, subgroup size 32)
+everything runs.
+
+Add a kernel by writing one `testX(device)` function (or a `makeXTest`
+factory when a scalar/`_sg` pair shares its reference) in `run.mjs` and
+listing it in `TESTS`.
 
 ## WebGPU without a GPU (CI / this sandbox)
 
@@ -43,19 +51,8 @@ hardware.
 
 ## GitHub Actions
 
-Adding this to CI needs a workflow edit (separate `workflow`-scoped commit):
-
-```yaml
-  kernels:
-    name: kernel correctness (lavapipe)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
-      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
-      - run: npm ci
-      - run: npm run test:kernels
-        env:
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
-```
+This suite runs in CI as the `kernels` job in `.github/workflows/ci.yml`
+(lavapipe via `mesa-vulkan-drivers`, `PUPPETEER_SKIP_DOWNLOAD=1` on `npm ci`
+since no browser is needed). Subgroup-gated tests print `SKIP` lines there
+when lavapipe can't satisfy the feature/lane-width requirement; the full
+matrix runs on a real GPU (`npm run test:kernels` on a dev machine).
