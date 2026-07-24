@@ -267,6 +267,48 @@ Updated after 3 qkv-tile negative results + WebLLM head-to-head (see above).
 5. **CPU/readback gap** is only 15% — not worth attacking until compute is
    much lower.
 
+### Pending experiments (built, correctness-tested, NOT yet measured)
+
+Three opt-in variants landed behind URL flags (all default OFF; every kernel
+passes the `npm run test:kernels` suite against CPU references and the
+compile-all gate). No throughput numbers exist yet — nothing below is a
+claimed speedup. A/B with `bench(128, 3)` + `bench(0, 0, true)` per flag.
+
+1. **Vectorized loads — `?vec4=1` (matmuls) / `?vec4qkv=1` (qkv_fused).**
+   Hypothesis: every matmul-family kernel currently issues 8 scalar f16 loads
+   per activation group and one u32 word per weight load; TVM emits vec4
+   loads. Re-declaring the same buffers as `array<vec4<u32>>` cuts load
+   instructions 4× on weights and 8× on activations — 4-8× fewer load
+   instructions on 100% of weight traffic (effective bandwidth today is
+   ~76 GB/s of ~200 available, so access pattern is the suspect, not the
+   bandwidth wall). Variants: `int4_matmul_{sg,tiled}[_f32]_vec4` (generator
+   knob `vec4: true` in `int4_matmul.gen.ts`) + `qkv_fused_sg_vec4.wgsl`.
+   Caveat: the qkv sibling is forced to 32 threads/WG (96 vec4-words/row
+   don't divide across 64), which entangles it with the known thread-count
+   sensitivity from the qkv-tile negative results. **Status: awaiting
+   measurement.**
+
+2. **Split-K flash-decode attention — `?splitk=N` (N = 2/4/8).**
+   Hypothesis: attention runs 32 WGs × 32 threads = 1,024 threads total,
+   serial over all KV slots — cost grows linearly with context. Splitting
+   the KV pages across N WGs per head (partials `m, d, o` merged by
+   `attention_combine.wgsl`) raises parallelism toward tens of thousands of
+   threads and removes the linear-in-context serial tail; the cost is one
+   extra dispatch + a partials round-trip per layer. Attention is only 1.6%
+   of GPU time at short context, so any win should appear at LONG context.
+   f16 KV only (ignored with `?kv8=1`). **Status: awaiting measurement.**
+
+3. **add_norm fused into the FFN prologue — `?fuseprologue=1`.**
+   Hypothesis: 64 of the ~96 one-workgroup dispatches per token are
+   add_norm/rms_norm sitting on the dependency chain. Folding the FFN-entry
+   add_norm (addNorm1) into the FFN kernel's shared-memory phase removes 32
+   dispatch bubbles + the hidden1 round-trip per token, at the cost of every
+   FFN workgroup redundantly recomputing the residual add + RMSNorm.
+   Scope note: only addNorm1 is fused — addNorm2's residual write feeds the
+   next add_norm (the ping-pong), so the tail becomes a 3-input
+   `add3_norm.wgsl` (net −32 dispatches/token, not −64). **Status: awaiting
+   measurement.**
+
 ## How to reproduce
 
 ```js
@@ -283,3 +325,10 @@ URL toggles for A/B bisection:
 - `?sgargmax=0`  — disable _sg argmax only
 - `?sgffn=0`     — disable tiled_sg FFN (use scalar fused_ffn)
 - `?matmul=scalar|sg|tiled` — force matmul variant
+
+Opt-in pending experiments (see above — no measured numbers yet):
+
+- `?vec4=1`         — vec4-load int4 matmuls
+- `?vec4qkv=1`      — vec4-load qkv_fused (32-thread)
+- `?splitk=2|4|8`   — split-K attention + combine (f16 KV only)
+- `?fuseprologue=1` — add_norm folded into the FFN prologue

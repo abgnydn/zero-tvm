@@ -206,6 +206,12 @@ export function buildDecodeEngine(
   const { pipelines } = compile(device, { subgroups: variants.subgroups })
   const P = pipelines
   const R = resolveVariantPipelines(variants, P)
+  // Split-K attention (?splitk=N) exists only for the f16 KV layout;
+  // attention_int8 has no split-K variant.
+  if (int8Mode && R.splitK) {
+    console.warn('[engine] ?splitk ignored with int8 KV (attention_int8 has no split-K variant)')
+  }
+  const splitK = int8Mode ? 0 : R.splitK
   console.log(
     `[engine] attention=${R.attentionLabel} argmax=${R.argmaxLabel} qkv=${R.qkvLabel} ` +
     `ffn=${R.ffnLabel} matmul=${R.matmulLabel} rowsPerWG=${R.matmulRowsPerWG} ` +
@@ -239,6 +245,12 @@ export function buildDecodeEngine(
     vOut:   null as GPUBuffer | null,
     kSlot:  null as GPUBuffer | null,
     vSlot:  null as GPUBuffer | null,
+    // ?fuseprologue=1: ffnDown writes here so add3_norm can still see the
+    // o-proj delta in hidden2 (addNorm1's residual sum never materializes).
+    hidden3: null as GPUBuffer | null,
+    // ?splitk=N: per-(head, partition) online-softmax partials
+    // [m, d, o[HEAD_DIM]] in f32, merged by attention_combine.
+    attnPartials: null as GPUBuffer | null,
   }
   if (!fused) {
     B.qkvOut = makeBuf(device, PHI3.QKV_DIM * 2, 'qkvOut')
@@ -248,6 +260,12 @@ export function buildDecodeEngine(
   if (int8Mode) {
     B.kSlot = makeBuf(device, PHI3.D * 2, 'kSlot')
     B.vSlot = makeBuf(device, PHI3.D * 2, 'vSlot')
+  }
+  if (R.ffnPrologue) {
+    B.hidden3 = makeBuf(device, PHI3.D * 2, 'hidden3')
+  }
+  if (splitK) {
+    B.attnPartials = makeBuf(device, PHI3.HEADS * splitK * (PHI3.HEAD_DIM + 2) * 4, 'attnPartials')
   }
 
   // Static uniforms — matmul shapes (K_packed, scales_per_row, M)
@@ -294,6 +312,33 @@ export function buildDecodeEngine(
     dv.setFloat32(28, SM_SCALE, true)          // sm_scale
     dv.setUint32(32, 1, true)                  // packGridDimX
     device.queue.writeBuffer(attnU, 0, init)
+  }
+
+  // Split-K attention uniforms (?splitk=N): the partial pass mirrors the
+  // f16 attention PODArgs with packGridDimX replaced by num_splits (same
+  // nnz_pages slot at byte offset 8, updated per token alongside attnU);
+  // the combine pass needs only num_splits.
+  let attnSkU: GPUBuffer | null = null
+  let combineU: GPUBuffer | null = null
+  if (splitK) {
+    attnSkU = device.createBuffer({
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'attnSkU',
+    })
+    const init = new ArrayBuffer(48)
+    const dv = new DataView(init)
+    dv.setInt32(0, 1, true)                    // B
+    dv.setInt32(4, PHI3.MAX_PAGES, true)       // max_num_pages
+    // offset 8: nnz_pages — updated per token via writeBuffer
+    dv.setInt32(12, 0, true)                   // pages_elem_offset
+    dv.setInt32(16, 0, true)                   // page_indptr_elem_offset
+    dv.setInt32(20, 0, true)                   // page_values_elem_offset
+    dv.setInt32(24, 0, true)                   // length_info_elem_offset
+    dv.setFloat32(28, SM_SCALE, true)          // sm_scale
+    dv.setUint32(32, splitK, true)             // num_splits
+    device.queue.writeBuffer(attnSkU, 0, init)
+    combineU = uniformBuf(device, [u32(splitK)])
   }
 
   // Attention uniform (int8-KV mode): extra scales_elem_offset field; 10 fields,
@@ -364,18 +409,23 @@ export function buildDecodeEngine(
   const bgArgmax = bg(device, R.argmax, [
     B.logits, B.tokenOut, argmaxU,
   ])
+  // Split-K combine reads the shared partials scratch and writes attnOut —
+  // identical for every layer, so one bind group serves all 32.
+  const bgAttnCombine = splitK
+    ? bg(device, R.attentionCombine!, [B.attnPartials!, B.attnOut, combineU!])
+    : null
 
   // Per-layer bind groups
   interface LayerBG {
     qkv: GPUBindGroup           // unfused: qkv matmul | fused: qkv_fused / qkv_fused_scratch
     kvApp?: GPUBindGroup        // unfused only
     kvQuantize?: GPUBindGroup   // int8 mode only
-    attn: GPUBindGroup
+    attn: GPUBindGroup          // splitK: the partial pass (writes attnPartials)
     oProj: GPUBindGroup
-    addNorm1: GPUBindGroup      // post-attention: reads residual, writes residual2
-    ffn: GPUBindGroup
-    ffnDown: GPUBindGroup
-    addNorm2: GPUBindGroup      // post-FFN: reads residual2, writes residual
+    addNorm1?: GPUBindGroup     // post-attention: reads residual, writes residual2 (absent w/ ?fuseprologue=1)
+    ffn: GPUBindGroup           // prologue mode: reads (rIn, hidden2, gamma) instead of hidden1
+    ffnDown: GPUBindGroup       // prologue mode: writes hidden3 (hidden2 must survive for add3_norm)
+    addNorm2: GPUBindGroup      // post-FFN: reads residual2, writes residual (prologue mode: add3_norm)
   }
   const layerBGs: LayerBG[] = []
   for (let L = 0; L < PHI3.LAYERS; L++) {
@@ -388,6 +438,15 @@ export function buildDecodeEngine(
     let attnBG: GPUBindGroup
     let kvAppBG: GPUBindGroup | undefined
     let kvQuantizeBG: GPUBindGroup | undefined
+    // Split-K partial pass replaces the single-WG-per-head attention bind
+    // group in the f16-KV modes (int8 has no split-K variant).
+    const attnF16BG = () => splitK
+      ? bg(device, R.attentionSplitK!, [
+          B.qOut, B.pageIndptr, B.pageValues, kvPages[L], B.lengthInfo, B.attnPartials!, attnSkU!,
+        ])
+      : bg(device, R.attention, [
+          B.qOut, B.pageIndptr, B.pageValues, kvPages[L], B.lengthInfo, B.attnOut, attnU,
+        ])
     if (!fused) {
       qkvBG = bg(device, R.matmul, [
         B.qkvOut!, B.hidden1, lw.qkvScales, lw.qkvWeights, qkvU!,
@@ -395,10 +454,7 @@ export function buildDecodeEngine(
       kvAppBG = bg(device, P.kvAppend, [
         B.kOut!, B.vOut!, kvPages[L], B.posMap, kvAppU!,
       ])
-      attnBG = bg(device, R.attention, [
-        B.qOut, B.pageIndptr, B.pageValues, kvPages[L],
-        B.lengthInfo, B.attnOut, attnU,
-      ])
+      attnBG = attnF16BG()
     } else if (int8Mode) {
       qkvBG = bg(device, P.qkvFusedScratch, [
         B.qOut, B.kSlot!, B.vSlot!, B.hidden1, lw.qkvScales, lw.qkvWeights, B.posMap, qkvFusedScratchU!,
@@ -414,9 +470,29 @@ export function buildDecodeEngine(
       qkvBG = bg(device, R.qkvFused, [
         B.qOut, kvPages[L], B.hidden1, lw.qkvScales, lw.qkvWeights, B.posMap, qkvFusedU!,
       ])
-      attnBG = bg(device, R.attention, [
-        B.qOut, B.pageIndptr, B.pageValues, kvPages[L], B.lengthInfo, B.attnOut, attnU,
-      ])
+      attnBG = attnF16BG()
+    }
+
+    if (R.ffnPrologue) {
+      // ?fuseprologue=1: addNorm1 is gone, so there is only ONE residual
+      // hand-off per layer and the ping-pong alternates by layer parity
+      // (two swaps per layer collapse to one). The FFN kernel computes
+      // rIn + hidden2 and its RMSNorm into shared memory itself; add3_norm
+      // reconstructs the residual sum (rIn + oproj + ffnDown) at the tail —
+      // which is why ffnDown must write hidden3, not hidden2.
+      const rIn  = L % 2 === 0 ? B.residual : B.residual2
+      const rOut = L % 2 === 0 ? B.residual2 : B.residual
+      layerBGs.push({
+        qkv: qkvBG,
+        kvApp: kvAppBG,
+        kvQuantize: kvQuantizeBG,
+        attn: attnBG,
+        oProj: bg(device, R.matmul, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
+        ffn: bg(device, R.ffn, [B.ffnOut, rIn, B.hidden2, lw.normGamma2, lw.ffnScales, lw.ffnWeights, ffnU]),
+        ffnDown: bg(device, R.matmul, [B.hidden3!, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
+        addNorm2: bg(device, P.add3Norm, [rIn, B.hidden2, B.hidden3!, nextGamma, B.hidden1, rOut, normU]),
+      })
+      continue
     }
 
     layerBGs.push({
@@ -485,6 +561,18 @@ export function buildDecodeEngine(
     for (let L = 0; L < PHI3.LAYERS; L++) {
       const blk = layerBGs[L]
 
+      // Attention on the f16 KV layout — split-K (?splitk=N) turns the one
+      // WG-per-head dispatch into a partial pass over N partitions per head
+      // plus a per-head combine over the partials scratch.
+      const attentionF16 = () => {
+        if (splitK) {
+          dispatch(enc, R.attentionSplitK!, blk.attn, splitK, PHI3.HEADS, 1, 'attention')
+          dispatch(enc, R.attentionCombine!, bgAttnCombine!, 1, PHI3.HEADS, 1, 'attnCombine')
+        } else {
+          dispatch(enc, R.attention, blk.attn, 1, PHI3.HEADS, 1, 'attention')
+        }
+      }
+
       if (!fused) {
         // QKV matmul: B.hidden1 → B.qkvOut
         dispatch(enc, R.matmul, blk.qkv, PHI3.QKV_DIM / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
@@ -493,7 +581,7 @@ export function buildDecodeEngine(
         // KV append: kOut, vOut → kvPages[L]
         dispatch(enc, P.kvAppend, blk.kvApp!, D_WGS, 1, 1, 'kvAppend')
         // Attention: Q + kvPages[L] → B.attnOut
-        dispatch(enc, R.attention, blk.attn, 1, PHI3.HEADS, 1, 'attention')
+        attentionF16()
       } else if (int8Mode) {
         dispatch(enc, P.qkvFusedScratch, blk.qkv, 4608, 1, 1, 'qkvFused')
         dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, 64, 1, 1, 'kvQuantize')
@@ -501,21 +589,30 @@ export function buildDecodeEngine(
       } else {
         // Fused QKV+RoPE+KV-append: B.hidden1 → B.qOut + kvPages[L]
         dispatch(enc, R.qkvFused, blk.qkv, 4608 / R.qkvPairsPerWG, 1, 1, 'qkvFused')
-        dispatch(enc, R.attention, blk.attn, 1, PHI3.HEADS, 1, 'attention')
+        attentionF16()
       }
 
       // O projection: B.attnOut → B.hidden2
       dispatch(enc, R.matmul, blk.oProj, PHI3.D / R.matmulRowsPerWG, 1, 1, 'oproj')
-      // AddNorm (attention): residual += hidden2; hidden1 = RMSNorm(residual)
-      dispatch(enc, P.addNorm, blk.addNorm1, 1, 1, 1, 'addNorm1')
-      // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
-      dispatch(enc, R.ffn, blk.ffn, PHI3.FFN / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
-      // FFN down: B.ffnOut → B.hidden2
-      dispatch(enc, R.matmul, blk.ffnDown, PHI3.D / R.matmulRowsPerWG, 1, 1, 'ffnDown')
-      // AddNorm (FFN): residual += hidden2; hidden1 = RMSNorm(residual)
-      //   For last layer the bind group binds finalNormGamma instead of next
-      //   layer's normGamma1, so hidden1 is ready for the LM head.
-      dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+      if (R.ffnPrologue) {
+        // ?fuseprologue=1: no addNorm1 dispatch. The FFN kernel computes
+        // rIn + hidden2 and its RMSNorm in its own prologue; ffnDown lands
+        // in hidden3; add3_norm merges rIn + hidden2 + hidden3 at the tail.
+        dispatch(enc, R.ffn, blk.ffn, PHI3.FFN / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+        dispatch(enc, R.matmul, blk.ffnDown, PHI3.D / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+        dispatch(enc, P.add3Norm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+      } else {
+        // AddNorm (attention): residual += hidden2; hidden1 = RMSNorm(residual)
+        dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
+        // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
+        dispatch(enc, R.ffn, blk.ffn, PHI3.FFN / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+        // FFN down: B.ffnOut → B.hidden2
+        dispatch(enc, R.matmul, blk.ffnDown, PHI3.D / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+        // AddNorm (FFN): residual += hidden2; hidden1 = RMSNorm(residual)
+        //   For last layer the bind group binds finalNormGamma instead of next
+        //   layer's normGamma1, so hidden1 is ready for the LM head.
+        dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+      }
     }
 
     // --- LM HEAD: B.hidden1 (already normalized with model.norm) → B.logits ---
@@ -543,6 +640,8 @@ export function buildDecodeEngine(
     // nnz_pages lives at byte offset 8 in both f16 and int8 attention uniforms.
     nnzPagesScratch[0] = nnzPages
     device.queue.writeBuffer(int8Mode ? attnI8U! : attnU, 8, nnzPagesScratch)
+    // The split-K partial-pass uniform mirrors the same layout (offset 8).
+    if (attnSkU) device.queue.writeBuffer(attnSkU, 8, nnzPagesScratch)
   }
 
   // ============================================================

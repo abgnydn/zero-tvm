@@ -77,6 +77,10 @@ The build produces a multi-page Vite output: `index.html` (landing page — proj
 - `?qkvtile=1` / `?qkvtile2=1` — opt into tiled QKV variants (both regressed on M2 Pro — kept for portability testing)
 - `?ffnsg=1` — opt into the tiled-subgroup fused FFN
 - `?kv8=1` — opt into the int8 KV cache path (`kv_quantize_int8` + `attention_int8`)
+- `?vec4=1` — vec4<u32> weight + activation loads in the generated int4 matmuls (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
+- `?vec4qkv=1` — vec4-load `qkv_fused` sibling, 32-thread (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
+- `?splitk=N` — split-K flash-decode attention, N ∈ 2..16 partitions per head + combine pass; f16 KV only (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
+- `?fuseprologue=1` — fold the FFN-entry add_norm into the FFN kernel's prologue, `add3_norm` at the layer tail (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
 
 Open DevTools and `window.specSim(160, 3, 3)` runs the CPU-side prompt-lookup speculative-decoding acceptance simulator over three prompt types — see `src/zero-tvm/spec-sim.ts`.
 

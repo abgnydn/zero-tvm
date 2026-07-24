@@ -17,6 +17,16 @@
  *   ?sgffn=0    disable tiled+subgroup FFN only
  *   ?matmul=    tiled8 | tiled | sg | scalar (default: tiled when sg on)
  *   ?kv8=1      opt into the int8 KV cache path
+ *
+ * Opt-in experiments — built and correctness-tested, awaiting measurement
+ * (run `npm run bench` / `bench(128, 3)` to A/B; see BENCH.md):
+ *   ?vec4=1        vec4<u32> weight + activation loads in the generated
+ *                  int4 matmuls (applies to matmul=tiled|sg; needs sg32)
+ *   ?vec4qkv=1     vec4-load qkv_fused sibling (32-thread; needs sg32)
+ *   ?splitk=N      split-K flash-decode attention, N ∈ 2..16 partitions
+ *                  per head + a combine pass (f16 KV only; ignored w/ ?kv8=1)
+ *   ?fuseprologue=1  fold the FFN-entry add_norm into the FFN kernel's
+ *                  shared-memory prologue; layer tail becomes add3_norm
  */
 
 import type { Pipelines } from '../compiler/compiler.js'
@@ -35,6 +45,14 @@ export interface VariantFlags {
   matmul: MatmulVariant
   /** int8 KV cache opt-in (?kv8=1). Consumed by the page's KV allocation, not by pipeline resolution. */
   int8KV: boolean
+  /** ?vec4=1 — vec4-load int4 matmuls (opt-in experiment, awaiting measurement). */
+  vec4: boolean
+  /** ?vec4qkv=1 — vec4-load qkv_fused sibling (opt-in experiment, awaiting measurement). */
+  vec4Qkv: boolean
+  /** ?splitk=N — split-K attention partitions per head; 0 = off (opt-in experiment). */
+  splitK: number
+  /** ?fuseprologue=1 — add_norm folded into the FFN prologue (opt-in experiment). */
+  fusePrologue: boolean
 }
 
 /** Everything scalar / off — the reference path validate.ts runs on. */
@@ -48,6 +66,10 @@ export const SCALAR_VARIANTS: VariantFlags = {
   sgFfn: false,
   matmul: 'scalar',
   int8KV: false,
+  vec4: false,
+  vec4Qkv: false,
+  splitK: 0,
+  fusePrologue: false,
 }
 
 /**
@@ -81,7 +103,21 @@ export function parseVariantFlags(
     //   scalar — original 64-thread tree reduction
     matmul: (q.get('matmul') ?? (sgAll ? 'tiled' : 'scalar')) as MatmulVariant,
     int8KV: q.get('kv8') === '1',
+    // Opt-in experiments — all default OFF; built + correctness-tested,
+    // awaiting measurement (BENCH.md "Pending experiments").
+    vec4: q.get('vec4') === '1',
+    vec4Qkv: q.get('vec4qkv') === '1',
+    splitK: parseSplitK(q.get('splitk')),
+    fusePrologue: q.get('fuseprologue') === '1',
   }
+}
+
+// ?splitk=N: partitions per head for the split-K attention experiment.
+// Sensible values are 2/4/8; anything in 2..16 is accepted (the engine sizes
+// its partials scratch from the parsed value). 0/absent/garbage = off.
+function parseSplitK(raw: string | null): number {
+  const n = Number.parseInt(raw ?? '0', 10)
+  return Number.isFinite(n) && n >= 2 && n <= 16 ? n : 0
 }
 
 // Map a matmul variant name to the int4 + int4-f32 pipelines and the
@@ -91,7 +127,18 @@ export function parseVariantFlags(
 export function resolveMatmul(
   variant: MatmulVariant,
   P: Pipelines,
+  vec4 = false,
 ): { pipeline: GPUComputePipeline; pipelineF32: GPUComputePipeline; rowsPerWG: number; label: string } {
+  // ?vec4=1 experiment: vec4-load builds exist for the tiled and sg shapes.
+  // tiled8 has no vec4 build (known-regressed tile size) and scalar can't
+  // have one (64-thread WG breaks K=3072 divisibility) — those fall through
+  // to their non-vec4 pipelines.
+  if (vec4 && variant === 'tiled' && P.int4MatmulTiledVec4 && P.int4MatmulF32TiledVec4) {
+    return { pipeline: P.int4MatmulTiledVec4, pipelineF32: P.int4MatmulF32TiledVec4, rowsPerWG: 4, label: 'tiled_vec4' }
+  }
+  if (vec4 && variant === 'sg' && P.int4MatmulSgVec4 && P.int4MatmulF32SgVec4) {
+    return { pipeline: P.int4MatmulSgVec4, pipelineF32: P.int4MatmulF32SgVec4, rowsPerWG: 1, label: 'sg_vec4' }
+  }
   if (variant === 'tiled8' && P.int4MatmulTiled8 && P.int4MatmulF32Tiled8) {
     return { pipeline: P.int4MatmulTiled8, pipelineF32: P.int4MatmulF32Tiled8, rowsPerWG: 8, label: 'tiled8' }
   }
@@ -112,6 +159,11 @@ export interface ResolvedPipelines {
   matmulLabel: string
   attention: GPUComputePipeline
   attentionLabel: string
+  /** Split-K attention pipelines — non-null only when ?splitk=N resolved. */
+  attentionSplitK: GPUComputePipeline | null
+  attentionCombine: GPUComputePipeline | null
+  /** Partitions per head; 0 when split-K is off. */
+  splitK: number
   argmax: GPUComputePipeline
   argmaxLabel: string
   qkvFused: GPUComputePipeline
@@ -121,6 +173,9 @@ export interface ResolvedPipelines {
   ffn: GPUComputePipeline
   ffnRowsPerWG: number
   ffnLabel: string
+  /** true when ffn is a prologue-fused kernel (?fuseprologue=1) — the engine
+   *  must bind (residual, delta, gamma) inputs and use add3_norm at the tail. */
+  ffnPrologue: boolean
 }
 
 /**
@@ -131,26 +186,48 @@ export interface ResolvedPipelines {
  */
 export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines): ResolvedPipelines {
   const { pipeline: matmul, pipelineF32: matmulF32, rowsPerWG: matmulRowsPerWG, label: matmulLabel } =
-    resolveMatmul(flags.matmul, P)
+    resolveMatmul(flags.matmul, P, flags.vec4)
   const attention = (flags.sgAttn && P.attentionSg) ? P.attentionSg : P.attention
+  // ?splitk=N experiment: partial pass follows the sgAttn toggle (subgroup
+  // reduce when available), combine is feature-free.
+  const splitK = flags.splitK >= 2 ? flags.splitK : 0
+  const attentionSplitK = splitK
+    ? ((flags.sgAttn && P.attentionSplitKSg) ? P.attentionSplitKSg : P.attentionSplitK)
+    : null
+  const attentionCombine = splitK ? P.attentionCombine : null
+  const attentionLabel = attentionSplitK
+    ? `splitk${splitK}${attentionSplitK === P.attentionSplitKSg ? '_sg' : ''}`
+    : attention === P.attentionSg ? '_sg' : 'scalar'
   const argmax = (flags.sgArgmax && P.argmaxSg) ? P.argmaxSg : P.argmax
-  const qkvFused = (flags.qkvTile2 && P.qkvFusedTiled2Sg) ? P.qkvFusedTiled2Sg
+  const qkvFused = (flags.vec4Qkv && P.qkvFusedSgVec4) ? P.qkvFusedSgVec4
+                 : (flags.qkvTile2 && P.qkvFusedTiled2Sg) ? P.qkvFusedTiled2Sg
                  : (flags.qkvTile && P.qkvFusedTiledSg) ? P.qkvFusedTiledSg
                  : (flags.sgQkv && P.qkvFusedSg) ? P.qkvFusedSg
                  : P.qkvFused
   // 1 pair/WG for scalar and _sg variants; 2 pairs/WG for tiled variants.
   const qkvPairsPerWG = (qkvFused === P.qkvFusedTiledSg || qkvFused === P.qkvFusedTiled2Sg) ? 2 : 1
-  const qkvLabel = qkvFused === P.qkvFusedTiled2Sg ? 'tiled2_sg'
+  const qkvLabel = qkvFused === P.qkvFusedSgVec4 ? '_sg_vec4'
+                 : qkvFused === P.qkvFusedTiled2Sg ? 'tiled2_sg'
                  : qkvFused === P.qkvFusedTiledSg ? 'tiled_sg'
                  : qkvFused === P.qkvFusedSg ? '_sg'
                  : 'scalar'
-  const ffn = (flags.sgFfn && P.fusedFfnTiledSg) ? P.fusedFfnTiledSg : P.fusedFfn
-  const ffnRowsPerWG = ffn === P.fusedFfnTiledSg ? 4 : 1
+  // ?fuseprologue=1 experiment: swap the FFN kernel for its prologue-fused
+  // sibling (same tile shape as the non-prologue pick would have had).
+  const ffnPrologue = flags.fusePrologue
+  const ffn = ffnPrologue
+    ? ((flags.sgFfn && P.fusedFfnTiledSgPrologue) ? P.fusedFfnTiledSgPrologue : P.fusedFfnPrologue)
+    : ((flags.sgFfn && P.fusedFfnTiledSg) ? P.fusedFfnTiledSg : P.fusedFfn)
+  const ffnRowsPerWG = (ffn === P.fusedFfnTiledSg || ffn === P.fusedFfnTiledSgPrologue) ? 4 : 1
+  const ffnLabel = ffn === P.fusedFfnTiledSgPrologue ? 'tiled_sg_prologue'
+                 : ffn === P.fusedFfnPrologue ? 'scalar_prologue'
+                 : ffn === P.fusedFfnTiledSg ? 'tiled_sg'
+                 : 'scalar'
   return {
     matmul, matmulF32, matmulRowsPerWG, matmulLabel,
-    attention, attentionLabel: attention === P.attentionSg ? '_sg' : 'scalar',
+    attention, attentionLabel,
+    attentionSplitK, attentionCombine, splitK: attentionSplitK ? splitK : 0,
     argmax, argmaxLabel: argmax === P.argmaxSg ? '_sg' : 'scalar',
     qkvFused, qkvPairsPerWG, qkvLabel,
-    ffn, ffnRowsPerWG, ffnLabel: ffn === P.fusedFfnTiledSg ? 'tiled_sg' : 'scalar',
+    ffn, ffnRowsPerWG, ffnLabel, ffnPrologue,
   }
 }

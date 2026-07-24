@@ -24,6 +24,15 @@ lack it) each gated test prints a loud `SKIP <name> <reason>` line rather
 than passing silently. On a real GPU (e.g. Apple Metal, subgroup size 32)
 everything runs.
 
+The opt-in experiment variants (see BENCH.md "Pending experiments") are
+correctness-tested here too: the four `_vec4` int4 matmuls and
+`qkv_fused_sg_vec4` (vs the same CPU references), `attention_splitk[_sg]` +
+`attention_combine` (N=2 and N=4, shuffled page table, page count not
+divisible by N, empty partitions, kv_len < N), and the prologue-fusion pair
+(`fused_ffn[_tiled_sg]_prologue` vs a sequential add_norm-then-FFN reference,
+plus `add3_norm`). Passing here says nothing about throughput — those
+variants are awaiting measurement.
+
 Every shader is compiled through the same prelude path the app uses
 (`src/compiler/shader-prelude.ts` injects the Phi-3 shape constants), and the
 int4_matmul family comes from the generator

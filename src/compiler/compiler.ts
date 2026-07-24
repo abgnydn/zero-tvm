@@ -21,6 +21,7 @@ import ropeSrc from './shaders/rope.wgsl?raw'
 import kvAppendSrc from './shaders/kv_append.wgsl?raw'
 import qkvFusedSrc from './shaders/qkv_fused.wgsl?raw'
 import qkvFusedSgSrc from './shaders/qkv_fused_sg.wgsl?raw'
+import qkvFusedSgVec4Src from './shaders/qkv_fused_sg_vec4.wgsl?raw'
 import qkvFusedTiledSgSrc from './shaders/qkv_fused_tiled_sg.wgsl?raw'
 import qkvFusedTiled2SgSrc from './shaders/qkv_fused_tiled2sg.wgsl?raw'
 import qkvFusedScratchSrc from './shaders/qkv_fused_scratch.wgsl?raw'
@@ -28,8 +29,14 @@ import kvQuantizeInt8Src from './shaders/kv_quantize_int8.wgsl?raw'
 import attentionInt8Src from './shaders/attention_int8.wgsl?raw'
 import attentionSrc from './shaders/attention.wgsl?raw'
 import attentionSgSrc from './shaders/attention_sg.wgsl?raw'
+import attentionSplitkSrc from './shaders/attention_splitk.wgsl?raw'
+import attentionSplitkSgSrc from './shaders/attention_splitk_sg.wgsl?raw'
+import attentionCombineSrc from './shaders/attention_combine.wgsl?raw'
 import fusedFfnSrc from './shaders/fused_ffn.wgsl?raw'
 import fusedFfnTiledSgSrc from './shaders/fused_ffn_tiled_sg.wgsl?raw'
+import fusedFfnPrologueSrc from './shaders/fused_ffn_prologue.wgsl?raw'
+import fusedFfnTiledSgPrologueSrc from './shaders/fused_ffn_tiled_sg_prologue.wgsl?raw'
+import add3NormSrc from './shaders/add3_norm.wgsl?raw'
 import embeddingSrc from './shaders/embedding.wgsl?raw'
 import argmaxSrc from './shaders/argmax.wgsl?raw'
 import argmaxSgSrc from './shaders/argmax_sg.wgsl?raw'
@@ -58,10 +65,16 @@ export interface Pipelines {
   int4MatmulF32Tiled: GPUComputePipeline | null  // tiled subgroup variant of LM head matmul
   int4MatmulF32Tiled8: GPUComputePipeline | null // wider tile variant of LM head matmul
   int4MatmulBatchedM4: GPUComputePipeline | null // M=4 batched GEMM (for spec decode / prefill chunks)
+  // ?vec4=1 experiment (built + correctness-tested, awaiting measurement):
+  int4MatmulSgVec4: GPUComputePipeline | null       // vec4-load _sg variant
+  int4MatmulTiledVec4: GPUComputePipeline | null    // vec4-load tiled variant (4 rows/WG)
+  int4MatmulF32SgVec4: GPUComputePipeline | null    // vec4-load _sg LM-head variant
+  int4MatmulF32TiledVec4: GPUComputePipeline | null // vec4-load tiled LM-head variant
   rope: GPUComputePipeline
   kvAppend: GPUComputePipeline
   qkvFused: GPUComputePipeline       // decode-path fusion: QKV matmul + RoPE + KV append
   qkvFusedSg: GPUComputePipeline | null  // subgroup variant of qkvFused
+  qkvFusedSgVec4: GPUComputePipeline | null  // ?vec4qkv=1 vec4-load variant (32-thread)
   qkvFusedTiledSg: GPUComputePipeline | null  // tiled+subgroup variant (input cache, 4 pairs/WG)
   qkvFusedTiled2Sg: GPUComputePipeline | null  // 2-subgroup, 2-pair tile (keeps 64 threads/WG)
   qkvFusedScratch: GPUComputePipeline  // int8-KV variant: writes K,V to scratch f16
@@ -69,10 +82,18 @@ export interface Pipelines {
   attentionInt8: GPUComputePipeline    // int8-KV variant of paged attention
   attention: GPUComputePipeline
   attentionSg: GPUComputePipeline | null  // subgroup variant; null if `subgroups` feature absent
+  // ?splitk=N experiment (built + correctness-tested, awaiting measurement):
+  attentionSplitK: GPUComputePipeline     // split-K partial pass (tree reduction)
+  attentionSplitKSg: GPUComputePipeline | null  // split-K partial pass (subgroupAdd)
+  attentionCombine: GPUComputePipeline    // merges split-K partials per head
   oProjMatmul: GPUComputePipeline     // int4 matmul, K=3072→3072
   addNorm: GPUComputePipeline
   fusedFfn: GPUComputePipeline        // gate+up+SiLU fused
   fusedFfnTiledSg: GPUComputePipeline | null  // tiled subgroup variant (4 rows/WG)
+  // ?fuseprologue=1 experiment (built + correctness-tested, awaiting measurement):
+  fusedFfnPrologue: GPUComputePipeline          // add_norm folded into the FFN's phase 1
+  fusedFfnTiledSgPrologue: GPUComputePipeline | null  // same, on the tiled_sg kernel
+  add3Norm: GPUComputePipeline        // 3-way residual merge + norm (layer tail)
   ffnDownMatmul: GPUComputePipeline   // int4 matmul, K=8192→3072
   lmHead: GPUComputePipeline          // int4 matmul f32 output
   argmax: GPUComputePipeline
@@ -136,10 +157,15 @@ export function compile(
     int4MatmulF32Tiled: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4 }), 'int4_matmul_f32_tiled') : null,
     int4MatmulF32Tiled8: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 8 }), 'int4_matmul_f32_tiled8') : null,
     int4MatmulBatchedM4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, m: 4 }), 'int4_matmul_batched_m4') : null,
+    int4MatmulSgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4') : null,
+    int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
+    int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,
+    int4MatmulF32TiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_f32_tiled_vec4') : null,
     rope: createPipeline(device, ropeSrc, 'rope_kernel'),
     kvAppend: createPipeline(device, kvAppendSrc, 'kv_append'),
     qkvFused: createPipeline(device, qkvFusedSrc, 'qkv_fused'),
     qkvFusedSg: subgroups ? createPipeline(device, qkvFusedSgSrc, 'qkv_fused_sg') : null,
+    qkvFusedSgVec4: subgroups ? createPipeline(device, qkvFusedSgVec4Src, 'qkv_fused_sg_vec4') : null,
     qkvFusedTiledSg: subgroups ? createPipeline(device, qkvFusedTiledSgSrc, 'qkv_fused_tiled_sg') : null,
     qkvFusedTiled2Sg: subgroups ? createPipeline(device, qkvFusedTiled2SgSrc, 'qkv_fused_tiled2sg') : null,
     qkvFusedScratch: createPipeline(device, qkvFusedScratchSrc, 'qkv_fused_scratch'),
@@ -147,10 +173,16 @@ export function compile(
     attentionInt8: createPipeline(device, attentionInt8Src, 'attention_int8'),
     attention: createPipeline(device, attentionSrc, 'attention'),
     attentionSg: subgroups ? createPipeline(device, attentionSgSrc, 'attention_sg') : null,
+    attentionSplitK: createPipeline(device, attentionSplitkSrc, 'attention_splitk'),
+    attentionSplitKSg: subgroups ? createPipeline(device, attentionSplitkSgSrc, 'attention_splitk_sg') : null,
+    attentionCombine: createPipeline(device, attentionCombineSrc, 'attention_combine'),
     oProjMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
     addNorm: createPipeline(device, addNormSrc, 'add_norm'),
     fusedFfn: createPipeline(device, fusedFfnSrc, 'fused_ffn_kernel'),
     fusedFfnTiledSg: subgroups ? createPipeline(device, fusedFfnTiledSgSrc, 'fused_ffn_tiled_sg') : null,
+    fusedFfnPrologue: createPipeline(device, fusedFfnPrologueSrc, 'fused_ffn_prologue'),
+    fusedFfnTiledSgPrologue: subgroups ? createPipeline(device, fusedFfnTiledSgPrologueSrc, 'fused_ffn_tiled_sg_prologue') : null,
+    add3Norm: createPipeline(device, add3NormSrc, 'add3_norm'),
     ffnDownMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
     lmHead: createPipeline(device, int4MatmulWGSL({ outF32: true }), 'int4_matmul_f32'),
     argmax: createPipeline(device, argmaxSrc, 'argmax_kernel'),
