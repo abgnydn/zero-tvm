@@ -12,7 +12,7 @@
 // a 32-lane subgroup; when the adapter can't provide that (lavapipe in CI
 // often can't) they SKIP loudly with the reason instead of passing silently.
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import {
@@ -25,9 +25,19 @@ import {
   BU,
 } from './gpu.mjs'
 import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
+// Node ≥23 strips TS types on import, so the tests share the exact prelude
+// and int4 generator the app compiles with — no duplicated logic.
+import { withPrelude } from '../../src/compiler/shader-prelude.ts'
+import {
+  int4MatmulWGSL,
+  int4MatmulEntry,
+  INT4_MATMUL_VARIANTS,
+} from '../../src/compiler/shaders/int4_matmul.gen.ts'
 
 const SHADERS = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/compiler/shaders')
-const wgsl = (name) => readFileSync(resolve(SHADERS, name), 'utf8')
+// Same render step as every app-side createShaderModule site: inject the
+// model-shape prelude after any `enable` directives.
+const wgsl = (name) => withPrelude(readFileSync(resolve(SHADERS, name), 'utf8'))
 
 // Small deterministic PRNG (mulberry32) so runs are reproducible.
 function rng(seed) {
@@ -56,8 +66,8 @@ function podBuffer(device, fields) {
   return buffer(device, new Uint8Array(buf), BU.UNIFORM | BU.COPY_DST)
 }
 
-// ── int4_matmul[_sg].wgsl : out[r] = dot(input, dequant(weights[r])) ─────────
-function makeInt4MatmulTest(file, entry) {
+// ── int4_matmul[_sg] (generated) : out[r] = dot(input, dequant(weights[r])) ──
+function makeInt4MatmulTest(src, entry) {
   return function int4MatmulTest(device) {
     const r = rng(1)
     const K = 512, M = 8, KP = K / 8, SPR = K / 32 // K must be a multiple of 512
@@ -78,7 +88,7 @@ function makeInt4MatmulTest(file, entry) {
       return toF16(acc)
     })
 
-    const pipe = pipelineFor(device, wgsl(file), entry)
+    const pipe = pipelineFor(device, withPrelude(src), entry)
     const out = device.createBuffer({ size: M * 2, usage: BU.STORAGE | BU.COPY_SRC })
     const buffers = [
       out,
@@ -498,7 +508,7 @@ function makeQkvFusedTest(file, entry) {
 // (most kernels lay out their cross-lane reduction for 32-lane subgroups —
 // same gate chat.ts applies before shipping them to a real GPU).
 const TESTS = [
-  { label: 'int4_matmul', fn: makeInt4MatmulTest('int4_matmul.wgsl', 'int4_matmul') },
+  { label: 'int4_matmul', fn: makeInt4MatmulTest(int4MatmulWGSL(), 'int4_matmul') },
   { label: 'rms_norm', fn: testRmsNorm },
   { label: 'argmax', fn: makeArgmaxTest('argmax.wgsl', 'argmax_kernel') },
   { label: 'embedding', fn: testEmbedding },
@@ -508,7 +518,7 @@ const TESTS = [
   { label: 'fused_ffn', fn: makeFusedFfnTest('fused_ffn.wgsl', 'fused_ffn_kernel', (rows) => rows) },
   { label: 'attention', fn: makeAttentionTest('attention.wgsl', 'attention') },
   { label: 'qkv_fused', fn: makeQkvFusedTest('qkv_fused.wgsl', 'qkv_fused') },
-  { label: 'int4_matmul_sg', fn: makeInt4MatmulTest('int4_matmul_sg.wgsl', 'int4_matmul_sg'), minSg: 32 },
+  { label: 'int4_matmul_sg', fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true }), 'int4_matmul_sg'), minSg: 32 },
   { label: 'argmax_sg', fn: makeArgmaxTest('argmax_sg.wgsl', 'argmax_sg'), minSg: 16 },
   { label: 'attention_sg', fn: makeAttentionTest('attention_sg.wgsl', 'attention_sg'), minSg: 32 },
   { label: 'qkv_fused_sg', fn: makeQkvFusedTest('qkv_fused_sg.wgsl', 'qkv_fused_sg'), minSg: 32 },
@@ -518,6 +528,62 @@ const TESTS = [
     minSg: 32,
   },
 ]
+
+// ── compile-all gate ─────────────────────────────────────────────────────────
+// Creates a shader module + compute pipeline for EVERY .wgsl file (through
+// the same prelude path the app uses) and every shipped generator variant,
+// and fails loudly on any compilation/validation error. This protects the
+// shaders the correctness tests above don't execute.
+async function compileAll(device, subgroups) {
+  const sources = readdirSync(SHADERS)
+    .filter((f) => f.endsWith('.wgsl'))
+    .sort()
+    .map((f) => ({ name: f, code: wgsl(f) }))
+  for (const v of INT4_MATMUL_VARIANTS) {
+    sources.push({ name: `gen:${int4MatmulEntry(v)}`, code: withPrelude(int4MatmulWGSL(v)) })
+  }
+
+  const errors = []
+  let compiled = 0
+  let skippedSg = 0
+  for (const s of sources) {
+    if (!subgroups && /^\s*enable subgroups;/m.test(s.code)) {
+      skippedSg++
+      continue
+    }
+    const entryMatch = s.code.match(/@compute[\s\S]*?fn\s+([A-Za-z0-9_]+)/)
+    if (!entryMatch) {
+      errors.push(`${s.name}: no @compute entry point found`)
+      continue
+    }
+    device.pushErrorScope('validation')
+    const module = device.createShaderModule({ code: s.code })
+    const info = module.getCompilationInfo ? await module.getCompilationInfo() : { messages: [] }
+    const msgs = [...info.messages].filter((m) => m.type === 'error')
+    if (msgs.length) {
+      errors.push(`${s.name}: ${msgs.map((m) => `${m.lineNum}:${m.linePos} ${m.message}`).join(' | ')}`)
+      await device.popErrorScope()
+      continue
+    }
+    device.createComputePipeline({
+      layout: 'auto',
+      compute: { module, entryPoint: entryMatch[1] },
+    })
+    const scopeErr = await device.popErrorScope()
+    if (scopeErr) {
+      errors.push(`${s.name}: ${String(scopeErr.message).split('\n')[0]}`)
+      continue
+    }
+    compiled++
+  }
+  for (const e of errors) console.error(`      ${e}`)
+  const skipNote = skippedSg ? `, ${skippedSg} sg-only skipped (no 'subgroups' feature)` : ''
+  return {
+    name: 'compile_all',
+    pass: errors.length === 0,
+    detail: `${compiled} shaders compile clean (${sources.length - INT4_MATMUL_VARIANTS.length} .wgsl + ${INT4_MATMUL_VARIANTS.length} generated${skipNote})`,
+  }
+}
 
 async function main() {
   let env
@@ -580,6 +646,20 @@ async function main() {
     ran++
     if (!res.pass) failed++
   }
+
+  // Compile-all gate: every shader must at least build on this adapter.
+  {
+    let res
+    try {
+      res = await compileAll(device, subgroups)
+    } catch (e) {
+      res = { pass: false, detail: String(e).split('\n')[0] }
+    }
+    console.log(`${res.pass ? 'PASS' : 'FAIL'}  ${'compile_all'.padEnd(18)} ${res.detail}`)
+    ran++
+    if (!res.pass) failed++
+  }
+
   const skipNote = skipped ? ` (${skipped} skipped — see SKIP lines above)` : ''
   console.log(`\n${ran - failed}/${ran} kernels correct${skipNote}`)
   process.exit(failed ? 1 : 0)

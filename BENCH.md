@@ -110,7 +110,8 @@ now the dominant matmuls. Both are still using the scalar reduction form.
 ### Negative result: 8-row matmul tile (tiled8)
 
 Ported the same tiled+sg idea to the int4 matmul with `ROWS_PER_WG = 8` in
-`int4_matmul_tiled8.wgsl` and `int4_matmul_f32_tiled8.wgsl`. Math says it
+the `int4_matmul_tiled8` and `int4_matmul_f32_tiled8` variants (now emitted by
+`src/compiler/shaders/int4_matmul.gen.ts`). Math says it
 should halve input-vector DRAM traffic for ffnDown and lmHead. Measurement
 disagrees:
 
@@ -181,7 +182,8 @@ lever on this hardware.
 
 Before porting `fused_ffn`, `qkv_fused`, `attention`, `argmax` to M-dim batched
 variants (to enable fast prefill + prompt-lookup spec decoding), we tested the
-weight-reuse claim in isolation. `int4_matmul_batched_m4.wgsl` computes
+weight-reuse claim in isolation. The `int4_matmul_batched_m4` variant (now
+emitted by `int4_matmul.gen.ts`) computes
 `[M=4, K] × [K, N] → [M=4, N]` with TILE_M=4 × ROWS_PER_WG=4 — loads each
 weight row once and reuses it across 4 batch rows.
 

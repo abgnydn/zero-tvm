@@ -3,7 +3,7 @@
  *
  * Loads weights from browser cache (cached by a prior WebLLM session)
  * or fetches from HuggingFace. Uses 10 hand-written WGSL kernel roles
- * (across 27 .wgsl files counting tiled/subgroup variants).
+ * (across 27 WGSL kernels — 18 .wgsl files + 9 generated int4_matmul variants — counting tiled/subgroup variants).
  *
  * Correct buffer layout:
  *   B.residual  — persistent running residual (updated in-place by add_norm)
@@ -1197,7 +1197,7 @@ async function main(): Promise<void> {
   setBadge('Initializing…', 'loading')
   setProgress(2, 'Requesting GPU access…')
   log('Zero-TVM Phi-3 — No WebLLM, No TVM')
-  log('10 hand-written WGSL kernel roles across 27 files')
+  log('10 hand-written WGSL kernel roles across 27 kernels (18 files + 9 generated)')
   log('')
 
   if (!navigator.gpu) {

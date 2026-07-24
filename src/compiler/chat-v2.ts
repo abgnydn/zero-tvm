@@ -14,8 +14,8 @@ import { ChatUI } from '../ui.js'
 import { patchForCapture, getCaptureResult, CaptureResult } from '../capture.js'
 import { WEIGHTS_OPFS_DIR } from '../zero-tvm/weight-loader.js'
 
-import int4MatmulSrc from './shaders/int4_matmul.wgsl?raw'
-import int4MatmulF32Src from './shaders/int4_matmul_f32.wgsl?raw'
+import { withPrelude } from './shader-prelude'
+import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
@@ -30,7 +30,7 @@ import attentionSrc from './shaders/attention.wgsl?raw'
 // ============================================================
 
 function makePipeline(dev: GPUDevice, src: string, entry: string): GPUComputePipeline {
-  return dev.createComputePipeline({ layout: 'auto', compute: { module: dev.createShaderModule({ code: src }), entryPoint: entry } })
+  return dev.createComputePipeline({ layout: 'auto', compute: { module: dev.createShaderModule({ code: withPrelude(src) }), entryPoint: entry } })
 }
 
 function makeUniform(dev: GPUDevice, values: number[]): GPUBuffer {
@@ -86,11 +86,11 @@ function buildOurEngine(cap: CaptureResult): OurEngine {
   const P = {
     embed: makePipeline(dev, embeddingSrc, 'embedding'),
     norm: makePipeline(dev, rmsNormSrc, 'rms_norm'),
-    matmul: makePipeline(dev, int4MatmulSrc, 'int4_matmul'),
+    matmul: makePipeline(dev, int4MatmulWGSL(), 'int4_matmul'),
     rope: makePipeline(dev, ropeSrc, 'rope_kernel'),
     addNorm: makePipeline(dev, addNormSrc, 'add_norm'),
     fusedFfn: makePipeline(dev, fusedFfnSrc, 'fused_ffn_kernel'),
-    lmHead: makePipeline(dev, int4MatmulF32Src, 'int4_matmul_f32'),
+    lmHead: makePipeline(dev, int4MatmulWGSL({ outF32: true }), 'int4_matmul_f32'),
     argmax: makePipeline(dev, argmaxSrc, 'argmax_kernel'),
     kvAppend: makePipeline(dev, kvAppendSrc, 'kv_append'),
     attention: makePipeline(dev, attentionSrc, 'attention'),

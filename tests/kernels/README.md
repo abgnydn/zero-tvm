@@ -24,6 +24,18 @@ lack it) each gated test prints a loud `SKIP <name> <reason>` line rather
 than passing silently. On a real GPU (e.g. Apple Metal, subgroup size 32)
 everything runs.
 
+Every shader is compiled through the same prelude path the app uses
+(`src/compiler/shader-prelude.ts` injects the Phi-3 shape constants), and the
+int4_matmul family comes from the generator
+(`src/compiler/shaders/int4_matmul.gen.ts`) — the tests exercise the exact
+WGSL the engine ships.
+
+A final `compile_all` gate creates a shader module **and** a compute pipeline
+for every `.wgsl` file plus every generator variant, failing loudly on any
+compilation or validation error. This protects the shaders the correctness
+tests above don't execute (int8-KV path, the tiled/regressed experiments, the
+tiled matmul variants).
+
 Add a kernel by writing one `testX(device)` function (or a `makeXTest`
 factory when a scalar/`_sg` pair shares its reference) in `run.mjs` and
 listing it in `TESTS`.

@@ -10,8 +10,9 @@ import rmsNormWGSL from './compiler/shaders/rms_norm.wgsl?raw'
 import qkvFusedWGSL from './compiler/shaders/qkv_fused.wgsl?raw'
 // @ts-ignore
 import attentionWGSL from './compiler/shaders/attention.wgsl?raw'
-// @ts-ignore
-import int4MatmulWGSL from './compiler/shaders/int4_matmul.wgsl?raw'
+import { int4MatmulWGSL as genInt4Matmul } from './compiler/shaders/int4_matmul.gen'
+// The int4_matmul family is generated; render the scalar variant for display.
+const int4MatmulWGSL = genInt4Matmul()
 // @ts-ignore
 import fusedFFNWGSL from './compiler/shaders/fused_ffn.wgsl?raw'
 // @ts-ignore

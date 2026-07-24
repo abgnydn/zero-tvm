@@ -3,7 +3,9 @@
 // where rms = sqrt(mean(input^2) + eps)
 //
 // All accumulation in f32 (matches TVM's rms_norm2_kernel).
-// D=3072, 64 threads, each handles 48 elements.
+// 64 threads, each handles D/64 elements.
+//
+// Model-shape constants (D, ...) are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -26,12 +28,12 @@ fn rms_norm(
   if (u32(batch) >= podArgs.packGridDimX) { return; }
 
   let tid : i32 = i32(threadIdx.x);
-  let base : i32 = batch * 3072;
+  let base : i32 = batch * D;
 
   // Phase 1: compute sum of squares in f32
   var sum_sq : f32 = 0.0;
-  for (var i : i32 = 0; i < 48; i = i + 1) {
-    let idx : i32 = tid * 48 + i;
+  for (var i : i32 = 0; i < D / 64; i = i + 1) {
+    let idx : i32 = tid * (D / 64) + i;
     let val : f32 = f32(input_buf[base + idx]);
     sum_sq = sum_sq + val * val;
   }
@@ -52,11 +54,11 @@ fn rms_norm(
   if (tid < 1) { red_buf[tid] = red_buf[tid] + red_buf[tid + 1]; }
   workgroupBarrier();
 
-  let rms_inv : f32 = 1.0 / sqrt(red_buf[0] / 3072.0 + 1e-5);
+  let rms_inv : f32 = 1.0 / sqrt(red_buf[0] / f32(D) + 1e-5);
 
   // Phase 2: normalize and scale
-  for (var i : i32 = 0; i < 48; i = i + 1) {
-    let idx : i32 = tid * 48 + i;
+  for (var i : i32 = 0; i < D / 64; i = i + 1) {
+    let idx : i32 = tid * (D / 64) + i;
     output_buf[base + idx] = f16(f32(input_buf[base + idx]) * rms_inv * f32(gamma[idx]));
   }
 }

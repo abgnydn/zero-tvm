@@ -8,6 +8,8 @@
 //
 // Expected win: 6 workgroupBarrier() per KV slot → 0. Attention dominates
 // tail latency on short-context decode; this is pure barrier elimination.
+//
+// Model-shape constants are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 enable subgroups;
@@ -43,10 +45,10 @@ fn attention_sg(
 
   if (batch >= podArgs.B) { return; }
 
-  // Each thread owns 3 elements of head_dim=96.
-  var q0 : f32 = f32(Q[batch * 3072 + head * 96 + tid * 3]);
-  var q1 : f32 = f32(Q[batch * 3072 + head * 96 + tid * 3 + 1]);
-  var q2 : f32 = f32(Q[batch * 3072 + head * 96 + tid * 3 + 2]);
+  // Each thread owns 3 elements of HEAD_DIM (32 threads × 3 = HEAD_DIM).
+  var q0 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]);
+  var q1 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1]);
+  var q2 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2]);
 
   let indptr_begin : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset];
   let indptr_end : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset + 1];
@@ -60,11 +62,12 @@ fn attention_sg(
 
   for (var page_idx : i32 = indptr_begin; page_idx < indptr_end; page_idx = page_idx + 1) {
     let page_no : i32 = page_table_values[page_idx + podArgs.page_values_elem_offset];
-    let page_start : i32 = (page_idx - indptr_begin) * 16;
-    let slots_in_page : i32 = min(16, kv_len - page_start);
+    let page_start : i32 = (page_idx - indptr_begin) * PAGE_SIZE;
+    let slots_in_page : i32 = min(PAGE_SIZE, kv_len - page_start);
 
     for (var slot : i32 = 0; slot < slots_in_page; slot = slot + 1) {
-      let k_base : i32 = page_no * 98304 + head * 1536 + slot * 96 + podArgs.pages_elem_offset;
+      let k_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
+                         + podArgs.pages_elem_offset;
 
       let partial : f32 = q0 * f32(pages[k_base + tid * 3])
                         + q1 * f32(pages[k_base + tid * 3 + 1])
@@ -80,7 +83,7 @@ fn attention_sg(
 
       d = d * scale_prev + scale_new;
 
-      let v_base : i32 = k_base + 49152;
+      let v_base : i32 = k_base + V_PAGE_OFFSET;
       o0 = o0 * scale_prev + scale_new * f32(pages[v_base + tid * 3]);
       o1 = o1 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 1]);
       o2 = o2 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 2]);
@@ -89,8 +92,8 @@ fn attention_sg(
 
   if (d > 0.0) {
     let inv_d : f32 = 1.0 / d;
-    output_buf[batch * 3072 + head * 96 + tid * 3]     = f16(o0 * inv_d);
-    output_buf[batch * 3072 + head * 96 + tid * 3 + 1] = f16(o1 * inv_d);
-    output_buf[batch * 3072 + head * 96 + tid * 3 + 2] = f16(o2 * inv_d);
+    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]     = f16(o0 * inv_d);
+    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1] = f16(o1 * inv_d);
+    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2] = f16(o2 * inv_d);
   }
 }

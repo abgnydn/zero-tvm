@@ -1,7 +1,7 @@
 {
   "name": "zero-tvm",
   "version": "0.2.0",
-  "description": "Phi-3-mini running in a browser on 10 hand-written kernel roles across 27 WGSL files. No TVM, no WebLLM runtime, no compiler.",
+  "description": "Phi-3-mini running in a browser on 10 hand-written kernel roles across 27 WGSL kernels (18 files + a 9-variant generator). No TVM, no WebLLM runtime, no compiler.",
   "type": "module",
   "license": "MIT",
   "author": "Ahmet Baris Gunaydin",

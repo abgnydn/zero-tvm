@@ -10,16 +10,11 @@
  *   KV cache: page_size=16, max_pages=257
  */
 
-// Shader sources imported as strings by Vite
-import int4MatmulSrc from './shaders/int4_matmul.wgsl?raw'
-import int4MatmulSgSrc from './shaders/int4_matmul_sg.wgsl?raw'
-import int4MatmulTiledSrc from './shaders/int4_matmul_tiled.wgsl?raw'
-import int4MatmulTiled8Src from './shaders/int4_matmul_tiled8.wgsl?raw'
-import int4MatmulF32Src from './shaders/int4_matmul_f32.wgsl?raw'
-import int4MatmulF32SgSrc from './shaders/int4_matmul_f32_sg.wgsl?raw'
-import int4MatmulF32TiledSrc from './shaders/int4_matmul_f32_tiled.wgsl?raw'
-import int4MatmulF32Tiled8Src from './shaders/int4_matmul_f32_tiled8.wgsl?raw'
-import int4MatmulBatchedM4Src from './shaders/int4_matmul_batched_m4.wgsl?raw'
+// Shader sources imported as strings by Vite; the int4_matmul family is
+// generated (see shaders/int4_matmul.gen.ts). Every source is piped through
+// withPrelude() so model-shape constants come from one place (shader-prelude.ts).
+import { withPrelude } from './shader-prelude'
+import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
@@ -43,18 +38,10 @@ import argmaxSgSrc from './shaders/argmax_sg.wgsl?raw'
 // Constants
 // ============================================================
 
-export const PHI3 = {
-  D: 3072,
-  HEADS: 32,
-  HEAD_DIM: 96,
-  LAYERS: 32,
-  FFN: 8192,
-  VOCAB: 32064,
-  QKV_DIM: 9216,     // 3 * 32 * 96
-  PAGE_SIZE: 16,
-  MAX_PAGES: 257,
-  MAX_SEQ: 4096,
-} as const
+// PHI3 lives in shader-prelude.ts (single source of truth for TS and WGSL);
+// re-exported here so existing importers keep working.
+export { PHI3 } from './shader-prelude'
+import { PHI3 } from './shader-prelude'
 
 // ============================================================
 // Types
@@ -163,7 +150,7 @@ interface Buffers {
 // ============================================================
 
 function createPipeline(device: GPUDevice, src: string, entry: string): GPUComputePipeline {
-  const module = device.createShaderModule({ code: src })
+  const module = device.createShaderModule({ code: withPrelude(src) })
   return device.createComputePipeline({
     layout: 'auto',
     compute: { module, entryPoint: entry },
@@ -191,15 +178,15 @@ export function compile(
   const pipelines: Pipelines = {
     embedding: createPipeline(device, embeddingSrc, 'embedding'),
     rmsNorm: createPipeline(device, rmsNormSrc, 'rms_norm'),
-    qkvMatmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
-    int4Matmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
-    int4MatmulSg: subgroups ? createPipeline(device, int4MatmulSgSrc, 'int4_matmul_sg') : null,
-    int4MatmulTiled: subgroups ? createPipeline(device, int4MatmulTiledSrc, 'int4_matmul_tiled') : null,
-    int4MatmulTiled8: subgroups ? createPipeline(device, int4MatmulTiled8Src, 'int4_matmul_tiled8') : null,
-    int4MatmulF32Sg: subgroups ? createPipeline(device, int4MatmulF32SgSrc, 'int4_matmul_f32_sg') : null,
-    int4MatmulF32Tiled: subgroups ? createPipeline(device, int4MatmulF32TiledSrc, 'int4_matmul_f32_tiled') : null,
-    int4MatmulF32Tiled8: subgroups ? createPipeline(device, int4MatmulF32Tiled8Src, 'int4_matmul_f32_tiled8') : null,
-    int4MatmulBatchedM4: subgroups ? createPipeline(device, int4MatmulBatchedM4Src, 'int4_matmul_batched_m4') : null,
+    qkvMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
+    int4Matmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
+    int4MatmulSg: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true }), 'int4_matmul_sg') : null,
+    int4MatmulTiled: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4 }), 'int4_matmul_tiled') : null,
+    int4MatmulTiled8: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 8 }), 'int4_matmul_tiled8') : null,
+    int4MatmulF32Sg: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true }), 'int4_matmul_f32_sg') : null,
+    int4MatmulF32Tiled: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4 }), 'int4_matmul_f32_tiled') : null,
+    int4MatmulF32Tiled8: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 8 }), 'int4_matmul_f32_tiled8') : null,
+    int4MatmulBatchedM4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, m: 4 }), 'int4_matmul_batched_m4') : null,
     rope: createPipeline(device, ropeSrc, 'rope_kernel'),
     kvAppend: createPipeline(device, kvAppendSrc, 'kv_append'),
     qkvFused: createPipeline(device, qkvFusedSrc, 'qkv_fused'),
@@ -211,12 +198,12 @@ export function compile(
     attentionInt8: createPipeline(device, attentionInt8Src, 'attention_int8'),
     attention: createPipeline(device, attentionSrc, 'attention'),
     attentionSg: subgroups ? createPipeline(device, attentionSgSrc, 'attention_sg') : null,
-    oProjMatmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
+    oProjMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
     addNorm: createPipeline(device, addNormSrc, 'add_norm'),
     fusedFfn: createPipeline(device, fusedFfnSrc, 'fused_ffn_kernel'),
     fusedFfnTiledSg: subgroups ? createPipeline(device, fusedFfnTiledSgSrc, 'fused_ffn_tiled_sg') : null,
-    ffnDownMatmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
-    lmHead: createPipeline(device, int4MatmulF32Src, 'int4_matmul_f32'),
+    ffnDownMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
+    lmHead: createPipeline(device, int4MatmulWGSL({ outF32: true }), 'int4_matmul_f32'),
     argmax: createPipeline(device, argmaxSrc, 'argmax_kernel'),
     argmaxSg: subgroups ? createPipeline(device, argmaxSgSrc, 'argmax_sg') : null,
   }

@@ -1,27 +1,29 @@
 // QKV_FUSED — decode-path fusion of QKV matmul + RoPE + KV append.
 //
 // Replaces 3 dispatches per layer with 1:
-//   int4_matmul (9216 WG) + rope (36 WG) + kv_append (12 WG)  →  qkv_fused (4608 WG)
+//   int4_matmul (QKV_DIM WG) + rope + kv_append  →  qkv_fused (QKV_DIM/2 WG)
 //
 // Each workgroup computes TWO output rows of the QKV projection that form a
-// RoPE pair (dim and dim+48 within the same head). The pair is rotated in
-// registers, and K/V are written straight into the paged KV cache — the
-// intermediate qkv/kOut/vOut buffers are skipped entirely.
+// RoPE pair (dim and dim+HALF_HEAD_DIM within the same head). The pair is
+// rotated in registers, and K/V are written straight into the paged KV cache
+// — the intermediate qkv/kOut/vOut buffers are skipped entirely.
 //
 // Workgroup index layout (pair_idx):
-//     [0, 1536)        — Q heads: 32 heads × 48 dim-pairs, write to q_out
-//     [1536, 3072)     — K heads: 32 heads × 48 dim-pairs, write K into kv_pages
-//     [3072, 4608)     — V heads: 32 heads × 48 dim-pairs, write V into kv_pages
+//     [0, QKV_GROUP_PAIRS)                    — Q heads: HEADS × HALF_HEAD_DIM dim-pairs, write to q_out
+//     [QKV_GROUP_PAIRS, 2*QKV_GROUP_PAIRS)    — K heads: write K into kv_pages
+//     [2*QKV_GROUP_PAIRS, 3*QKV_GROUP_PAIRS)  — V heads: write V into kv_pages
 //
 // Decode-only (ntoken=1). Prefill still uses the 3-dispatch path.
+//
+// Model-shape constants are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
-@group(0) @binding(0) var<storage, read_write> q_out        : array<f16>;  // 3072 Q
+@group(0) @binding(0) var<storage, read_write> q_out        : array<f16>;  // D-wide Q
 @group(0) @binding(1) var<storage, read_write> kv_pages     : array<f16>;  // paged KV cache
-@group(0) @binding(2) var<storage, read>       hidden       : array<f16>;  // 3072 hidden state
-@group(0) @binding(3) var<storage, read>       scales       : array<f16>;  // 9216 × 96 f16
-@group(0) @binding(4) var<storage, read>       weights      : array<u32>;  // 9216 × 384 u32
+@group(0) @binding(2) var<storage, read>       hidden       : array<f16>;  // D-wide hidden state
+@group(0) @binding(3) var<storage, read>       scales       : array<f16>;  // QKV_DIM × D_SCALES f16
+@group(0) @binding(4) var<storage, read>       weights      : array<u32>;  // QKV_DIM × D_PACKED u32
 @group(0) @binding(5) var<storage, read>       position_map : array<i32>;
 
 struct PODArgs {
@@ -30,9 +32,6 @@ struct PODArgs {
   packGridDimX             : u32,
 }
 @group(0) @binding(6) var<uniform> podArgs : PODArgs;
-
-const K_PACKED       : i32 = 384;  // K=3072 → K/8
-const SCALES_PER_ROW : i32 = 96;   // K/32
 
 var<workgroup> red0 : array<f32, 64>;
 var<workgroup> red1 : array<f32, 64>;
@@ -49,25 +48,26 @@ fn qkv_fused(
   let tid : i32 = i32(threadIdx.x);
 
   // Decompose pair_idx → (group, head, dim_lo) where group ∈ {0:Q, 1:K, 2:V}.
-  let group         : i32 = pair_idx / 1536;
-  let pair_in_group : i32 = pair_idx - group * 1536;
-  let head          : i32 = pair_in_group / 48;
-  let dim_lo        : i32 = pair_in_group - head * 48;
+  let group         : i32 = pair_idx / QKV_GROUP_PAIRS;
+  let pair_in_group : i32 = pair_idx - group * QKV_GROUP_PAIRS;
+  let head          : i32 = pair_in_group / HALF_HEAD_DIM;
+  let dim_lo        : i32 = pair_in_group - head * HALF_HEAD_DIM;
 
-  // Absolute rows in the 9216-wide QKV projection.
-  let row_lo : i32 = group * 3072 + head * 96 + dim_lo;
-  let row_hi : i32 = row_lo + 48;
+  // Absolute rows in the QKV_DIM-wide QKV projection.
+  let row_lo : i32 = group * D + head * HEAD_DIM + dim_lo;
+  let row_hi : i32 = row_lo + HALF_HEAD_DIM;
 
   // Two dot products in parallel: acc0 = row_lo · hidden, acc1 = row_hi · hidden.
   var acc0 : f32 = 0.0;
   var acc1 : f32 = 0.0;
 
-  for (var chunk : i32 = 0; chunk < K_PACKED / 64; chunk = chunk + 1) {
+  // Per-group scale factored out of the 8 unpacked terms.
+  for (var chunk : i32 = 0; chunk < D_PACKED / 64; chunk = chunk + 1) {
     let w_offset : i32 = tid + chunk * 64;
-    let packed_lo : u32 = weights[row_lo * K_PACKED + w_offset];
-    let packed_hi : u32 = weights[row_hi * K_PACKED + w_offset];
-    let scale_lo : f32 = f32(scales[row_lo * SCALES_PER_ROW + (w_offset >> 2)]);
-    let scale_hi : f32 = f32(scales[row_hi * SCALES_PER_ROW + (w_offset >> 2)]);
+    let packed_lo : u32 = weights[row_lo * D_PACKED + w_offset];
+    let packed_hi : u32 = weights[row_hi * D_PACKED + w_offset];
+    let scale_lo : f32 = f32(scales[row_lo * D_SCALES + (w_offset >> 2)]);
+    let scale_hi : f32 = f32(scales[row_hi * D_SCALES + (w_offset >> 2)]);
     let base : i32 = w_offset * 8;
 
     let x0 = f32(hidden[base    ]);
@@ -79,23 +79,25 @@ fn qkv_fused(
     let x6 = f32(hidden[base + 6]);
     let x7 = f32(hidden[base + 7]);
 
-    acc0 = acc0 + x0 * (f32((packed_lo >>  0u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x1 * (f32((packed_lo >>  4u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x2 * (f32((packed_lo >>  8u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x3 * (f32((packed_lo >> 12u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x4 * (f32((packed_lo >> 16u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x5 * (f32((packed_lo >> 20u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x6 * (f32((packed_lo >> 24u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x7 * (f32((packed_lo >> 28u) & 15u) - 7.0) * scale_lo;
+    acc0 = acc0 + scale_lo * (
+        x0 * (f32((packed_lo >>  0u) & 15u) - 7.0)
+      + x1 * (f32((packed_lo >>  4u) & 15u) - 7.0)
+      + x2 * (f32((packed_lo >>  8u) & 15u) - 7.0)
+      + x3 * (f32((packed_lo >> 12u) & 15u) - 7.0)
+      + x4 * (f32((packed_lo >> 16u) & 15u) - 7.0)
+      + x5 * (f32((packed_lo >> 20u) & 15u) - 7.0)
+      + x6 * (f32((packed_lo >> 24u) & 15u) - 7.0)
+      + x7 * (f32((packed_lo >> 28u) & 15u) - 7.0));
 
-    acc1 = acc1 + x0 * (f32((packed_hi >>  0u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x1 * (f32((packed_hi >>  4u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x2 * (f32((packed_hi >>  8u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x3 * (f32((packed_hi >> 12u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x4 * (f32((packed_hi >> 16u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x5 * (f32((packed_hi >> 20u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x6 * (f32((packed_hi >> 24u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x7 * (f32((packed_hi >> 28u) & 15u) - 7.0) * scale_hi;
+    acc1 = acc1 + scale_hi * (
+        x0 * (f32((packed_hi >>  0u) & 15u) - 7.0)
+      + x1 * (f32((packed_hi >>  4u) & 15u) - 7.0)
+      + x2 * (f32((packed_hi >>  8u) & 15u) - 7.0)
+      + x3 * (f32((packed_hi >> 12u) & 15u) - 7.0)
+      + x4 * (f32((packed_hi >> 16u) & 15u) - 7.0)
+      + x5 * (f32((packed_hi >> 20u) & 15u) - 7.0)
+      + x6 * (f32((packed_hi >> 24u) & 15u) - 7.0)
+      + x7 * (f32((packed_hi >> 28u) & 15u) - 7.0));
   }
 
   red0[tid] = acc0;
@@ -135,22 +137,22 @@ fn qkv_fused(
   // V: no RoPE, copy into paged KV cache.
   if (group == 2) {
     let position : i32 = position_map[podArgs.position_map_elem_offset];
-    let page_no : i32 = position / 16;
-    let slot : i32 = position - page_no * 16;
-    // V region starts at 49152 within each page (see kv_append.wgsl).
-    let v_base : i32 = page_no * 98304 + head * 1536 + slot * 96 + 49152
-                       + podArgs.pages_elem_offset;
-    kv_pages[v_base + dim_lo]      = f16(v_lo);
-    kv_pages[v_base + dim_lo + 48] = f16(v_hi);
+    let page_no : i32 = position / PAGE_SIZE;
+    let slot : i32 = position - page_no * PAGE_SIZE;
+    // V region starts at V_PAGE_OFFSET within each page (see kv_append.wgsl).
+    let v_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
+                       + V_PAGE_OFFSET + podArgs.pages_elem_offset;
+    kv_pages[v_base + dim_lo]                 = f16(v_lo);
+    kv_pages[v_base + dim_lo + HALF_HEAD_DIM] = f16(v_hi);
     return;
   }
 
-  // Q or K: apply RoPE. dim_lo ∈ [0, 48) is the "low" index; row_hi is "high".
-  // Matches rope.wgsl:
-  //   dim < 48  : out = cos*x + sin*(-x_pair_hi)
-  //   dim >= 48 : out = cos*x + sin*( x_pair_lo)
+  // Q or K: apply RoPE. dim_lo ∈ [0, HALF_HEAD_DIM) is the "low" index;
+  // row_hi is "high". Matches rope.wgsl:
+  //   dim < HALF_HEAD_DIM  : out = cos*x + sin*(-x_pair_hi)
+  //   dim >= HALF_HEAD_DIM : out = cos*x + sin*( x_pair_lo)
   let pos  : f32 = f32(position_map[podArgs.position_map_elem_offset]);
-  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / 96.0);
+  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / f32(HEAD_DIM));
   let c    : f32 = cos(freq);
   let s    : f32 = sin(freq);
 
@@ -158,17 +160,17 @@ fn qkv_fused(
   let rot_hi : f32 = c * v_hi + s * ( v_lo);
 
   if (group == 0) {
-    let base = head * 96 + dim_lo;
-    q_out[base     ] = f16(rot_lo);
-    q_out[base + 48] = f16(rot_hi);
+    let base = head * HEAD_DIM + dim_lo;
+    q_out[base                 ] = f16(rot_lo);
+    q_out[base + HALF_HEAD_DIM ] = f16(rot_hi);
   } else {
     // K → paged KV cache.
     let position : i32 = position_map[podArgs.position_map_elem_offset];
-    let page_no : i32 = position / 16;
-    let slot : i32 = position - page_no * 16;
-    let k_base : i32 = page_no * 98304 + head * 1536 + slot * 96
+    let page_no : i32 = position / PAGE_SIZE;
+    let slot : i32 = position - page_no * PAGE_SIZE;
+    let k_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
                        + podArgs.pages_elem_offset;
-    kv_pages[k_base + dim_lo]      = f16(rot_lo);
-    kv_pages[k_base + dim_lo + 48] = f16(rot_hi);
+    kv_pages[k_base + dim_lo]                 = f16(rot_lo);
+    kv_pages[k_base + dim_lo + HALF_HEAD_DIM] = f16(rot_hi);
   }
 }

@@ -3,7 +3,9 @@
 // output[i] = rmsnorm(residual) * gamma[i]
 //
 // Fuses TVM's fuse_add_norm_decode_kernel.
-// 256 threads, each handles 12 elements of D=3072.
+// 256 threads, each handles D/256 elements.
+//
+// Model-shape constants (D, ...) are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -28,13 +30,13 @@ fn add_norm(
   if (u32(batch) >= podArgs.packGridDimX) { return; }
 
   let tid : i32 = i32(threadIdx.x);
-  let base : i32 = batch * 3072;
+  let base : i32 = batch * D;
 
   // Phase 1: add residual and compute local sum of squares
-  var local_vals : array<f16, 12>;
+  var local_vals : array<f16, D / 256>;
   var sum_sq : f32 = 0.0;
 
-  for (var i : i32 = 0; i < 12; i = i + 1) {
+  for (var i : i32 = 0; i < D / 256; i = i + 1) {
     let idx : i32 = tid + i * 256;
     let val : f16 = A[base + idx] + B[base + idx];
     local_vals[i] = val;
@@ -54,10 +56,10 @@ fn add_norm(
   if (tid < 2) { red_buf[tid] = red_buf[tid] + red_buf[tid + 2]; } workgroupBarrier();
   if (tid < 1) { red_buf[tid] = red_buf[tid] + red_buf[tid + 1]; } workgroupBarrier();
 
-  let rms_inv : f32 = 1.0 / sqrt(red_buf[0] / 3072.0 + 1e-5);
+  let rms_inv : f32 = 1.0 / sqrt(red_buf[0] / f32(D) + 1e-5);
 
   // Phase 2: normalize
-  for (var i : i32 = 0; i < 12; i = i + 1) {
+  for (var i : i32 = 0; i < D / 256; i = i + 1) {
     let idx : i32 = tid + i * 256;
     output_buf[base + idx] = f16(f32(local_vals[i]) * rms_inv * f32(gamma[idx]));
   }

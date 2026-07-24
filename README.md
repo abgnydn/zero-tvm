@@ -15,14 +15,14 @@
 | | WebLLM (TVM) | Zero-TVM (this repo) |
 |---|---|---|
 | Decode speed (M2 Pro, same weights) | **~51 tok/s** | **~40 tok/s** |
-| Unique WGSL kernels | **85** (autotuned) | **10 roles / 27 files** |
-| Total WGSL lines | **12,962** (generated) | **3,078** (hand-written) |
+| Unique WGSL kernels | **85** (autotuned) | **10 roles / 27 kernels** (18 .wgsl + 9 generated int4 variants) |
+| Total WGSL lines | **12,962** (generated) | **~2,150** hand-written + a 280-line readable generator |
 | Dispatches per decode step | **342** | **228** (f16 KV) / **260** (int8 KV) |
 | Runtime | TVM → WASM scheduler | Plain TypeScript, none |
 | Tokenizer | bundled from WebLLM | BPE from scratch (`tokenizer.ts`) |
 | JS bundle (chat page, excl. weights) | **5.9 MB** / 2.1 MB gz | **157 kB** / 33 kB gz |
 
-Same model, same quantized weights. [WebLLM / MLC-LLM](https://webllm.mlc.ai/) — the standard way to run a browser LLM — ships an Apache-TVM pipeline that emits 85 autotuned WGSL kernels driven from a WASM scheduler. This repo replaces that whole stack with **10 kernel roles (27 WGSL files, counting subgroup/tiled/int8 variants) and ~2,000 lines of TypeScript** (engine + tokenizer + weight loader) — and lands within ~20% of it. The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
+Same model, same quantized weights. [WebLLM / MLC-LLM](https://webllm.mlc.ai/) — the standard way to run a browser LLM — ships an Apache-TVM pipeline that emits 85 autotuned WGSL kernels driven from a WASM scheduler. This repo replaces that whole stack with **10 kernel roles (27 WGSL kernels — 18 hand-written files plus 9 int4-matmul variants emitted by a small readable generator, counting subgroup/tiled/int8 variants) and ~2,000 lines of TypeScript** (engine + tokenizer + weight loader) — and lands within ~20% of it. The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
 
 ## What's actually in the box
 
@@ -132,10 +132,15 @@ src/
                           bits. See BENCH.md.
 
   compiler/             THE SHADERS
-    compiler.ts           ~280 lines — pipeline creation, PHI3 model constants,
-                          weight buffer allocation. Not an optimizing compiler —
-                          the name is historical.
-    shaders/              27 hand-written WGSL files, 3,078 lines total:
+    compiler.ts           ~280 lines — pipeline creation, weight buffer
+                          allocation. Not an optimizing compiler — the name is
+                          historical.
+    shader-prelude.ts     ~70 lines — PHI3 model constants (single source of
+                          truth) rendered as a WGSL `const` prelude that is
+                          injected into every shader at module creation, so no
+                          model-shape literal lives inside the WGSL itself.
+    shaders/              18 hand-written WGSL files (~2,150 lines) + one
+                          generator for the 9-variant int4_matmul family:
       add_norm.wgsl              Residual add + RMSNorm fused
       embedding.wgsl
       rms_norm.wgsl
@@ -152,15 +157,14 @@ src/
       attention_int8.wgsl        int8-KV opt-in path
       fused_ffn.wgsl             Gate + up + SiLU, fused
       fused_ffn_tiled_sg.wgsl    tile + subgroup variant
-      int4_matmul.wgsl           OProj / FFN-down baseline
-      int4_matmul_sg.wgsl        subgroup-reduce variant
-      int4_matmul_tiled.wgsl     tiled variant (rows×4)
-      int4_matmul_tiled8.wgsl    tiled variant (rows×8)
-      int4_matmul_f32.wgsl       LM head (f32 output for stable argmax)
-      int4_matmul_f32_sg.wgsl    LM head, subgroup variant
-      int4_matmul_f32_tiled.wgsl
-      int4_matmul_f32_tiled8.wgsl
-      int4_matmul_batched_m4.wgsl  M=4 batched path (for batched-prefill experiments)
+      int4_matmul.gen.ts         generator for the int4 matmul family — the 9
+                                 former files differed only on {f16|f32 out} ×
+                                 {1|4|8 rows/WG} × {tree|subgroup reduce} × {M=1|4};
+                                 entry names are unchanged (int4_matmul, _sg,
+                                 _tiled, _tiled8, _f32, _f32_sg, _f32_tiled,
+                                 _f32_tiled8, _batched_m4). Every variant is
+                                 still plain readable WGSL — dump them all with:
+                                 node -e "import('./src/compiler/shaders/int4_matmul.gen.ts').then(m => console.log(m.debugDumpAll()))"
       argmax.wgsl
       argmax_sg.wgsl             subgroup variant
 
@@ -238,9 +242,9 @@ These are the caveats that survive the code as-shipped. Several earlier ones —
 
 ### Inherent
 
-- **Phi-3-mini-4k-instruct Q4 only, by shader surgery.** The constants in `src/compiler/compiler.ts` declare `D=3072`, `HEADS=32`, `HEAD_DIM=96`, `LAYERS=32`, `FFN=8192`, `VOCAB=32064`, `PAGE_SIZE=16`, `MAX_PAGES=257` — but those values are **also hard-coded as integer literals in address arithmetic inside most of the shaders** (`grep '3072\|9216\|98304\|1536\|8192' src/compiler/shaders/`). Porting to Mistral, Llama, or any other architecture is not a config edit; it is a per-shader rewrite of offsets and strides.
+- **Phi-3-mini-4k-instruct Q4 only.** The model shape lives in one place — the `PHI3` object in `src/compiler/shader-prelude.ts` (`D=3072`, `HEADS=32`, `HEAD_DIM=96`, `LAYERS=32`, `FFN=8192`, `VOCAB=32064`, `PAGE_SIZE=16`, `MAX_PAGES=257`) — which is rendered as a WGSL `const` prelude and injected into every shader, so the address arithmetic uses named constants (`D`, `HEAD_DIM`, `KV_PAGE_STRIDE`, …) instead of magic literals. Porting to Mistral or Llama is still not just a config edit: the kernels bake in structural assumptions (MHA with no GQA, `HEAD_DIM = 32×3` thread partitioning in attention, `D` divisible by 256, RoPE pair layout), plus the tokenizer/template/loader items below.
 - **GPU memory footprint ≈ 3.6 GB.** Phi-3-mini Q4 weights are ~1.8 GB, and the paged KV cache is `32 layers × 257 pages × 196,608 B/page ≈ 1.6 GB`. On an M2 Pro with 16 GB unified memory this is invisible; on a 4 GB integrated GPU it will OOM during KV allocation before the first token. If you want to trade context length for memory, lower `MAX_PAGES` in `src/compiler/compiler.ts` — 128 pages = 2048-token context, ~0.8 GB KV, which fits almost anywhere. The optional `?kv8=1` int8 KV path roughly halves the KV footprint.
-- **Requires the `shader-f16` WebGPU feature.** Matmuls run in f16 (see `enable f16` at the top of every `int4_matmul*.wgsl`). The LM head uses an f32 output buffer (`int4_matmul_f32.wgsl`) because the sampling pipeline needs f32 logits — TVM's `NT_matmul14_cast2` does the same cast. Chrome/Edge with WebGPU and `shader-f16` is required; Safari's WebGPU does not yet expose `shader-f16`.
+- **Requires the `shader-f16` WebGPU feature.** Matmuls run in f16 (`enable f16` at the top of every int4 matmul variant). The LM head uses an f32 output buffer (the `int4_matmul_f32` generator variant) because the sampling pipeline needs f32 logits — TVM's `NT_matmul14_cast2` does the same cast. Chrome/Edge with WebGPU and `shader-f16` is required; Safari's WebGPU does not yet expose `shader-f16`.
 - **BPE tokenizer is a hand-rolled reimplementation, not `tokenizers.js`.** `src/zero-tvm/tokenizer.ts` is ~280 lines: vocab lookup, merge table, metaspace prefixing, byte fallback, SentencePiece hex-byte decode. It does **not** implement HuggingFace's full pre-tokenization regex pipeline or Unicode NFKC normalization. For normal English chat it matches the reference tokenizer; for emoji, unusual Unicode, or some punctuation patterns it may diverge. If correctness matters for your input, run the prompt through `@huggingface/tokenizers` and compare.
 - **Phi-3 chat template is baked in.** `buildChatPrompt` in `tokenizer.ts` emits `<|system|>...<|end|>\n<|user|>...<|end|>\n<|assistant|>\n`. Stop tokens are the Phi-3 set `{2, 32000, 32007}`. Port to another model → edit both.
 - **Weight loader expects MLC's Q4f16_1 layout.** [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC), including MLC's renamed parameter scheme (`transformer.h.N.mixer.*`, not `model.layers.N.*`). If MLC re-quantizes or re-names, the loader needs a patch.
@@ -248,7 +252,7 @@ These are the caveats that survive the code as-shipped. Several earlier ones —
 ### Deliberate scoping
 
 - **Greedy decoding only.** Sampling is a single `argmax.wgsl` dispatch. No temperature, top-k, top-p, repetition penalty. A CPU-side sampler over the f32 logit buffer would be ~30 lines; left out to keep the minimal-stack claim honest.
-- **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts; `int4_matmul_batched_m4.wgsl` is the shader for a batched-prefill attention path but is not yet wired into the decode loop.
+- **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts; the `int4_matmul_batched_m4` generator variant is the shader for a batched-prefill attention path but is not yet wired into the decode loop.
 - **Two decode implementations.** `engine-core.ts` is the reference (used by `validate.html`); `chat.ts` is the experimental monolith with the progressive-streaming / fused-QKV / int8-KV work (used by `zero-tvm.html`). Both correct, not yet unified.
 - **Residual buffer ping-pong.** WebGPU forbids read+write to the same buffer in one dispatch, so the decode loops swap between `B.residual` and `B.residual2` across the `add_norm` dispatches. The two swaps per layer cancel out, which is why the per-layer bind groups can be pre-computed once and reused for every token.
 
