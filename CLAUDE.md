@@ -42,7 +42,7 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
   inspection against `src/compiler/shaders/`.
 - `src/webllm-bench/` — the head-to-head benchmarker (imports
   `@mlc-ai/web-llm`).
-- `src/{engine,phi3v2,standalone,capture,ui,main}.ts` — an older engine
+- `src/{engine,phi3v2,standalone-test,capture,ui}.ts` — an older engine
   generation + TVM-capture tooling. Not in the Vite build graph and not
   imported by the shipped pages (`capture.ts`/`dump-tvm.ts` back the
   RESEARCH.md interception work).
@@ -76,17 +76,15 @@ taglines, and the `sameAs` identity list there.
 
 ## Known gaps
 
-- **No ESLint.** `package.json`'s `lint` was renamed to `typecheck`, but
-  `.github/workflows/ci.yml` still calls `npm run lint` (CI red). Editing the
-  workflow needs `workflow` OAuth scope, unavailable to the bot, so
-  `package.json` re-adds a `lint` → `typecheck` alias as a stopgap to keep CI
-  green. Proper fix: point ci.yml at `npm run typecheck` and drop the alias.
-  ESLint config is still a future addition.
+- **No ESLint.** `.github/workflows/ci.yml` calls `npm run lint`, which
+  `package.json` aliases to `typecheck` (`tsc --noEmit`) — that alias shipped
+  and CI is green. Cosmetic follow-up: point ci.yml at `npm run typecheck`
+  directly and drop the alias. ESLint config is still a future addition.
 - The "More by Ahmet" footer is repeated (and has drifted out of sync)
   across ~5 HTML pages. The JSON-LD `Person` block and "Related work" grid
   live only in `index.html`. Will migrate to sites-shared HTML partials.
 - **Forked decode loop.** `buildDecodeEngine` exists in both `chat.ts`
   (shipped) and `engine-core.ts` (validate + dev tools). De-dupe pending.
-- **Dead top-level modules.** `src/{engine,phi3v2,standalone,capture,ui,
-  main}.ts` are unreferenced by the build; some are research/capture
+- **Dead top-level modules.** `src/{engine,phi3v2,standalone-test,capture,
+  ui}.ts` are unreferenced by the build; some are research/capture
   tooling. Prune or relocate under a `tools/` dir.

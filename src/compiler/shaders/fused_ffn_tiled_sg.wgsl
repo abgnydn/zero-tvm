@@ -17,10 +17,9 @@
 //   Rows 8192..16383 = up weights
 //   output[i] = SiLU(gate[i]) * up[i]
 //
-// Input/output share a buffer. shared_input snapshot-copies at WG start;
-// output writes happen at kernel end, so by the time any WG writes an output
-// every WG's input load has long since finished (same timing argument as
-// fused_ffn.wgsl — the dot-product phase dwarfs the load phase).
+// Input and output are separate buffers (hidden1 in, ffnOut out — same as
+// fused_ffn.wgsl). shared_input is a bandwidth optimization: the input vector
+// is loaded into workgroup memory once and reused across all 8 weight rows.
 //
 // Requires sg_size = 32; gated in chat.ts.
 

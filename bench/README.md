@@ -19,7 +19,8 @@ GPU-less CI sandbox. It:
 
 1. boots `zero-tvm.html` and calls `window.bench()` → Zero-TVM decode median,
 2. boots `webllm-bench.html` → WebLLM decode median,
-3. writes `bench/results.json` (the single source of truth, git-ignored),
+3. writes `bench/results.json` (the single source of truth — commit it after
+   each bench run so the repo records the numbers the docs were synced from),
 4. runs `sync-docs.mjs --write` to update the docs.
 
 Env knobs: `BENCH_TOKENS` (default 128), `BENCH_RUNS` (default 5), `BENCH_HW`.

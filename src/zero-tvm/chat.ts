@@ -11,7 +11,7 @@
  *   B.hidden2   — matmul output scratch (OProj, FFN down)
  */
 
-import { loadWeights, LoadedWeights } from './weight-loader.js'
+import { loadWeights, LoadedWeights, WEIGHTS_OPFS_DIR } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt, Tokenizer } from './tokenizer.js'
 import { summarize as summarizePLD } from './spec-sim.js'
 import { compile, PHI3 } from '../compiler/compiler.js'
@@ -137,7 +137,14 @@ interface BatchedBenchResult {
 }
 
 interface DecodeEngine {
-  generate(promptIds: number[], maxTokens: number, onToken: (id: number) => void): Promise<number[]>
+  generate(
+    promptIds: number[],
+    maxTokens: number,
+    onToken: (id: number) => void,
+    shouldStop?: () => boolean,
+  ): Promise<number[]>
+  /** Hard KV ceiling in tokens: PHI3.MAX_PAGES × PHI3.PAGE_SIZE. */
+  maxContext: number
   profileStep(warmupIds: number[]): Promise<KernelProfile | null>
   benchBatchedFfnDown(
     M: number,
@@ -238,6 +245,10 @@ function buildDecodeEngine(
   const kvQuantU = uniformBuf(device, [i32(0), i32(0), i32(0), u32(64)])    // pos_off, pages_off, scales_off, 64 WG
 
   const SM_SCALE = 1.0 / Math.sqrt(PHI3.HEAD_DIM)
+
+  // Hard KV ceiling — writing a slot at or past this position would run off
+  // the last page and silently corrupt the cache (same check as engine-core).
+  const MAX_CONTEXT = PHI3.MAX_PAGES * PHI3.PAGE_SIZE
 
   // Attention uniform (f16-KV mode): 9 fields, 36 bytes, padded to 48.
   // nnz_pages at offset 8 is the only per-token field; the rest are constant.
@@ -566,10 +577,19 @@ function buildDecodeEngine(
   async function generate(
     promptIds: number[],
     maxTokens: number,
-    onToken: (id: number) => void
+    onToken: (id: number) => void,
+    shouldStop?: () => boolean
   ): Promise<number[]> {
     const tokens: number[] = []
     if (promptIds.length === 0 || maxTokens <= 0) return tokens
+    // Refuse oversized prompts up front — prefilling at position >= MAX_CONTEXT
+    // would write past the last KV page and silently corrupt the cache.
+    if (promptIds.length >= MAX_CONTEXT) {
+      throw new Error(
+        `zero-tvm: prompt (${promptIds.length} tokens) exceeds max context ` +
+        `${MAX_CONTEXT} (PHI3.MAX_PAGES=${PHI3.MAX_PAGES} × PAGE_SIZE=${PHI3.PAGE_SIZE})`
+      )
+    }
 
     // --- Prefill ---
     // Fire all but the last step without readback. The argmax of intermediate
@@ -596,28 +616,32 @@ function buildDecodeEngine(
     const inFlight: Promise<number>[] = []
     let pos = promptIds.length
 
-    for (let k = 0; k < PIPELINE_DEPTH && tokens.length + k < maxTokens; k++) {
-      inFlight.push(submitStep(null, pos, true)!)
-      pos++
-    }
-
-    while (inFlight.length > 0) {
-      const tok = await inFlight.shift()!
-      if (STOP.has(tok) || tok < 0 || tok >= PHI3.VOCAB) {
-        // Drain the rest without emitting (frees readback slots for next generation).
-        while (inFlight.length > 0) await inFlight.shift()!
-        break
-      }
-      tokens.push(tok)
-      onToken(tok)
-      if (tokens.length >= maxTokens) {
-        while (inFlight.length > 0) await inFlight.shift()!
-        break
-      }
-      // Keep the pipeline full, but don't overshoot maxTokens.
-      if (tokens.length + inFlight.length < maxTokens) {
+    try {
+      for (let k = 0; k < PIPELINE_DEPTH && tokens.length + k < maxTokens && pos < MAX_CONTEXT; k++) {
         inFlight.push(submitStep(null, pos, true)!)
         pos++
+      }
+
+      while (inFlight.length > 0) {
+        const tok = await inFlight.shift()!
+        if (STOP.has(tok) || tok < 0 || tok >= PHI3.VOCAB) break
+        tokens.push(tok)
+        onToken(tok)
+        if (tokens.length >= maxTokens) break
+        // Cooperative stop: never unwind mid-pipeline — just stop submitting;
+        // the finally-drain below leaves the readback ring clean.
+        if (shouldStop?.()) break
+        // Keep the pipeline full, but don't overshoot maxTokens or the KV window.
+        if (tokens.length + inFlight.length < maxTokens && pos < MAX_CONTEXT) {
+          inFlight.push(submitStep(null, pos, true)!)
+          pos++
+        }
+      }
+    } finally {
+      // Drain pending readbacks (frees ring slots for the next generation —
+      // mapAsync on a still-pending slot buffer would be a validation error).
+      while (inFlight.length > 0) {
+        await inFlight.shift()!.catch(() => {})
       }
     }
 
@@ -749,7 +773,7 @@ function buildDecodeEngine(
     return { msBatched, msTiledTotal, msPerMBatched, msPerMTiled, speedup }
   }
 
-  return { generate, profileStep, benchBatchedFfnDown }
+  return { generate, maxContext: MAX_CONTEXT, profileStep, benchBatchedFfnDown }
 }
 
 // ============================================================
@@ -1127,7 +1151,7 @@ async function hasWeightsCached(): Promise<boolean> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
   try {
     const root = await navigator.storage.getDirectory()
-    const dir = await root.getDirectoryHandle('zero-tvm-weights')
+    const dir = await root.getDirectoryHandle(WEIGHTS_OPFS_DIR)
     // ndarray-cache.json is the smallest sentinel — its presence means at
     // least the manifest has been fetched (and shards followed in-session).
     await dir.getFileHandle('ndarray-cache.json')
@@ -1207,6 +1231,14 @@ async function main(): Promise<void> {
     return
   }
   log(`GPU ready — features: ${wantFeatures.join(', ')}`)
+  // Surface device loss (driver reset, OOM, GPU process crash) instead of
+  // letting every later submit fail silently. No retry — a reload is the fix.
+  void device.lost.then((info) => {
+    if (info.reason === 'destroyed') return  // intentional teardown
+    setBadge('GPU lost', 'error')
+    showLoadingError(`GPU device lost: ${info.message || info.reason}. Reload the page to recover.`)
+    log(`ERROR: GPU device lost (${info.reason}): ${info.message}`)
+  })
   setProgress(5, 'Probing GPU subgroups…')
   // Our _sg shaders assume subgroup size == 32 (full 32-thread workgroup in
   // one subgroup). Apple M-series and most shipping WebGPU subgroup backends
@@ -1290,6 +1322,18 @@ async function main(): Promise<void> {
   log('Building decode engine…')
   const engine = buildDecodeEngine(device, weights, kvPages, kvInt8, { sgSizeOk })
 
+  // Pipeline warmup. createComputePipeline only registers shaders — Dawn
+  // lazily JITs them on the first dispatch, which costs ~5s on a cold cache
+  // (see loading-ui.ts, where validate gets the same treatment). Run one
+  // throwaway single-token generation behind the progress bar so the first
+  // chat message streams at steady-state speed. The KV slots it writes are
+  // overwritten by the first real turn's prefill (chat always prefills from 0).
+  setProgress(99, 'Warming up GPU pipelines…')
+  const warmupT0 = performance.now()
+  const warmupIds = buildChatPrompt([{ role: 'user', content: 'Hi.' }], tokenizer)
+  await engine.generate(warmupIds, 1, () => {})
+  log(`Warmup forward: ${Math.round(performance.now() - warmupT0)} ms`)
+
   setProgress(100, 'Ready')
   log('')
   log('Ready. Zero TVM. 10 WGSL kernel roles.')
@@ -1333,11 +1377,15 @@ async function main(): Promise<void> {
 
   function updateCtxHint(nTokens?: number) {
     if (!ctxHint) return
+    // True ceiling is the KV page table (MAX_PAGES × PAGE_SIZE = 4112), not
+    // the model's nominal 4096 — derived from the same constant the engine uses.
     if (!nTokens) {
       ctxHint.textContent = 'Zero TVM · 10 WGSL kernels · 228 dispatches/token'
+    } else if (nTokens >= engine.maxContext) {
+      ctxHint.textContent = `Context full — ${engine.maxContext} / ${engine.maxContext} tokens · start a new chat`
     } else {
-      const pct = Math.round((nTokens / PHI3.MAX_SEQ) * 100)
-      ctxHint.textContent = `Context ${nTokens} / ${PHI3.MAX_SEQ} tokens (${pct}%) · 228 dispatches/token`
+      const pct = Math.round((nTokens / engine.maxContext) * 100)
+      ctxHint.textContent = `Context ${nTokens} / ${engine.maxContext} tokens (${pct}%) · 228 dispatches/token`
     }
   }
 
@@ -1349,6 +1397,7 @@ async function main(): Promise<void> {
     if (msgs) msgs.replaceChildren()
     welcome?.classList.remove('hidden')
     setStats('')
+    setBadge('Ready', 'ready')   // clears a lingering "Context full" state
     updateCtxHint()
     inp?.focus()
   }
@@ -1400,8 +1449,9 @@ async function main(): Promise<void> {
     let fullResponse = ''
 
     try {
+      // Cooperative cancellation: the engine polls the flag between pipeline
+      // submissions and drains its in-flight readbacks before returning.
       await engine.generate(promptIds, 500, (id) => {
-        if (stopRequested) throw new Error('__stopped__')
         if (firstToken) {
           // Swap thinking indicator for the real body on first token.
           ai.body.replaceChildren(ai.cursor)
@@ -1413,14 +1463,10 @@ async function main(): Promise<void> {
         ai.render(fullResponse)
         const elapsed = (performance.now() - t0) / 1000
         setStats(`${count} tok · ${(count / elapsed).toFixed(1)} tok/s`)
-      })
+      }, () => stopRequested)
     } catch (e) {
-      if (e instanceof Error && e.message === '__stopped__') {
-        fullResponse = tokenizer.decode(allIds)
-      } else {
-        fullResponse += `\n\n_[Error: ${e}]_`
-        log(`Error: ${e}`)
-      }
+      fullResponse += `\n\n_[Error: ${e}]_`
+      log(`Error: ${e}`)
     }
     const totalSec = (performance.now() - t0) / 1000
     const tokPerS = count / Math.max(totalSec, 0.001)
@@ -1432,6 +1478,10 @@ async function main(): Promise<void> {
     })
     // Reflect the true KV position count (prompt + generated) in the context hint.
     updateCtxHint(promptIds.length + count)
+    if (promptIds.length + count >= engine.maxContext) {
+      setBadge('Context full', 'error')
+      log(`Context window full (${engine.maxContext} tokens) — start a new chat to continue.`)
+    }
     return fullResponse
   }
 
@@ -1441,6 +1491,19 @@ async function main(): Promise<void> {
     setBusy(true); stopRequested = false
     const ai = addAiMsg()
     const promptIds = buildChatPrompt(history, tokenizer)
+    // Every turn re-prefills the whole history, so once it no longer fits the
+    // KV window the only way forward is a fresh conversation. Refuse cleanly
+    // instead of letting prefill corrupt the cache.
+    if (promptIds.length >= engine.maxContext) {
+      const msg = `Context full — the conversation (${promptIds.length} tokens) exceeds the ${engine.maxContext}-token window. Start a new chat.`
+      ai.finish({ fullText: `_${msg}_`, tokens: 0, tokPerS: 0 })
+      setBadge('Context full', 'error')
+      updateCtxHint(promptIds.length)
+      log(msg)
+      setBusy(false); stopRequested = false
+      updateSendEnabled()
+      return
+    }
     const fullResponse = await runGeneration(ai, promptIds)
     history.push({ role: 'assistant', content: fullResponse })
     setBusy(false); stopRequested = false

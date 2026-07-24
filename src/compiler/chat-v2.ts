@@ -12,6 +12,7 @@
 import { LLMEngine, MODELS } from '../engine.js'
 import { ChatUI } from '../ui.js'
 import { patchForCapture, getCaptureResult, CaptureResult } from '../capture.js'
+import { WEIGHTS_OPFS_DIR } from '../zero-tvm/weight-loader.js'
 
 import int4MatmulSrc from './shaders/int4_matmul.wgsl?raw'
 import int4MatmulF32Src from './shaders/int4_matmul_f32.wgsl?raw'
@@ -417,7 +418,7 @@ async function hasSharedWeightsCached(): Promise<boolean> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
   try {
     const root = await navigator.storage.getDirectory()
-    const dir = await root.getDirectoryHandle('zero-tvm-weights')
+    const dir = await root.getDirectoryHandle(WEIGHTS_OPFS_DIR)
     await dir.getFileHandle('ndarray-cache.json')
     return true
   } catch {

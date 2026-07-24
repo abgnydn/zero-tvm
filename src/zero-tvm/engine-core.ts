@@ -4,9 +4,10 @@
  * Pure GPU pipeline: takes a loaded device + weights, returns a DecodeEngine
  * that exposes generate / forwardLogits / resetKVTracking. No DOM, no UI.
  *
- * chat.ts wires this into the chat page; validate.ts wires it into the
- * validation page. Anything that touches the GPU lives here so the two pages
- * cannot diverge in how they exercise the model.
+ * validate.ts wires this into the validation page (via loading-ui.ts's
+ * bootEngine). chat.ts does NOT use this module yet — it carries its own
+ * forked copy of the decode loop (see CLAUDE.md "Known gaps"); unification is
+ * planned. Until then, keep inner-loop edits in sync across both files.
  */
 
 import { LoadedWeights } from './weight-loader.js'
@@ -413,14 +414,16 @@ export function buildDecodeEngine(
       }
     }
 
-    // Decode loop
+    // Decode loop. Each emitted token is fed back at the next free KV slot:
+    // the first generated token decodes at position promptIds.length (the
+    // slot right after the prompt), then the position advances by one.
     let pos = promptIds.length
     for (let i = 0; i < maxTokens; i++) {
       if (tokenId < 0 || tokenId >= PHI3.VOCAB || STOP.has(tokenId)) break
       tokens.push(tokenId)
       onToken(tokenId)
-      pos++
       tokenId = await decodeToken(tokenId, pos)
+      pos++
     }
 
     return tokens

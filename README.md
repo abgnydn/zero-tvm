@@ -33,6 +33,10 @@ Numbers above are measured from the source and build output in this repo; throug
 - `fused_ffn.wgsl` — gate + up + SiLU in one pass.
 - `add_norm.wgsl` — residual add + RMSNorm in one pass.
 
+Counting note: "10 kernel roles" counts the default f16-KV decode path. By file
+basename there are 11 prefixes — the eleventh, `kv_quantize_int8.wgsl`, only
+runs on the opt-in `?kv8=1` int8-KV path.
+
 Every FLOP the model executes is in a file you can open. Every GPU buffer has a human label. Every dispatch is annotated in `src/zero-tvm/chat.ts` (the experimental path) and `src/zero-tvm/engine-core.ts` (the reference path).
 
 ## Why this might be interesting
@@ -62,7 +66,7 @@ To build a deployable bundle:
 npm run build   # → dist/
 ```
 
-The build produces a multi-page Vite output: `index.html` (landing page — project overview, shader catalog, compare table), `zero-tvm.html` (chat demo), `compiler-chat.html`, `demo.html` (dispatch visualization), `validate.html` (multi-prompt smoke test), `webllm-bench.html` (head-to-head harness), `architecture.html`, `docs.html`.
+The build produces a multi-page Vite output: `index.html` (landing page — project overview, shader catalog, compare table), `zero-tvm.html` (chat demo), `compiler-chat.html`, `demo.html` (dispatch visualization), `validate.html` (multi-prompt smoke test), `webllm-bench.html` (head-to-head harness), `architecture.html`, `docs.html`, `dump.html` (TVM shader capture), `shaders.html` (captured-shader browser).
 
 ### URL flags
 
@@ -108,7 +112,7 @@ src/
                           allocKVPages, the 32-layer decode loop. No DOM.
                           Used by validate.ts (and by chat.ts's ancestor before
                           the progressive-streaming refactor).
-    chat.ts               ~1,100 lines — the experimental path: progressive
+    chat.ts               ~1,700 lines — the experimental path: progressive
                           weight streaming with OPFS cache, fused QKV+RoPE+KV
                           dispatch, opt-in int8 KV cache, URL-flag A/B harness.
                           Currently a monolith rather than a thin UI on top of
@@ -210,7 +214,9 @@ Measured on M2 Pro, Chrome 120+, Phi-3-mini-4k-instruct q4f16_1, steady-state de
 | Zero-TVM (this repo, f16 KV, default shaders) | **~40** |
 
 Reproduce on any WebGPU GPU with `npm run bench` — it drives both engines on
-identical weights and regenerates the numbers in BENCH.md. It also runs headless
+identical weights and rewrites the three marker-wrapped numbers in BENCH.md
+(`zt` / `webllm` / `gap`); prose mentions of the numbers are reported for
+hand-updating, not auto-edited (see `bench/README.md`). It also runs headless
 on a cloud GPU (Colab notebook + Docker image in [`bench/`](bench/)) for machines
 without a local one.
 

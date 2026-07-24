@@ -1,10 +1,11 @@
 /**
  * SHARED LOADING UI + BOOT FLOW
  *
- * Both chat.ts and validate.ts need to do the same thing before they can run
- * anything: request the GPU, load the tokenizer, download the weights with a
- * visible progress bar, allocate the KV cache, and compile the shaders. This
- * module owns that pipeline so the two pages cannot drift in how they boot.
+ * Booting an engine means: request the GPU, load the tokenizer, download the
+ * weights with a visible progress bar, allocate the KV cache, and compile the
+ * shaders. This module owns that pipeline. Today only validate.ts boots
+ * through bootEngine — chat.ts still has its own inline boot flow (moving it
+ * here is part of the planned chat/engine-core unification).
  *
  * Pages must include the standard progress markup (see zero-tvm.html /
  * validate.html): #badge, #progress-wrap, #progress-status, #progress-bar,
@@ -117,6 +118,14 @@ export async function bootEngine(): Promise<BootResult> {
     return { ok: false, reason: 'shader-f16 unsupported — Chrome/Edge required' }
   }
   log('GPU: shader-f16 enabled')
+  // Surface device loss (driver reset, OOM, GPU process crash) instead of
+  // letting every later submit fail silently. No retry — a reload is the fix.
+  void device.lost.then((info) => {
+    if (info.reason === 'destroyed') return  // intentional teardown
+    setBadge('GPU lost', 'error')
+    setProgress(0, `GPU device lost: ${info.message || info.reason} — reload the page to recover`)
+    log(`ERROR: GPU device lost (${info.reason}): ${info.message}`)
+  })
   setProgress(5, 'Loading tokenizer...')
 
   setBadge('Tokenizer...', 'loading')

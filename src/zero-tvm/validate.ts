@@ -39,7 +39,7 @@ interface TestPrompt {
   user: string
   /** Optional sanity hint — string the top-1 continuation should plausibly contain.
    * This is informational only; the test doesn't fail if it's missing, since
-   * Phi-3's greedy decode is occasionally weird. */
+   * a correct greedy continuation can legitimately phrase things differently. */
   hint?: string
 }
 

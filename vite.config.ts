@@ -100,9 +100,10 @@ export default defineConfig({
     },
   },
   build: {
-    // Deploy all user-facing entries. Dev-only pages (shaders, test-*,
-    // standalone-test) are intentionally excluded — they're in-repo for
-    // debugging and not linked from the main site.
+    // Deploy all user-facing entries, including the shader-inspection pages
+    // (dump, shaders) which README documents as part of the build. Dev-only
+    // pages (test-shaders, test-chain, standalone-test) are intentionally
+    // excluded — they're in-repo for debugging and not linked from the site.
     rollupOptions: {
       input: {
         index:         resolve(__dirname, 'index.html'),
