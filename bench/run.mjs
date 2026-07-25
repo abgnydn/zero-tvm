@@ -27,6 +27,10 @@ const HOST = '127.0.0.1'
 const BASE = `http://${HOST}:${PORT}`
 const N_TOKENS = Number(process.env.BENCH_TOKENS ?? 128)
 const N_RUNS = Number(process.env.BENCH_RUNS ?? 5)
+// BENCH_QUERY="?vec4=1" A/Bs a shader-variant flag: appended to /zero-tvm.html,
+// skips the WebLLM half and does NOT touch results.json (A/B runs are for
+// comparing flags, not for updating the headline numbers).
+const QUERY = process.env.BENCH_QUERY ?? ''
 const HARDWARE = process.env.BENCH_HW ?? 'unknown GPU'
 const READY_MS = 12 * 60 * 1000 // first run downloads ~2 GB
 // headless:false matches the e2e harness (most reliable on a desktop GPU under
@@ -154,34 +158,40 @@ try {
   // 1) Zero-TVM decode median via the engine's built-in bench().
   const ztPage = await browser.newPage()
   attachDiagnostics(ztPage, 'zt')
-  await bootReady(ztPage, '/zero-tvm.html')
+  await bootReady(ztPage, `/zero-tvm.html${QUERY}`)
   const zt = await ztPage.evaluate((n, runs) => window.bench(n, runs), N_TOKENS, N_RUNS)
-  console.log(`→ Zero-TVM median: ${zt.median.toFixed(2)} tok/s`)
+  console.log(`→ Zero-TVM median: ${zt.median.toFixed(2)} tok/s${QUERY ? `  (${QUERY})` : ''}`)
 
-  // 2) WebLLM decode median — webllm-bench.html runs on start and sets window.webllmResult.
-  const wlPage = await browser.newPage()
-  attachDiagnostics(wlPage, 'wl')
-  await bootReady(wlPage, '/webllm-bench.html')
-  const wl = await wlPage
-    .waitForFunction(() => window.webllmResult, { timeout: READY_MS, polling: 1000 })
-    .then((h) => h.jsonValue())
-  console.log(`→ WebLLM median: ${wl.median.toFixed(2)} tok/s`)
+  if (QUERY) {
+    // A/B mode: one engine config, no WebLLM half, no results.json.
+    console.log(`[a/b] runs: ${zt.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
+    ok = true
+  } else {
+    // 2) WebLLM decode median — webllm-bench.html runs on start and sets window.webllmResult.
+    const wlPage = await browser.newPage()
+    attachDiagnostics(wlPage, 'wl')
+    await bootReady(wlPage, '/webllm-bench.html')
+    const wl = await wlPage
+      .waitForFunction(() => window.webllmResult, { timeout: READY_MS, polling: 1000 })
+      .then((h) => h.jsonValue())
+    console.log(`→ WebLLM median: ${wl.median.toFixed(2)} tok/s`)
 
-  const results = {
-    ztDecode: +zt.median.toFixed(2),
-    ztRuns: zt.runs?.map((x) => +x.tokPerS.toFixed(2)),
-    webllmDecode: +wl.median.toFixed(2),
-    hardware: HARDWARE,
-    date: new Date().toISOString().slice(0, 10),
-    nTokens: N_TOKENS,
-    nRuns: N_RUNS,
+    const results = {
+      ztDecode: +zt.median.toFixed(2),
+      ztRuns: zt.runs?.map((x) => +x.tokPerS.toFixed(2)),
+      webllmDecode: +wl.median.toFixed(2),
+      hardware: HARDWARE,
+      date: new Date().toISOString().slice(0, 10),
+      nTokens: N_TOKENS,
+      nRuns: N_RUNS,
+    }
+    writeFileSync(resolve(ROOT, 'bench/results.json'), JSON.stringify(results, null, 2) + '\n')
+    console.log('\nwrote bench/results.json')
+    ok = true
   }
-  writeFileSync(resolve(ROOT, 'bench/results.json'), JSON.stringify(results, null, 2) + '\n')
-  console.log('\nwrote bench/results.json')
-  ok = true
 } finally {
   await browser?.close().catch(() => {})
   vite.kill('SIGTERM')
 }
 
-if (ok) spawnSync('node', [resolve(ROOT, 'bench/sync-docs.mjs'), '--write'], { cwd: ROOT, stdio: 'inherit' })
+if (ok && !QUERY) spawnSync('node', [resolve(ROOT, 'bench/sync-docs.mjs'), '--write'], { cwd: ROOT, stdio: 'inherit' })

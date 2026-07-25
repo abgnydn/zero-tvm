@@ -4,3 +4,4 @@ dist/
 .tests-cache/
 *.log
 .DS_Store
+public/weights/

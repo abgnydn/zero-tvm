@@ -12,8 +12,10 @@
 //   - Subgroup 1 computes pair 1 (rows rl1, rh1)
 //   - Input cached into workgroup shared memory (D f16 = 6 KB, fits)
 //
-// If this still regresses, the 22% gap vs WebLLM is definitively not
-// reachable via hand-tuned QKV tiling on Apple.
+// Result: it regressed too (BENCH.md) — hand-tuned QKV tiling is
+// definitively not a lever on Apple. (Written in the M2 Pro era, when
+// Zero-TVM still trailed WebLLM by 22%; the lever that did work on this
+// kernel was load width — qkv_fused_sg_vec4, now the default.)
 //
 // Bind-group layout matches qkv_fused_sg.wgsl so chat.ts can swap pipelines.
 //

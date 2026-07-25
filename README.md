@@ -10,11 +10,11 @@
 
 **[zerotvm.com](https://zerotvm.com)**
 
-**Phi-3-mini (3.8B) running in the browser on 10 hand-written WGSL kernels — ~80% of WebLLM's decode speed, with no TVM, no compiler, and no WASM runtime.**
+**Phi-3-mini (3.8B) running in the browser on 10 hand-written WGSL kernels — measured ~28% faster than WebLLM's decode on an Apple M2 Max, with no TVM, no compiler, and no WASM runtime.**
 
 | | WebLLM (TVM) | Zero-TVM (this repo) |
 |---|---|---|
-| Decode speed (M2 Pro, same weights) | **~51 tok/s** | **~40 tok/s** |
+| Decode speed (M2 Max, same weights, same run) | **51.98 tok/s** | **66.33 tok/s** |
 | Unique WGSL kernels | **85** (autotuned) | **10 roles / 27 kernels** (18 .wgsl + 9 generated int4 variants) |
 | Total WGSL lines | **12,962** (generated) | **~2,150** hand-written + a 280-line readable generator |
 | Dispatches per decode step | **342** | **228** (f16 KV) / **260** (int8 KV) |
@@ -22,7 +22,7 @@
 | Tokenizer | bundled from WebLLM | BPE from scratch (`tokenizer.ts`) |
 | JS bundle (chat page, excl. weights) | **5.9 MB** / 2.1 MB gz | **157 kB** / 33 kB gz |
 
-Same model, same quantized weights. [WebLLM / MLC-LLM](https://webllm.mlc.ai/) — the standard way to run a browser LLM — ships an Apache-TVM pipeline that emits 85 autotuned WGSL kernels driven from a WASM scheduler. This repo replaces that whole stack with **10 kernel roles (27 WGSL kernels — 18 hand-written files plus 9 int4-matmul variants emitted by a small readable generator, counting subgroup/tiled/int8 variants) and ~2,000 lines of TypeScript** (engine + tokenizer + weight loader) — and lands within ~20% of it. The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
+Same model, same quantized weights. [WebLLM / MLC-LLM](https://webllm.mlc.ai/) — the standard way to run a browser LLM — ships an Apache-TVM pipeline that emits 85 autotuned WGSL kernels driven from a WASM scheduler. This repo replaces that whole stack with **10 kernel roles (27 WGSL kernels — 18 hand-written files plus 9 int4-matmul variants emitted by a small readable generator, counting subgroup/tiled/int8 variants) and ~2,000 lines of TypeScript** (engine + tokenizer + weight loader) — and, as of the 2026-07-25 head-to-head, decodes faster than it on the one machine measured. The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
 
 ## What's actually in the box
 
@@ -43,15 +43,15 @@ Every FLOP the model executes is in a file you can open. Every GPU buffer has a 
 
 Hand-written GPU kernels usually lose significantly to an autotuning compiler. The claim this repo is designed to test is: **for a decoder-only LLM of this shape, most of the compiler's complexity budget isn't buying much.** The expensive parts are matmul, attention, and int4 dequant. Everything else is plumbing. ~10 kernels of plumbing, instead of 85.
 
-Measured result on an M2 Pro (WebGPU + `shader-f16`, identical Phi-3-mini-q4f16_1 weights): ~40 tok/s decode vs WebLLM's ~51 tok/s — **about 22% behind the autotuned compiler**. Full methodology and A/B results in [BENCH.md](BENCH.md), including three tile-variant experiments and a prompt-lookup speculative-decoding experiment that were *falsified* by measurement rather than shipped.
+Measured result on an Apple M2 Max, Chrome 150, identical Phi-3-mini-q4f16_1 weights, same-day same-run head-to-head (2026-07-25): **66.33 tok/s decode vs WebLLM's 51.98 — about 28% faster than the autotuned compiler.** Full methodology and A/B results in [BENCH.md](BENCH.md), including three tile-variant experiments, a prompt-lookup speculative-decoding experiment, and an FFN-prologue-fusion experiment that were *falsified* by measurement rather than shipped. (An earlier measurement on an M2 Pro with an older, buggier engine put this repo 22% *behind* WebLLM — that history is preserved, not retconned, in BENCH.md.)
 
-That the gap is 22% and not 2× is the interesting fact. The repo makes the stack *auditable*: if you want to instrument a layer, add a new fusion, test a different attention pattern, or teach someone how browser LLM inference works at the metal, there is no compiler in the way — just WGSL and a few hundred lines of TypeScript orchestrating it.
+The scope of that number matters: one machine, one model, one browser, decode-only, short-context bench. But within that scope the question the repo was built to test now has a sharper answer — the ten hand-written kernels aren't merely "close enough" to the 85 autotuned ones; on this hardware they win. The repo also makes the stack *auditable*: if you want to instrument a layer, add a new fusion, test a different attention pattern, or teach someone how browser LLM inference works at the metal, there is no compiler in the way — just WGSL and a few hundred lines of TypeScript orchestrating it.
 
 The closest reference point is Karpathy's [llm.c](https://github.com/karpathy/llm.c) (hand-written CUDA/C GPT-2). This is that thesis — *you don't need the giant framework* — ported to browser / WebGPU / int4 / paged KV / modern arch, for a model people actually use.
 
 ## How to run
 
-**Requirements:** A recent Chrome or Edge with WebGPU enabled and the `shader-f16` feature available. Tested on macOS (M2 Pro, Chrome 120+). Other platforms should work but are untested.
+**Requirements:** A recent Chrome or Edge with WebGPU enabled and the `shader-f16` feature available. Tested on macOS (M2 Pro / M2 Max, Chrome 120–150). Other platforms should work but are untested.
 
 ```bash
 npm install
@@ -77,10 +77,9 @@ The build produces a multi-page Vite output: `index.html` (landing page — proj
 - `?qkvtile=1` / `?qkvtile2=1` — opt into tiled QKV variants (both regressed on M2 Pro — kept for portability testing)
 - `?ffnsg=1` — opt into the tiled-subgroup fused FFN
 - `?kv8=1` — opt into the int8 KV cache path (`kv_quantize_int8` + `attention_int8`)
-- `?vec4=1` — vec4<u32> weight + activation loads in the generated int4 matmuls (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
-- `?vec4qkv=1` — vec4-load `qkv_fused` sibling, 32-thread (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
-- `?splitk=N` — split-K flash-decode attention, N ∈ 2..16 partitions per head + combine pass; f16 KV only (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
-- `?fuseprologue=1` — fold the FFN-entry add_norm into the FFN kernel's prologue, `add3_norm` at the layer tail (built and correctness-tested; not yet measured — run `npm run bench` to A/B)
+- `?vec4=0` / `?vec4qkv=0` — opt OUT of the vec4<u32> weight + activation loads in the int4 matmuls / `qkv_fused`. Default ON since 2026-07-25: measured +7.1% together on M2 Max (see BENCH.md)
+- `?splitk=N` — split-K flash-decode attention, N ∈ 2..16 partitions per head + combine pass; f16 KV only. Still opt-in: measured ~+3% at short context on M2 Max; needs a long-context A/B before defaulting
+- `?fuseprologue=1` — fold the FFN-entry add_norm into the FFN kernel's prologue, `add3_norm` at the layer tail. Measured −13.7% on M2 Max — a documented negative result, kept for A/B on other GPUs
 
 Open DevTools and `window.specSim(160, 3, 3)` runs the CPU-side prompt-lookup speculative-decoding acceptance simulator over three prompt types — see `src/zero-tvm/spec-sim.ts`.
 
@@ -221,12 +220,13 @@ buffers, and bind-group layout the chat page ships.
 
 ## Performance
 
-Measured on M2 Pro, Chrome 120+, Phi-3-mini-4k-instruct q4f16_1, steady-state decode:
+Measured on Apple M2 Max, Chrome 150.0.7871.182, Phi-3-mini-4k-instruct q4f16_1,
+steady-state decode, 128 tokens × 5 runs, median (2026-07-25):
 
 | | tok/s (median) |
 |---|---|
-| WebLLM v0.2.80 (MLC-LLM, same weights) | **~51** |
-| Zero-TVM (this repo, f16 KV, default shaders) | **~40** |
+| Zero-TVM (this repo, f16 KV, default shaders) | **66.33** |
+| WebLLM v0.2.80 (MLC-LLM, same weights, same run) | **51.98** |
 
 Reproduce on any WebGPU GPU with `npm run bench` — it drives both engines on
 identical weights and rewrites the three marker-wrapped numbers in BENCH.md
@@ -235,9 +235,13 @@ hand-updating, not auto-edited (see `bench/README.md`). It also runs headless
 on a cloud GPU (Colab notebook + Docker image in [`bench/`](bench/)) for machines
 without a local one.
 
-That's ~22% behind the autotuned compiler on an identical workload. See
-[BENCH.md](BENCH.md) for the full protocol, the raw numbers, and three optimization
-experiments that were *measured and dropped*:
+That's ~28% faster than the autotuned compiler on an identical workload —
+one machine, one model, one browser; the best measured opt-in config
+(`?vec4=1&vec4qkv=1&splitk=8`) reaches 68.36 tok/s. An earlier M2 Pro
+measurement with an older engine read 22% *behind*; both hardware and code
+changed since, so the same-day WebLLM number is the only valid comparator
+(details in BENCH.md). See [BENCH.md](BENCH.md) for the full protocol, the
+raw numbers, and the optimization experiments that were *measured and dropped*:
 
 - Three QKV tiling strategies (1152 WGs × 32 threads, 2304 × 32, 2304 × 64) — all
   regressed vs the 4608-WG subgroup baseline. Apple GPUs want high WG occupancy
@@ -246,6 +250,10 @@ experiments that were *measured and dropped*:
   (prose, code, summary). Acceptance rate <8% at N=3, K=3; below the 67% threshold
   the `(1+αK)/((K+1)/2)` throughput formula needs to break even. Falsified before
   any shader was written (`src/zero-tvm/spec-sim.ts`).
+- FFN prologue fusion (`?fuseprologue=1`) — folding addNorm1 into the FFN kernel
+  to remove 32 dispatch bubbles per token measured **−13.7%** on M2 Max: the
+  redundant per-workgroup RMSNorm recompute costs more than the dispatch
+  bubbles save. Kept behind its flag for A/B on other GPUs.
 
 ## Known caveats
 

@@ -41,7 +41,7 @@ those by hand from the printed checklist.
 `results.json` schema:
 
 ```json
-{ "ztDecode": 42.14, "webllmDecode": 51.5, "hardware": "M2 Pro, 19-core", "date": "2026-06-23" }
+{ "ztDecode": 66.33, "webllmDecode": 51.98, "hardware": "Apple M2 Max", "date": "2026-07-25" }
 ```
 
 ## Run it on a cloud GPU (no Mac)

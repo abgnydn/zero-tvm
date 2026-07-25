@@ -322,8 +322,9 @@ ${writes}
 }
 
 /** The shipped variants (the first 9 are 1:1 with the deleted .wgsl files;
- *  the 4 `_vec4` entries are the ?vec4=1 experiment — built and
- *  correctness-tested, awaiting measurement). */
+ *  the 4 `_vec4` entries are the vec4-load variants — measured +4.5% on
+ *  M2 Max, 2026-07-25, and now the default where sg32 holds; ?vec4=0 opts
+ *  out — see BENCH.md). */
 export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   {},                                            // int4_matmul
   { subgroups: true },                           // int4_matmul_sg

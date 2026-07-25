@@ -9,7 +9,7 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:url" content="https://zerotvm.com/demo.html">
   <meta property="og:title" content="Dispatch Visualization — Zero-TVM">
-  <meta property="og:description" content="Reverse-engineering trace of WebLLM's 342 GPU dispatches on Phi-3-mini, feeding the 10-kernel Zero-TVM rewrite (228 dispatches, ~40 tok/s on M2 Pro).">
+  <meta property="og:description" content="Reverse-engineering trace of WebLLM's 342 GPU dispatches on Phi-3-mini, feeding the 10-kernel Zero-TVM rewrite (228 dispatches, ~66 tok/s on M2 Max).">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
   <style>
@@ -90,14 +90,14 @@
 <!-- Section 1: Hero -->
 <section id="hero">
   <h1>WebGPU Shader Interception<br>for Browser LLMs</h1>
-  <p class="subtitle">I intercepted a 3.8B parameter AI model running in your browser, captured every GPU operation, decoded its architecture, and rewrote the hot path in 10 hand-written WGSL kernels — 228 dispatches per token at ~40 tok/s on M2 Pro, 22% behind WebLLM's TVM-autotuned 85 kernels on identical weights.</p>
+  <p class="subtitle">I intercepted a 3.8B parameter AI model running in your browser, captured every GPU operation, decoded its architecture, and rewrote the hot path in 10 hand-written WGSL kernels — 228 dispatches per token at ~66 tok/s on M2 Max, ~28% faster than WebLLM's TVM-autotuned 85 kernels on identical weights.</p>
 
   <div class="pills">
     <div class="pill"><span>85 → 10</span> TVM shaders → kernel roles</div>
     <div class="pill"><span>342 → 228</span> dispatches per token</div>
     <div class="pill"><span>728</span> GPU buffers mapped</div>
     <div class="pill"><span>12,962 → 3,078</span> LOC WGSL</div>
-    <div class="pill"><span>~40</span> tok/s decode (M2 Pro)</div>
+    <div class="pill"><span>~66</span> tok/s decode (M2 Max)</div>
   </div>
 
   <details>
@@ -105,7 +105,7 @@
     <div class="content">
       <p>Large Language Models like Phi-3 generate text one word at a time. For each word, the model runs 342 GPU compute operations ("dispatches") across 32 neural network layers. Each layer does matrix multiplication, attention computation, and activation functions — all running on your GPU via WebGPU.</p>
       <p>Normally, a framework called TVM manages these operations. TVM's runtime (written in WASM) decides which GPU shader to run, writes the parameters, submits the work, and reads the result — 342 times per word.</p>
-      <p>I intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, then threw away the 85 TVM shaders and wrote 10 of my own (27 WGSL files, 3,078 LOC) that drive the GPU directly. Same weights, same math — 228 dispatches per token instead of 342, fully readable in one sitting, 22% slower than TVM's autotuned kernels on M2 Pro.</p>
+      <p>I intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, then threw away the 85 TVM shaders and wrote 10 of my own (27 WGSL files, 3,078 LOC) that drive the GPU directly. Same weights, same math — 228 dispatches per token instead of 342, fully readable in one sitting, ~28% faster than TVM's autotuned kernels on M2 Max (an earlier, buggier revision measured 22% slower on M2 Pro).</p>
     </div>
   </details>
 </section>
@@ -194,9 +194,9 @@ fused_split_silu_multiply        — gate split + SiLU + elementwise mul</pre>
   <details>
     <summary>The memory bandwidth wall</summary>
     <div class="content">
-      <p>At ~40 tok/s on M2 Pro (200 GB/s memory bandwidth), the model loads ~1.8 GB of weights per token:</p>
-      <pre>1.8 GB / 200 GB/s = 9 ms per token = ~111 tok/s theoretical maximum</pre>
-      <p>Zero-TVM at ~40 tok/s hits ~36% of that bandwidth ceiling; WebLLM at ~51 tok/s hits ~46%. The gap between us and WebLLM is compute (their matmul tiling, attention reduction, subgroup use) — not dispatch overhead, which we already win. Neither engine can change the bandwidth limit.</p>
+      <p>At ~66 tok/s on M2 Max (400 GB/s memory bandwidth), the model loads ~1.8 GB of weights per token:</p>
+      <pre>1.8 GB / 400 GB/s = ~4.5 ms per token = ~222 tok/s theoretical maximum</pre>
+      <p>Zero-TVM at 66.3 tok/s hits ~30% of that bandwidth ceiling; WebLLM at 52.0 tok/s hits ~23%. Since the vec4-load defaults (2026-07) Zero-TVM leads on both compute and dispatch overhead on this hardware — but neither engine can change the bandwidth limit, and ~70% of the ceiling is still on the table.</p>
     </div>
   </details>
 

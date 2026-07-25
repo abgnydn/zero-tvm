@@ -4,7 +4,9 @@
  * Loads @mlc-ai/web-llm against the EXACT same Phi-3-mini-q4f16_1 weights
  * Zero-TVM uses, served from our local mirror at /local-weights/*. This is
  * a true apples-to-apples: identical bytes on disk, identical prompt,
- * identical hardware (M2 Pro, 19-core). Only the inference engine differs.
+ * identical hardware (whatever machine runs the bench — the recorded
+ * head-to-head is on an Apple M2 Max, see BENCH.md). Only the inference
+ * engine differs.
  *
  * The WASM `model_lib` (compiled Relax compute graph) still comes from
  * WebLLM's CDN — it's architecture-matched for Phi-3-mini-4k-instruct.
@@ -116,8 +118,8 @@ async function main() {
   log(`[summary] WebLLM on ${MODEL_ID}`)
   log(`  median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s`)
   log('')
-  const ztvm = 42.14 // bench:zt — Zero-TVM decode median (tok/s), updated by `npm run bench`
-  log(`[comparison] Zero-TVM (this repo) median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (M2 Pro, 19-core)`)
+  const ztvm = 66.33 // bench:zt — Zero-TVM decode median (tok/s), updated by `npm run bench`
+  log(`[comparison] Zero-TVM (this repo) median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (Apple M2 Max, 2026-07-25 — see bench/results.json)`)
   const delta = ((median - ztvm) / ztvm) * 100
   log(`  → Zero-TVM is ${delta < 0 ? '+' : '-'}${Math.abs(delta).toFixed(1)}% ${delta < 0 ? 'faster' : 'slower'} than WebLLM on this machine`)
 

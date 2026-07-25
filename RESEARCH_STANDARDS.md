@@ -103,9 +103,11 @@ Nvidia Vulkan vs Intel iGPU) yields statistically equivalent logits
   count in the diagnosis.
 - **`honest negative`** — failures that are evidence. `CLAUDE.md §
   Known gaps` cites the artifact and the rejected hypothesis. The
-  "22% behind WebLLM" headline is an honest negative encoded as a
-  pass-bar miss with documented root cause (WebLLM's TVM-autotuned
-  85 kernels still beat 10 hand-written roles on raw GEMM throughput).
+  2026-06 "22% behind WebLLM" headline was an honest negative encoded
+  as a pass-bar miss with documented root cause; it stood until the
+  2026-07-25 M2 Max re-measurement (correctness fixes + vec4-load
+  defaults) flipped it to ~28% ahead — the negative's full arc is
+  preserved in BENCH.md, not retconned out.
 
 Honest negatives become the project's evidence base. They are not
 bugs to fix; they are findings.
@@ -162,8 +164,9 @@ sophistication / decreasing strength:
      for *weights*. Both `zero-tvm` and WebLLM read these from the
      same OPFS cache.
    - **WebLLM (`mlc-ai/web-llm`) as the head-to-head reference** —
-     same hardware, same weights, same prompt. The 22%-behind
-     headline is the falsifiable claim.
+     same hardware, same weights, same prompt. The head-to-head
+     headline (~28% ahead as of the 2026-07-25 M2 Max run; 22%
+     behind before it) is the falsifiable claim.
 4. **Experiment**: human-readable output equivalence on a fixed
    prompt corpus, scored against WebLLM's output for "did this
    answer the question equally well."
@@ -294,11 +297,14 @@ Hypothesis B — <alternative>
 Falsification experiment: <what would distinguish them>
 ```
 
-Standing entry: the **22% throughput gap behind WebLLM** on M2 Pro
-identical-weights identical-prompt. Documented hypotheses include
-TVM autotuning advantage on raw GEMM tile shape, subgroup intrinsic
-usage in WebLLM that's not yet in WGSL 1.0 spec, and prefill/decode
-schedule differences. Falsification experiments are queued.
+Standing entry (**closed 2026-07-25**): the 22% throughput gap
+behind WebLLM on M2 Pro, identical-weights identical-prompt. Closed
+by correctness fixes (fused_ffn f32 accumulation, attention barrier,
+decode off-by-one) plus promoting the measured vec4-load kernels to
+default; the M2 Max head-to-head now reads ~28% *ahead* (BENCH.md).
+Hardware changed too (M2 Pro → M2 Max), so per-hypothesis attribution
+is not fully resolved; the surviving open sub-question — split-K
+attention at long context — is queued in BENCH.md.
 
 Entries are removed when the underlying gap closes; the artifact
 references stay in `CHANGELOG.md`. Tested-and-rejected hypotheses
@@ -315,7 +321,10 @@ that surfaces the data**, with the full arc preserved. Examples:
 - "Zero-TVM matches WebLLM throughput" — false on initial measurement.
   README and BENCH.md were updated in the same commit as the
   head-to-head artifact to read "22% behind WebLLM" instead. The
-  earlier overclaim is preserved in `CHANGELOG.md`.
+  earlier overclaim is preserved in `CHANGELOG.md`. (The arc
+  continued: the 2026-07-25 M2 Max re-measurement flipped the
+  headline to ~28% ahead, recorded the same way — measurement first,
+  claim second.)
 - "228 dispatches/token" was the result after fusing QKV+RoPE+KV-append
   into one dispatch; the earlier 3-dispatch-per-layer count is
   archived rather than retconned out.

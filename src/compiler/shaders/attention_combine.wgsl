@@ -17,8 +17,8 @@
 // (tiny) partition list; each thread then owns 3 output dims (32 × 3 = 96).
 // No cross-thread reduction is needed.
 //
-// Built and correctness-tested; awaiting measurement (see BENCH.md
-// "Pending experiments").
+// Measured 2026-07-25 (M2 Max): ~+3% end-to-end at short context; stays
+// opt-in until a long-context A/B (see BENCH.md "Measured 2026-07-25").
 //
 // Model-shape constants are injected by src/compiler/shader-prelude.ts.
 

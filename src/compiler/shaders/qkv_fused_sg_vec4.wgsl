@@ -17,8 +17,9 @@
 //
 // Requires sg_size = 32 (gated in chat.ts).
 //
-// Built and correctness-tested; awaiting measurement (see BENCH.md
-// "Pending experiments").
+// Measured 2026-07-25 (M2 Max): +4.2% alone, +7.1% combined with ?vec4=1
+// — promoted to default (opt out with ?vec4qkv=0; see BENCH.md
+// "Measured 2026-07-25").
 //
 // Model-shape constants are injected by src/compiler/shader-prelude.ts.
 

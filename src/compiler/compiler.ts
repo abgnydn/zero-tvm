@@ -65,7 +65,8 @@ export interface Pipelines {
   int4MatmulF32Tiled: GPUComputePipeline | null  // tiled subgroup variant of LM head matmul
   int4MatmulF32Tiled8: GPUComputePipeline | null // wider tile variant of LM head matmul
   int4MatmulBatchedM4: GPUComputePipeline | null // M=4 batched GEMM (for spec decode / prefill chunks)
-  // ?vec4=1 experiment (built + correctness-tested, awaiting measurement):
+  // vec4-load variants — default ON since 2026-07-25 (+7.1% with the qkv
+  // sibling on M2 Max, BENCH.md); ?vec4=0 opts out:
   int4MatmulSgVec4: GPUComputePipeline | null       // vec4-load _sg variant
   int4MatmulTiledVec4: GPUComputePipeline | null    // vec4-load tiled variant (4 rows/WG)
   int4MatmulF32SgVec4: GPUComputePipeline | null    // vec4-load _sg LM-head variant
@@ -82,7 +83,8 @@ export interface Pipelines {
   attentionInt8: GPUComputePipeline    // int8-KV variant of paged attention
   attention: GPUComputePipeline
   attentionSg: GPUComputePipeline | null  // subgroup variant; null if `subgroups` feature absent
-  // ?splitk=N experiment (built + correctness-tested, awaiting measurement):
+  // ?splitk=N experiment (measured ~+3% at short context on M2 Max,
+  // 2026-07-25; opt-in until a long-context A/B — BENCH.md):
   attentionSplitK: GPUComputePipeline     // split-K partial pass (tree reduction)
   attentionSplitKSg: GPUComputePipeline | null  // split-K partial pass (subgroupAdd)
   attentionCombine: GPUComputePipeline    // merges split-K partials per head
@@ -90,7 +92,8 @@ export interface Pipelines {
   addNorm: GPUComputePipeline
   fusedFfn: GPUComputePipeline        // gate+up+SiLU fused
   fusedFfnTiledSg: GPUComputePipeline | null  // tiled subgroup variant (4 rows/WG)
-  // ?fuseprologue=1 experiment (built + correctness-tested, awaiting measurement):
+  // ?fuseprologue=1 experiment (measured −13.7% on M2 Max, 2026-07-25 —
+  // falsified there; kept for A/B on other GPUs — BENCH.md):
   fusedFfnPrologue: GPUComputePipeline          // add_norm folded into the FFN's phase 1
   fusedFfnTiledSgPrologue: GPUComputePipeline | null  // same, on the tiled_sg kernel
   add3Norm: GPUComputePipeline        // 3-way residual merge + norm (layer tail)

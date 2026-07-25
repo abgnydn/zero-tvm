@@ -17,16 +17,22 @@
  *   ?sgffn=0    disable tiled+subgroup FFN only
  *   ?matmul=    tiled8 | tiled | sg | scalar (default: tiled when sg on)
  *   ?kv8=1      opt into the int8 KV cache path
+ *   ?vec4=0     opt OUT of vec4<u32> weight + activation loads in the
+ *               generated int4 matmuls (default ON for matmul=tiled|sg with
+ *               sg32; measured +4.5% alone, +7.1% with ?vec4qkv — BENCH.md
+ *               2026-07-25 M2 Max A/B)
+ *   ?vec4qkv=0  opt OUT of the vec4-load qkv_fused sibling (32-thread;
+ *               default ON with sg32; measured +4.2% alone)
  *
- * Opt-in experiments — built and correctness-tested, awaiting measurement
- * (run `npm run bench` / `bench(128, 3)` to A/B; see BENCH.md):
- *   ?vec4=1        vec4<u32> weight + activation loads in the generated
- *                  int4 matmuls (applies to matmul=tiled|sg; needs sg32)
- *   ?vec4qkv=1     vec4-load qkv_fused sibling (32-thread; needs sg32)
+ * Opt-in experiments — measured 2026-07-25 on M2 Max (see BENCH.md):
  *   ?splitk=N      split-K flash-decode attention, N ∈ 2..16 partitions
- *                  per head + a combine pass (f16 KV only; ignored w/ ?kv8=1)
+ *                  per head + a combine pass (f16 KV only; ignored w/ ?kv8=1).
+ *                  ~+3% at short context; needs a long-context A/B before
+ *                  becoming default.
  *   ?fuseprologue=1  fold the FFN-entry add_norm into the FFN kernel's
- *                  shared-memory prologue; layer tail becomes add3_norm
+ *                  shared-memory prologue; layer tail becomes add3_norm.
+ *                  Measured −13.7% on M2 Max (falsified there; kept for
+ *                  A/B on other GPUs).
  */
 
 import type { Pipelines } from '../compiler/compiler.js'
@@ -45,13 +51,13 @@ export interface VariantFlags {
   matmul: MatmulVariant
   /** int8 KV cache opt-in (?kv8=1). Consumed by the page's KV allocation, not by pipeline resolution. */
   int8KV: boolean
-  /** ?vec4=1 — vec4-load int4 matmuls (opt-in experiment, awaiting measurement). */
+  /** vec4-load int4 matmuls — default ON (measured +4.5% on M2 Max); ?vec4=0 to disable. */
   vec4: boolean
-  /** ?vec4qkv=1 — vec4-load qkv_fused sibling (opt-in experiment, awaiting measurement). */
+  /** vec4-load qkv_fused sibling — default ON (measured +4.2% on M2 Max); ?vec4qkv=0 to disable. */
   vec4Qkv: boolean
-  /** ?splitk=N — split-K attention partitions per head; 0 = off (opt-in experiment). */
+  /** ?splitk=N — split-K attention partitions per head; 0 = off (opt-in: ~+3% at short context). */
   splitK: number
-  /** ?fuseprologue=1 — add_norm folded into the FFN prologue (opt-in experiment). */
+  /** ?fuseprologue=1 — add_norm folded into the FFN prologue (opt-in; −13.7% on M2 Max — falsified there). */
   fusePrologue: boolean
 }
 
@@ -103,10 +109,14 @@ export function parseVariantFlags(
     //   scalar — original 64-thread tree reduction
     matmul: (q.get('matmul') ?? (sgAll ? 'tiled' : 'scalar')) as MatmulVariant,
     int8KV: q.get('kv8') === '1',
-    // Opt-in experiments — all default OFF; built + correctness-tested,
-    // awaiting measurement (BENCH.md "Pending experiments").
-    vec4: q.get('vec4') === '1',
-    vec4Qkv: q.get('vec4qkv') === '1',
+    // vec4 loads: measured +7% decode on M2 Max (BENCH.md 2026-07-25 A/B),
+    // default ON where the sg32 builds exist; ?vec4=0 / ?vec4qkv=0 to A/B off.
+    vec4: sgAll && q.get('vec4') !== '0',
+    vec4Qkv: sgAll && q.get('vec4qkv') !== '0',
+    // Still opt-in: split-K measured +3% at short context (win should grow
+    // with context — needs a long-context A/B before defaulting); prologue
+    // fusion measured -14% on M2 Max (falsified there; flag kept for other
+    // GPUs). BENCH.md "Measured experiments".
     splitK: parseSplitK(q.get('splitk')),
     fusePrologue: q.get('fuseprologue') === '1',
   }

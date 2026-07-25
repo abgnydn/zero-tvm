@@ -18,6 +18,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
  * isn't primed.
  */
 function findMlcSnapshotDir(): string | null {
+  // Repo-local: where scripts/download-weights.mjs puts the snapshot.
+  const repoLocal = join(__dirname, 'public', 'weights', 'Phi-3-mini-4k-instruct-q4f16_1-MLC')
+  if (existsSync(join(repoLocal, 'ndarray-cache.json'))) return repoLocal
+
   // Preferred: a flat mirror dir populated via parallel curl (fastest to prime).
   const flatMirror = join(homedir(), 'mlc-weights', 'Phi-3-mini-4k-instruct-q4f16_1-MLC')
   if (existsSync(join(flatMirror, 'ndarray-cache.json'))) return flatMirror

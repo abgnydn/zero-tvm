@@ -13,8 +13,9 @@
 // Same structure as add_norm.wgsl otherwise: 256 threads, D/256 elements
 // each, one workgroup per token.
 //
-// Built and correctness-tested; awaiting measurement (see BENCH.md
-// "Pending experiments").
+// Measured 2026-07-25 (M2 Max): -13.7% end-to-end — falsified on Apple
+// (the per-WG RMSNorm recompute costs more than the saved dispatch
+// bubbles); kept for A/B on other GPUs (see BENCH.md "Measured 2026-07-25").
 //
 // Model-shape constants (D, ...) are injected by src/compiler/shader-prelude.ts.
 

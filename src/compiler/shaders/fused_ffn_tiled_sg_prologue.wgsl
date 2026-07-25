@@ -21,8 +21,9 @@
 // NOTE: this kernel does NOT write the residual sum anywhere — in
 // ?fuseprologue=1 mode add3_norm.wgsl reconstructs it at the layer tail.
 //
-// Built and correctness-tested; awaiting measurement (see BENCH.md
-// "Pending experiments").
+// Measured 2026-07-25 (M2 Max): -13.7% end-to-end — falsified on Apple
+// (the per-WG RMSNorm recompute costs more than the saved dispatch
+// bubbles); kept for A/B on other GPUs (see BENCH.md "Measured 2026-07-25").
 //
 // Model-shape constants (D, D_PACKED, D_SCALES, FFN_DIM) are injected by
 // src/compiler/shader-prelude.ts.

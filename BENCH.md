@@ -1,14 +1,104 @@
 # Zero-TVM Phi-3 decode benchmarks
 
-All numbers are decode-only (prefill excluded via warmup runs), 120 tokens
-generated, measured on Apple M-series with `bench(128, 3)` in devtools.
+All numbers are decode-only (prefill excluded via warmup runs), measured with
+`npm run bench` (128 decode tokens × 5 runs, median) or `bench(128, 3)` in
+devtools. Newest measurements first; prior-generation numbers are preserved
+under "Prior measurements" — nothing is retconned out.
 
-## Headline
+## Headline — head-to-head vs WebLLM (2026-07-25, Apple M2 Max)
+
+Same machine, same run, same Phi-3-mini-4k-instruct-q4f16_1 weight bytes
+(served from `/local-weights/*`), same prompt, greedy decoding. Google Chrome
+150.0.7871.182. Protocol: `npm run bench` — 128 decode tokens × 5 runs,
+median. Artifact of the final run: `bench/results.json`. Only the inference
+engine differs.
+
+| Engine                         | decode tok/s (median) |
+|-------------------------------:|----------------------:|
+| **Zero-TVM (this repo, defaults)** | **<!--bench:zt-->66.33<!--/bench:zt-->** |
+| WebLLM 0.2.80 (`tensor-cache`) |   **<!--bench:webllm-->52.0<!--/bench:webllm-->** |
+
+**Zero-TVM is ~28% faster than WebLLM on decode** on this machine with our
+own weights (auto-synced gap — Zero-TVM's deficit as a share of WebLLM's
+throughput, negative = ahead: <!--bench:gap-->-28<!--/bench:gap-->%).
+Zero-TVM runs: 66.33, 66.42, 66.42, 65.58, 65.79 tok/s.
+
+Scope caveats, stated up front: one machine (M2 Max), one model
+(Phi-3-mini q4f16_1), one browser (Chrome 150), decode-only, short-context
+bench. The defaults now include the vec4-load kernels measured below.
+
+**This supersedes the old "22% behind" story** (42.14 vs ~51.5 tok/s on an
+M2 Pro, 2026-06). That comparison was a different machine AND an older
+engine — three correctness bugs have been fixed since (fused_ffn f32
+accumulation, an attention workgroup-barrier bug, a decode off-by-one), plus
+the unified engine and the vec4 defaults. The +24 tok/s delta over the old
+number is NOT all optimization; the valid comparator for 66.33 is the
+same-day, same-machine WebLLM figure of 51.98. The old numbers are preserved
+in "Prior measurements" below.
+
+Entry point: `webllm-bench.html` + `src/webllm-bench/main.ts` — wires a custom
+`AppConfig` with `model: ${origin}/local-weights/resolve/main/` and the
+published Phi-3-mini WASM `model_lib`. The vite middleware aliases
+`tensor-cache.json` ← `ndarray-cache.json` (WebLLM renamed it in v0.2.80) and
+strips the HF-style `resolve/main/` prefix.
+
+## Measured 2026-07-25 (M2 Max) — flag A/B series
+
+Each cell is the median of 5 × 128-token runs, versus the same-day
+pre-vec4-default baseline of **60.96 tok/s** (old defaults). Run-to-run
+medians varied 60.5–61.8 across boots, so treat **±1 tok/s as noise**.
+
+| Config                                | tok/s | Δ vs 60.96 | Verdict |
+|---------------------------------------|------:|-----------:|---------|
+| old defaults (baseline)                | 60.96 |          — | — |
+| `?vec4=1` (oProj/ffnDown/LM-head)      | 63.73 |      +4.5% | win |
+| `?vec4qkv=1` (qkv_fused vec4 sibling)  | 63.55 |      +4.2% | win |
+| both vec4 flags                        | 65.27 |      +7.1% | **promoted to default** |
+| `?splitk=4`                            | 62.70 |      ~+3%  | stays opt-in (see below) |
+| `?splitk=8`                            | 62.82 |      ~+3%  | stays opt-in (see below) |
+| `?fuseprologue=1`                      | 52.62 |     −13.7% | **falsified on Apple** |
+| `?vec4=1&vec4qkv=1&splitk=8`           | 68.36 |       +12% | best measured config |
+
+Outcomes:
+
+1. **Vectorized loads — promoted to default.** Both vec4 experiments won
+   individually and compose (+7.1% together). They are now the default path
+   where the sg32 builds exist; opt OUT with `?vec4=0` / `?vec4qkv=0` for
+   A/B. The 66.33 headline number is with these defaults on.
+
+2. **Split-K attention — stays opt-in.** ~+3% measured, but at short context
+   (~tens of tokens of KV). The hypothesis says the win grows with context
+   length (attention's serial tail is linear in KV length), so this needs a
+   long-context A/B before it can earn default status. `?splitk=2|4|8`
+   remains available. The best measured config overall stacks it on the vec4
+   defaults: 68.36 tok/s (+12% over the old defaults, ~+32% vs WebLLM's
+   51.98).
+
+3. **FFN prologue fusion — falsified on Apple.** −13.7%. The hypothesis was
+   that removing 32 dispatch bubbles (addNorm1 folded into the FFN's
+   shared-memory phase) would beat the cost of every FFN workgroup
+   redundantly recomputing the residual add + RMSNorm. Measurement says the
+   opposite: the redundant per-WG RMSNorm recompute costs far more than the
+   saved dispatch bubbles. Same treatment as the tiling and spec-decode
+   negatives: flag + shaders kept compiled for A/B on other GPUs
+   (`?fuseprologue=1`), documented as a negative result, not shipped.
+
+## Prior measurements (M2 Pro, 19-core — historical)
+
+Everything below this line was measured on an **M2 Pro with the pre-2026-07
+engine** (`bench(128, 3)` in devtools, 120–128 tokens). Three correctness
+bugs have been fixed since — fused_ffn f32 accumulation, an attention
+workgroup-barrier bug, and a decode off-by-one — so the old Zero-TVM numbers
+**understate the current engine** even on that hardware. The per-kernel
+percentages and the negative results remain valid as relative findings on
+Apple GPUs; the absolute tok/s figures are of historical interest only.
+
+### FFN tiling milestone (M2 Pro)
 
 | Config                                   | tok/s (median) | ms/token | GPU compute ms |
 |-----------------------------------------:|---------------:|---------:|---------------:|
 | scalar FFN (baseline)                    |          22.01 |     45.5 |           37.7 |
-| **tiled+subgroup FFN (current)**         |      **<!--bench:zt-->42.14<!--/bench:zt-->** | **23.8** |       **20.2** |
+| **tiled+subgroup FFN**                   |      **42.14** | **23.8** |       **20.2** |
 
 **End-to-end: ~1.91×** from porting the 4-row tiled subgroup strategy to
 `fused_ffn.wgsl` (the kernel that was 67.7% of GPU time).
@@ -17,27 +107,18 @@ Correctness: A/B tested with `?sgffn=0` URL toggle. Same prompt produces
 **bit-identical greedy output** between tiled and scalar FFN paths on a 28-token
 completion.
 
-## Head-to-head vs WebLLM (MLC-LLM)
-
-Same hardware (M2 Pro, 19-core), same Phi-3-mini-4k-instruct-q4f16_1 weight
-bytes (served from `/local-weights/*`), same prompt, same 120-token target,
-greedy decoding (temperature=0). Only the inference engine differs.
+### Head-to-head vs WebLLM (M2 Pro, 2026-06 — superseded)
 
 | Engine                        | decode tok/s | end-to-end tok/s |
 |------------------------------:|-------------:|-----------------:|
-| WebLLM 0.2.80 (`tensor-cache`) |   **<!--bench:webllm-->51.5<!--/bench:webllm-->**  |            48.22 |
-| Zero-TVM (this repo)          |   **<!--bench:zt-->42.14<!--/bench:zt-->**  |                — |
+| WebLLM 0.2.80 (`tensor-cache`) |    **~51.5** |            48.22 |
+| Zero-TVM (pre-fix engine)     |    **42.14** |                — |
 
-**WebLLM is ~<!--bench:gap-->22<!--/bench:gap-->% faster on decode** on this machine with our own weights.
-That's the real number, not a projection. The gap is the optimization budget.
+This was the origin of the "22% behind WebLLM" headline. Superseded by the
+2026-07-25 M2 Max head-to-head above (different machine AND fixed engine —
+do not read the two Zero-TVM numbers as a pure optimization delta).
 
-Entry point: `webllm-bench.html` + `src/webllm-bench/main.ts` — wires a custom
-`AppConfig` with `model: ${origin}/local-weights/resolve/main/` and the
-published Phi-3-mini WASM `model_lib`. The vite middleware aliases
-`tensor-cache.json` ← `ndarray-cache.json` (WebLLM renamed it in v0.2.80) and
-strips the HF-style `resolve/main/` prefix.
-
-## Current profile — tiled+subgroup FFN
+### Profile — tiled+subgroup FFN (M2 Pro)
 
 ```
 bench(128, 3)
@@ -48,7 +129,7 @@ bench(128, 3)
   max:    42.63
 ```
 
-### Per-kernel GPU profile (timestamp-query, single instrumented step)
+#### Per-kernel GPU profile (timestamp-query, single instrumented step)
 
 Total GPU compute: **20.19 ms/token**
 
@@ -70,7 +151,7 @@ CPU/readback gap: 23.8 − 20.2 = **3.6 ms/token** (~15%). Pipelining is hiding
 essentially all submit/readback cost — further end-to-end wins must come from
 reducing GPU compute.
 
-## Previous profile — scalar FFN
+### Profile — scalar FFN (M2 Pro)
 
 Total GPU compute: **37.68 ms/token**
 
@@ -87,7 +168,7 @@ Total GPU compute: **37.68 ms/token**
 | embedding     |     1 |     0.26 |  0.7% |
 | argmax        |     1 |     0.07 |  0.2% |
 
-## What changed
+### What changed (FFN tiling)
 
 `src/compiler/shaders/fused_ffn_tiled_sg.wgsl` — new kernel:
 - 4 output rows per workgroup (was 1)
@@ -102,10 +183,10 @@ reference without rebuilding bind groups. Feature-gated behind the `subgroups`
 WebGPU feature + a runtime probe that checks `sg_size == 32`; falls back to the
 scalar kernel otherwise.
 
-## Where the remaining compute goes
+### Where the remaining compute went (M2 Pro era)
 
-After the FFN win, **qkvFused + ffnDown = 7.2 ms = 35.7%** of GPU time and are
-now the dominant matmuls. Both are still using the scalar reduction form.
+After the FFN win, **qkvFused + ffnDown = 7.2 ms = 35.7%** of GPU time and were
+the dominant matmuls. Both were still using the scalar reduction form.
 
 ### Negative result: 8-row matmul tile (tiled8)
 
@@ -176,7 +257,8 @@ variant (no per-WG redundancy to amortize).
 
 Shader kept compiled; off by default (opt-in via `?qkvtile2=1`). The three
 qkv-tile negative results together close off hand-tuned qkv-matmul tiling as a
-lever on this hardware.
+lever on this hardware. (The `?vec4qkv=1` win above is a different lever —
+load width, not tile shape.)
 
 ### Falsifiability result: batched M-dim matmul caps at ~2× on Apple
 
@@ -235,84 +317,51 @@ for ~20% of the engineering cost.
 
 Shader kept compiled as a primitive. Not dispatched in the default forward.
 
-### Plausible next levers (in priority order)
+### Negative result: prompt-lookup speculative decoding
 
-Updated after 3 qkv-tile negative results + WebLLM head-to-head (see above).
+**Ruled out** by CPU-only acceptance simulation on three prompt types
+(prose, code, list summary). Measured with `specSim(160, N, K)` over actual
+Phi-3 greedy generations:
 
-1. ~~**Speculative decoding (prompt-lookup)**~~ — **ruled out** by CPU-only
-   acceptance simulation on three prompt types (prose, code, list summary).
-   Measured with `specSim(160, N, K)` over actual Phi-3 greedy generations:
+| prompt  | hit@N=3 | α@N=3,K=3 | speedup | hit@N=2 | α@N=2,K=2 | speedup |
+|---------|--------:|----------:|--------:|--------:|----------:|--------:|
+| prose   |    2.5% |        0% |   0.50× |    8.5% |      1.3% |   0.68× |
+| code    |   11.6% |      3.2% |   0.55× |   27.3% |      7.6% |   0.77× |
+| summary |    1.3% |      0.2% |   0.50× |    7.6% |      1.0% |   0.68× |
 
-   | prompt  | hit@N=3 | α@N=3,K=3 | speedup | hit@N=2 | α@N=2,K=2 | speedup |
-   |---------|--------:|----------:|--------:|--------:|----------:|--------:|
-   | prose   |    2.5% |        0% |   0.50× |    8.5% |      1.3% |   0.68× |
-   | code    |   11.6% |      3.2% |   0.55× |   27.3% |      7.6% |   0.77× |
-   | summary |    1.3% |      0.2% |   0.50× |    7.6% |      1.0% |   0.68× |
+Acceptance stays under 8% in the best case — nowhere near the 50–67% floor
+needed to overcome batched-forward's 2× cost. With speedup = 2·(1+α·K)/(K+1),
+α=0 bottoms out at 2/(K+1), so PLD is a **guaranteed net regression** on
+these workloads regardless of K tuning. Phi-3 greedy prose doesn't repeat
+n-grams from prompt or itself often enough for prompt-lookup to work.
 
-   Acceptance stays under 8% in the best case — nowhere near the 50–67% floor
-   needed to overcome batched-forward's 2× cost. With speedup = 2·(1+α·K)/(K+1),
-   α=0 bottoms out at 2/(K+1), so PLD is a **guaranteed net regression** on
-   these workloads regardless of K tuning. Phi-3 greedy prose doesn't repeat
-   n-grams from prompt or itself often enough for prompt-lookup to work.
+Simulator: `src/zero-tvm/spec-sim.ts`. Window helper: `await specSim(160, N, K)`.
 
-   Simulator: `src/zero-tvm/spec-sim.ts`. Window helper: `await specSim(160, N, K)`.
+### Remaining levers (updated after the 2026-07-25 measurements)
+
+1. **Split-K attention at long context** — the +3% short-context result
+   needs a long-context A/B; the hypothesis predicts the win grows with KV
+   length. This is the gate on promoting `?splitk` to default.
 2. **Fuse addNorm into the matmul that feeds it** (addNorm1 ← oproj output,
-   addNorm2 ← ffnDown output). Eliminates 64 buffer round-trips per token
-   and the 1.84 ms addNorm kernels. Requires global reduction inside the
-   matmul shader's tail — architecturally significant, medium risk.
+   addNorm2 ← ffnDown output) — still open, but the prologue-fusion negative
+   above says the fold must not duplicate the norm work per workgroup;
+   a matmul-tail reduction is the only shape left with a chance.
 3. **Batched-forward for prefill** — uses the already-landed M=4 primitive
    at measured 2× ceiling. Drops 100-token prompt from ~2.4 s to ~1.2 s.
    Independent of decode tok/s.
-4. ~~Subgroup-tile qkvFused~~ — **ruled out** by 3 negative results above.
-5. **CPU/readback gap** is only 15% — not worth attacking until compute is
-   much lower.
-
-### Pending experiments (built, correctness-tested, NOT yet measured)
-
-Three opt-in variants landed behind URL flags (all default OFF; every kernel
-passes the `npm run test:kernels` suite against CPU references and the
-compile-all gate). No throughput numbers exist yet — nothing below is a
-claimed speedup. A/B with `bench(128, 3)` + `bench(0, 0, true)` per flag.
-
-1. **Vectorized loads — `?vec4=1` (matmuls) / `?vec4qkv=1` (qkv_fused).**
-   Hypothesis: every matmul-family kernel currently issues 8 scalar f16 loads
-   per activation group and one u32 word per weight load; TVM emits vec4
-   loads. Re-declaring the same buffers as `array<vec4<u32>>` cuts load
-   instructions 4× on weights and 8× on activations — 4-8× fewer load
-   instructions on 100% of weight traffic (effective bandwidth today is
-   ~76 GB/s of ~200 available, so access pattern is the suspect, not the
-   bandwidth wall). Variants: `int4_matmul_{sg,tiled}[_f32]_vec4` (generator
-   knob `vec4: true` in `int4_matmul.gen.ts`) + `qkv_fused_sg_vec4.wgsl`.
-   Caveat: the qkv sibling is forced to 32 threads/WG (96 vec4-words/row
-   don't divide across 64), which entangles it with the known thread-count
-   sensitivity from the qkv-tile negative results. **Status: awaiting
-   measurement.**
-
-2. **Split-K flash-decode attention — `?splitk=N` (N = 2/4/8).**
-   Hypothesis: attention runs 32 WGs × 32 threads = 1,024 threads total,
-   serial over all KV slots — cost grows linearly with context. Splitting
-   the KV pages across N WGs per head (partials `m, d, o` merged by
-   `attention_combine.wgsl`) raises parallelism toward tens of thousands of
-   threads and removes the linear-in-context serial tail; the cost is one
-   extra dispatch + a partials round-trip per layer. Attention is only 1.6%
-   of GPU time at short context, so any win should appear at LONG context.
-   f16 KV only (ignored with `?kv8=1`). **Status: awaiting measurement.**
-
-3. **add_norm fused into the FFN prologue — `?fuseprologue=1`.**
-   Hypothesis: 64 of the ~96 one-workgroup dispatches per token are
-   add_norm/rms_norm sitting on the dependency chain. Folding the FFN-entry
-   add_norm (addNorm1) into the FFN kernel's shared-memory phase removes 32
-   dispatch bubbles + the hidden1 round-trip per token, at the cost of every
-   FFN workgroup redundantly recomputing the residual add + RMSNorm.
-   Scope note: only addNorm1 is fused — addNorm2's residual write feeds the
-   next add_norm (the ping-pong), so the tail becomes a 3-input
-   `add3_norm.wgsl` (net −32 dispatches/token, not −64). **Status: awaiting
-   measurement.**
+4. ~~Prompt-lookup speculative decoding~~ — ruled out (see above).
+5. ~~Subgroup-tile qkvFused~~ — ruled out by 3 negative results above.
+6. ~~FFN prologue fusion~~ — ruled out on Apple (2026-07-25, −13.7%).
 
 ## How to reproduce
 
+```bash
+npm run bench   # both engines, identical local weights, 128 tok × 5 runs;
+                # writes bench/results.json and syncs the marked numbers
+```
+
 ```js
-// In devtools on zero-tvm.html after the badge flips to Ready:
+// Or in devtools on zero-tvm.html after the badge flips to Ready:
 await bench(128, 3)            // end-to-end tok/s, 3 runs + 1 warmup
 await bench(0, 0, true)        // per-kernel profile (requires timestamp-query)
 ```
@@ -325,10 +374,12 @@ URL toggles for A/B bisection:
 - `?sgargmax=0`  — disable _sg argmax only
 - `?sgffn=0`     — disable tiled_sg FFN (use scalar fused_ffn)
 - `?matmul=scalar|sg|tiled` — force matmul variant
+- `?vec4=0` / `?vec4qkv=0` — disable the vec4-load defaults (measured +7.1%
+  together on M2 Max; default ON since 2026-07-25)
 
-Opt-in pending experiments (see above — no measured numbers yet):
+Opt-in experiments (measured 2026-07-25 on M2 Max — see the A/B table above):
 
-- `?vec4=1`         — vec4-load int4 matmuls
-- `?vec4qkv=1`      — vec4-load qkv_fused (32-thread)
-- `?splitk=2|4|8`   — split-K attention + combine (f16 KV only)
-- `?fuseprologue=1` — add_norm folded into the FFN prologue
+- `?splitk=2|4|8`   — split-K attention + combine (f16 KV only): ~+3% at
+  short context, awaiting a long-context A/B before defaulting
+- `?fuseprologue=1` — add_norm folded into the FFN prologue: −13.7% on Apple
+  (falsified there; kept for A/B on other GPUs)
