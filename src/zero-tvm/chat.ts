@@ -11,8 +11,8 @@
  * wired by bench-console.ts; the streaming Markdown renderer by markdown.ts.
  */
 
-import { WEIGHTS_OPFS_DIR } from './weight-loader.js'
-import { buildChatPrompt } from './tokenizer.js'
+import { opfsDirFor } from './weight-loader.js'
+import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
 import {
   allocKVPages,
   allocKVPagesInt8,
@@ -22,6 +22,16 @@ import { parseVariantFlags } from './variants.js'
 import { bootEngine, setBadge } from './loading-ui.js'
 import { renderMarkdown, wireCopyButton, ICON_REFRESH } from './markdown.js'
 import { installBenchConsole } from './bench-console.js'
+
+// ============================================================
+// Active model — ?model=qwen3 selects Qwen3-4B, default is Phi-3.
+// ============================================================
+
+const SPEC = specFromSearch(location.search)
+const BRAND = modelBranding(SPEC)
+// Dispatches per decode token: Phi-3 runs the fused path (32×7+4 = 228);
+// qkNorm specs (Qwen3) run unfused with qk_norm (36×10+4 = 364).
+const DISPATCHES_PER_TOKEN = SPEC.qkNorm ? SPEC.layers * 10 + 4 : SPEC.layers * 7 + 4
 
 // ============================================================
 // UI helpers
@@ -115,12 +125,13 @@ function addAiMsg(): AiMsgHandle {
   wrap.innerHTML = `
     <div class="role">
       <span class="role-dot">Z</span>
-      <span class="role-name">Phi-3-mini</span>
+      <span class="role-name"></span>
       <span class="model-tag">q4f16_1</span>
     </div>
     <div class="body"></div>
     <div class="actions"></div>
   `
+  ;(wrap.querySelector('.role-name') as HTMLElement).textContent = BRAND.name
   const body = wrap.querySelector('.body') as HTMLElement
   const cursor = document.createElement('span')
   cursor.className = 'cursor'
@@ -208,7 +219,7 @@ async function hasWeightsCached(): Promise<boolean> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
   try {
     const root = await navigator.storage.getDirectory()
-    const dir = await root.getDirectoryHandle(WEIGHTS_OPFS_DIR)
+    const dir = await root.getDirectoryHandle(opfsDirFor(SPEC))
     // ndarray-cache.json is the smallest sentinel — its presence means at
     // least the manifest has been fetched (and shards followed in-session).
     await dir.getFileHandle('ndarray-cache.json')
@@ -241,15 +252,19 @@ function showDownloadGate(): Promise<void> {
     // e2e harness (which clicks #start-btn) works on both pages uniformly.
     chat.innerHTML = `
       <div id="start-screen" class="start-screen" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;gap:1.25rem;text-align:center;padding:2rem">
-        <div class="title" style="font-size:1.1rem;font-weight:600;color:#ccc">Phi-3-mini, in your browser</div>
+        <div class="title" style="font-size:1.1rem;font-weight:600;color:#ccc"></div>
         <div class="desc" style="font-size:0.85rem;color:#888;max-width:440px;line-height:1.6">
-          First load downloads ~1.8 GB of Phi-3-mini-q4f16_1 weights and caches them
+          First load downloads the q4f16_1 weights and caches them
           locally (OPFS). Every subsequent visit — including the WebLLM comparison
           page — is instant; weights are served from the same shared browser cache.
         </div>
         <button id="start-btn" class="start-btn" style="background:#10b981;color:#000;font-weight:600;font-size:0.95rem;padding:0.7rem 2rem;border:none;border-radius:8px;cursor:pointer">Download &amp; Start</button>
-        <div class="start-hint" style="font-size:0.68rem;color:#444">Phi-3-mini-4k-instruct-q4f16_1 · ~1.8 GB · cached after first load</div>
+        <div class="start-hint" style="font-size:0.68rem;color:#444"></div>
       </div>`
+    const titleEl = chat.querySelector('#start-screen .title') as HTMLElement | null
+    if (titleEl) titleEl.textContent = `${BRAND.name}, in your browser`
+    const hintEl = chat.querySelector('#start-screen .start-hint') as HTMLElement | null
+    if (hintEl) hintEl.textContent = `${SPEC.hfRepo.split('/')[1]} · ${BRAND.sizeLabel} · cached after first load`
     setBadge('Waiting')
     const btn = document.getElementById('start-btn') as HTMLButtonElement | null
     btn?.addEventListener('click', () => {
@@ -267,11 +282,12 @@ function showDownloadGate(): Promise<void> {
 
 async function main(): Promise<void> {
   setBadge('Initializing…', 'loading')
-  log('Zero-TVM Phi-3 — No WebLLM, No TVM')
+  log(`Zero-TVM ${BRAND.name} — No WebLLM, No TVM`)
   log('10 hand-written WGSL kernel roles across 27 kernels (18 files + 9 generated)')
   log('')
 
   const boot = await bootEngine({
+    spec: SPEC,
     // Subgroups (when the adapter has them) for the _sg shader variants;
     // timestamp-query for profileStep / `await bench(0, 0, true)`.
     optionalFeatures: ['subgroups' as GPUFeatureName, 'timestamp-query' as GPUFeatureName],
@@ -280,19 +296,29 @@ async function main(): Promise<void> {
     onDeviceLost: (info) => {
       showLoadingError(`GPU device lost: ${info.message || info.reason}. Reload the page to recover.`)
     },
-    buildEngine: ({ device, weights, sgSizeOk }) => {
+    buildEngine: ({ device, weights, sgSizeOk, spec }) => {
       const flags = parseVariantFlags(location.search, {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
       })
+      // qkNorm specs (Qwen3) run the unfused composition — qkv_fused folds
+      // RoPE+append into the projection with no per-head norm hook, and the
+      // int8-KV path rides on qkv_fused_scratch, so ?kv8 is gated off too
+      // until an unfused-int8 composition is verified end-to-end.
+      const fused = !spec.qkNorm
+      const int8KV = flags.int8KV && fused
+      if (flags.int8KV && !int8KV) {
+        log(`?kv8=1 ignored for ${spec.id} — int8 KV requires the fused QKV path (Phi-3 only for now)`)
+      }
       // KV cache: int8 halves memory at the cost of one extra dispatch per layer.
-      log(flags.int8KV ? 'Allocating int8 KV cache (~800 MB)…' : 'Allocating KV cache (~1.6 GB)…')
-      const kv = flags.int8KV ? allocKVPagesInt8(device) : allocKVPages(device)
+      log(int8KV ? 'Allocating int8 KV cache (~800 MB)…' : 'Allocating KV cache…')
+      const kv = int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
       log('Building decode engine…')
       return buildDecodeEngine(device, weights, kv, {
         variants: flags,
-        fused: true,
-        int8KV: flags.int8KV,
+        fused,
+        int8KV,
+        spec,
       })
     },
     // Pipeline warmup: one throwaway single-token generation behind the
@@ -300,7 +326,7 @@ async function main(): Promise<void> {
     // The KV slots it writes are overwritten by the first real turn's
     // prefill (chat always prefills from 0).
     warmup: async (engine, tokenizer) => {
-      const warmupIds = buildChatPrompt([{ role: 'user', content: 'Hi.' }], tokenizer)
+      const warmupIds = buildChatPromptFor(SPEC, [{ role: 'user', content: 'Hi.' }], tokenizer)
       await engine.generatePipelined(warmupIds, 1, () => {})
     },
   })
@@ -344,7 +370,7 @@ async function main(): Promise<void> {
     stopBtn.disabled = !busy
     inp.disabled = busy
     newBtn.disabled = busy
-    inp.placeholder = busy ? 'Generating…' : 'Ask Phi-3 anything…'
+    inp.placeholder = busy ? 'Generating…' : `Ask ${BRAND.name} anything…`
   }
 
   function updateCtxHint(nTokens?: number) {
@@ -352,12 +378,12 @@ async function main(): Promise<void> {
     // True ceiling is the KV page table (MAX_PAGES × PAGE_SIZE = 4112), not
     // the model's nominal 4096 — derived from the same constant the engine uses.
     if (!nTokens) {
-      ctxHint.textContent = 'Zero TVM · 10 WGSL kernels · 228 dispatches/token'
+      ctxHint.textContent = `Zero TVM · 10 WGSL kernels · ${DISPATCHES_PER_TOKEN} dispatches/token`
     } else if (nTokens >= engine.maxContext) {
       ctxHint.textContent = `Context full — ${engine.maxContext} / ${engine.maxContext} tokens · start a new chat`
     } else {
       const pct = Math.round((nTokens / engine.maxContext) * 100)
-      ctxHint.textContent = `Context ${nTokens} / ${engine.maxContext} tokens (${pct}%) · 228 dispatches/token`
+      ctxHint.textContent = `Context ${nTokens} / ${engine.maxContext} tokens (${pct}%) · ${DISPATCHES_PER_TOKEN} dispatches/token`
     }
   }
 
@@ -376,7 +402,7 @@ async function main(): Promise<void> {
 
   // Initial enabled state
   inp.disabled = false
-  inp.placeholder = 'Ask Phi-3 anything…'
+  inp.placeholder = `Ask ${BRAND.name} anything…`
   newBtn && (newBtn.disabled = false)
   autoGrow(inp)
   updateSendEnabled()
@@ -462,7 +488,7 @@ async function main(): Promise<void> {
   async function runTurn(): Promise<void> {
     setBusy(true); stopRequested = false
     const ai = addAiMsg()
-    const promptIds = buildChatPrompt(history, tokenizer)
+    const promptIds = buildChatPromptFor(SPEC, history, tokenizer)
     // Every turn re-prefills the whole history, so once it no longer fits the
     // KV window the only way forward is a fresh conversation. Refuse cleanly
     // instead of letting prefill corrupt the cache.
@@ -512,7 +538,23 @@ async function main(): Promise<void> {
   })
 }
 
+/** Rewrite the static Phi-3 markup (gate dialog, header, welcome) for the
+ * active model. The HTML ships with Phi-3 copy, so this is a no-op there. */
+function applyModelBranding(): void {
+  if (SPEC.id === 'phi3-mini') return
+  document.title = `Zero-TVM Chat — ${BRAND.name}`
+  const set = (sel: string, text: string) => {
+    const el = document.querySelector(sel) as HTMLElement | null
+    if (el) el.textContent = text
+  }
+  set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
+  set('#start-dialog .dialog-stats .dstat .val', BRAND.sizeLabel)  // first stat is the download size
+  set('.model-info h1', BRAND.name)
+  set('#welcome .welcome-title', `Chat with ${BRAND.name}`)
+}
+
 async function boot(): Promise<void> {
+  applyModelBranding()
   // Register the weight-cache SW first so it intercepts the very first
   // network fetch (from bootEngine's loadWeights call) — and any future
   // fetch from WebLLM in compiler-chat / webllm-bench.

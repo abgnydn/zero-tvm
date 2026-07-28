@@ -6,7 +6,8 @@
  * chat UI. Imported by chat.ts for its side effects via installBenchConsole().
  */
 
-import { buildChatPrompt, Tokenizer } from './tokenizer.js'
+import { Tokenizer } from './tokenizer.js'
+import { buildChatPromptFor } from './model-select.js'
 import { summarize as summarizePLD } from './spec-sim.js'
 import type { DecodeEngine } from './engine-core.js'
 
@@ -37,7 +38,7 @@ export function installBenchConsole(ctx: BenchConsoleCtx): void {
           { role: 'system', content: 'You are a helpful assistant.' },
           { role: 'user', content: benchPrompt },
         ]
-        const promptIds = buildChatPrompt(benchHist, tokenizer)
+        const promptIds = buildChatPromptFor(engine.spec, benchHist, tokenizer)
 
         if (profile) {
           const prof = await engine.profileStep(promptIds)
@@ -122,7 +123,7 @@ export function installBenchConsole(ctx: BenchConsoleCtx): void {
 
         const results = []
         for (const p of prompts) {
-          const promptIds = buildChatPrompt(p.messages, tokenizer)
+          const promptIds = buildChatPromptFor(engine.spec, p.messages, tokenizer)
           const generated: number[] = []
           await engine.generatePipelined(promptIds, nTokens, (id) => { generated.push(id) })
           // Concatenate prompt + generated; PLD keys search over the full

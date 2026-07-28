@@ -72,6 +72,7 @@ export interface ModelSpecBase {
   qkNorm: boolean          // per-head q_norm/k_norm RMSNorm before RoPE
   stops: readonly number[] // stop token ids for the decode loops
   chatTemplateId: 'phi3' | 'chatml'
+  tokenizerKind: 'spm' | 'byteLevel'  // which tokenizer pipeline tokenizer.json needs
   hfRepo: string           // HuggingFace repo with the MLC q4f16_1 layout
   paramNaming: ParamNaming
 }
@@ -155,6 +156,7 @@ export const PHI3: ModelSpec = makeModelSpec({
   qkNorm: false,
   stops: [2, 32000, 32007],  // </s>, <|endoftext|>, <|end|>
   chatTemplateId: 'phi3',
+  tokenizerKind: 'spm',
   hfRepo: 'mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC',
   paramNaming: {
     embedWeight: ['transformer.embd.q_weight', 'embed_tokens.q_weight', 'model.embed_tokens.q_weight'],
@@ -205,6 +207,7 @@ export const QWEN3_4B: ModelSpec = makeModelSpec({
   qkNorm: true,           // per-head RMSNorm over head_dim before RoPE
   stops: [151645, 151643], // <|im_end|>, <|endoftext|>
   chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
   hfRepo: 'mlc-ai/Qwen3-4B-q4f16_1-MLC',
   paramNaming: {
     embedWeight: ['model.embed_tokens.q_weight'],

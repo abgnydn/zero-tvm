@@ -20,7 +20,8 @@
  *   modulo fp16 noise.
  */
 
-import { buildChatPrompt, Tokenizer } from './tokenizer.js'
+import { Tokenizer } from './tokenizer.js'
+import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
 import { type DecodeEngine } from './engine-core.js'
 import {
   bootEngine,
@@ -28,6 +29,11 @@ import {
   log as bootLog,
   setBadge,
 } from './loading-ui.js'
+
+// ?model=qwen3 runs the battery on Qwen3-4B; default is Phi-3. The prompts
+// are generic and every assertion downstream is lexical, so both specs run
+// the identical harness.
+const SPEC = specFromSearch(location.search)
 
 // ============================================================
 // Test prompts — chosen to exercise different LM behaviors
@@ -185,7 +191,8 @@ async function runPrompt(
   tokenizer: Tokenizer,
   p: TestPrompt
 ): Promise<PromptResult> {
-  const promptIds = buildChatPrompt(
+  const promptIds = buildChatPromptFor(
+    engine.spec,
     [
       { role: 'system', content: p.system },
       { role: 'user', content: p.user },
@@ -261,6 +268,13 @@ async function main(): Promise<void> {
     return
   }
 
+  // Per-model gate copy — the static HTML ships the Phi-3 text.
+  if (SPEC.id !== 'phi3-mini') {
+    const brand = modelBranding(SPEC)
+    const hint = document.querySelector('.start-hint') as HTMLElement | null
+    if (hint) hint.textContent = `${brand.sizeLabel} ${brand.name} weights download on first run, cached after`
+  }
+
   const startBtn = document.getElementById('start-btn') as HTMLButtonElement
   await new Promise<void>((resolve) => {
     startBtn.addEventListener('click', () => {
@@ -277,7 +291,7 @@ async function main(): Promise<void> {
   // byte counter the chat page uses, so the user can see how much download
   // is left on first run.
   setStatus('Booting engine...')
-  const boot = await bootEngine()
+  const boot = await bootEngine({ spec: SPEC })
   if (!boot.ok) {
     setStatus(boot.reason)
     return

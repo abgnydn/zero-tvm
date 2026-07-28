@@ -347,9 +347,12 @@ export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): ByteLeve
   return { encode, decode, bosId, eosId, stopIds }
 }
 
-export async function loadByteLevelTokenizer(onProgress?: (msg: string) => void): Promise<ByteLevelTokenizer> {
+export async function loadByteLevelTokenizer(
+  onProgress?: (msg: string) => void,
+  baseUrl: string = QWEN3_MODEL_BASE,
+): Promise<ByteLevelTokenizer> {
   onProgress?.('Loading tokenizer.json...')
-  const url = QWEN3_MODEL_BASE + 'tokenizer.json'
+  const url = baseUrl + 'tokenizer.json'
   const json: ByteLevelTokenizerJSON = JSON.parse(await fetchText(url))
   const tokenizer = createByteLevelTokenizer(json)
   onProgress?.('Tokenizer ready')
@@ -379,7 +382,9 @@ export const QWEN3_DEFAULT_SYSTEM_MESSAGE = 'You are a helpful assistant.'
 
 export function buildChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-  tokenizer: ByteLevelTokenizer,
+  // Only encode() is needed, so the SPM Tokenizer shape (no stopIds) is
+  // accepted too — the model-select factory routes either kind here.
+  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
   opts?: { thinking?: boolean }
 ): number[] {
   let text = ''

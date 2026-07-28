@@ -197,16 +197,21 @@ async function fetchWithRetry(url: string, retries = FETCH_RETRIES): Promise<Res
 // Tiered shard fetch: local mirror (dev) → OPFS → Cache API → HuggingFace
 // ============================================================
 
-// In dev, the Vite server mirrors the HF hub snapshot under /local-weights/*
-// (see vite.config.ts). This makes cold-start e2e testing instant without
-// re-downloading 2 GB over the network.
-const LOCAL_MIRROR_BASE = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
-  ? '/local-weights/'
-  : null
+// In dev, the Vite server mirrors HF hub snapshots under
+// /local-weights/<repo-name>/* (see vite.config.ts; the bare /local-weights/*
+// form still serves the Phi-3 snapshot for WebLLM's URL shape). This makes
+// cold-start e2e testing instant without re-downloading 2 GB over the network.
+const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
+
+/** Dev-mirror base for a spec: /local-weights/<repo-name>/ (null in prod). */
+function localMirrorBase(spec: ModelSpec): string | null {
+  return DEV ? `/local-weights/${spec.hfRepo.split('/')[1]}/` : null
+}
 
 async function fetchShard(
   url: string,
   dataPath: string,
+  mirrorBase: string | null,
   opfs: OPFSDir,
   cacheStores: Cache[],
   pendingWrites: Promise<void>[],
@@ -215,10 +220,10 @@ async function fetchShard(
   const leaf = url.split('/').at(-1)
   const cache = (buf: ArrayBuffer) => { pendingWrites.push(opfsWrite(opfs, dataPath, buf)) }
 
-  // Tier 0: dev-only local mirror served by Vite from ~/.cache/huggingface/hub
-  if (LOCAL_MIRROR_BASE) {
+  // Tier 0: dev-only local mirror served by Vite from .weights-local / HF cache
+  if (mirrorBase) {
     try {
-      const resp = await fetch(LOCAL_MIRROR_BASE + dataPath)
+      const resp = await fetch(mirrorBase + dataPath)
       if (resp.ok) {
         onProgress?.(`[local] ${leaf}`)
         const buf = await resp.arrayBuffer()
@@ -345,6 +350,7 @@ export async function loadWeights(
 ): Promise<LoadedWeights> {
   const baseUrl = modelBaseUrl(spec)
   const opfsDir = opfsDirFor(spec)
+  const mirrorBase = localMirrorBase(spec)
 
   // Manifest
   onProgress?.('Loading ndarray-cache.json…')
@@ -362,6 +368,7 @@ export async function loadWeights(
   const manifestBytes = await fetchShard(
     baseUrl + 'ndarray-cache.json',
     'ndarray-cache.json',
+    mirrorBase,
     opfs,
     cacheStores,
     pendingWrites,
@@ -391,7 +398,7 @@ export async function loadWeights(
   const shardEntries = [...byShard.entries()]
 
   await mapLimited(shardEntries, FETCH_CONCURRENCY, async ([dataPath, records]) => {
-    const shard = await fetchShard(baseUrl + dataPath, dataPath, opfs, cacheStores, pendingWrites, onProgress)
+    const shard = await fetchShard(baseUrl + dataPath, dataPath, mirrorBase, opfs, cacheStores, pendingWrites, onProgress)
     for (const rec of records) {
       gpuBuffers.set(rec.name, uploadRecord(device, shard, rec))
     }

@@ -5,9 +5,11 @@
  * DecodeEngine. No DOM, no UI. Both shipped pages drive this one engine:
  *
  *   - validate.ts (via loading-ui.ts's bootEngine) runs the default
- *     configuration — unfused reference path (9 dispatches/layer), scalar
- *     shaders, blocking generate()/forwardLogits() with deterministic
- *     per-token positions and logits access.
+ *     configuration — unfused reference path (9 dispatches/layer; 10 for
+ *     qkNorm specs like Qwen3, which insert a per-head Q/K RMSNorm between
+ *     the QKV matmul and RoPE), scalar shaders, blocking
+ *     generate()/forwardLogits() with deterministic per-token positions and
+ *     logits access.
  *   - chat.ts runs the throughput configuration — fused QKV+RoPE+KV-append
  *     (7 dispatches/layer, 8 with int8 KV), URL-flag shader variants
  *     (src/zero-tvm/variants.ts), and generatePipelined()'s readback ring
@@ -176,7 +178,9 @@ export interface DecodeEngineOptions {
   /**
    * true  → fused QKV+RoPE+KV-append (qkv_fused writes kvPages directly;
    *         7 dispatches/layer, 8 with int8 KV) — the chat path.
-   * false → unfused reference: qkv matmul → rope → kv_append (9/layer).
+   *         Incompatible with qkNorm specs (Qwen3) — throws.
+   * false → unfused reference: qkv matmul → [qk_norm →] rope → kv_append
+   *         (9/layer; 10 with qkNorm).
    */
   fused?: boolean
   /** int8 KV cache. Requires `fused` and a kv argument carrying `scales`. */
@@ -199,6 +203,15 @@ export function buildDecodeEngine(
   const kvScales = Array.isArray(kv) ? undefined : kv.scales
   if (int8Mode && (!fused || !kvScales)) {
     throw new Error('buildDecodeEngine: int8KV requires fused mode and a KV cache with scales buffers')
+  }
+  // QK-norm specs (Qwen3) must run the unfused composition: qkv_fused folds
+  // RoPE+KV-append into the projection, leaving nowhere to normalize Q/K
+  // between the matmul and the rotation. Pages gate `fused` off per spec.
+  if (S.qkNorm && fused) {
+    throw new Error(
+      'buildDecodeEngine: fused QKV is incompatible with qkNorm specs (Qwen3) — ' +
+      'the per-head Q/K RMSNorm must run between the QKV matmul and RoPE. Use unfused mode.'
+    )
   }
 
   // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and SCALES = K/32.
@@ -295,6 +308,11 @@ export function buildDecodeEngine(
   // Unfused: rope + kv_append. Fused: qkv_fused (f16) or scratch + quantize (int8).
   const ropeU  = fused ? null : uniformBuf(device, [i32(1), i32(0), i32(1), u32(QKV_WGS)])
   const kvAppU = fused ? null : uniformBuf(device, [i32(1), i32(S.maxPages), i32(0), i32(0), u32(KV_WGS)])
+  // Qwen3 per-head Q/K RMSNorm — one 32-thread WG per (token, head), heads
+  // ordered Q then K: grid = seq_len × (HEADS + KV_HEADS). seq_len is 1 on
+  // the decode path, so the uniform is fully constant.
+  const QK_NORM_WGS = S.heads + S.kvHeads
+  const qkNormU = S.qkNorm ? uniformBuf(device, [i32(1), u32(QK_NORM_WGS)]) : null
   const qkvFusedU = (fused && !int8Mode) ? uniformBuf(device, [i32(0), i32(0), u32(S.qkvPairs)]) : null      // f16-KV mode
   const qkvFusedScratchU = int8Mode ? uniformBuf(device, [i32(0), u32(S.qkvPairs)]) : null                   // int8-KV mode
   const kvQuantU = int8Mode ? uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]) : null  // pos_off, pages_off, scales_off, kvHeads*2 WG
@@ -431,6 +449,7 @@ export function buildDecodeEngine(
   // Per-layer bind groups
   interface LayerBG {
     qkv: GPUBindGroup           // unfused: qkv matmul | fused: qkv_fused / qkv_fused_scratch
+    qkNorm?: GPUBindGroup       // qkNorm specs (Qwen3) only — in-place Q/K RMSNorm on qkvOut
     kvApp?: GPUBindGroup        // unfused only
     kvQuantize?: GPUBindGroup   // int8 mode only
     attn: GPUBindGroup          // splitK: the partial pass (writes attnPartials)
@@ -449,6 +468,7 @@ export function buildDecodeEngine(
 
     let qkvBG: GPUBindGroup
     let attnBG: GPUBindGroup
+    let qkNormBG: GPUBindGroup | undefined
     let kvAppBG: GPUBindGroup | undefined
     let kvQuantizeBG: GPUBindGroup | undefined
     // Split-K partial pass replaces the single-WG-per-head attention bind
@@ -464,6 +484,14 @@ export function buildDecodeEngine(
       qkvBG = bg(device, R.matmul, [
         B.qkvOut!, B.hidden1, lw.qkvScales, lw.qkvWeights, qkvU!,
       ])
+      if (S.qkNorm) {
+        // q_norm/k_norm gammas are HEAD_DIM f16 vectors in the MLC layout —
+        // same dtype as every other norm gamma, uploaded raw by the loader.
+        if (!lw.qNormGamma || !lw.kNormGamma) {
+          throw new Error(`buildDecodeEngine: spec ${S.id} sets qkNorm but layer ${L} has no q_norm/k_norm weights`)
+        }
+        qkNormBG = bg(device, P.qkNorm, [B.qkvOut!, lw.qNormGamma, lw.kNormGamma, qkNormU!])
+      }
       kvAppBG = bg(device, P.kvAppend, [
         B.kOut!, B.vOut!, kvPages[L], B.posMap, kvAppU!,
       ])
@@ -497,6 +525,7 @@ export function buildDecodeEngine(
       const rOut = L % 2 === 0 ? B.residual2 : B.residual
       layerBGs.push({
         qkv: qkvBG,
+        qkNorm: qkNormBG,
         kvApp: kvAppBG,
         kvQuantize: kvQuantizeBG,
         attn: attnBG,
@@ -510,6 +539,7 @@ export function buildDecodeEngine(
 
     layerBGs.push({
       qkv: qkvBG,
+      qkNorm: qkNormBG,
       kvApp: kvAppBG,
       kvQuantize: kvQuantizeBG,
       attn: attnBG,
@@ -569,8 +599,10 @@ export function buildDecodeEngine(
     // --- TRANSFORMER LAYERS ---
     // Residual ping-pong is encoded into the cached bind groups: addNorm1 reads
     // residual / writes residual2; addNorm2 reads residual2 / writes residual.
-    // Unfused: 9 dispatches/layer. Fused f16: 7. Fused int8: 8 (adds a
-    // kv_quantize pass between qkv_fused_scratch and attention_int8).
+    // Unfused: 9 dispatches/layer (10 for qkNorm specs — Qwen3 inserts the
+    // per-head Q/K RMSNorm between qkv matmul and rope). Fused f16: 7. Fused
+    // int8: 8 (adds a kv_quantize pass between qkv_fused_scratch and
+    // attention_int8).
     for (let L = 0; L < S.layers; L++) {
       const blk = layerBGs[L]
 
@@ -589,6 +621,8 @@ export function buildDecodeEngine(
       if (!fused) {
         // QKV matmul: B.hidden1 → B.qkvOut
         dispatch(enc, R.matmul, blk.qkv, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
+        // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
+        if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
         // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
         dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
         // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
@@ -942,7 +976,9 @@ export function buildDecodeEngine(
     await warmA; await warmB
     const nextPos = warmupIds.length + 2
 
-    const CAPACITY = 600  // 2 slots × (~228 fused / ~260 int8 / ~292 unfused passes)
+    // 2 slots per pass; worst case is the unfused qkNorm path (10/layer) plus
+    // embedding, init norm, LM head, argmax and a little headroom.
+    const CAPACITY = 2 * (S.layers * 10 + 8)
     const querySet = device.createQuerySet({ type: 'timestamp', count: CAPACITY })
     const resolveBuf = device.createBuffer({
       size: CAPACITY * 8,

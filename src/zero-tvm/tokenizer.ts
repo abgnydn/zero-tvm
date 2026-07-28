@@ -300,9 +300,12 @@ export function createTokenizer(json: TokenizerJSON): Tokenizer {
   return { encode, decode, bosId, eosId }
 }
 
-export async function loadTokenizer(onProgress?: (msg: string) => void): Promise<Tokenizer> {
+export async function loadTokenizer(
+  onProgress?: (msg: string) => void,
+  baseUrl: string = PHI3_MODEL_BASE,
+): Promise<Tokenizer> {
   onProgress?.('Loading tokenizer.json...')
-  const url = PHI3_MODEL_BASE + 'tokenizer.json'
+  const url = baseUrl + 'tokenizer.json'
   const json: TokenizerJSON = JSON.parse(await fetchText(url))
   const tokenizer = createTokenizer(json)
   onProgress?.('Tokenizer ready')
