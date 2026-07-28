@@ -475,6 +475,7 @@
     <a href="#phi3" class="sidebar-link">Phi-3 constants</a>
     <a href="#quantization" class="sidebar-link">Q4F16 format</a>
     <a href="#weights" class="sidebar-link">Weight naming</a>
+    <a href="#qwen3" class="sidebar-link">Qwen3-4B port</a>
   </div>
 
   <div class="sidebar-section">
@@ -1004,10 +1005,44 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   </tbody>
 </table>
 
+<!-- QWEN3 -->
+<h2 id="qwen3">Qwen3-4B (<code>?model=qwen3</code>)</h2>
+
+<p>
+  The engine is parameterized over a <code>ModelSpec</code>, and a v1 Qwen3-4B (q4f16_1) port ships alongside Phi-3.
+  Append <code>?model=qwen3</code> to <code>zero-tvm.html</code> or <code>validate.html</code> — it works on the live
+  site (weights stream from HuggingFace, ~2.3 GB), and <code>node scripts/download-weights.mjs --model qwen3</code>
+  primes the local dev mirror. Phi-3 stays the default; all existing URLs keep their exact behavior.
+</p>
+
+<p>What the port exercises that Phi-3 doesn't:</p>
+
+<table>
+  <thead><tr><th></th><th>Phi-3-mini (default)</th><th>Qwen3-4B</th></tr></thead>
+  <tbody>
+    <tr><td>Attention</td><td>MHA, 32/32 heads</td><td>GQA, 32 query heads over 8 KV heads</td></tr>
+    <tr><td>QK-norm</td><td>none</td><td>per-head RMSNorm on Q and K between projection and RoPE</td></tr>
+    <tr><td>Tokenizer</td><td>SentencePiece</td><td>byte-level BPE (Qwen2-style <code>tokenizer.json</code>)</td></tr>
+    <tr><td>LM head</td><td>separate</td><td>tied — logits reuse the quantized embedding matrix (151,936 vocab)</td></tr>
+    <tr><td>Decode path</td><td>fused, 7 dispatches/layer</td><td>unfused v1, 10 dispatches/layer</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Measured 2026-07-28 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
+  <strong>25.43 tok/s</strong> decode vs WebLLM's prebuilt Qwen3-4B at <strong>14.15 tok/s</strong> — +80% on that
+  pair. Unlike the Phi-3 headline, these figures are static dated text, not synced from <code>bench/results.json</code>.
+</p>
+
+<div class="callout warning">
+  <div class="callout-title">Read the +80% cautiously — this is the untuned path</div>
+  <p>QK-norm must run between the QKV matmul and RoPE, which is incompatible with the fused QKV+RoPE+KV-append kernel — so Qwen runs the unfused reference composition, 10 dispatches/layer vs the Phi-3 chat path's 7. And both engines run Qwen3-4B far below their Phi-3 rates on this machine (62.9 → 25.4; 47.9 → 14.2), so the gap says as much about WebLLM's prebuilt Qwen3 lib on this GPU as about the port. One machine, one pair; full protocol and caveats in BENCH.md.</p>
+</div>
+
 <!-- PORTING -->
 <h2 id="porting">Port to Phi-4-mini or Qwen3</h2>
 
-<p>Both are available as MLC Q4F16 packages. The steps to port:</p>
+<p>Both are available as MLC Q4F16 packages. The Qwen3 port has since landed (see <a href="#qwen3">Qwen3-4B</a> above) — these are the steps it followed, and the recipe for the next model:</p>
 
 <ol>
   <li><strong>Update <code>PHI3</code> constants</strong> in <code>compiler.ts</code> — D, HEADS, HEAD_DIM, LAYERS, FFN, VOCAB</li>

@@ -56,6 +56,11 @@ Subsequent loads are instant. **Both `zero-tvm.html` and `compiler-chat.html` sh
 
 **Requirements**: Chrome / Edge with WebGPU enabled and the `shader-f16` feature available (default on macOS Apple-Silicon, enabled on most modern Windows / Linux GPUs).
 
+## Models
+
+- **Phi-3-mini-4k-instruct (3.8B, q4f16_1)** — the default. Every headline number above is Phi-3; no URL flag needed.
+- **Qwen3-4B (q4f16_1)** — append `?model=qwen3` to `zero-tvm.html` or `validate.html`; weights stream from [`mlc-ai/Qwen3-4B-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC) (~2.3 GB). A v1 port of the spec-parameterized engine: GQA 32/8, per-head QK-norm, byte-level BPE, tied lm_head. Measured 2026-07-28 (Apple M2 Max, same session, identical weight bytes): Zero-TVM **25.43 tok/s** vs WebLLM's prebuilt Qwen3-4B at **14.15 tok/s** (+80%) — on a deliberately untuned path (QK-norm rules out the fused QKV kernel, 10 dispatches/layer vs Phi-3's 7), so read the gap cautiously; caveats in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md).
+
 ## Pages in this Space
 
 - [`index.html`](./index.html) — landing page, shader catalog, compare table
