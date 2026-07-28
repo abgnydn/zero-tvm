@@ -15,9 +15,10 @@
  */
 
 import { loadWeights, LoadedWeights } from './weight-loader.js'
-import { loadTokenizer, buildChatPrompt, Tokenizer } from './tokenizer.js'
+import { Tokenizer } from './tokenizer.js'
+import { loadTokenizerFor, buildChatPromptFor } from './model-select.js'
 import { allocKVPages, buildDecodeEngine, type DecodeEngine } from './engine-core.js'
-import { PHI3 } from '../compiler/compiler.js'
+import { PHI3, type ModelSpec } from '../compiler/compiler.js'
 
 // ============================================================
 // DOM helpers — safe to call even if a target element is missing
@@ -127,6 +128,9 @@ export interface BootError {
 export type BootResult = ({ ok: true } & BootedEngine) | BootError
 
 export interface BootEngineOptions {
+  /** Model to boot. Default: PHI3. Selects the weights repo, tokenizer
+   * pipeline, chat template and engine shape (see model-select.ts). */
+  spec?: ModelSpec
   /** GPU features to request in addition to the required 'shader-f16', each
    * only if the adapter supports it (e.g. 'subgroups', 'timestamp-query'). */
   optionalFeatures?: GPUFeatureName[]
@@ -138,7 +142,7 @@ export interface BootEngineOptions {
   onDeviceLost?: (info: GPUDeviceLostInfo) => void
   /** Allocate the KV cache and build the engine. Default: f16 KV pages +
    * buildDecodeEngine defaults (unfused reference path, scalar shaders). */
-  buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean }) => DecodeEngine
+  buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean; spec: ModelSpec }) => DecodeEngine
   /** Warm the lazily-JIT'd pipelines. Default: one forwardLogits pass. */
   warmup?: (engine: DecodeEngine, tokenizer: Tokenizer) => Promise<void>
 }
@@ -151,6 +155,7 @@ export interface BootEngineOptions {
  * 80% (the long pole), and KV alloc + shader compile take the last 10%.
  */
 export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResult> {
+  const spec = opts.spec ?? PHI3
   if (!navigator.gpu) {
     setBadge('No WebGPU', 'error')
     setProgress(0, 'No WebGPU available')
@@ -172,9 +177,21 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   for (const f of opts.optionalFeatures ?? []) {
     if (adapter.features.has(f)) wantFeatures.push(f)
   }
+  // Lift the storage-binding/buffer ceilings to whatever the adapter offers
+  // (same as tests/kernels/gpu.mjs — RESEARCH_STANDARDS.md §13). The default
+  // 128 MiB maxStorageBufferBindingSize is smaller than Qwen3-4B's tied
+  // embedding/LM-head q_weight (151936 × 320 u32 ≈ 194 MB); binding it fails
+  // validation, which invalidates every submit that touches it and reads back
+  // as silent all-zero logits. Requesting the adapter's own limits is always
+  // valid per spec.
+  const requiredLimits: Record<string, number> = {}
+  if (adapter.limits) {
+    requiredLimits.maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize
+    requiredLimits.maxBufferSize = adapter.limits.maxBufferSize
+  }
   let device: GPUDevice
   try {
-    device = await adapter.requestDevice({ requiredFeatures: wantFeatures })
+    device = await adapter.requestDevice({ requiredFeatures: wantFeatures, requiredLimits })
   } catch {
     setBadge('shader-f16 missing', 'error')
     setProgress(0, 'GPU does not support shader-f16 — Chrome or Edge required')
@@ -205,7 +222,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   setBadge('Tokenizer...', 'loading')
   let tokenizer: Tokenizer
   try {
-    tokenizer = await loadTokenizer((m) => log(m))
+    tokenizer = await loadTokenizerFor(spec, (m) => log(m))
   } catch (e) {
     setBadge('Tokenizer failed', 'error')
     setProgress(5, `Tokenizer error: ${e}`)
@@ -223,11 +240,11 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
       const match = /Loading layer (\d+)/.exec(m)
       if (match) {
         const layer = parseInt(match[1], 10)
-        const pct = (layer / PHI3.LAYERS) * 100
-        setProgress(10 + pct * 0.8, `Loading layer ${layer} / ${PHI3.LAYERS}`, `${Math.round(pct)}%`)
+        const pct = (layer / spec.layers) * 100
+        setProgress(10 + pct * 0.8, `Loading layer ${layer} / ${spec.layers}`, `${Math.round(pct)}%`)
         setBadge(`${Math.round(pct)}%`, 'loading')
       }
-    })
+    }, undefined, spec)
   } catch (e) {
     setBadge('Download failed', 'error')
     setProgress(10, `Weight load error: ${e}`)
@@ -241,13 +258,13 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     // The page allocates its own KV cache (f16 or int8) and picks the engine
     // mode + shader variants. It may call log() for its own alloc messages.
     setProgress(96, 'Compiling shaders...')
-    engine = opts.buildEngine({ device, weights, sgSizeOk })
+    engine = opts.buildEngine({ device, weights, sgSizeOk, spec })
   } else {
-    log(`Allocating KV cache (${PHI3.LAYERS} layers × ${PHI3.MAX_PAGES} pages)`)
-    const kvPages = allocKVPages(device)
+    log(`Allocating KV cache (${spec.layers} layers × ${spec.maxPages} pages)`)
+    const kvPages = allocKVPages(device, spec)
     setProgress(96, 'Compiling shaders...')
     log('Compiling 27 WGSL kernels (10 roles; 18 files + 9 generated)')
-    engine = buildDecodeEngine(device, weights, kvPages)
+    engine = buildDecodeEngine(device, weights, kvPages, { spec })
   }
 
   // Pipeline warmup. createComputePipeline only registers shaders — Chrome's
@@ -260,7 +277,8 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   if (opts.warmup) {
     await opts.warmup(engine, tokenizer)
   } else {
-    const warmupIds = buildChatPrompt(
+    const warmupIds = buildChatPromptFor(
+      spec,
       [{ role: 'user', content: 'Hi.' }],
       tokenizer
     )

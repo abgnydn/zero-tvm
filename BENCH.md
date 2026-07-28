@@ -1,4 +1,4 @@
-# Zero-TVM Phi-3 decode benchmarks
+# Zero-TVM decode benchmarks (Phi-3 headline + Qwen3-4B v1)
 
 All numbers are decode-only (prefill excluded via warmup runs), measured with
 `npm run bench` (128 decode tokens × 5 runs, median) or `bench(128, 3)` in
@@ -49,6 +49,51 @@ Entry point: `webllm-bench.html` + `src/webllm-bench/main.ts` — wires a custom
 published Phi-3-mini WASM `model_lib`. The vite middleware aliases
 `tensor-cache.json` ← `ndarray-cache.json` (WebLLM renamed it in v0.2.80) and
 strips the HF-style `resolve/main/` prefix.
+
+## Qwen3-4B (2026-07-28, Apple M2 Max) — v1 port, same-weights A/B vs WebLLM
+
+First cross-engine measurement of the Qwen3-4B port (`?model=qwen3`). Same
+protocol shape as the Phi-3 headline: same machine, same session (halves run
+back-to-back), same Qwen3-4B-q4f16_1 weight bytes served from the local
+mirror (`/local-weights/Qwen3-4B-q4f16_1-MLC/`), greedy decoding, Chrome
+150.0.7871.187. Zero-TVM half: `BENCH_QUERY="?model=qwen3" npm run bench`,
+128 decode tokens × 5 runs, median. WebLLM half: `webllm-bench.html?model=qwen3`
+— WebLLM v0.2.80's own prebuilt `Qwen3-4B-q4f16_1-ctx4k_cs1k-webgpu.wasm`
+model_lib, its fixed protocol (3 × 120-token completions + warmup, median,
+wall-clock — identical accounting to the Phi-3 headline's WebLLM half).
+`bench/results.json` is untouched — it remains the Phi-3 headline artifact.
+
+| Engine (Qwen3-4B q4f16_1)                | decode tok/s (median) |
+|-----------------------------------------:|----------------------:|
+| **Zero-TVM (`?model=qwen3`, defaults)**   | **25.43** |
+| WebLLM 0.2.80 (prebuilt Qwen3-4B lib)     | **14.15** |
+
+Raw runs — Zero-TVM: 25.53, 25.43, 25.40, 33.12, 17.18 (two outliers in
+both directions; the median is the stable statistic — a separate session
+earlier the same day measured 25.34). WebLLM: 14.62, 12.81, 14.15; WebLLM's
+own reported `decode_tokens_per_s` was 15.57 (the wall-clock figure includes
+its ~0.5 s prefill, same as every number in this file).
+
+Zero-TVM measures **+79.8% over WebLLM on this pair** — but do NOT read this
+as "the Qwen port is tuned". The caveats, up front:
+
+- **The Qwen path is v1-unfused.** QK-norm must run between the QKV matmul
+  and RoPE, which is incompatible with the fused QKV+RoPE+KV-append kernel —
+  so Qwen runs the unfused reference composition, 10 dispatches/layer vs the
+  Phi-3 chat path's 7. The vec4-load matmuls engage only where K % 1024 == 0
+  (o_proj's K=4096 yes; d=2560 and ffn=9728 no). No int8-KV. The gap vs
+  WebLLM is measured on an untuned port.
+- **Both engines run Qwen3-4B far below their Phi-3 rates on this machine**
+  (Zero-TVM 62.9 → 25.4; WebLLM 47.9 → 14.2). WebLLM's prebuilt Qwen3 lib
+  appears at least as untuned for this GPU as our v1 path, so the +80% says
+  as much about that lib as about our kernels. The Phi-3 headline above is
+  the tuned-vs-tuned comparison; this one is untuned-vs-untuned.
+- **One machine, one pair, short-context, decode-only.** Same scope limits
+  as everything else in this file, with even less replication (a single
+  same-session pair plus one corroborating Zero-TVM-only session).
+
+This is the recorded baseline for the Qwen tuning phase (fused-path work,
+vec4 builds for K≡512 (mod 1024) shapes, int8-KV), not a headline claim.
 
 ## Measured 2026-07-25 (M2 Max) — flag A/B series
 

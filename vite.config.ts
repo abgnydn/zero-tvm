@@ -9,21 +9,28 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 /**
  * Local MLC-weights mirror for e2e testing without re-downloading 2 GB.
  *
- * Expects:   huggingface-cli download mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC
- * Serves:    ~/.cache/huggingface/hub/models--mlc-ai--Phi-3-mini-4k-instruct-q4f16_1-MLC/
- *            snapshots/<hash>/*   →   /local-weights/*
+ * Expects:   node scripts/download-weights.mjs [--model qwen3]
+ *            (or huggingface-cli download mlc-ai/<repo>)
+ * Serves:    /local-weights/<repo-name>/*  →  .weights-local/<repo-name>/
+ *            (or ~/mlc-weights/<repo-name>, or the HF hub snapshot dir)
  *
- * Weight loader tries /local-weights/<file> first (tier 0) when import.meta.env.DEV.
- * Falls through to OPFS / browser cache / HuggingFace CDN if the local mirror
- * isn't primed.
+ * The bare legacy form /local-weights/* (no repo segment) still serves the
+ * Phi-3 snapshot — WebLLM's compiler-chat / webllm-bench pages depend on that
+ * exact URL shape, and Phi-3 mirror behavior must stay byte-compatible.
+ *
+ * Weight loader tries /local-weights/<repo-name>/<file> first (tier 0) when
+ * import.meta.env.DEV. Falls through to OPFS / browser cache / HuggingFace
+ * CDN if the local mirror isn't primed.
  */
-function findMlcSnapshotDir(): string | null {
+const PHI3_REPO_NAME = 'Phi-3-mini-4k-instruct-q4f16_1-MLC'
+
+function findMlcSnapshotDir(repoName: string = PHI3_REPO_NAME): string | null {
   // Repo-local: where scripts/download-weights.mjs puts the snapshot.
-  const repoLocal = join(__dirname, '.weights-local', 'Phi-3-mini-4k-instruct-q4f16_1-MLC')
+  const repoLocal = join(__dirname, '.weights-local', repoName)
   if (existsSync(join(repoLocal, 'ndarray-cache.json'))) return repoLocal
 
   // Preferred: a flat mirror dir populated via parallel curl (fastest to prime).
-  const flatMirror = join(homedir(), 'mlc-weights', 'Phi-3-mini-4k-instruct-q4f16_1-MLC')
+  const flatMirror = join(homedir(), 'mlc-weights', repoName)
   if (existsSync(join(flatMirror, 'ndarray-cache.json'))) return flatMirror
 
   // Fallback: HF hub snapshot dir (hf download populates this).
@@ -32,7 +39,7 @@ function findMlcSnapshotDir(): string | null {
     '.cache',
     'huggingface',
     'hub',
-    'models--mlc-ai--Phi-3-mini-4k-instruct-q4f16_1-MLC',
+    `models--mlc-ai--${repoName}`,
     'snapshots',
   )
   if (!existsSync(cacheRoot)) return null
@@ -48,14 +55,27 @@ function localWeightsPlugin() {
   return {
     name: 'local-mlc-weights',
     configureServer(server: any) {
-      const snapshot = findMlcSnapshotDir()
-      if (!snapshot) {
+      const defaultSnapshot = findMlcSnapshotDir()
+      if (defaultSnapshot) {
         // eslint-disable-next-line no-console
-        console.log('[local-weights] No MLC snapshot found — /local-weights/* will 404')
-        return
+        console.log(`[local-weights] Serving /local-weights/* from ${defaultSnapshot}`)
+      } else {
+        // eslint-disable-next-line no-console
+        console.log('[local-weights] No Phi-3 snapshot found — bare /local-weights/* will 404')
       }
-      // eslint-disable-next-line no-console
-      console.log(`[local-weights] Serving /local-weights/* from ${snapshot}`)
+      // Per-model snapshot lookup, memoized per repo-name segment.
+      const snapshotCache = new Map<string, string | null>()
+      const snapshotFor = (repoName: string): string | null => {
+        if (!snapshotCache.has(repoName)) {
+          const dir = findMlcSnapshotDir(repoName)
+          if (dir) {
+            // eslint-disable-next-line no-console
+            console.log(`[local-weights] Serving /local-weights/${repoName}/* from ${dir}`)
+          }
+          snapshotCache.set(repoName, dir)
+        }
+        return snapshotCache.get(repoName) ?? null
+      }
       server.middlewares.use('/local-weights', (req: any, res: any, next: any) => {
         // Strip query string, resolve safely inside snapshot dir.
         let urlPath = decodeURIComponent((req.url ?? '/').split('?')[0])
@@ -63,9 +83,30 @@ function localWeightsPlugin() {
         // `resolve/main/` to it (HF-hub convention). Strip that prefix so the
         // same mirror serves both Zero-TVM (bare) and WebLLM (HF-shaped) URLs.
         urlPath = urlPath.replace(/^\/resolve\/[^/]+\//, '/')
+        // Model routing: /<repo-name>/<file> serves <file> from that repo's
+        // mirror dir. Unknown first segments fall through to the legacy
+        // single-model (Phi-3) behavior, byte-compatible with before.
+        let snapshot = defaultSnapshot
+        const seg = /^\/([^/]+)\/(.+)$/.exec(urlPath)
+        if (seg) {
+          const modelSnap = snapshotFor(seg[1])
+          if (modelSnap) {
+            snapshot = modelSnap
+            // Per-model WebLLM URLs are /<repo-name>/resolve/main/<file>
+            // (webllm-bench points AppConfig.model at the repo route, and
+            // cleanModelUrl() leaves the resolve/main/ suffix alone) — strip
+            // the HF-shape prefix again now that the repo segment is gone.
+            urlPath = ('/' + seg[2]).replace(/^\/resolve\/[^/]+\//, '/')
+          }
+        }
         // WebLLM v0.2.80 renamed ndarray-cache.json → tensor-cache.json; our
-        // mirror still has the old name. Contents/shape are identical.
+        // mirrors still have the old name. Contents/shape are identical.
         if (urlPath === '/tensor-cache.json') urlPath = '/ndarray-cache.json'
+        if (!snapshot) {
+          res.statusCode = 404
+          res.end('Not found')
+          return
+        }
         const target = resolve(snapshot, '.' + urlPath)
         if (!target.startsWith(snapshot)) {
           res.statusCode = 403

@@ -5,9 +5,11 @@
  * DecodeEngine. No DOM, no UI. Both shipped pages drive this one engine:
  *
  *   - validate.ts (via loading-ui.ts's bootEngine) runs the default
- *     configuration — unfused reference path (9 dispatches/layer), scalar
- *     shaders, blocking generate()/forwardLogits() with deterministic
- *     per-token positions and logits access.
+ *     configuration — unfused reference path (9 dispatches/layer; 10 for
+ *     qkNorm specs like Qwen3, which insert a per-head Q/K RMSNorm between
+ *     the QKV matmul and RoPE), scalar shaders, blocking
+ *     generate()/forwardLogits() with deterministic per-token positions and
+ *     logits access.
  *   - chat.ts runs the throughput configuration — fused QKV+RoPE+KV-append
  *     (7 dispatches/layer, 8 with int8 KV), URL-flag shader variants
  *     (src/zero-tvm/variants.ts), and generatePipelined()'s readback ring
@@ -19,7 +21,7 @@
  */
 
 import { LoadedWeights } from './weight-loader.js'
-import { compile, PHI3 } from '../compiler/compiler.js'
+import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, type VariantFlags } from './variants.js'
 
 // ============================================================
@@ -74,29 +76,29 @@ interface ProfileState {
 // KV cache allocation (one pages buffer per layer)
 // ============================================================
 
-export function allocKVPages(device: GPUDevice): GPUBuffer[] {
-  const bytesPerPage = 98304 * 2  // 32 heads * 16 slots * 96 dims * 2 (K+V) * 2 bytes
-  const pages = PHI3.MAX_PAGES * bytesPerPage  // 257 * 196608 ≈ 50MB
-  return Array.from({ length: PHI3.LAYERS }, (_, i) =>
+export function allocKVPages(device: GPUDevice, spec: ModelSpec = PHI3): GPUBuffer[] {
+  const bytesPerPage = spec.kvPageStride * 2  // kvHeads * pageSize slots * headDim * 2 (K+V) * 2 bytes
+  const pages = spec.maxPages * bytesPerPage  // Phi-3: 257 * 196608 ≈ 50MB
+  return Array.from({ length: spec.layers }, (_, i) =>
     makeBuf(device, pages, `kvPages_${i}`)
   )
 }
 
-// int8 layout: 32 heads × 16 slots × 2 sides × 24 u32-words = 24576 u32 per page.
-// Halves KV memory from ~1.6GB to ~800MB for 4K context, at the cost of one
-// extra dispatch per layer (quantize). Opt-in (?kv8=1 on the chat page) —
-// validate output parity against the f16 baseline on your target hardware.
-export function allocKVPagesInt8(device: GPUDevice): { pages: GPUBuffer[]; scales: GPUBuffer[] } {
-  const wordsPerPage = 32 * 16 * 2 * 24     // 24576
-  const bytesPerPage = wordsPerPage * 4     // 96 KB
-  const scalesPerPage = 32 * 16 * 2         // 1024 f16 per page
-  const pagesBytes = PHI3.MAX_PAGES * bytesPerPage
-  const scalesBytes = PHI3.MAX_PAGES * scalesPerPage * 2
+// int8 layout: kvHeads × pageSize slots × 2 sides × headDim/4 u32-words per page
+// (Phi-3: 24576 u32). Halves KV memory from ~1.6GB to ~800MB for 4K context, at
+// the cost of one extra dispatch per layer (quantize). Opt-in (?kv8=1 on the
+// chat page) — validate output parity against the f16 baseline on your target
+// hardware.
+export function allocKVPagesInt8(device: GPUDevice, spec: ModelSpec = PHI3): { pages: GPUBuffer[]; scales: GPUBuffer[] } {
+  const bytesPerPage = spec.kvI8PageWords * 4       // Phi-3: 96 KB
+  const scalesPerPage = spec.kvScalesPerPage        // Phi-3: 1024 f16 per page
+  const pagesBytes = spec.maxPages * bytesPerPage
+  const scalesBytes = spec.maxPages * scalesPerPage * 2
   return {
-    pages: Array.from({ length: PHI3.LAYERS }, (_, i) =>
+    pages: Array.from({ length: spec.layers }, (_, i) =>
       makeBuf(device, pagesBytes, `kvPagesI8_${i}`)
     ),
-    scales: Array.from({ length: PHI3.LAYERS }, (_, i) =>
+    scales: Array.from({ length: spec.layers }, (_, i) =>
       makeBuf(device, scalesBytes, `kvScales_${i}`)
     ),
   }
@@ -112,18 +114,11 @@ export function allocKVPagesInt8(device: GPUDevice): { pages: GPUBuffer[]; scale
 const PACK = 8
 const GROUP = 32
 
-// Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and SCALES = K/32
-const QKV_K_PACKED   = PHI3.D / PACK            // 384  (K=3072)
-const QKV_SCALES     = PHI3.D / GROUP           // 96
-const FFN_DN_K_PACKED = PHI3.FFN / PACK         // 1024 (K=8192)
-const FFN_DN_SCALES   = PHI3.FFN / GROUP        // 256
-
-// Workgroup-count constants — derived from each shader's @workgroup_size:
-//   embedding/rms_norm/add_norm/kv_append/rope: WG_SIZE_D = 256, one wg per 256 hidden units
-//   matmul shaders: one wg per output element (M), divided by the variant's rows/WG
+// Workgroup width shared by the elementwise shaders — derived from their
+// @workgroup_size: embedding/rms_norm/add_norm/kv_append/rope use 256
+// threads, one wg per 256 hidden units. Matmul shaders get one wg per
+// output element (M), divided by the variant's rows/WG.
 const WG_SIZE_D = 256
-const D_WGS     = PHI3.D / WG_SIZE_D            // 12   (3072/256)
-const QKV_WGS   = PHI3.QKV_DIM / WG_SIZE_D      // 36   (9216/256)
 
 export interface KernelProfile {
   kernels: Array<{ label: string; totalMs: number; calls: number; pctOfTotal: number }>
@@ -164,8 +159,10 @@ export interface DecodeEngine {
   forwardLogits(promptIds: number[]): Promise<Float32Array>
   /** Reset KV-cache invalidation tracking (call when starting a fresh conversation). */
   resetKVTracking(): void
-  /** Hard KV ceiling in tokens: PHI3.MAX_PAGES × PHI3.PAGE_SIZE. */
+  /** Hard KV ceiling in tokens: spec.maxPages × spec.pageSize. */
   maxContext: number
+  /** The ModelSpec this engine was built for. */
+  spec: ModelSpec
   /** Timestamp-query profile of one steady-state decode step (null if the feature is off). */
   profileStep(warmupIds: number[]): Promise<KernelProfile | null>
   benchBatchedFfnDown(
@@ -181,11 +178,15 @@ export interface DecodeEngineOptions {
   /**
    * true  → fused QKV+RoPE+KV-append (qkv_fused writes kvPages directly;
    *         7 dispatches/layer, 8 with int8 KV) — the chat path.
-   * false → unfused reference: qkv matmul → rope → kv_append (9/layer).
+   *         Incompatible with qkNorm specs (Qwen3) — throws.
+   * false → unfused reference: qkv matmul → [qk_norm →] rope → kv_append
+   *         (9/layer; 10 with qkNorm).
    */
   fused?: boolean
   /** int8 KV cache. Requires `fused` and a kv argument carrying `scales`. */
   int8KV?: boolean
+  /** Model shape to build for. Default: PHI3. Must match the loaded weights. */
+  spec?: ModelSpec
 }
 
 export function buildDecodeEngine(
@@ -197,15 +198,40 @@ export function buildDecodeEngine(
   const variants = opts.variants ?? SCALAR_VARIANTS
   const fused = opts.fused ?? false
   const int8Mode = opts.int8KV ?? false
+  const S = opts.spec ?? PHI3
   const kvPages = Array.isArray(kv) ? kv : kv.pages
   const kvScales = Array.isArray(kv) ? undefined : kv.scales
   if (int8Mode && (!fused || !kvScales)) {
     throw new Error('buildDecodeEngine: int8KV requires fused mode and a KV cache with scales buffers')
   }
+  // QK-norm specs (Qwen3) must run the unfused composition: qkv_fused folds
+  // RoPE+KV-append into the projection, leaving nowhere to normalize Q/K
+  // between the matmul and the rotation. Pages gate `fused` off per spec.
+  if (S.qkNorm && fused) {
+    throw new Error(
+      'buildDecodeEngine: fused QKV is incompatible with qkNorm specs (Qwen3) — ' +
+      'the per-head Q/K RMSNorm must run between the QKV matmul and RoPE. Use unfused mode.'
+    )
+  }
 
-  const { pipelines } = compile(device, { subgroups: variants.subgroups })
+  // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and SCALES = K/32.
+  // K = d for the QKV/gate_up projections, qDim for o_proj (== d when
+  // heads == kvHeads), ffn for down_proj.
+  const QKV_K_PACKED    = S.d / PACK          // Phi-3: 384  (K=3072)
+  const QKV_SCALES      = S.d / GROUP         // Phi-3: 96
+  const OPROJ_K_PACKED  = S.qDim / PACK       // Phi-3: 384 (qDim == d)
+  const OPROJ_SCALES    = S.qDim / GROUP      // Phi-3: 96
+  const FFN_DN_K_PACKED = S.ffn / PACK        // Phi-3: 1024 (K=8192)
+  const FFN_DN_SCALES   = S.ffn / GROUP       // Phi-3: 256
+
+  // Elementwise workgroup counts (one wg per WG_SIZE_D elements).
+  const D_WGS   = S.d / WG_SIZE_D             // Phi-3: 12   (3072/256)
+  const QKV_WGS = S.qkvDim / WG_SIZE_D        // Phi-3: 36   (9216/256)
+  const KV_WGS  = S.kvDim / WG_SIZE_D         // kv_append grid — Phi-3: 12, Qwen3: 4
+
+  const { pipelines } = compile(device, { subgroups: variants.subgroups }, S)
   const P = pipelines
-  const R = resolveVariantPipelines(variants, P)
+  const R = resolveVariantPipelines(variants, P, S)
   // Split-K attention (?splitk=N) exists only for the f16 KV layout;
   // attention_int8 has no split-K variant.
   if (int8Mode && R.splitK) {
@@ -225,19 +251,19 @@ export function buildDecodeEngine(
   //   fused int8 — qkv_fused_scratch writes qOut + kSlot/vSlot, kv_quantize
   //                packs them into int8 pages + f16 scales
   const B = {
-    residual:  makeBuf(device, PHI3.D * 2, 'residual'),      // running residual (ping)
-    residual2: makeBuf(device, PHI3.D * 2, 'residual2'),     // running residual (pong)
-    hidden1:   makeBuf(device, PHI3.D * 2, 'hidden1'),       // normed scratch
-    hidden2:   makeBuf(device, PHI3.D * 2, 'hidden2'),       // matmul output scratch
-    qOut:      makeBuf(device, PHI3.D * 2, 'qOut'),
-    attnOut:   makeBuf(device, PHI3.D * 2, 'attnOut'),
-    ffnOut:    makeBuf(device, PHI3.FFN * 2, 'ffnOut'),
-    logits:    makeBuf(device, PHI3.VOCAB * 4, 'logits'),
+    residual:  makeBuf(device, S.d * 2, 'residual'),      // running residual (ping)
+    residual2: makeBuf(device, S.d * 2, 'residual2'),     // running residual (pong)
+    hidden1:   makeBuf(device, S.d * 2, 'hidden1'),       // normed scratch
+    hidden2:   makeBuf(device, S.d * 2, 'hidden2'),       // matmul output scratch
+    qOut:      makeBuf(device, S.qDim * 2, 'qOut'),
+    attnOut:   makeBuf(device, S.qDim * 2, 'attnOut'),
+    ffnOut:    makeBuf(device, S.ffn * 2, 'ffnOut'),
+    logits:    makeBuf(device, S.vocab * 4, 'logits'),
     tokenOut:  makeBuf(device, 4, 'tokenOut'),
     inputIds:  makeBuf(device, 4, 'inputIds'),
     posMap:    makeBuf(device, 4, 'posMap'),
     pageIndptr: makeBuf(device, 8, 'pageIndptr'),
-    pageValues: makeBuf(device, PHI3.MAX_PAGES * 4, 'pageValues'),
+    pageValues: makeBuf(device, S.maxPages * 4, 'pageValues'),
     lengthInfo: makeBuf(device, 12, 'lengthInfo'),
     // Mode-conditional entries (see above)
     qkvOut: null as GPUBuffer | null,
@@ -253,44 +279,49 @@ export function buildDecodeEngine(
     attnPartials: null as GPUBuffer | null,
   }
   if (!fused) {
-    B.qkvOut = makeBuf(device, PHI3.QKV_DIM * 2, 'qkvOut')
-    B.kOut   = makeBuf(device, PHI3.D * 2, 'kOut')
-    B.vOut   = makeBuf(device, PHI3.D * 2, 'vOut')
+    B.qkvOut = makeBuf(device, S.qkvDim * 2, 'qkvOut')
+    B.kOut   = makeBuf(device, S.kvDim * 2, 'kOut')
+    B.vOut   = makeBuf(device, S.kvDim * 2, 'vOut')
   }
   if (int8Mode) {
-    B.kSlot = makeBuf(device, PHI3.D * 2, 'kSlot')
-    B.vSlot = makeBuf(device, PHI3.D * 2, 'vSlot')
+    B.kSlot = makeBuf(device, S.kvDim * 2, 'kSlot')
+    B.vSlot = makeBuf(device, S.kvDim * 2, 'vSlot')
   }
   if (R.ffnPrologue) {
-    B.hidden3 = makeBuf(device, PHI3.D * 2, 'hidden3')
+    B.hidden3 = makeBuf(device, S.d * 2, 'hidden3')
   }
   if (splitK) {
-    B.attnPartials = makeBuf(device, PHI3.HEADS * splitK * (PHI3.HEAD_DIM + 2) * 4, 'attnPartials')
+    B.attnPartials = makeBuf(device, S.heads * splitK * (S.headDim + 2) * 4, 'attnPartials')
   }
 
   // Static uniforms — matmul shapes (K_packed, scales_per_row, M)
-  const qkvU   = fused ? null : uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(PHI3.QKV_DIM)])
-  const oProjU = uniformBuf(device, [u32(QKV_K_PACKED),    u32(QKV_SCALES),    u32(PHI3.D)])
-  const ffnDnU = uniformBuf(device, [u32(FFN_DN_K_PACKED), u32(FFN_DN_SCALES), u32(PHI3.D)])
-  const lmHdU  = uniformBuf(device, [u32(QKV_K_PACKED),    u32(QKV_SCALES),    u32(PHI3.VOCAB)])
+  const qkvU   = fused ? null : uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(S.qkvDim)])
+  const oProjU = uniformBuf(device, [u32(OPROJ_K_PACKED),  u32(OPROJ_SCALES),  u32(S.d)])
+  const ffnDnU = uniformBuf(device, [u32(FFN_DN_K_PACKED), u32(FFN_DN_SCALES), u32(S.d)])
+  const lmHdU  = uniformBuf(device, [u32(QKV_K_PACKED),    u32(QKV_SCALES),    u32(S.vocab)])
   const embU   = uniformBuf(device, [u32(1), u32(D_WGS)])
   const normU  = uniformBuf(device, [u32(1)])
-  const ffnU   = uniformBuf(device, [u32(PHI3.FFN)])
-  const argmaxU = uniformBuf(device, [u32(PHI3.VOCAB)])
+  const ffnU   = uniformBuf(device, [u32(S.ffn)])
+  const argmaxU = uniformBuf(device, [u32(S.vocab)])
 
   // Hoisted per-layer uniforms — all fields are constant across tokens.
   // Unfused: rope + kv_append. Fused: qkv_fused (f16) or scratch + quantize (int8).
   const ropeU  = fused ? null : uniformBuf(device, [i32(1), i32(0), i32(1), u32(QKV_WGS)])
-  const kvAppU = fused ? null : uniformBuf(device, [i32(1), i32(PHI3.MAX_PAGES), i32(0), i32(0), u32(D_WGS)])
-  const qkvFusedU = (fused && !int8Mode) ? uniformBuf(device, [i32(0), i32(0), u32(4608)]) : null      // f16-KV mode
-  const qkvFusedScratchU = int8Mode ? uniformBuf(device, [i32(0), u32(4608)]) : null                   // int8-KV mode
-  const kvQuantU = int8Mode ? uniformBuf(device, [i32(0), i32(0), i32(0), u32(64)]) : null             // pos_off, pages_off, scales_off, 64 WG
+  const kvAppU = fused ? null : uniformBuf(device, [i32(1), i32(S.maxPages), i32(0), i32(0), u32(KV_WGS)])
+  // Qwen3 per-head Q/K RMSNorm — one 32-thread WG per (token, head), heads
+  // ordered Q then K: grid = seq_len × (HEADS + KV_HEADS). seq_len is 1 on
+  // the decode path, so the uniform is fully constant.
+  const QK_NORM_WGS = S.heads + S.kvHeads
+  const qkNormU = S.qkNorm ? uniformBuf(device, [i32(1), u32(QK_NORM_WGS)]) : null
+  const qkvFusedU = (fused && !int8Mode) ? uniformBuf(device, [i32(0), i32(0), u32(S.qkvPairs)]) : null      // f16-KV mode
+  const qkvFusedScratchU = int8Mode ? uniformBuf(device, [i32(0), u32(S.qkvPairs)]) : null                   // int8-KV mode
+  const kvQuantU = int8Mode ? uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]) : null  // pos_off, pages_off, scales_off, kvHeads*2 WG
 
-  const SM_SCALE = 1.0 / Math.sqrt(PHI3.HEAD_DIM)
+  const SM_SCALE = 1.0 / Math.sqrt(S.headDim)
 
   // Hard KV ceiling — writing a slot at or past this position would run off
   // the last page and silently corrupt the cache.
-  const MAX_CONTEXT = PHI3.MAX_PAGES * PHI3.PAGE_SIZE
+  const MAX_CONTEXT = S.maxContext
 
   // Attention uniform (f16-KV mode): 9 fields, 36 bytes, padded to 48.
   // nnz_pages at offset 8 is the only per-token field; the rest are constant.
@@ -303,7 +334,7 @@ export function buildDecodeEngine(
     const init = new ArrayBuffer(48)
     const dv = new DataView(init)
     dv.setInt32(0, 1, true)                    // batch
-    dv.setInt32(4, PHI3.MAX_PAGES, true)       // max_num_pages
+    dv.setInt32(4, S.maxPages, true)           // max_num_pages
     // offset 8: nnz_pages — updated per token via writeBuffer
     dv.setInt32(12, 0, true)                   // pages_elem_offset
     dv.setInt32(16, 0, true)                   // page_indptr_elem_offset
@@ -329,7 +360,7 @@ export function buildDecodeEngine(
     const init = new ArrayBuffer(48)
     const dv = new DataView(init)
     dv.setInt32(0, 1, true)                    // B
-    dv.setInt32(4, PHI3.MAX_PAGES, true)       // max_num_pages
+    dv.setInt32(4, S.maxPages, true)           // max_num_pages
     // offset 8: nnz_pages — updated per token via writeBuffer
     dv.setInt32(12, 0, true)                   // pages_elem_offset
     dv.setInt32(16, 0, true)                   // page_indptr_elem_offset
@@ -349,7 +380,7 @@ export function buildDecodeEngine(
     const tmpl = new ArrayBuffer(48)
     const dv = new DataView(tmpl)
     dv.setInt32(0, 1, true)                    // B
-    dv.setInt32(4, PHI3.MAX_PAGES, true)       // max_num_pages
+    dv.setInt32(4, S.maxPages, true)           // max_num_pages
     // offset 8: nnz_pages — rewritten per token
     dv.setInt32(12, 0, true)                   // pages_elem_offset
     dv.setInt32(16, 0, true)                   // page_indptr_elem_offset
@@ -376,8 +407,8 @@ export function buildDecodeEngine(
 
   // Initialize identity page table (page i → physical page i)
   {
-    const pageVals = new Int32Array(PHI3.MAX_PAGES)
-    for (let i = 0; i < PHI3.MAX_PAGES; i++) pageVals[i] = i
+    const pageVals = new Int32Array(S.maxPages)
+    for (let i = 0; i < S.maxPages; i++) pageVals[i] = i
     device.queue.writeBuffer(B.pageValues, 0, pageVals)
   }
 
@@ -385,7 +416,7 @@ export function buildDecodeEngine(
   // Pre-computed bind groups
   //
   // Bind group contents are deterministic (same buffers, same layout) so we
-  // hoist them out of the hot loop — ~10 per layer × 32 layers otherwise.
+  // hoist them out of the hot loop — ~10 per layer × spec.layers otherwise.
   //
   // The residual ping-pong is also deterministic: every layer reads `residual`
   // and writes `residual2` in addNorm1 (post-attention), then reads `residual2`
@@ -410,7 +441,7 @@ export function buildDecodeEngine(
     B.logits, B.tokenOut, argmaxU,
   ])
   // Split-K combine reads the shared partials scratch and writes attnOut —
-  // identical for every layer, so one bind group serves all 32.
+  // identical for every layer, so one bind group serves every layer.
   const bgAttnCombine = splitK
     ? bg(device, R.attentionCombine!, [B.attnPartials!, B.attnOut, combineU!])
     : null
@@ -418,6 +449,7 @@ export function buildDecodeEngine(
   // Per-layer bind groups
   interface LayerBG {
     qkv: GPUBindGroup           // unfused: qkv matmul | fused: qkv_fused / qkv_fused_scratch
+    qkNorm?: GPUBindGroup       // qkNorm specs (Qwen3) only — in-place Q/K RMSNorm on qkvOut
     kvApp?: GPUBindGroup        // unfused only
     kvQuantize?: GPUBindGroup   // int8 mode only
     attn: GPUBindGroup          // splitK: the partial pass (writes attnPartials)
@@ -428,14 +460,15 @@ export function buildDecodeEngine(
     addNorm2: GPUBindGroup      // post-FFN: reads residual2, writes residual (prologue mode: add3_norm)
   }
   const layerBGs: LayerBG[] = []
-  for (let L = 0; L < PHI3.LAYERS; L++) {
+  for (let L = 0; L < S.layers; L++) {
     const lw = weights.layers[L]
-    const nextGamma = L < PHI3.LAYERS - 1
+    const nextGamma = L < S.layers - 1
       ? weights.layers[L + 1].normGamma1
       : weights.finalNormGamma
 
     let qkvBG: GPUBindGroup
     let attnBG: GPUBindGroup
+    let qkNormBG: GPUBindGroup | undefined
     let kvAppBG: GPUBindGroup | undefined
     let kvQuantizeBG: GPUBindGroup | undefined
     // Split-K partial pass replaces the single-WG-per-head attention bind
@@ -451,6 +484,14 @@ export function buildDecodeEngine(
       qkvBG = bg(device, R.matmul, [
         B.qkvOut!, B.hidden1, lw.qkvScales, lw.qkvWeights, qkvU!,
       ])
+      if (S.qkNorm) {
+        // q_norm/k_norm gammas are HEAD_DIM f16 vectors in the MLC layout —
+        // same dtype as every other norm gamma, uploaded raw by the loader.
+        if (!lw.qNormGamma || !lw.kNormGamma) {
+          throw new Error(`buildDecodeEngine: spec ${S.id} sets qkNorm but layer ${L} has no q_norm/k_norm weights`)
+        }
+        qkNormBG = bg(device, P.qkNorm, [B.qkvOut!, lw.qNormGamma, lw.kNormGamma, qkNormU!])
+      }
       kvAppBG = bg(device, P.kvAppend, [
         B.kOut!, B.vOut!, kvPages[L], B.posMap, kvAppU!,
       ])
@@ -484,12 +525,13 @@ export function buildDecodeEngine(
       const rOut = L % 2 === 0 ? B.residual2 : B.residual
       layerBGs.push({
         qkv: qkvBG,
+        qkNorm: qkNormBG,
         kvApp: kvAppBG,
         kvQuantize: kvQuantizeBG,
         attn: attnBG,
-        oProj: bg(device, R.matmul, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
+        oProj: bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
         ffn: bg(device, R.ffn, [B.ffnOut, rIn, B.hidden2, lw.normGamma2, lw.ffnScales, lw.ffnWeights, ffnU]),
-        ffnDown: bg(device, R.matmul, [B.hidden3!, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
+        ffnDown: bg(device, R.matmulFfnDown, [B.hidden3!, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
         addNorm2: bg(device, P.add3Norm, [rIn, B.hidden2, B.hidden3!, nextGamma, B.hidden1, rOut, normU]),
       })
       continue
@@ -497,13 +539,14 @@ export function buildDecodeEngine(
 
     layerBGs.push({
       qkv: qkvBG,
+      qkNorm: qkNormBG,
       kvApp: kvAppBG,
       kvQuantize: kvQuantizeBG,
       attn: attnBG,
-      oProj: bg(device, R.matmul, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
+      oProj: bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
       addNorm1: bg(device, P.addNorm, [B.hidden2, B.residual, lw.normGamma2, B.hidden1, B.residual2, normU]),
       ffn: bg(device, R.ffn, [B.ffnOut, B.hidden1, lw.ffnScales, lw.ffnWeights, ffnU]),
-      ffnDown: bg(device, R.matmul, [B.hidden2, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
+      ffnDown: bg(device, R.matmulFfnDown, [B.hidden2, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
       addNorm2: bg(device, P.addNorm, [B.hidden2, B.residual2, nextGamma, B.hidden1, B.residual, normU]),
     })
   }
@@ -543,7 +586,7 @@ export function buildDecodeEngine(
   }
 
   /**
-   * Record one full forward pass (embedding → 32 layers → LM head → argmax)
+   * Record one full forward pass (embedding → all layers → LM head → argmax)
    * into `enc`. Both generate styles and profileStep share this recorder, so
    * dispatch order is identical everywhere.
    */
@@ -553,12 +596,14 @@ export function buildDecodeEngine(
     // --- INITIAL RMSNORM: B.residual → B.hidden1 (layer 0's normGamma1) ---
     dispatch(enc, P.rmsNorm, bgInitNorm, 1, 1, 1, 'rmsNorm_init')
 
-    // --- 32 TRANSFORMER LAYERS ---
+    // --- TRANSFORMER LAYERS ---
     // Residual ping-pong is encoded into the cached bind groups: addNorm1 reads
     // residual / writes residual2; addNorm2 reads residual2 / writes residual.
-    // Unfused: 9 dispatches/layer. Fused f16: 7. Fused int8: 8 (adds a
-    // kv_quantize pass between qkv_fused_scratch and attention_int8).
-    for (let L = 0; L < PHI3.LAYERS; L++) {
+    // Unfused: 9 dispatches/layer (10 for qkNorm specs — Qwen3 inserts the
+    // per-head Q/K RMSNorm between qkv matmul and rope). Fused f16: 7. Fused
+    // int8: 8 (adds a kv_quantize pass between qkv_fused_scratch and
+    // attention_int8).
+    for (let L = 0; L < S.layers; L++) {
       const blk = layerBGs[L]
 
       // Attention on the f16 KV layout — split-K (?splitk=N) turns the one
@@ -566,48 +611,50 @@ export function buildDecodeEngine(
       // plus a per-head combine over the partials scratch.
       const attentionF16 = () => {
         if (splitK) {
-          dispatch(enc, R.attentionSplitK!, blk.attn, splitK, PHI3.HEADS, 1, 'attention')
-          dispatch(enc, R.attentionCombine!, bgAttnCombine!, 1, PHI3.HEADS, 1, 'attnCombine')
+          dispatch(enc, R.attentionSplitK!, blk.attn, splitK, S.heads, 1, 'attention')
+          dispatch(enc, R.attentionCombine!, bgAttnCombine!, 1, S.heads, 1, 'attnCombine')
         } else {
-          dispatch(enc, R.attention, blk.attn, 1, PHI3.HEADS, 1, 'attention')
+          dispatch(enc, R.attention, blk.attn, 1, S.heads, 1, 'attention')
         }
       }
 
       if (!fused) {
         // QKV matmul: B.hidden1 → B.qkvOut
-        dispatch(enc, R.matmul, blk.qkv, PHI3.QKV_DIM / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
+        dispatch(enc, R.matmul, blk.qkv, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
+        // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
+        if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
         // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
         dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
-        // KV append: kOut, vOut → kvPages[L]
-        dispatch(enc, P.kvAppend, blk.kvApp!, D_WGS, 1, 1, 'kvAppend')
+        // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
+        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
         // Attention: Q + kvPages[L] → B.attnOut
         attentionF16()
       } else if (int8Mode) {
-        dispatch(enc, P.qkvFusedScratch, blk.qkv, 4608, 1, 1, 'qkvFused')
-        dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, 64, 1, 1, 'kvQuantize')
-        dispatch(enc, P.attentionInt8, blk.attn, 1, PHI3.HEADS, 1, 'attention')
+        dispatch(enc, P.qkvFusedScratch, blk.qkv, S.qkvPairs, 1, 1, 'qkvFused')
+        dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
+        dispatch(enc, P.attentionInt8, blk.attn, 1, S.heads, 1, 'attention')
       } else {
         // Fused QKV+RoPE+KV-append: B.hidden1 → B.qOut + kvPages[L]
-        dispatch(enc, R.qkvFused, blk.qkv, 4608 / R.qkvPairsPerWG, 1, 1, 'qkvFused')
+        dispatch(enc, R.qkvFused, blk.qkv, S.qkvPairs / R.qkvPairsPerWG, 1, 1, 'qkvFused')
         attentionF16()
       }
 
-      // O projection: B.attnOut → B.hidden2
-      dispatch(enc, R.matmul, blk.oProj, PHI3.D / R.matmulRowsPerWG, 1, 1, 'oproj')
+      // O projection: B.attnOut → B.hidden2 (K = qDim instance)
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
       if (R.ffnPrologue) {
         // ?fuseprologue=1: no addNorm1 dispatch. The FFN kernel computes
         // rIn + hidden2 and its RMSNorm in its own prologue; ffnDown lands
         // in hidden3; add3_norm merges rIn + hidden2 + hidden3 at the tail.
-        dispatch(enc, R.ffn, blk.ffn, PHI3.FFN / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
-        dispatch(enc, R.matmul, blk.ffnDown, PHI3.D / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+        dispatch(enc, R.ffn, blk.ffn, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+        dispatch(enc, R.matmulFfnDown, blk.ffnDown, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
         dispatch(enc, P.add3Norm, blk.addNorm2, 1, 1, 1, 'addNorm2')
       } else {
         // AddNorm (attention): residual += hidden2; hidden1 = RMSNorm(residual)
         dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
         // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
-        dispatch(enc, R.ffn, blk.ffn, PHI3.FFN / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
-        // FFN down: B.ffnOut → B.hidden2
-        dispatch(enc, R.matmul, blk.ffnDown, PHI3.D / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+        dispatch(enc, R.ffn, blk.ffn, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+        // FFN down: B.ffnOut → B.hidden2 (K = ffn instance)
+        dispatch(enc, R.matmulFfnDown, blk.ffnDown, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
         // AddNorm (FFN): residual += hidden2; hidden1 = RMSNorm(residual)
         //   For last layer the bind group binds finalNormGamma instead of next
         //   layer's normGamma1, so hidden1 is ready for the LM head.
@@ -616,8 +663,17 @@ export function buildDecodeEngine(
     }
 
     // --- LM HEAD: B.hidden1 (already normalized with model.norm) → B.logits ---
-    // PHI3.VOCAB=32064 is divisible by 4, so rowsPerWG=4 works exactly.
-    dispatch(enc, R.matmulF32, bgLmHead, PHI3.VOCAB / R.matmulRowsPerWG, 1, 1, 'lmHead')
+    // vocab (Phi-3: 32064, Qwen3: 151936) is divisible by 4, so rowsPerWG=4
+    // works exactly. Grids past maxComputeWorkgroupsPerDimension (65535 —
+    // Qwen3's 151936-row scalar case) are folded into z; the kernels index by
+    // blockIdx.z * gridDim.x + blockIdx.x and guard on packGridDimX.
+    const lmWGs = S.vocab / R.matmulRowsPerWG
+    if (lmWGs > 65535) {
+      const lmX = 16384
+      dispatch(enc, R.matmulF32, bgLmHead, lmX, 1, Math.ceil(lmWGs / lmX), 'lmHead')
+    } else {
+      dispatch(enc, R.matmulF32, bgLmHead, lmWGs, 1, 1, 'lmHead')
+    }
     // --- ARGMAX: B.logits → B.tokenOut ---
     dispatch(enc, R.argmax, bgArgmax, 1, 1, 1, 'argmax')
   }
@@ -629,7 +685,7 @@ export function buildDecodeEngine(
    * even while previous submits are still in flight.
    */
   function writeStepState(inputId: number | null, position: number): void {
-    const nnzPages = Math.floor(position / PHI3.PAGE_SIZE) + 1
+    const nnzPages = Math.floor(position / S.pageSize) + 1
     if (inputId !== null) {
       device.queue.writeBuffer(B.inputIds, 0, new Int32Array([inputId]))
     }
@@ -652,8 +708,8 @@ export function buildDecodeEngine(
     if (position < 0 || position >= MAX_CONTEXT) {
       throw new Error(
         `zero-tvm: context overflow — position ${position} exceeds max context ` +
-        `${MAX_CONTEXT} tokens (PHI3.MAX_PAGES=${PHI3.MAX_PAGES} × PAGE_SIZE=${PHI3.PAGE_SIZE}). ` +
-        `Shorten the prompt or raise MAX_PAGES in src/compiler/compiler.ts (costs ~${Math.round(PHI3.LAYERS * 196608 / (1024 * 1024))} MB of KV cache per page block).`
+        `${MAX_CONTEXT} tokens (maxPages=${S.maxPages} × pageSize=${S.pageSize}). ` +
+        `Shorten the prompt or raise maxPages in src/compiler/model-spec.ts (costs ~${Math.round(S.layers * S.kvPageStride * 2 / (1024 * 1024))} MB of KV cache per page block).`
       )
     }
     writeStepState(tokenId, position)
@@ -683,13 +739,13 @@ export function buildDecodeEngine(
 
     if (!logitsReadBuf) {
       logitsReadBuf = device.createBuffer({
-        size: PHI3.VOCAB * 4,
+        size: S.vocab * 4,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
         label: 'logitsReadback',
       })
     }
     const enc = device.createCommandEncoder()
-    enc.copyBufferToBuffer(B.logits, 0, logitsReadBuf, 0, PHI3.VOCAB * 4)
+    enc.copyBufferToBuffer(B.logits, 0, logitsReadBuf, 0, S.vocab * 4)
     device.queue.submit([enc.finish()])
 
     await logitsReadBuf.mapAsync(GPUMapMode.READ)
@@ -698,7 +754,7 @@ export function buildDecodeEngine(
     return out
   }
 
-  const STOP = new Set([2, 32000, 32007])
+  const STOP = new Set(S.stops)
 
   async function generate(
     promptIds: number[],
@@ -731,7 +787,7 @@ export function buildDecodeEngine(
     // slot right after the prompt), then the position advances by one.
     let pos = promptIds.length
     for (let i = 0; i < maxTokens; i++) {
-      if (tokenId < 0 || tokenId >= PHI3.VOCAB || STOP.has(tokenId)) break
+      if (tokenId < 0 || tokenId >= S.vocab || STOP.has(tokenId)) break
       tokens.push(tokenId)
       onToken(tokenId)
       tokenId = await decodeToken(tokenId, pos)
@@ -833,7 +889,7 @@ export function buildDecodeEngine(
     if (promptIds.length >= MAX_CONTEXT) {
       throw new Error(
         `zero-tvm: prompt (${promptIds.length} tokens) exceeds max context ` +
-        `${MAX_CONTEXT} (PHI3.MAX_PAGES=${PHI3.MAX_PAGES} × PAGE_SIZE=${PHI3.PAGE_SIZE})`
+        `${MAX_CONTEXT} (maxPages=${S.maxPages} × pageSize=${S.pageSize})`
       )
     }
 
@@ -851,7 +907,7 @@ export function buildDecodeEngine(
       true,
     )!
     const firstToken = await firstTokenPromise
-    if (STOP.has(firstToken) || firstToken < 0 || firstToken >= PHI3.VOCAB) return tokens
+    if (STOP.has(firstToken) || firstToken < 0 || firstToken >= S.vocab) return tokens
     tokens.push(firstToken)
     onToken(firstToken)
     if (tokens.length >= maxTokens) return tokens
@@ -870,7 +926,7 @@ export function buildDecodeEngine(
 
       while (inFlight.length > 0) {
         const tok = await inFlight.shift()!
-        if (STOP.has(tok) || tok < 0 || tok >= PHI3.VOCAB) break
+        if (STOP.has(tok) || tok < 0 || tok >= S.vocab) break
         tokens.push(tok)
         onToken(tok)
         if (tokens.length >= maxTokens) break
@@ -920,7 +976,9 @@ export function buildDecodeEngine(
     await warmA; await warmB
     const nextPos = warmupIds.length + 2
 
-    const CAPACITY = 600  // 2 slots × (~228 fused / ~260 int8 / ~292 unfused passes)
+    // 2 slots per pass; worst case is the unfused qkNorm path (10/layer) plus
+    // embedding, init norm, LM head, argmax and a little headroom.
+    const CAPACITY = 2 * (S.layers * 10 + 8)
     const querySet = device.createQuerySet({ type: 'timestamp', count: CAPACITY })
     const resolveBuf = device.createBuffer({
       size: CAPACITY * 8,
@@ -1008,12 +1066,15 @@ export function buildDecodeEngine(
     }
     // Target matmul: ffnDown has K=8192, oproj has K=3072.
     const isFfnDown = target === 'ffnDown'
-    const K = isFfnDown ? 8192 : 3072
-    const N = 3072
+    const K = isFfnDown ? S.ffn : S.qDim
+    const N = S.d
     const uniformBufForTarget = isFfnDown ? ffnDnU : oProjU
     const scalesBuf = isFfnDown ? weights.layers[0].ffnDownScales : weights.layers[0].oProjScales
     const weightsBuf = isFfnDown ? weights.layers[0].ffnDownWeights : weights.layers[0].oProjWeights
     const batchedPipeline = P.int4MatmulBatchedM4
+    // Per-instance vec4 gating: compare against the pipeline the engine
+    // actually dispatches for this K (identical to R.matmul on Phi-3).
+    const tiledPipeline = isFfnDown ? R.matmulFfnDown : R.matmulOProj
 
     const inBuf  = makeBuf(device, M * K * 2, 'batchedBench.in')
     const outBuf = makeBuf(device, M * N * 2, 'batchedBench.out')
@@ -1025,7 +1086,7 @@ export function buildDecodeEngine(
 
     const batchedBG = bg(device, batchedPipeline,
       [outBuf, inBuf, scalesBuf, weightsBuf, uniformBufForTarget])
-    const tiledBG = bg(device, R.matmul,
+    const tiledBG = bg(device, tiledPipeline,
       [tiledOutBuf, inBuf, scalesBuf, weightsBuf, uniformBufForTarget])
 
     const batchedWGs = N / 4
@@ -1038,7 +1099,7 @@ export function buildDecodeEngine(
         p1.setPipeline(batchedPipeline); p1.setBindGroup(0, batchedBG)
         p1.dispatchWorkgroups(batchedWGs); p1.end()
         const p2 = enc.beginComputePass()
-        p2.setPipeline(R.matmul); p2.setBindGroup(0, tiledBG)
+        p2.setPipeline(tiledPipeline); p2.setBindGroup(0, tiledBG)
         p2.dispatchWorkgroups(tiledWGs); p2.end()
       }
       device.queue.submit([enc.finish()])
@@ -1063,7 +1124,7 @@ export function buildDecodeEngine(
       const enc = device.createCommandEncoder()
       for (let i = 0; i < iters * M; i++) {
         const pass = enc.beginComputePass()
-        pass.setPipeline(R.matmul); pass.setBindGroup(0, tiledBG)
+        pass.setPipeline(tiledPipeline); pass.setBindGroup(0, tiledBG)
         pass.dispatchWorkgroups(tiledWGs); pass.end()
       }
       device.queue.submit([enc.finish()])
@@ -1113,6 +1174,7 @@ export function buildDecodeEngine(
     forwardLogits,
     resetKVTracking,
     maxContext: MAX_CONTEXT,
+    spec: S,
     profileStep,
     benchBatchedFfnDown,
   }

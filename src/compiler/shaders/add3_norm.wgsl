@@ -70,7 +70,7 @@ fn add3_norm(
   if (tid < 2) { red_buf[tid] = red_buf[tid] + red_buf[tid + 2]; } workgroupBarrier();
   if (tid < 1) { red_buf[tid] = red_buf[tid] + red_buf[tid + 1]; } workgroupBarrier();
 
-  let rms_inv : f32 = 1.0 / sqrt(red_buf[0] / f32(D) + 1e-5);
+  let rms_inv : f32 = 1.0 / sqrt(red_buf[0] / f32(D) + RMS_EPS);
 
   // Phase 2: normalize
   for (var i : i32 = 0; i < D / 256; i = i + 1) {

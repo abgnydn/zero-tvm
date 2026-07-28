@@ -1,22 +1,44 @@
 #!/usr/bin/env node
 /**
- * Download Phi-3-mini-4k-instruct-q4f16_1-MLC weights from HuggingFace
- * to .weights-local/ so Vite serves them locally. Run once, never re-download.
+ * Download MLC q4f16_1 weights from HuggingFace to .weights-local/ so Vite
+ * serves them locally. Run once, never re-download.
  *
  * Usage:
- *   node scripts/download-weights.mjs
+ *   node scripts/download-weights.mjs                # Phi-3-mini (default)
+ *   node scripts/download-weights.mjs --model qwen3  # Qwen3-4B
  *
- * Downloads to: .weights-local/Phi-3-mini-4k-instruct-q4f16_1-MLC/
- * Served at:    http://localhost:5173/weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/
+ * Downloads to: .weights-local/<repo-name>/
+ * Served at:    http://localhost:5173/local-weights/<repo-name>/
  */
 
 import fs from 'fs'
 import path from 'path'
 import { pipeline } from 'stream/promises'
 
-const MODEL_ID   = 'mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC'
+const MODELS = {
+  phi3:  'mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC',
+  qwen3: 'mlc-ai/Qwen3-4B-q4f16_1-MLC',
+}
+
+function parseModelArg(argv) {
+  const args = argv.slice(2)
+  let key = 'phi3'
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--model') key = args[i + 1]
+    else if (args[i].startsWith('--model=')) key = args[i].slice('--model='.length)
+  }
+  if (!MODELS[key]) {
+    console.error(`Unknown --model "${key}". Valid: ${Object.keys(MODELS).join(', ')}`)
+    process.exit(1)
+  }
+  return key
+}
+
+const MODEL_KEY  = parseModelArg(process.argv)
+const MODEL_ID   = MODELS[MODEL_KEY]
+const REPO_NAME  = MODEL_ID.split('/')[1]
 const BASE_URL   = `https://huggingface.co/${MODEL_ID}/resolve/main`
-const OUT_DIR    = `.weights-local/Phi-3-mini-4k-instruct-q4f16_1-MLC`
+const OUT_DIR    = `.weights-local/${REPO_NAME}`
 
 // Extra files needed besides the shards
 const EXTRA_FILES = [
@@ -118,7 +140,7 @@ async function main() {
 
   console.log(`\n✓ Done — ${fetched} fetched, ${skipped} skipped`)
   console.log(`  Total on disk: ${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB`)
-  console.log(`  Served at:     /weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/\n`)
+  console.log(`  Served at:     /local-weights/${REPO_NAME}/\n`)
 }
 
 main().catch(e => { console.error('\nFATAL:', e.message); process.exit(1) })

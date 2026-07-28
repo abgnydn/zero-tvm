@@ -31,6 +31,7 @@ struct PODArgs {
 @group(0) @binding(6) var<uniform> podArgs : PODArgs;
 
 const PAIRS_PER_WG : u32 = 2u;
+const KV_GROUP_PAIRS = KV_DIM / 2;   // KV_HEADS * HALF_HEAD_DIM
 
 var<workgroup> shared_input : array<f16, D>;
 
@@ -55,12 +56,24 @@ fn qkv_fused_tiled_sg(
 
   // Both pairs in this WG share group and head (PAIRS_PER_WG=2 divides
   // HALF_HEAD_DIM = pairs per head, so consecutive pair_idx stay in one head).
-  let group_id : u32 = pair_base / QKV_GROUP_PAIRS;
-  let pair_in_group : u32 = pair_base - group_id * QKV_GROUP_PAIRS;
+  // Unequal [Q | K | V] groups under GQA (see qkv_fused.wgsl).
+  var group_id : u32 = 0u;
+  var pair_in_group : u32 = pair_base;
+  var grp_base : u32 = 0u;
+  if (pair_in_group >= u32(QKV_GROUP_PAIRS)) {
+    group_id = 1u;
+    pair_in_group = pair_in_group - u32(QKV_GROUP_PAIRS);
+    grp_base = u32(Q_DIM);
+    if (pair_in_group >= u32(KV_GROUP_PAIRS)) {
+      group_id = 2u;
+      pair_in_group = pair_in_group - u32(KV_GROUP_PAIRS);
+      grp_base = u32(Q_DIM + KV_DIM);
+    }
+  }
   let head : u32 = pair_in_group / HALF_HEAD_DIM;
   let dim_lo_0 : u32 = pair_in_group - head * HALF_HEAD_DIM;
 
-  let row_base : u32 = group_id * D + head * HEAD_DIM + dim_lo_0;
+  let row_base : u32 = grp_base + head * HEAD_DIM + dim_lo_0;
   // 4 rows: 2 "lo" + 2 "hi" (hi = lo + HALF_HEAD_DIM).
   let rl0 = row_base;            let rl1 = row_base + 1u;
   let rh0 = rl0 + HALF_HEAD_DIM; let rh1 = rl1 + HALF_HEAD_DIM;
@@ -138,7 +151,7 @@ fn qkv_fused_tiled_sg(
       continue;
     }
 
-    let freq : f32 = pos_f / pow(10000.0, f32(dim_lo * 2u) / f32(HEAD_DIM));
+    let freq : f32 = pos_f / pow(ROPE_THETA, f32(dim_lo * 2u) / f32(HEAD_DIM));
     let c    : f32 = cos(freq);
     let s    : f32 = sin(freq);
     let rot_lo : f32 = c * v_lo + s * (-v_hi);

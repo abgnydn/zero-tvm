@@ -4,12 +4,14 @@
 // scale instead of f16. Per-row scale (one scale per head-slot-side) keeps
 // accuracy close to f16.
 //
+// GQA-aware: query head h reads the KV pages/scales of kv_head = h / GQA_GROUP.
+//
 // Layout of pages_i8 (u32 words; 4 int8 per u32):
-//   word_idx = page_no * KV_I8_PAGE_WORDS + head * KV_I8_HEAD_WORDS
+//   word_idx = page_no * KV_I8_PAGE_WORDS + kv_head * KV_I8_HEAD_WORDS
 //            + slot * KV_I8_SLOT_WORDS + side * KV_I8_ROW_WORDS + (dim/4)
 //
 // Layout of scales (f16):
-//   scale_idx = page_no * KV_SCALES_PER_PAGE + head * KV_SCALES_PER_HEAD
+//   scale_idx = page_no * KV_SCALES_PER_PAGE + kv_head * KV_SCALES_PER_HEAD
 //             + slot * KV_SCALES_PER_SLOT + side
 //
 // Model-shape constants are injected by src/compiler/shader-prelude.ts.
@@ -38,6 +40,8 @@ struct PODArgs {
 }
 @group(0) @binding(7) var<uniform> podArgs : PODArgs;
 
+const EPT = HEAD_DIM / 32;   // elements per thread (Phi-3: 3, Qwen3: 4)
+
 var<workgroup> score_reduce : array<f32, 32>;
 
 // Unpack signed int8 from a packed u32 word at byte index (0..3). Sign-extends.
@@ -58,10 +62,13 @@ fn attention_int8(
 
   if (batch >= podArgs.B) { return; }
 
-  // Each thread owns 3 elements of HEAD_DIM (32 threads × 3 = HEAD_DIM).
-  var q0 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]);
-  var q1 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1]);
-  var q2 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2]);
+  let kv_head : i32 = head / GQA_GROUP;
+
+  // Each thread owns EPT elements of HEAD_DIM (32 threads × EPT = HEAD_DIM).
+  var q : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) {
+    q[e] = f32(Q[batch * Q_DIM + head * HEAD_DIM + tid * EPT + e]);
+  }
 
   let indptr_begin : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset];
   let indptr_end   : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset + 1];
@@ -69,19 +76,19 @@ fn attention_int8(
 
   var m  : f32 = -50000.0;
   var d  : f32 = 0.0;
-  var o0 : f32 = 0.0;
-  var o1 : f32 = 0.0;
-  var o2 : f32 = 0.0;
+  var o : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) { o[e] = 0.0; }
 
-  // tid * 3 in [0, HEAD_DIM). The 3 dims span either 1 u32 word (aligned) or
-  // straddle 2 words. Precompute byte layout:
-  let byte_0 : i32 = tid * 3;                 // 0..HEAD_DIM-1
-  let word_0 : i32 = byte_0 / 4;              // 0..KV_I8_ROW_WORDS-1
-  let lane_0 : u32 = u32(byte_0 - word_0 * 4);
-  let word_1 : i32 = (byte_0 + 1) / 4;
-  let lane_1 : u32 = u32((byte_0 + 1) - word_1 * 4);
-  let word_2 : i32 = (byte_0 + 2) / 4;
-  let lane_2 : u32 = u32((byte_0 + 2) - word_2 * 4);
+  // tid * EPT in [0, HEAD_DIM). Each dim maps to a (word, byte-lane) inside
+  // the packed int8 row; EPT=3 straddles words, EPT=4 is word-aligned.
+  // Precompute byte layout:
+  var words : array<i32, EPT>;
+  var lanes : array<u32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) {
+    let byte_e : i32 = tid * EPT + e;         // 0..HEAD_DIM-1
+    words[e] = byte_e / 4;                    // 0..KV_I8_ROW_WORDS-1
+    lanes[e] = u32(byte_e - words[e] * 4);
+  }
 
   for (var page_idx : i32 = indptr_begin; page_idx < indptr_end; page_idx = page_idx + 1) {
     let page_no : i32 = page_table_values[page_idx + podArgs.page_values_elem_offset];
@@ -89,28 +96,28 @@ fn attention_int8(
     let slots_in_page : i32 = min(PAGE_SIZE, kv_len - page_start);
 
     for (var slot : i32 = 0; slot < slots_in_page; slot = slot + 1) {
-      // Base word indices for K and V within this (page, head, slot).
+      // Base word indices for K and V within this (page, kv_head, slot).
       let kv_word_base : i32 = page_no * KV_I8_PAGE_WORDS
-                             + head * KV_I8_HEAD_WORDS
+                             + kv_head * KV_I8_HEAD_WORDS
                              + slot * KV_I8_SLOT_WORDS
                              + podArgs.pages_elem_offset;
       let k_word_base : i32 = kv_word_base;                    // side=0
       let v_word_base : i32 = kv_word_base + KV_I8_ROW_WORDS;  // side=1
 
-      // Per-(head, slot, side) scales.
+      // Per-(kv_head, slot, side) scales.
       let scale_base : i32 = page_no * KV_SCALES_PER_PAGE
-                           + head * KV_SCALES_PER_HEAD
+                           + kv_head * KV_SCALES_PER_HEAD
                            + slot * KV_SCALES_PER_SLOT
                            + podArgs.scales_elem_offset;
       let k_scale : f32 = f32(scales[scale_base]);
       let v_scale : f32 = f32(scales[scale_base + 1]);
 
-      // K dequant: read 3 int8 values; k_scale factored out of the dot.
-      let k0 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_0], lane_0));
-      let k1 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_1], lane_1));
-      let k2 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_2], lane_2));
-
-      let partial : f32 = (q0 * k0 + q1 * k1 + q2 * k2) * k_scale;
+      // K dequant: read EPT int8 values; k_scale factored out of the dot.
+      var qk : f32 = 0.0;
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        qk = qk + q[e] * f32(unpack_i8(pages_i8[k_word_base + words[e]], lanes[e]));
+      }
+      let partial : f32 = qk * k_scale;
 
       score_reduce[tid] = partial;
       workgroupBarrier();
@@ -139,20 +146,17 @@ fn attention_int8(
 
       // V dequant + online softmax accumulate; hoist scale_new * v_scale.
       let sv : f32 = scale_new * v_scale;
-      let vv0 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_0], lane_0));
-      let vv1 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_1], lane_1));
-      let vv2 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_2], lane_2));
-
-      o0 = o0 * scale_prev + sv * vv0;
-      o1 = o1 * scale_prev + sv * vv1;
-      o2 = o2 * scale_prev + sv * vv2;
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        let vv : f32 = f32(unpack_i8(pages_i8[v_word_base + words[e]], lanes[e]));
+        o[e] = o[e] * scale_prev + sv * vv;
+      }
     }
   }
 
   if (d > 0.0) {
     let inv_d : f32 = 1.0 / d;
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]     = f16(o0 * inv_d);
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1] = f16(o1 * inv_d);
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2] = f16(o2 * inv_d);
+    for (var e : i32 = 0; e < EPT; e = e + 1) {
+      output_buf[batch * Q_DIM + head * HEAD_DIM + tid * EPT + e] = f16(o[e] * inv_d);
+    }
   }
 }

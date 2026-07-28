@@ -68,7 +68,7 @@ fn fused_ffn_tiled_sg_prologue(
   }
   // One subgroup — subgroupAdd returns the workgroup-wide sum on all lanes.
   let total_sq : f32 = subgroupAdd(sum_sq);
-  let rms_inv : f32 = 1.0 / sqrt(total_sq / f32(D) + 1e-5);
+  let rms_inv : f32 = 1.0 / sqrt(total_sq / f32(D) + RMS_EPS);
 
   // Normalize in place: each thread rewrites the elements it loaded,
   // rounding to f16 — exactly what the hidden1 store used to do.

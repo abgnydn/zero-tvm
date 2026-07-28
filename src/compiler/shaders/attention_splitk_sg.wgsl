@@ -5,6 +5,8 @@
 // following attention_sg.wgsl's pattern. Requires subgroup size >= 32
 // (the full 32-lane workgroup sits inside one subgroup).
 //
+// GQA-aware: query head h reads the KV pages of head h / GQA_GROUP.
+//
 // Measured 2026-07-25 (M2 Max): ~+3% end-to-end at short context; stays
 // opt-in until a long-context A/B (see BENCH.md "Measured 2026-07-25").
 //
@@ -34,6 +36,7 @@ struct PODArgs {
 @group(0) @binding(6) var<uniform> podArgs : PODArgs;
 
 const PARTIAL_STRIDE = HEAD_DIM + 2;   // per-(head, partition) f32 stride: m, d, o[HEAD_DIM]
+const EPT = HEAD_DIM / 32;             // elements per thread (Phi-3: 3, Qwen3: 4)
 
 @compute @workgroup_size(32, 1, 1)
 fn attention_splitk_sg(
@@ -48,9 +51,12 @@ fn attention_splitk_sg(
 
   if (part >= num_splits) { return; }
 
-  var q0 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]);
-  var q1 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1]);
-  var q2 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2]);
+  let kv_head : i32 = head / GQA_GROUP;
+
+  var q : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) {
+    q[e] = f32(Q[batch * Q_DIM + head * HEAD_DIM + tid * EPT + e]);
+  }
 
   let indptr_begin : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset];
   let indptr_end : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset + 1];
@@ -63,9 +69,8 @@ fn attention_splitk_sg(
 
   var m : f32 = -50000.0;
   var d : f32 = 0.0;
-  var o0 : f32 = 0.0;
-  var o1 : f32 = 0.0;
-  var o2 : f32 = 0.0;
+  var o : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) { o[e] = 0.0; }
 
   for (var page_idx : i32 = p_begin; page_idx < p_end; page_idx = page_idx + 1) {
     let page_no : i32 = page_table_values[page_idx + podArgs.page_values_elem_offset];
@@ -73,12 +78,13 @@ fn attention_splitk_sg(
     let slots_in_page : i32 = min(PAGE_SIZE, kv_len - page_start);
 
     for (var slot : i32 = 0; slot < slots_in_page; slot = slot + 1) {
-      let k_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
+      let k_base : i32 = page_no * KV_PAGE_STRIDE + kv_head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
                          + podArgs.pages_elem_offset;
 
-      let partial : f32 = q0 * f32(pages[k_base + tid * 3])
-                        + q1 * f32(pages[k_base + tid * 3 + 1])
-                        + q2 * f32(pages[k_base + tid * 3 + 2]);
+      var partial : f32 = 0.0;
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        partial = partial + q[e] * f32(pages[k_base + tid * EPT + e]);
+      }
 
       // Single subgroupAdd replaces 6 tree-reduction barriers.
       let s : f32 = subgroupAdd(partial) * podArgs.sm_scale;
@@ -91,16 +97,16 @@ fn attention_splitk_sg(
       d = d * scale_prev + scale_new;
 
       let v_base : i32 = k_base + V_PAGE_OFFSET;
-      o0 = o0 * scale_prev + scale_new * f32(pages[v_base + tid * 3]);
-      o1 = o1 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 1]);
-      o2 = o2 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 2]);
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        o[e] = o[e] * scale_prev + scale_new * f32(pages[v_base + tid * EPT + e]);
+      }
     }
   }
 
   let pbase : i32 = (head * num_splits + part) * PARTIAL_STRIDE;
-  partials[pbase + 2 + tid * 3] = o0;
-  partials[pbase + 2 + tid * 3 + 1] = o1;
-  partials[pbase + 2 + tid * 3 + 2] = o2;
+  for (var e : i32 = 0; e < EPT; e = e + 1) {
+    partials[pbase + 2 + tid * EPT + e] = o[e];
+  }
   if (tid == 0) {
     partials[pbase] = m;
     partials[pbase + 1] = d;

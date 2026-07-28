@@ -11,6 +11,28 @@ Correctness fixes, the first measured optimization promoted to default, and a
 new headline number. The engine now measures **faster than WebLLM** on the
 one machine benchmarked.
 
+### Added
+
+- **Qwen3-4B port (v1, `?model=qwen3`)** — the spec-parameterized engine now
+  runs a second architecture end-to-end in the browser: GQA 32/8 with
+  qDim ≠ d, per-head QK-norm, byte-level BPE tokenizer, tied lm_head, ChatML
+  (non-thinking) template. `zero-tvm.html?model=qwen3` and
+  `validate.html?model=qwen3`; Phi-3 stays the default and all existing URLs
+  keep their exact behavior. The Qwen path is **v1-unfused** (QK-norm rules
+  out the fused QKV kernel → 10 dispatches/layer; vec4 loads only where
+  K % 1024 == 0; no int8-KV). Suites: `npm run test:kernels:qwen` (21/21
+  compile-and-shape gate) + a mirror-gated e2e file (`tests/e2e/qwen.test.ts`).
+- **Qwen3 same-weights A/B vs WebLLM** — `BENCH_QUERY="?model=qwen3"
+  npm run bench` now runs BOTH engines back-to-back in one session against
+  the same local weight bytes (WebLLM via its own prebuilt Qwen3-4B wasm and
+  a per-model mirror route) and prints both medians + the gap, without
+  touching `bench/results.json` (that stays the Phi-3 headline artifact).
+  First measured pair (2026-07-28, M2 Max, Chrome 150): Zero-TVM **25.43**
+  vs WebLLM **14.15** tok/s (+79.8%) — but both engines run Qwen3-4B far
+  below their Phi-3 rates on this machine, so the gap reflects WebLLM's
+  prebuilt Qwen3 lib as much as our v1 port. Recorded in BENCH.md as the
+  baseline for the Qwen tuning phase, not promoted to any headline.
+
 ### Fixed
 
 - **fused_ffn f32 accumulation** — the fused FFN now accumulates in f32

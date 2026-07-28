@@ -1,6 +1,7 @@
 // KV_QUANTIZE_INT8 — int8 quantize of one (K,V) slot per layer, per decode step.
 //
-// Input:  k_slot [HEADS*HEAD_DIM f16], v_slot [HEADS*HEAD_DIM f16]  (from qkv_fused_scratch)
+// Input:  k_slot [KV_DIM f16], v_slot [KV_DIM f16]  (from qkv_fused_scratch;
+//         KV_DIM = KV_HEADS * HEAD_DIM — == HEADS * HEAD_DIM for MHA)
 // Output: kv_pages_i8 (packed int8 in u32), kv_scales (per-(head, side) f16)
 //
 // Granularity: one scale per (page, slot, head, side) — HEAD_DIM f16 values
@@ -19,8 +20,9 @@
 //   scale_idx = page_no * KV_SCALES_PER_PAGE + h * KV_SCALES_PER_HEAD
 //             + s * KV_SCALES_PER_SLOT + side
 //
-// One workgroup = one (head, side). 32 threads cooperate to compute max over
-// HEAD_DIM dims, then each thread quantizes 3 consecutive dims (HEAD_DIM = 32 × 3).
+// One workgroup = one (kv head, side) — KV_HEADS × 2 workgroups. 32 threads
+// cooperate to compute max over HEAD_DIM dims (EPT = HEAD_DIM/32 dims per
+// thread), then threads 0..KV_I8_ROW_WORDS-1 each pack one u32 word (4 dims).
 //
 // Model-shape constants are injected by src/compiler/shader-prelude.ts.
 
@@ -36,9 +38,11 @@ struct PODArgs {
   position_map_elem_offset : i32,
   pages_elem_offset        : i32,  // u32-word offset
   scales_elem_offset       : i32,
-  packGridDimX             : u32,  // HEADS × 2 sides
+  packGridDimX             : u32,  // KV_HEADS × 2 sides
 }
 @group(0) @binding(5) var<uniform> podArgs : PODArgs;
+
+const EPT = HEAD_DIM / 32;   // dims per thread in the max phase (Phi-3: 3, Qwen3: 4)
 
 var<workgroup> max_reduce : array<f32, 32>;
 
@@ -53,27 +57,24 @@ fn kv_quantize_int8(
 
   let tid : i32 = i32(threadIdx.x);
 
-  // Decompose wg_id → (head, side). side=0 for K, 1 for V.
+  // Decompose wg_id → (kv head, side). side=0 for K, 1 for V.
   let head : i32 = wg_id / 2;
   let side : i32 = wg_id - head * 2;
 
-  // Each thread reads 3 of the HEAD_DIM dims for this (head, side).
-  let slot_base : i32 = head * HEAD_DIM + tid * 3;
-  var v0 : f32;
-  var v1 : f32;
-  var v2 : f32;
-  if (side == 0) {
-    v0 = f32(k_slot[slot_base]);
-    v1 = f32(k_slot[slot_base + 1]);
-    v2 = f32(k_slot[slot_base + 2]);
-  } else {
-    v0 = f32(v_slot[slot_base]);
-    v1 = f32(v_slot[slot_base + 1]);
-    v2 = f32(v_slot[slot_base + 2]);
+  // Each thread reads EPT of the HEAD_DIM dims for this (head, side).
+  let slot_base : i32 = head * HEAD_DIM + tid * EPT;
+  var m : f32 = 0.0;
+  for (var e : i32 = 0; e < EPT; e = e + 1) {
+    var v : f32;
+    if (side == 0) {
+      v = f32(k_slot[slot_base + e]);
+    } else {
+      v = f32(v_slot[slot_base + e]);
+    }
+    m = max(m, abs(v));
   }
 
   // Tree-reduce max(|x|) over 32 threads.
-  var m : f32 = max(abs(v0), max(abs(v1), abs(v2)));
   max_reduce[tid] = m;
   workgroupBarrier();
   if (tid < 16) { max_reduce[tid] = max(max_reduce[tid], max_reduce[tid + 16]); }
@@ -105,18 +106,10 @@ fn kv_quantize_int8(
     scales[scale_idx] = f16(scale);
   }
 
-  // Quantize 3 dims and pack into int8. Because 3 is not a multiple of 4,
-  // we use atomic-free write-via-packing: each thread writes its own
-  // contribution to one u32 word using read-modify-write (safe because
-  // different threads touch non-overlapping 8-bit lanes within each word).
-  //
-  // Simpler: redistribute so each thread owns ONE u32 word = 4 dims.
-  // KV_I8_ROW_WORDS words per row, 32 threads → threads 0..KV_I8_ROW_WORDS-1
-  // each own one word. We already have v0..v2 (dims tid*3, tid*3+1, tid*3+2).
-  // That does NOT align to 4-dim groups. So we need to re-read.
-  //
-  // Switch to per-word indexing: thread `t` in [0, KV_I8_ROW_WORDS) writes one
-  // word containing dims [t*4, t*4+4). Re-read those dims.
+  // Pack phase — per-word indexing: thread `t` in [0, KV_I8_ROW_WORDS)
+  // writes one u32 word containing dims [t*4, t*4+4). The max-phase EPT
+  // split does not align to 4-dim groups, so re-read those dims.
+  // (KV_I8_ROW_WORDS = HEAD_DIM/4 ≤ 32 for both specs.)
   if (tid >= KV_I8_ROW_WORDS) { return; }
 
   let d0 : i32 = tid * 4;

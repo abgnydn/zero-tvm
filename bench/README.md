@@ -25,6 +25,26 @@ GPU-less CI sandbox. It:
 
 Env knobs: `BENCH_TOKENS` (default 128), `BENCH_RUNS` (default 5), `BENCH_HW`.
 
+### A/B modes (`BENCH_QUERY`) — never touch results.json
+
+`BENCH_QUERY` appends a query string to `/zero-tvm.html` and switches the
+script into A/B mode. A/B runs **never** write `bench/results.json` — that
+file is the Phi-3 headline artifact and only the plain `npm run bench` flow
+updates it.
+
+- **Flag A/B** — `BENCH_QUERY="?vec4=0" npm run bench` runs only the
+  Zero-TVM half with that flag. For comparing shader variants against the
+  defaults.
+- **Cross-engine model A/B** — `BENCH_QUERY="?model=qwen3" npm run bench`
+  runs BOTH halves on that model: `zero-tvm.html?model=qwen3` and
+  `webllm-bench.html?model=qwen3` (WebLLM's own Qwen3-4B-q4f16_1 prebuilt
+  wasm against the same local weight mirror), back-to-back in the same
+  session, and prints both medians + the gap. Same-session pairing matters:
+  absolute tok/s drifts with machine state, so only the pair is meaningful.
+  Note the WebLLM page always runs its fixed protocol (3 × 120-token runs +
+  warmup, median) regardless of `BENCH_TOKENS`/`BENCH_RUNS` — identical to
+  how the Phi-3 headline's WebLLM half is measured.
+
 ## `npm run bench:sync` (no GPU needed)
 
 Propagates `bench/results.json` into the docs. Dry-run by default; `--write`
