@@ -548,7 +548,9 @@ function applyModelBranding(): void {
     if (el) el.textContent = text
   }
   set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
-  set('#start-dialog .dialog-stats .dstat .val', BRAND.sizeLabel)  // first stat is the download size
+  const statVals = document.querySelectorAll('#start-dialog .dialog-stats .dstat .val')
+  if (statVals[0]) statVals[0].textContent = BRAND.sizeLabel   // download size
+  if (statVals[1]) statVals[1].textContent = BRAND.rateLabel   // measured decode rate
   set('.model-info h1', BRAND.name)
   set('#welcome .welcome-title', `Chat with ${BRAND.name}`)
 }

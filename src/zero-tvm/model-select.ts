@@ -28,10 +28,10 @@ export function specFromSearch(search: string): ModelSpec {
 }
 
 /** Page-facing copy for the active model (gate dialog, header, hints). */
-export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: string } {
+export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: string; rateLabel: string } {
   return spec.id === QWEN3_4B.id
-    ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB' }
-    : { name: 'Phi-3-mini', sizeLabel: '~2 GB' }
+    ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~25 t/s' }  // v1 unfused path, M2 Max (BENCH.md)
+    : { name: 'Phi-3-mini', sizeLabel: '~2 GB', rateLabel: '60+ t/s' }
 }
 
 /**
