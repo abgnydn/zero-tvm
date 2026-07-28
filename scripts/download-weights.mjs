@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
  * Download Phi-3-mini-4k-instruct-q4f16_1-MLC weights from HuggingFace
- * to public/weights/ so Vite serves them locally. Run once, never re-download.
+ * to .weights-local/ so Vite serves them locally. Run once, never re-download.
  *
  * Usage:
  *   node scripts/download-weights.mjs
  *
- * Downloads to: public/weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/
+ * Downloads to: .weights-local/Phi-3-mini-4k-instruct-q4f16_1-MLC/
  * Served at:    http://localhost:5173/weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/
  */
 
@@ -16,7 +16,7 @@ import { pipeline } from 'stream/promises'
 
 const MODEL_ID   = 'mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC'
 const BASE_URL   = `https://huggingface.co/${MODEL_ID}/resolve/main`
-const OUT_DIR    = `public/weights/Phi-3-mini-4k-instruct-q4f16_1-MLC`
+const OUT_DIR    = `.weights-local/Phi-3-mini-4k-instruct-q4f16_1-MLC`
 
 // Extra files needed besides the shards
 const EXTRA_FILES = [

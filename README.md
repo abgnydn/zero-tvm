@@ -10,11 +10,11 @@
 
 **[zerotvm.com](https://zerotvm.com)**
 
-**Phi-3-mini (3.8B) running in the browser on 10 hand-written WGSL kernels — measured ~28% faster than WebLLM's decode on an Apple M2 Max, with no TVM, no compiler, and no WASM runtime.**
+**Phi-3-mini (3.8B) running in the browser on 10 hand-written WGSL kernels — measured 28–31% faster than WebLLM's decode on an Apple M2 Max, with no TVM, no compiler, and no WASM runtime.**
 
 | | WebLLM (TVM) | Zero-TVM (this repo) |
 |---|---|---|
-| Decode speed (M2 Max, same weights, same run) | **51.98 tok/s** | **66.33 tok/s** |
+| Decode speed (M2 Max, same weights, same run) | **<!--bench:webllm-->47.9<!--/bench:webllm--> tok/s** | **<!--bench:zt-->62.90<!--/bench:zt--> tok/s** (ratio stable −28…−31% across sessions, see [BENCH.md](BENCH.md)) |
 | Unique WGSL kernels | **85** (autotuned) | **10 roles / 27 kernels** (18 .wgsl + 9 generated int4 variants) |
 | Total WGSL lines | **12,962** (generated) | **~2,150** hand-written + a 280-line readable generator |
 | Dispatches per decode step | **342** | **228** (f16 KV) / **260** (int8 KV) |
@@ -43,7 +43,7 @@ Every FLOP the model executes is in a file you can open. Every GPU buffer has a 
 
 Hand-written GPU kernels usually lose significantly to an autotuning compiler. The claim this repo is designed to test is: **for a decoder-only LLM of this shape, most of the compiler's complexity budget isn't buying much.** The expensive parts are matmul, attention, and int4 dequant. Everything else is plumbing. ~10 kernels of plumbing, instead of 85.
 
-Measured result on an Apple M2 Max, Chrome 150, identical Phi-3-mini-q4f16_1 weights, same-run head-to-head (2026-07-25): **66.33 tok/s decode vs WebLLM's 51.98 — about 28% faster than the autotuned compiler** (a second session measured 62.90 vs 47.92, −31%; absolute numbers drift with machine state, the ratio is stable). Full methodology and A/B results in [BENCH.md](BENCH.md), including three tile-variant experiments, a prompt-lookup speculative-decoding experiment, and an FFN-prologue-fusion experiment that were *falsified* by measurement rather than shipped. (An earlier measurement on an M2 Pro with an older, buggier engine put this repo 22% *behind* WebLLM — that history is preserved, not retconned, in BENCH.md.)
+Measured result on an Apple M2 Max, Chrome 150, identical Phi-3-mini-q4f16_1 weights, same-run head-to-head: **Zero-TVM decodes 28–31% faster than the autotuned compiler across sessions** (absolute tok/s drifts with machine state; the ratio is stable — the current medians are in the table above and in [BENCH.md](BENCH.md), synced from `bench/results.json`). Full methodology and A/B results in [BENCH.md](BENCH.md), including three tile-variant experiments, a prompt-lookup speculative-decoding experiment, and an FFN-prologue-fusion experiment that were *falsified* by measurement rather than shipped. (An earlier measurement on an M2 Pro with an older, buggier engine put this repo 22% *behind* WebLLM — that history is preserved, not retconned, in BENCH.md.)
 
 The scope of that number matters: one machine, one model, one browser, decode-only, short-context bench. But within that scope the question the repo was built to test now has a sharper answer — the ten hand-written kernels aren't merely "close enough" to the 85 autotuned ones; on this hardware they win. The repo also makes the stack *auditable*: if you want to instrument a layer, add a new fusion, test a different attention pattern, or teach someone how browser LLM inference works at the metal, there is no compiler in the way — just WGSL and a few hundred lines of TypeScript orchestrating it.
 
@@ -221,21 +221,32 @@ buffers, and bind-group layout the chat page ships.
 ## Performance
 
 Measured on Apple M2 Max, Chrome 150.0.7871.182, Phi-3-mini-4k-instruct q4f16_1,
-steady-state decode, 128 tokens × 5 runs, median (2026-07-25):
+steady-state decode, 128 tokens × 5 runs, median (latest run recorded in
+`bench/results.json`; ratio stable −28…−31% across sessions):
 
 | | tok/s (median) |
 |---|---|
-| Zero-TVM (this repo, f16 KV, default shaders) | **66.33** |
-| WebLLM v0.2.80 (MLC-LLM, same weights, same run) | **51.98** |
+| Zero-TVM (this repo, f16 KV, default shaders) | **<!--bench:zt-->62.90<!--/bench:zt-->** |
+| WebLLM v0.2.80 (MLC-LLM, same weights, same run) | **<!--bench:webllm-->47.9<!--/bench:webllm-->** |
 
 Reproduce on any WebGPU GPU with `npm run bench` — it drives both engines on
-identical weights and rewrites the three marker-wrapped numbers in BENCH.md
-(`zt` / `webllm` / `gap`); prose mentions of the numbers are reported for
-hand-updating, not auto-edited (see `bench/README.md`). It also runs headless
-on a cloud GPU (Colab notebook + Docker image in [`bench/`](bench/)) for machines
-without a local one.
+identical weights and refreshes every marker-wrapped number (see below). It
+also runs headless on a cloud GPU (Colab notebook + Docker image in
+[`bench/`](bench/)) for machines without a local one.
 
-That's ~28% faster than the autotuned compiler on an identical workload —
+### Keeping the numbers in sync
+
+`bench/results.json` is the single source of truth. `npm run bench` writes it
+and rewrites every marker-wrapped number (`<!--bench:zt/webllm/gap-->`) in
+BENCH.md, README.md, index.html, and docs.html, plus the `// bench:zt` constant
+in `src/webllm-bench/main.ts` — `npm run bench:sync -- --write` re-propagates
+it without a GPU (see `bench/README.md`). Merging to `main` then auto-deploys
+zerotvm.com (Cloudflare Pages) and mirrors the built site + Space card to the
+[Hugging Face Space](https://huggingface.co/spaces/abgunaydin/zero-tvm) via
+`.github/workflows/deploy-space.yml` (needs an `HF_TOKEN` repo secret; the job
+skips with a notice if it's absent).
+
+That's 28–31% faster than the autotuned compiler on an identical workload —
 one machine, one model, one browser; the best measured opt-in config
 (`?vec4=1&vec4qkv=1&splitk=8`) reaches 68.36 tok/s. An earlier M2 Pro
 measurement with an older engine read 22% *behind*; both hardware and code
