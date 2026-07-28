@@ -36,7 +36,7 @@
   "devDependencies": {
     "@huggingface/transformers": "^3.4.0",
     "@kmamal/gpu": "^0.2.1",
-    "@mlc-ai/web-llm": "^0.2.80",
+    "@mlc-ai/web-llm": "^0.2.84",
     "@types/node": "^22.13.0",
     "@webgpu/types": "^0.1.69",
     "puppeteer": "^24.40.0",

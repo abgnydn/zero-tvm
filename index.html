@@ -730,6 +730,7 @@
   <div class="hero-actions">
     <a href="zero-tvm.html" class="btn-primary">Open Chat →</a>
     <a href="zero-tvm.html?model=qwen3" class="btn-ghost">Chat with Qwen3-4B →</a>
+    <a href="zero-tvm.html?model=qwen35" class="btn-ghost">Chat with Qwen3.5-4B →</a>
     <a href="https://github.com/abgnydn/zero-tvm" class="btn-ghost" target="_blank" rel="noopener">GitHub ↗</a>
     <button class="btn-ghost" onclick="document.getElementById('share-modal').classList.add('open')" style="cursor:pointer;font-family:inherit;">Share</button>
   </div>
@@ -1024,8 +1025,14 @@
             <td>not measured here</td>
           </tr>
           <tr>
+            <td>Decode speed (Qwen3.5-4B hybrid, M2 Max, 2026-07-28)</td>
+            <td class="ours">47.99 tok/s (v1 scalar-GDN path)</td>
+            <td>31.99 tok/s (prebuilt Qwen3.5 lib, WebLLM 0.2.84)</td>
+            <td>not measured here</td>
+          </tr>
+          <tr>
             <td>Model scope</td>
-            <td class="ours">Phi-3 Mini (default) + Qwen3-4B (<code>?model=qwen3</code>), Q4F16_1</td>
+            <td class="ours">Phi-3 Mini (default) + Qwen3-4B (<code>?model=qwen3</code>) + Qwen3.5-4B hybrid (<code>?model=qwen35</code>), Q4F16_1</td>
             <td>~20 MLC-compiled models</td>
             <td>~200 architectures</td>
           </tr>
@@ -1046,11 +1053,13 @@
     </div>
 
     <p style="margin-top:1.25rem;font-size:0.9rem;color:var(--text-dim);max-width:720px;">
-      Two models, both faster than WebLLM on identical weights, same session. The Phi-3 row is the tuned-vs-tuned
-      headline and syncs from <code>bench/results.json</code>; the Qwen3-4B row is a static dated measurement of the
-      deliberately untuned v1 port (QK-norm rules out the fused QKV kernel — 10 dispatches/layer vs Phi-3's 7), so
-      read its +80% cautiously — protocol and caveats in BENCH.md.
-      <a href="zero-tvm.html?model=qwen3" style="color:var(--accent);text-decoration:none;">Chat with Qwen3-4B →</a>
+      Three models, all faster than WebLLM on identical weights, same session — each pair one machine, one
+      session, v1 paths. The Phi-3 row is the tuned-vs-tuned headline and syncs from <code>bench/results.json</code>;
+      the Qwen rows are static dated measurements of deliberately untuned v1 ports (Qwen3-4B: QK-norm rules out the
+      fused QKV kernel — 10 dispatches/layer vs Phi-3's 7; Qwen3.5-4B: a 24-layer gated-DeltaNet + 8-layer
+      attention hybrid on scalar GDN kernels — to our knowledge the first hand-written-kernel int4 hybrid of this
+      kind in a browser), so read the gaps cautiously — protocol and caveats in BENCH.md.
+      <a href="zero-tvm.html?model=qwen35" style="color:var(--accent);text-decoration:none;">Chat with Qwen3.5-4B →</a>
     </p>
 
     <p style="margin-top:2rem;font-size:0.95rem;color:var(--text-dim);max-width:720px;">
@@ -1064,7 +1073,7 @@
       <h3 style="margin-top:0;margin-bottom:0.75rem;">What this repo is <em>not</em></h3>
       <ul style="margin:0;padding-left:1.25rem;line-height:1.7;color:var(--text-dim);">
         <li><strong>Not a compiler.</strong> Nothing here emits WGSL — the 27 shader files are human-written.</li>
-        <li><strong>Not cross-architecture.</strong> Two models — Phi-3 Mini (default) and Qwen3-4B (<code>?model=qwen3</code>), both Q4F16_1. No Llama / Gemma path without shader work.</li>
+        <li><strong>Not cross-architecture.</strong> Three models — Phi-3 Mini (default), Qwen3-4B (<code>?model=qwen3</code>), and the Qwen3.5-4B GDN+attention hybrid (<code>?model=qwen35</code>), all Q4F16_1. No Llama / Gemma path without shader work.</li>
         <li><strong>Not cross-runtime.</strong> Browser WebGPU only. No Node / Bun / Deno target.</li>
         <li><strong>Not a production replacement for Transformers.js v4.</strong> It does fewer things, on purpose.</li>
         <li><strong>Not a benchmark sweep.</strong> The 28–31%-faster-than-WebLLM result is one machine (M2 Max), one model, one browser, decode-only, short context. An earlier M2 Pro measurement with an older engine read 22% <em>behind</em> — both results live in BENCH.md.</li>
