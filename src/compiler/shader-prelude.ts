@@ -22,8 +22,8 @@
 // rewriteRelativeImportExtensions so tsc emit stays correct.
 import { PHI3, type ModelSpec } from './model-spec.ts'
 
-export { PHI3, QWEN3_4B, makeModelSpec } from './model-spec.ts'
-export type { ModelSpec, ModelSpecBase, ParamNaming, LayerParamNames } from './model-spec.ts'
+export { PHI3, QWEN3_4B, QWEN35_4B, makeModelSpec } from './model-spec.ts'
+export type { ModelSpec, ModelSpecBase, ParamNaming, LayerParamNames, GdnDims } from './model-spec.ts'
 
 /** Emit a float literal that is valid WGSL AbstractFloat (always has a dot or exponent). */
 function f(v: number): string {
@@ -64,6 +64,24 @@ const KV_DIM          = ${P.kvDim};      // KV_HEADS * HEAD_DIM
 const GQA_GROUP       = ${P.gqaGroup};         // HEADS / KV_HEADS (query heads per KV head)
 const ROPE_THETA      = ${f(P.ropeTheta)};  // RoPE base frequency
 const RMS_EPS         = ${f(P.rmsEps)};     // RMSNorm epsilon
+// Qwen3.5 hybrid consts (collapse to plain-attention values for other specs
+// — ROTARY_DIM == HEAD_DIM, C_ATTN_DIM == QKV_DIM, GDN_* mirror the attention
+// dims — so every kernel compiles under every spec; only Qwen3.5 dispatches
+// the gdn_* / gated-attention kernels)
+const ROTARY_DIM      = ${P.rotaryDim};        // RoPE-rotated dims per head (partial RoPE)
+const HALF_ROTARY     = ${P.halfRotary};        // ROTARY_DIM / 2 (pair distance in the rotary slice)
+const ATTN_GATE       = ${P.attnGate ? 1 : 0};         // 1: c_attn packs per-head [Q|gate], sigmoid-gated output
+const C_ATTN_DIM      = ${P.cAttnDim};      // fused attention projection rows (QKV_DIM + gate rows)
+const GDN_K_HEADS     = ${P.gdnKHeads};        // GDN key/query heads
+const GDN_V_HEADS     = ${P.gdnVHeads};        // GDN value heads (GVA)
+const GDN_HEAD_K      = ${P.gdnHeadK};       // GDN key/query head dim
+const GDN_HEAD_V      = ${P.gdnHeadV};       // GDN value head dim
+const GDN_CONV_K      = ${P.gdnConvK};         // causal-conv kernel width
+const GDN_GVA_GROUP   = ${P.gdnGvaGroup};         // GDN_V_HEADS / GDN_K_HEADS
+const GDN_K_DIM       = ${P.gdnKDim};      // GDN_K_HEADS * GDN_HEAD_K (Q rows == K rows)
+const GDN_V_DIM       = ${P.gdnVDim};      // GDN_V_HEADS * GDN_HEAD_V (V / z-gate / out_proj width)
+const GDN_QKV_DIM     = ${P.gdnQkvDim};      // 2*GDN_K_DIM + GDN_V_DIM (in_proj_qkv rows == conv channels)
+const GDN_STATE_PER_HEAD = ${P.gdnStatePerHead};   // GDN_HEAD_K * GDN_HEAD_V (f32 state cells per v-head)
 // ── end injected prelude ──
 `
 }

@@ -26,6 +26,7 @@
     "test:e2e": "vitest run tests/e2e",
     "test:kernels": "node tests/kernels/run.mjs",
     "test:kernels:qwen": "node tests/kernels/compile-qwen.mjs",
+    "test:kernels:qwen35": "node tests/kernels/compile-qwen35.mjs",
     "gen:tokenizer-fixtures": "node scripts/gen-tokenizer-fixtures.mjs",
     "gen:tokenizer-fixtures-qwen": "node scripts/gen-tokenizer-fixtures-qwen.mjs",
     "bench": "node bench/run.mjs",

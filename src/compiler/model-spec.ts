@@ -35,6 +35,23 @@ export interface LayerParamNames {
   ffnDownScale: string[]
   qNorm?: string[]       // per-head RMSNorm gamma over head_dim (Qwen3)
   kNorm?: string[]
+  // GatedDeltaNet (Qwen3.5 linear_attn) records — present only on specs with
+  // `gdn`; a layer resolves either the self_attn fields above or these,
+  // according to layerKinds[L].
+  gdnQkvWeight?: string[]   // in_proj_qkv [2*gdnKDim+gdnVDim, d] int4
+  gdnQkvScale?: string[]
+  gdnZWeight?: string[]     // in_proj_z (output gate) [gdnVDim, d] int4
+  gdnZScale?: string[]
+  gdnAWeight?: string[]     // in_proj_a (decay input) [vHeads, d] int4
+  gdnAScale?: string[]
+  gdnBWeight?: string[]     // in_proj_b (beta input) [vHeads, d] int4
+  gdnBScale?: string[]
+  gdnALog?: string[]        // A_log [vHeads] f32
+  gdnDtBias?: string[]      // dt_bias [vHeads] f32
+  gdnConvWeight?: string[]  // conv1d_weight [conv dim, 1, convK] f16
+  gdnNormWeight?: string[]  // gated RMSNorm gamma [headV] f16 (no +1 offset)
+  gdnOutWeight?: string[]   // out_proj [d, gdnVDim] int4
+  gdnOutScale?: string[]
 }
 
 /** Candidate-name tables for each weight the engine binds. Each entry is an
@@ -52,6 +69,15 @@ export interface ParamNaming {
 // ============================================================
 // ModelSpec
 // ============================================================
+
+/** Gated-DeltaNet (linear attention) dimensions — Qwen3.5 `linear_attn`. */
+export interface GdnDims {
+  kHeads: number   // linear_num_key_heads (Q and K share these heads)
+  vHeads: number   // linear_num_value_heads (state + gates are per v-head)
+  headK: number    // linear_key_head_dim
+  headV: number    // linear_value_head_dim
+  convK: number    // linear_conv_kernel_dim (causal depthwise conv width)
+}
 
 export interface ModelSpecBase {
   /** Short stable id — used for per-model cache-dir suffixes. */
@@ -75,6 +101,21 @@ export interface ModelSpecBase {
   tokenizerKind: 'spm' | 'byteLevel'  // which tokenizer pipeline tokenizer.json needs
   hfRepo: string           // HuggingFace repo with the MLC q4f16_1 layout
   paramNaming: ParamNaming
+  // ── Qwen3.5 hybrid-architecture fields (all optional; absent = pure attention)
+  /** Every Nth layer is full attention, the rest are GDN. HF layer_types:
+   *  layer i is attention iff (i+1) % interval == 0 (Qwen3.5: 4 → layers
+   *  3,7,…,31 attention, verified against tensor-cache.json self_attn records).
+   *  Requires `gdn` when set. */
+  fullAttnInterval?: number
+  /** GatedDeltaNet dims (Qwen3.5 linear_attn layers). */
+  gdn?: GdnDims
+  /** Fraction of headDim rotated by RoPE (Qwen3.5: 0.25 → 64 of 256 dims).
+   *  Default 1 (full rotation). */
+  partialRotaryFactor?: number
+  /** Gated attention (Qwen3.5): the fused attention projection packs per-head
+   *  [Q|gate] pairs before K and V — cAttnDim = 2*qDim + 2*kvDim — and
+   *  sigmoid(gate) multiplies the attention output before o_proj. */
+  attnGate?: boolean
 }
 
 export interface ModelSpec extends ModelSpecBase {
@@ -100,17 +141,72 @@ export interface ModelSpec extends ModelSpecBase {
   kvScalesPerSlot: number  // K + V
   kvScalesPerHead: number  // pageSize * kvScalesPerSlot
   kvScalesPerPage: number  // kvHeads * kvScalesPerHead
+  // Qwen3.5 hybrid derivations. For specs without gdn/attnGate these collapse
+  // to the plain-attention values (rotaryDim == headDim, cAttnDim == qkvDim,
+  // layerKinds all 'attn', gdn* mirror the attention dims) so the shader
+  // prelude can emit every const unconditionally and all kernels compile
+  // under every spec.
+  layerKinds: ReadonlyArray<'gdn' | 'attn'>  // per-layer block kind for the engine
+  rotaryDim: number     // headDim * partialRotaryFactor (RoPE-rotated dims per head)
+  halfRotary: number    // rotaryDim / 2 (RoPE pair distance in the rotary slice)
+  cAttnDim: number      // fused attention projection rows: qkvDim (+qDim gate rows when attnGate)
+  gdnKHeads: number     // GDN key/query heads
+  gdnVHeads: number     // GDN value heads (GVA: >= kHeads)
+  gdnHeadK: number      // GDN key/query head dim
+  gdnHeadV: number      // GDN value head dim
+  gdnConvK: number      // causal-conv kernel width
+  gdnGvaGroup: number   // vHeads / kHeads (v-heads sharing one k/q head)
+  gdnKDim: number       // kHeads * headK (Q rows == K rows in in_proj_qkv)
+  gdnVDim: number       // vHeads * headV (V rows; also z-gate / out_proj width)
+  gdnQkvDim: number     // 2*gdnKDim + gdnVDim (in_proj_qkv rows == conv channels)
+  gdnStatePerHead: number // headK * headV (f32 recurrent-state cells per v-head)
 }
 
 export function makeModelSpec(base: ModelSpecBase): ModelSpec {
   if (base.heads % base.kvHeads !== 0) throw new Error(`${base.id}: heads not divisible by kvHeads`)
   if (base.headDim % 2 !== 0) throw new Error(`${base.id}: headDim must be even (RoPE pairs)`)
   if (base.d % 32 !== 0) throw new Error(`${base.id}: d must be divisible by 32 (int4 scale groups)`)
+  if (base.fullAttnInterval && !base.gdn)
+    throw new Error(`${base.id}: fullAttnInterval requires gdn dims`)
   const qDim = base.heads * base.headDim
   const kvDim = base.kvHeads * base.headDim
   const kvI8RowWords = base.headDim / 4
+  // GDN fallback for pure-attention specs: mirror the attention dims so the
+  // prelude consts stay valid (nonzero) and every shader compiles; no GDN
+  // kernel is ever dispatched for these specs (layerKinds is all 'attn').
+  const g = base.gdn ?? {
+    kHeads: base.heads,
+    vHeads: base.heads,
+    headK: base.headDim,
+    headV: base.headDim,
+    convK: 4,
+  }
+  if (g.vHeads % g.kHeads !== 0) throw new Error(`${base.id}: gdn vHeads not divisible by kHeads`)
+  const interval = base.fullAttnInterval ?? 0
+  // HF Qwen3_5Config: layer i is "linear_attention" iff (i+1) % interval != 0.
+  const layerKinds = Object.freeze(
+    Array.from({ length: base.layers }, (_, i): 'gdn' | 'attn' =>
+      interval && (i + 1) % interval !== 0 ? 'gdn' : 'attn',
+    ),
+  )
+  const rotaryDim = Math.round(base.headDim * (base.partialRotaryFactor ?? 1))
+  if (rotaryDim % 2 !== 0) throw new Error(`${base.id}: rotaryDim must be even (RoPE pairs)`)
   return Object.freeze({
     ...base,
+    layerKinds,
+    rotaryDim,
+    halfRotary: rotaryDim / 2,
+    cAttnDim: qDim + 2 * kvDim + (base.attnGate ? qDim : 0),
+    gdnKHeads: g.kHeads,
+    gdnVHeads: g.vHeads,
+    gdnHeadK: g.headK,
+    gdnHeadV: g.headV,
+    gdnConvK: g.convK,
+    gdnGvaGroup: g.vHeads / g.kHeads,
+    gdnKDim: g.kHeads * g.headK,
+    gdnVDim: g.vHeads * g.headV,
+    gdnQkvDim: 2 * g.kHeads * g.headK + g.vHeads * g.headV,
+    gdnStatePerHead: g.headK * g.headV,
     qDim,
     kvDim,
     qkvDim: qDim + 2 * kvDim,
@@ -231,6 +327,96 @@ export const QWEN3_4B: ModelSpec = makeModelSpec({
         ffnDownScale: [`${p}.mlp.down_proj.q_scale`],
         qNorm: [`${p}.self_attn.q_norm.weight`],
         kNorm: [`${p}.self_attn.k_norm.weight`],
+      }
+    },
+  },
+})
+
+// ============================================================
+// Qwen3.5-4B (q4f16_1) — hybrid GatedDeltaNet + gated attention.
+//
+// Verified against mlc-ai/Qwen3.5-4B-q4f16_1-MLC (mlc-chat-config.json +
+// tensor-cache.json) and the mlc-llm qwen35 model/loader sources:
+//   - 32 layers, full_attention_interval=4: layers 3,7,…,31 are self_attn
+//     (8 attention layers), the other 24 are linear_attn (GDN).
+//   - GDN: in_proj_qkv [8192,d] rows = Q(16×128) | K(16×128) | V(32×128)
+//     (HF Qwen3_5GatedDeltaNet splits [key_dim, key_dim, value_dim]);
+//     conv1d_weight [8192,1,4]; in_proj_z [4096,d]; in_proj_a/in_proj_b
+//     [32,d]; A_log/dt_bias [32] f32; norm.weight [128]; out_proj [d,4096].
+//   - Attention: c_attn [10240,d] = q_proj(16 heads × [256 Q | 256 gate]
+//     interleaved per head) ‖ K(4×256) ‖ V(4×256) (qwen35_loader.py:
+//     concat(q_proj, k_proj, v_proj)); partial RoPE rotary_dim=64, theta 1e7;
+//     q/k_norm[256] (+1.0 offset pre-baked by the MLC loader); output gated
+//     by sigmoid(gate) before o_proj.
+//   - lm_head tied to the 248320-row embedding.
+// No kernel is wired to this spec yet — the GDN kernel family compiles and
+// tests against it (tests/kernels/compile-qwen35.mjs).
+// ============================================================
+
+export const QWEN35_4B: ModelSpec = makeModelSpec({
+  id: 'qwen35-4b',
+  d: 2560,
+  layers: 32,
+  heads: 16,
+  kvHeads: 4,      // GQA 4:1 on the 8 attention layers
+  headDim: 256,
+  ffn: 9216,       // gate_up fused rows = 18432
+  vocab: 248320,
+  pageSize: 16,
+  maxPages: 257,   // same page budget as the other specs (model supports 262144)
+  maxSeq: 262144,
+  ropeTheta: 1e7,
+  rmsEps: 1e-6,
+  tiedEmbeddings: true,
+  qkNorm: true,
+  stops: [151645, 151643], // <|im_end|>, <|endoftext|> (mlc-chat-config stop_token_ids)
+  chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'mlc-ai/Qwen3.5-4B-q4f16_1-MLC',
+  fullAttnInterval: 4,
+  gdn: { kHeads: 16, vHeads: 32, headK: 128, headV: 128, convK: 4 },
+  partialRotaryFactor: 0.25,  // rotary_dim = 64 of 256 dims per head
+  attnGate: true,
+  paramNaming: {
+    embedWeight: ['model.embed_tokens.q_weight'],
+    embedScale: ['model.embed_tokens.q_scale'],
+    // Tied embeddings: MLC ships no separate lm_head records.
+    lmHeadWeight: ['model.embed_tokens.q_weight'],
+    lmHeadScale: ['model.embed_tokens.q_scale'],
+    finalNorm: ['model.norm.weight'],
+    // Every layer gets both name sets; layerKinds[L] says which resolves
+    // (self_attn records exist only on attention layers, linear_attn records
+    // only on GDN layers — verified in tensor-cache.json).
+    layer: (L: number) => {
+      const p = `model.layers.${L}`
+      const g = `${p}.linear_attn`
+      return {
+        qkvWeight: [`${p}.self_attn.c_attn.q_weight`],
+        qkvScale: [`${p}.self_attn.c_attn.q_scale`],
+        oProjWeight: [`${p}.self_attn.o_proj.q_weight`],
+        oProjScale: [`${p}.self_attn.o_proj.q_scale`],
+        norm1: [`${p}.input_layernorm.weight`],
+        norm2: [`${p}.post_attention_layernorm.weight`],
+        ffnWeight: [`${p}.mlp.gate_up_proj.q_weight`],
+        ffnScale: [`${p}.mlp.gate_up_proj.q_scale`],
+        ffnDownWeight: [`${p}.mlp.down_proj.q_weight`],
+        ffnDownScale: [`${p}.mlp.down_proj.q_scale`],
+        qNorm: [`${p}.self_attn.q_norm.weight`],
+        kNorm: [`${p}.self_attn.k_norm.weight`],
+        gdnQkvWeight: [`${g}.in_proj_qkv.q_weight`],
+        gdnQkvScale: [`${g}.in_proj_qkv.q_scale`],
+        gdnZWeight: [`${g}.in_proj_z.q_weight`],
+        gdnZScale: [`${g}.in_proj_z.q_scale`],
+        gdnAWeight: [`${g}.in_proj_a.q_weight`],
+        gdnAScale: [`${g}.in_proj_a.q_scale`],
+        gdnBWeight: [`${g}.in_proj_b.q_weight`],
+        gdnBScale: [`${g}.in_proj_b.q_scale`],
+        gdnALog: [`${g}.A_log`],
+        gdnDtBias: [`${g}.dt_bias`],
+        gdnConvWeight: [`${g}.conv1d_weight`],
+        gdnNormWeight: [`${g}.norm.weight`],
+        gdnOutWeight: [`${g}.out_proj.q_weight`],
+        gdnOutScale: [`${g}.out_proj.q_scale`],
       }
     },
   },
