@@ -70,7 +70,7 @@ npm run test:e2e     # puppeteer end-to-end
 npm run check        # typecheck + test
 ```
 
-Deploy: `node ~/sites-shared/deploy.mjs zerotvm` (CF Pages, project
+Deploy: `npx wrangler pages deploy dist --project-name=zerotvm --branch=main` (CF Pages, project
 `zerotvm`).
 
 ## Cross-site context

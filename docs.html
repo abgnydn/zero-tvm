@@ -500,7 +500,7 @@
   <p class="lead">
     A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
     10 hand-written WGSL kernel roles (27 files, 3,078 LOC), a BPE tokenizer, and raw WebGPU.
-    66.3 tok/s on M2 Max — ~28% faster than WebLLM's TVM-autotuned 85 kernels on identical weights, same run.
+    Decodes 28–31% faster than WebLLM's TVM-autotuned 85 kernels on identical weights, same run (M2 Max).
   </p>
 
   <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
@@ -551,7 +551,7 @@
     <div class="step-line"><div class="step-dot">3</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Chat</h5>
-      <p>Phi-3-mini runs at ~66 tok/s on M2 Max (vs ~52 tok/s WebLLM on identical weights, same run). Your conversation never leaves the browser. No API calls during inference.</p>
+      <p>Phi-3-mini decodes at 60+ tok/s on M2 Max — 28–31% faster than WebLLM on identical weights, same run. Your conversation never leaves the browser. No API calls during inference.</p>
     </div>
   </div>
   <div class="step-row">
@@ -1101,13 +1101,13 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <!-- VS WEBLLM -->
 <h2 id="vs-webllm">vs WebLLM</h2>
 
-<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same run, same browser (Chrome 150 with WebGPU), Apple M2 Max, 2026-07-25 — <code>npm run bench</code>, 128 decode tokens × 5 runs, median:</p>
+<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same run, same browser (Chrome 150 with WebGPU), Apple M2 Max — <code>npm run bench</code>, 128 decode tokens × 5 runs, median (latest run recorded in <code>bench/results.json</code>):</p>
 
 <table>
   <thead><tr><th></th><th>Zero-TVM</th><th>WebLLM</th></tr></thead>
   <tbody>
-    <tr><td>Decode speed</td><td>66.33 tok/s</td><td>51.98 tok/s</td></tr>
-    <tr><td>Gap</td><td colspan="2">Zero-TVM is ~28% faster than WebLLM</td></tr>
+    <tr><td>Decode speed</td><td><!--bench:zt-->62.90<!--/bench:zt--> tok/s</td><td><!--bench:webllm-->47.9<!--/bench:webllm--> tok/s</td></tr>
+    <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-31<!--/bench:gap-->% relative to WebLLM (negative = Zero-TVM ahead; ratio stable −28…−31% across sessions)</td></tr>
     <tr><td>Dispatches / token</td><td>228 (260 with <code>?int8kv=1</code>)</td><td>342</td></tr>
     <tr><td>Distinct shaders</td><td>10 kernel roles · 27 .wgsl files · 3,078 LOC</td><td>85 TVM-generated shaders · 12,962 LOC</td></tr>
     <tr><td>Shipped JS bundle</td><td>157 kB / 33 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (<code>compiler-chat.html</code>)</td></tr>
@@ -1117,8 +1117,8 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   </tbody>
 </table>
 
-<h3>How the result flipped (22% behind &rarr; ~28% ahead)</h3>
-<p>An earlier head-to-head (M2 Pro, 2026-06) read 42.14 vs ~51.5 tok/s — Zero-TVM 22% <em>behind</em>. Both the hardware and the engine changed since, so the two Zero-TVM numbers are not a pure optimization delta; the same-day, same-machine WebLLM number (51.98) is the valid comparator for 66.33. What changed in the engine:</p>
+<h3>How the result flipped (22% behind &rarr; 28–31% ahead)</h3>
+<p>An earlier head-to-head (M2 Pro, 2026-06) read 42.14 vs ~51.5 tok/s — Zero-TVM 22% <em>behind</em>. Both the hardware and the engine changed since, so the two Zero-TVM numbers are not a pure optimization delta; the same-day, same-machine WebLLM number is the valid comparator for the current Zero-TVM median (both in the table above). What changed in the engine:</p>
 <ul>
   <li><strong>Correctness fixes</strong>. f32 accumulation in the fused FFN, a workgroup-barrier fix in attention, and a decode off-by-one fix — the old number understates even the old hardware.</li>
   <li><strong>vec4 loads, now default</strong>. Re-declaring weight + activation buffers as <code>array&lt;vec4&lt;u32&gt;&gt;</code> in the int4 matmuls and <code>qkv_fused</code> measured +7.1% on M2 Max; opt out with <code>?vec4=0</code> / <code>?vec4qkv=0</code>.</li>
@@ -1127,7 +1127,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <p>Still opt-in: split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured config <code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code> reaches 68.36 tok/s. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (228 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
 
 <h3>The memory-bandwidth ceiling</h3>
-<p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Max's 400 GB/s memory bus that's ~4.5 ms/token, or ~222 tok/s theoretical max. Zero-TVM at 66.3 tok/s hits ~30% of that ceiling; WebLLM at 52.0 tok/s hits ~23%. Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
+<p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Max's 400 GB/s memory bus that's ~4.5 ms/token, or ~222 tok/s theoretical max. Zero-TVM's measured decode median sits at roughly 30% of that ceiling; WebLLM's at roughly 23% (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
 
 </main>
 </div>

@@ -1,0 +1,42 @@
+name: Deploy HF Space
+
+# Mirrors the built site (dist/) + hf-space/README.md to the static Space at
+# https://huggingface.co/spaces/abgunaydin/zero-tvm on every push to main.
+# Needs an `HF_TOKEN` repo secret (a HF write token); skips with a notice if
+# it's absent. zerotvm.com itself deploys separately via Cloudflare Pages.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: build · push to Space
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        env:
+          # No browser needed in this job — skip Puppeteer's ~150MB Chrome download.
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+      - name: Deploy to HF Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::notice::HF_TOKEN secret not set — skipping Hugging Face Space deploy."
+            exit 0
+          fi
+          bash scripts/deploy-space.sh

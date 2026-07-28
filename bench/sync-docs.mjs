@@ -8,10 +8,12 @@
 // with --write. You can also re-run it standalone after editing results.json.
 //
 // What it updates automatically:
-//   - BENCH.md   — numbers wrapped in <!--bench:KEY-->…<!--/bench:KEY--> markers
+//   - BENCH.md, README.md, index.html, docs.html
+//     — numbers wrapped in <!--bench:KEY-->…<!--/bench:KEY--> markers
 //   - src/webllm-bench/main.ts — the `// bench:zt` constant
 // Prose mentions in README/docs/demo are reported for manual review, not
-// rewritten (auto-editing prose is how numbers get mangled).
+// rewritten (auto-editing prose is how numbers get mangled) — prose should
+// cite the stable ratio range, not exact medians.
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -76,7 +78,10 @@ function reportProse() {
     readFileSync(p, 'utf8')
       .split('\n')
       .forEach((line, i) => {
-        if (/\b\d+(\.\d+)?\s*tok\/s/i.test(line) || /\b\d+\s*%\s*(faster|slower|behind)/i.test(line))
+        if (line.includes('<!--bench:')) return // marker-managed, not prose
+        // The % pattern skips range phrasing like "28–31% faster" — that's the
+        // evergreen wording prose is supposed to use.
+        if (/\b\d+(\.\d+)?\s*tok\/s/i.test(line) || /(?<![\d.–-])\b\d+\s*%\s*(faster|slower|behind)/i.test(line))
           hits.push(`  ${rel}:${i + 1}  ${line.trim().slice(0, 96)}`)
       })
   }
@@ -87,6 +92,9 @@ console.log(`bench/results.json: Zero-TVM ${markerVals.zt} tok/s · WebLLM ${mar
   + `· gap ${gap}% · ${r.hardware ?? 'unknown HW'} · ${r.date ?? ''}`)
 
 syncMarkers('BENCH.md')
+syncMarkers('README.md')
+syncMarkers('index.html')
+syncMarkers('docs.html')
 syncTsConst('src/webllm-bench/main.ts')
 
 console.log(`\n${WRITE ? 'Applied' : 'Would change'} ${changes.length} marked value(s):`)

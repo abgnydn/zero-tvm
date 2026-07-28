@@ -30,13 +30,19 @@ Env knobs: `BENCH_TOKENS` (default 128), `BENCH_RUNS` (default 5), `BENCH_HW`.
 Propagates `bench/results.json` into the docs. Dry-run by default; `--write`
 to apply. Updates:
 
-- **BENCH.md** — numbers wrapped in `<!--bench:KEY-->…<!--/bench:KEY-->`
-  markers (`zt`, `webllm`, `gap`). The markers are invisible on GitHub.
+- **BENCH.md, README.md, index.html, docs.html** — every number wrapped in
+  `<!--bench:KEY-->…<!--/bench:KEY-->` markers (`zt`, `webllm`, `gap`) in
+  tables and stat tiles. The markers are invisible on GitHub and in the
+  rendered pages.
 - **`src/webllm-bench/main.ts`** — the `// bench:zt` constant.
 
-Prose mentions in README / docs.html / demo.html are **reported, not
-rewritten** — auto-editing prose is how benchmark numbers get mangled. Update
-those by hand from the printed checklist.
+Prose mentions in README / docs.html / demo.html / index.html are **reported,
+not rewritten** — auto-editing prose is how benchmark numbers get mangled.
+Prose should cite the stable ratio range ("28–31% faster across sessions"),
+not exact medians; exact medians belong only in marker-wrapped table/stat-tile
+positions. Anything the script prints in its prose checklist is either
+intentional history (the old M2 Pro numbers, falsified experiments) or needs
+rewording.
 
 `results.json` schema:
 
