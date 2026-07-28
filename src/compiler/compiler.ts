@@ -3,7 +3,8 @@
  *
  * No TVM. We create every pipeline, buffer, and bind group ourselves.
  *
- * Phi-3 config:
+ * The model shape comes from a ModelSpec (src/compiler/model-spec.ts);
+ * compile() defaults to PHI3:
  *   D=3072, HEADS=32, HEAD_DIM=96, LAYERS=32
  *   FFN=8192, VOCAB=32064
  *   Q4: group_size=32, zero_point=7
@@ -13,7 +14,7 @@
 // Shader sources imported as strings by Vite; the int4_matmul family is
 // generated (see shaders/int4_matmul.gen.ts). Every source is piped through
 // withPrelude() so model-shape constants come from one place (shader-prelude.ts).
-import { withPrelude } from './shader-prelude'
+import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
 import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
@@ -45,9 +46,11 @@ import argmaxSgSrc from './shaders/argmax_sg.wgsl?raw'
 // Constants
 // ============================================================
 
-// PHI3 lives in shader-prelude.ts (single source of truth for TS and WGSL);
-// re-exported here so existing importers keep working.
-export { PHI3 } from './shader-prelude'
+// PHI3 / QWEN3_4B live in model-spec.ts (single source of truth for TS and
+// WGSL, via shader-prelude.ts); re-exported here so existing importers keep
+// working.
+export { PHI3, QWEN3_4B } from './shader-prelude'
+export type { ModelSpec } from './shader-prelude'
 
 // ============================================================
 // Types
@@ -122,8 +125,8 @@ export interface LayerWeights {
 // Compile
 // ============================================================
 
-function createPipeline(device: GPUDevice, src: string, entry: string): GPUComputePipeline {
-  const module = device.createShaderModule({ code: withPrelude(src) })
+function createPipelineFor(device: GPUDevice, src: string, entry: string, spec: ModelSpec): GPUComputePipeline {
+  const module = device.createShaderModule({ code: withPrelude(src, spec) })
   return device.createComputePipeline({
     layout: 'auto',
     compute: { module, entryPoint: entry },
@@ -143,10 +146,15 @@ const STORAGE = GPUBufferUsage.STORAGE
 export function compile(
   device: GPUDevice,
   opts: { subgroups?: boolean } = {},
+  spec: ModelSpec = PHI3,
 ): { pipelines: Pipelines } {
-  console.log('[compiler] Creating pipelines...')
+  console.log(`[compiler] Creating pipelines (${spec.id})...`)
   const subgroups = !!opts.subgroups
   if (subgroups) console.log('[compiler] subgroups feature enabled — compiling _sg variants')
+
+  // Bind createPipeline to this spec so the big literal below stays readable.
+  const createPipeline = (device: GPUDevice, src: string, entry: string) =>
+    createPipelineFor(device, src, entry, spec)
 
   const pipelines: Pipelines = {
     embedding: createPipeline(device, embeddingSrc, 'embedding'),
@@ -201,19 +209,22 @@ export function compile(
 }
 
 /** Allocate per-layer weight buffers */
-export function allocateLayerWeights(device: GPUDevice): LayerWeights {
+export function allocateLayerWeights(device: GPUDevice, spec: ModelSpec = PHI3): LayerWeights {
   const f16 = 2
+  const S = spec
   return {
-    qkvWeights: createBuf(device, 9216 * 384 * 4, STORAGE),
-    qkvScales: createBuf(device, 9216 * 96 * f16, STORAGE),
-    oProjWeights: createBuf(device, 3072 * 384 * 4, STORAGE),
-    oProjScales: createBuf(device, 3072 * 96 * f16, STORAGE),
-    normGamma1: createBuf(device, 3072 * f16, STORAGE),
-    normGamma2: createBuf(device, 3072 * f16, STORAGE),
-    ffnWeights: createBuf(device, 16384 * 384 * 4, STORAGE),
-    ffnScales: createBuf(device, 16384 * 96 * f16, STORAGE),
-    ffnDownWeights: createBuf(device, 3072 * 1024 * 4, STORAGE),
-    ffnDownScales: createBuf(device, 3072 * 256 * f16, STORAGE),
-    kvPages: createBuf(device, 257 * 98304 * f16, STORAGE),
+    // Weight rows are (out_dim × K/8) u32 words; scales are (out_dim × K/32) f16.
+    // K = d for qkv/gate_up, K = qDim for o_proj, K = ffn for down_proj.
+    qkvWeights: createBuf(device, S.qkvDim * S.dPacked * 4, STORAGE),
+    qkvScales: createBuf(device, S.qkvDim * S.dScales * f16, STORAGE),
+    oProjWeights: createBuf(device, S.d * (S.qDim / 8) * 4, STORAGE),
+    oProjScales: createBuf(device, S.d * (S.qDim / 32) * f16, STORAGE),
+    normGamma1: createBuf(device, S.d * f16, STORAGE),
+    normGamma2: createBuf(device, S.d * f16, STORAGE),
+    ffnWeights: createBuf(device, 2 * S.ffn * S.dPacked * 4, STORAGE),
+    ffnScales: createBuf(device, 2 * S.ffn * S.dScales * f16, STORAGE),
+    ffnDownWeights: createBuf(device, S.d * (S.ffn / 8) * 4, STORAGE),
+    ffnDownScales: createBuf(device, S.d * (S.ffn / 32) * f16, STORAGE),
+    kvPages: createBuf(device, S.maxPages * S.kvPageStride * f16, STORAGE),
   }
 }

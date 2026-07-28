@@ -28,7 +28,7 @@ import {
 import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
 // Node ≥23 strips TS types on import, so the tests share the exact prelude
 // and int4 generator the app compiles with — no duplicated logic.
-import { withPrelude } from '../../src/compiler/shader-prelude.ts'
+import { withPrelude, PHI3 } from '../../src/compiler/shader-prelude.ts'
 import {
   int4MatmulWGSL,
   int4MatmulEntry,
@@ -118,7 +118,7 @@ function makeInt4MatmulTest(src, entry, { K = 512, rowsPerWG = 1, outF32 = false
 // ── rms_norm.wgsl : out[i] = input[i] / sqrt(mean(input^2)+1e-5) * gamma[i] ──
 function testRmsNorm(device) {
   const r = rng(2)
-  const D = 3072 // hardcoded in the kernel
+  const D = PHI3.d // prelude const in the kernel
   const input = arr(D, () => toF16(r() * 2 - 1))
   const gamma = arr(D, () => toF16(r() * 0.5 + 0.75))
 
@@ -146,7 +146,7 @@ function testRmsNorm(device) {
 function makeArgmaxTest(file, entry) {
   return function argmaxTest(device) {
     const r = rng(3)
-    const V = 32064 // Phi-3 vocab
+    const V = PHI3.vocab
     const logits = Float32Array.from(arr(V, () => r() * 20 - 10))
     let refIdx = 0
     for (let i = 1; i < V; i++) if (logits[i] > logits[refIdx]) refIdx = i
@@ -168,7 +168,7 @@ function makeArgmaxTest(file, entry) {
 // ── embedding.wgsl : out[i] = dequant(embd_weight[token_id, i]) ──────────────
 function testEmbedding(device) {
   const r = rng(4)
-  const D = 3072, VOCAB = 64, DP = D / 8, SPR = D / 32, token = 17
+  const D = PHI3.d, VOCAB = 64, DP = D / 8, SPR = D / 32, token = 17
   const scales = arr(VOCAB * SPR, () => toF16(r() * 0.05 + 0.01))
   const weights = Uint32Array.from(arr(VOCAB * DP, () => (r() * 0xffffffff) >>> 0))
   const ref = arr(D, (_, i) => {
@@ -194,7 +194,7 @@ function testEmbedding(device) {
 // ── rope.wgsl : RoPE on Q/K heads, copy V ────────────────────────────────────
 function testRope(device) {
   const r = rng(5)
-  const QKV = 9216, HD = 96, pos = 7
+  const QKV = PHI3.qkvDim, HD = PHI3.headDim, pos = 7
   const qkv = arr(QKV, () => toF16(r() * 2 - 1))
   const rope = (val, pair, dim) => {
     const freq = pos / Math.pow(10000, ((dim % 48) * 2) / 96)
@@ -237,7 +237,7 @@ function testRope(device) {
 // ── add_norm.wgsl : residual = A+B ; out = rmsnorm(residual) * gamma ─────────
 function testAddNorm(device) {
   const r = rng(6)
-  const D = 3072
+  const D = PHI3.d
   const A = arr(D, () => toF16(r() * 2 - 1))
   const B = arr(D, () => toF16(r() * 2 - 1))
   const gamma = arr(D, () => toF16(r() * 0.5 + 0.75))
@@ -266,7 +266,7 @@ function testAddNorm(device) {
 // ── kv_append.wgsl : write K,V into the paged cache at `position` ────────────
 function testKvAppend(device) {
   const r = rng(7)
-  const ROW = 3072, PAGE = 98304, NUM_PAGES = 2, position = 20
+  const ROW = PHI3.kvDim, PAGE = PHI3.kvPageStride, NUM_PAGES = 2, position = 20
   const kData = arr(ROW, () => toF16(r() * 2 - 1))
   const vData = arr(ROW, () => toF16(r() * 2 - 1))
   const pageNo = (position / 16) | 0, slot = position % 16
@@ -306,8 +306,8 @@ function testKvAppend(device) {
 function makeFusedFfnTest(file, entry, wgPerDispatch) {
   return function fusedFfnTest(device) {
     const r = rng(8)
-    const D = 3072, DP = D / 8, SPR = D / 32, ROWS = 8
-    const maxRow = ROWS - 1 + 8192
+    const D = PHI3.d, DP = D / 8, SPR = D / 32, ROWS = 8
+    const maxRow = ROWS - 1 + PHI3.ffn
     const input = arr(D, () => toF16(r() * 1.5 - 0.75))
     const scales = arr((maxRow + 1) * SPR, () => toF16(r() * 0.05 + 0.01))
     const weights = Uint32Array.from(arr((maxRow + 1) * DP, () => (r() * 0xffffffff) >>> 0))
@@ -324,7 +324,7 @@ function makeFusedFfnTest(file, entry, wgPerDispatch) {
       return acc
     }
     const ref = arr(ROWS, (_, i) => {
-      const g = dot(i), u = dot(i + 8192)
+      const g = dot(i), u = dot(i + PHI3.ffn)
       const silu = g * (1 / (1 + Math.exp(-g)))
       return toF16(u * silu)
     })
@@ -352,7 +352,7 @@ function makeFusedFfnTest(file, entry, wgPerDispatch) {
 function makeAttentionTest(file, entry) {
   return function attentionTest(device) {
     const r = rng(9)
-    const HEADS = 2, HD = 96, PAGE = 98304, NUM_PAGES = 3
+    const HEADS = 2, HD = PHI3.headDim, PAGE = PHI3.kvPageStride, NUM_PAGES = 3
     const KV_LEN = 40 // 3 pages: 16 + 16 + 8 slots
     const smScale = 1 / Math.sqrt(HD)
     const pageOrder = [2, 0, 1] // logical page → physical page (exercises the table)
@@ -431,10 +431,10 @@ function makeAttentionTest(file, entry) {
 function makeQkvFusedTest(file, entry) {
   return function qkvFusedTest(device) {
     const r = rng(10)
-    const D = 3072, ROWS = 9216, KP = 384, SPR = 96
-    const POS = 20, NUM_PAGES = 2, PAGE = 98304
+    const D = PHI3.d, ROWS = PHI3.qkvDim, KP = PHI3.dPacked, SPR = PHI3.dScales
+    const POS = 20, NUM_PAGES = 2, PAGE = PHI3.kvPageStride
     const pageNo = (POS / 16) | 0, slot = POS % 16
-    const PAIRS = 4608
+    const PAIRS = PHI3.qkvPairs
 
     const hidden = new Float32Array(D)
     for (let i = 0; i < D; i++) hidden[i] = toF16(r() * 2 - 1)
@@ -521,7 +521,7 @@ function makeQkvFusedTest(file, entry) {
 function makeAttentionSplitkTest(file, entry, N, KV_LEN) {
   return function attentionSplitkTest(device) {
     const r = rng(9)
-    const HEADS = 2, HD = 96, PAGE = 98304
+    const HEADS = 2, HD = PHI3.headDim, PAGE = PHI3.kvPageStride
     const NUM_PAGES = Math.ceil(KV_LEN / 16)
     const smScale = 1 / Math.sqrt(HD)
     // Deterministic shuffle: logical page i → physical page (i-1) mod P
@@ -625,7 +625,7 @@ function makeAttentionSplitkTest(file, entry, N, KV_LEN) {
 // ── add3_norm.wgsl : residual = (A+B)+C ; out = rmsnorm(residual) * gamma ────
 function testAdd3Norm(device) {
   const r = rng(6)
-  const D = 3072
+  const D = PHI3.d
   const A = arr(D, () => toF16(r() * 2 - 1))
   const B = arr(D, () => toF16(r() * 2 - 1))
   const C = arr(D, () => toF16(r() * 2 - 1))
@@ -668,8 +668,8 @@ function testAdd3Norm(device) {
 function makeFusedFfnPrologueTest(file, entry, wgPerDispatch) {
   return function fusedFfnPrologueTest(device) {
     const r = rng(8)
-    const D = 3072, DP = D / 8, SPR = D / 32, ROWS = 8
-    const maxRow = ROWS - 1 + 8192
+    const D = PHI3.d, DP = D / 8, SPR = D / 32, ROWS = 8
+    const maxRow = ROWS - 1 + PHI3.ffn
     const residual = arr(D, () => toF16(r() * 1.5 - 0.75))
     const delta = arr(D, () => toF16(r() * 1.5 - 0.75))
     const gamma = arr(D, () => toF16(r() * 0.5 + 0.75))
@@ -696,7 +696,7 @@ function makeFusedFfnPrologueTest(file, entry, wgPerDispatch) {
       return acc
     }
     const ref = arr(ROWS, (_, i) => {
-      const g = dot(i), u = dot(i + 8192)
+      const g = dot(i), u = dot(i + PHI3.ffn)
       const silu = g * (1 / (1 + Math.exp(-g)))
       return toF16(u * silu)
     })

@@ -34,6 +34,13 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
   `compiler.ts` is the hand-written pipeline builder: `compile()`
   creates every GPU compute pipeline (no codegen, no TVM); activation
   buffers and bind groups are owned by `engine-core.ts`.
+  The engine is **spec-parameterized**: `model-spec.ts` defines
+  `ModelSpec` (base dims + derived address math + weight naming +
+  HF repo) with `PHI3` as the default everywhere and `QWEN3_4B` as a
+  second spec for the GQA port. `shaderPrelude(spec)` injects the WGSL
+  const block; `compile()`, `buildDecodeEngine()`, and `loadWeights()`
+  all take an optional spec (default PHI3 — Phi-3 behavior unchanged).
+  `npm run test:kernels:qwen` is a compile-only gate under QWEN3_4B dims.
   `src/compiler/shaders/` holds the 27 WGSL files
   (10 roles + tiled/subgroup/int8/f32 variants). The WebLLM/TVM
   reference path is `chat-v2.ts` (the `compiler-chat` page), which is

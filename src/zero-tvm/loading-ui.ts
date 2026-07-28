@@ -223,8 +223,8 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
       const match = /Loading layer (\d+)/.exec(m)
       if (match) {
         const layer = parseInt(match[1], 10)
-        const pct = (layer / PHI3.LAYERS) * 100
-        setProgress(10 + pct * 0.8, `Loading layer ${layer} / ${PHI3.LAYERS}`, `${Math.round(pct)}%`)
+        const pct = (layer / PHI3.layers) * 100
+        setProgress(10 + pct * 0.8, `Loading layer ${layer} / ${PHI3.layers}`, `${Math.round(pct)}%`)
         setBadge(`${Math.round(pct)}%`, 'loading')
       }
     })
@@ -243,7 +243,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     setProgress(96, 'Compiling shaders...')
     engine = opts.buildEngine({ device, weights, sgSizeOk })
   } else {
-    log(`Allocating KV cache (${PHI3.LAYERS} layers × ${PHI3.MAX_PAGES} pages)`)
+    log(`Allocating KV cache (${PHI3.layers} layers × ${PHI3.maxPages} pages)`)
     const kvPages = allocKVPages(device)
     setProgress(96, 'Compiling shaders...')
     log('Compiling 27 WGSL kernels (10 roles; 18 files + 9 generated)')

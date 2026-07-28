@@ -25,7 +25,9 @@
     "test:unit": "vitest run tests/tokenizer",
     "test:e2e": "vitest run tests/e2e",
     "test:kernels": "node tests/kernels/run.mjs",
+    "test:kernels:qwen": "node tests/kernels/compile-qwen.mjs",
     "gen:tokenizer-fixtures": "node scripts/gen-tokenizer-fixtures.mjs",
+    "gen:tokenizer-fixtures-qwen": "node scripts/gen-tokenizer-fixtures-qwen.mjs",
     "bench": "node bench/run.mjs",
     "bench:sync": "node bench/sync-docs.mjs",
     "check": "npm run typecheck && npm run test"

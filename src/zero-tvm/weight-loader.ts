@@ -1,21 +1,28 @@
 /**
- * WEIGHT LOADER — Load Phi-3 MLC weights from OPFS / browser Cache API / HuggingFace.
+ * WEIGHT LOADER — Load MLC-layout weights from OPFS / browser Cache API / HuggingFace.
  *
  * No TVM, no WebLLM runtime.
  * Reads MLC's ndarray-cache.json, fetches shard binaries with bounded
  * concurrency + retry/backoff, uploads to GPU as each shard arrives.
+ * The model repo + parameter naming come from a ModelSpec (default PHI3).
  *
  * Tiered cache: OPFS (shared with the weight-cache service worker, persisted
  * when granted) → browser Cache API (populated by prior WebLLM sessions) →
  * HuggingFace fetch.
  */
 
+import { PHI3, type ModelSpec } from '../compiler/model-spec.js'
+
 // ============================================================
 // Model URL + cache dir
 // ============================================================
 
-export const PHI3_MODEL_BASE =
-  'https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC/resolve/main/'
+/** HuggingFace snapshot base URL for a spec's MLC repo. */
+export function modelBaseUrl(spec: ModelSpec): string {
+  return `https://huggingface.co/${spec.hfRepo}/resolve/main/`
+}
+
+export const PHI3_MODEL_BASE = modelBaseUrl(PHI3)
 
 /**
  * Canonical shared OPFS dir for the Phi-3 weights. The weight-cache service
@@ -26,6 +33,16 @@ export const PHI3_MODEL_BASE =
  * JS and cannot import this constant, so the two definitions are paired by hand.
  */
 export const WEIGHTS_OPFS_DIR = 'zero-tvm-weights'
+
+/**
+ * Per-model OPFS dir. Phi-3 keeps the historical unsuffixed name for cache
+ * compatibility; other models get a `.`-joined suffix. The separator MUST NOT
+ * be `-`: openOPFS() deletes stale `zero-tvm-weights-<rev>` dirs left by old
+ * loader revisions, and a dash-suffixed model dir would match that sweep.
+ */
+export function opfsDirFor(spec: ModelSpec): string {
+  return spec.id === PHI3.id ? WEIGHTS_OPFS_DIR : `${WEIGHTS_OPFS_DIR}.${spec.id}`
+}
 
 /** Max concurrent shard fetches. HTTP/2 multiplexes fine but we don't want to
  *  hold ~2 GB of in-flight ArrayBuffers on low-RAM devices. */
@@ -86,7 +103,7 @@ interface OpenedOPFS {
   persisted: boolean
 }
 
-async function openOPFS(): Promise<OpenedOPFS> {
+async function openOPFS(dirName: string): Promise<OpenedOPFS> {
   try {
     if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
       return { dir: null, persisted: false }
@@ -114,7 +131,7 @@ async function openOPFS(): Promise<OpenedOPFS> {
       const remove = (root as unknown as { removeEntry(n: string, o?: { recursive: boolean }): Promise<void> })
       await Promise.all(stale.map((n) => remove.removeEntry(n, { recursive: true })))
     } catch { /* iteration unsupported or in-use — skip */ }
-    const dir = await root.getDirectoryHandle(WEIGHTS_OPFS_DIR, { create: true })
+    const dir = await root.getDirectoryHandle(dirName, { create: true })
     return { dir, persisted }
   } catch {
     return { dir: null, persisted: false }
@@ -324,14 +341,16 @@ export async function loadWeights(
   device: GPUDevice,
   onProgress?: (msg: string) => void,
   onStats?: (stats: WeightLoadStats) => void,
+  spec: ModelSpec = PHI3,
 ): Promise<LoadedWeights> {
-  const baseUrl = PHI3_MODEL_BASE
+  const baseUrl = modelBaseUrl(spec)
+  const opfsDir = opfsDirFor(spec)
 
   // Manifest
   onProgress?.('Loading ndarray-cache.json…')
-  const { dir: opfs, persisted } = await openOPFS()
+  const { dir: opfs, persisted } = await openOPFS(opfsDir)
   onProgress?.(opfs
-    ? `OPFS ready (${WEIGHTS_OPFS_DIR}, ${persisted ? 'persistent' : 'best-effort'})`
+    ? `OPFS ready (${opfsDir}, ${persisted ? 'persistent' : 'best-effort'})`
     : 'OPFS unavailable')
   const cacheStores = await openAllCacheStores()
   if (cacheStores.length > 0) onProgress?.(`Cache API: ${cacheStores.length} store(s) open`)
@@ -398,30 +417,33 @@ export async function loadWeights(
     )
   }
 
-  // Resolve the weight layout this engine expects.
-  const embdWeights = find('transformer.embd.q_weight', 'embed_tokens.q_weight', 'model.embed_tokens.q_weight')
-  const embdScales = find('transformer.embd.q_scale', 'embed_tokens.q_scale', 'model.embed_tokens.q_scale')
-  const initNormGamma = find('transformer.h.0.ln.weight', 'model.layers.0.input_layernorm.weight')
-  const lmHeadWeights = find('lm_head.q_weight', 'model.lm_head.q_weight')
-  const lmHeadScales = find('lm_head.q_scale', 'model.lm_head.q_scale')
-  const finalNormGamma = find('transformer.norm.weight', 'model.norm.weight', 'norm.weight')
+  // Resolve the weight layout this engine expects — candidate names come from
+  // the spec's paramNaming table (first match wins, same contract as before).
+  const N = spec.paramNaming
+  const embdWeights = find(...N.embedWeight)
+  const embdScales = find(...N.embedScale)
+  const initNormGamma = find(...N.layer(0).norm1)
+  const lmHeadWeights = find(...N.lmHeadWeight)
+  const lmHeadScales = find(...N.lmHeadScale)
+  const finalNormGamma = find(...N.finalNorm)
 
-  const LAYERS = 32
   const layers: LoadedWeights['layers'] = []
-  for (let L = 0; L < LAYERS; L++) {
-    const h = `transformer.h.${L}`   // MLC prefix
-    const p = `model.layers.${L}`    // HF prefix fallback
+  for (let L = 0; L < spec.layers; L++) {
+    const n = N.layer(L)
     layers.push({
-      qkvWeights: find(`${h}.mixer.qkv_proj.q_weight`, `${p}.self_attn.qkv_proj.q_weight`),
-      qkvScales: find(`${h}.mixer.qkv_proj.q_scale`, `${p}.self_attn.qkv_proj.q_scale`),
-      oProjWeights: find(`${h}.mixer.out_proj.q_weight`, `${p}.self_attn.o_proj.q_weight`),
-      oProjScales: find(`${h}.mixer.out_proj.q_scale`, `${p}.self_attn.o_proj.q_scale`),
-      normGamma1: find(`${h}.ln.weight`, `${p}.input_layernorm.weight`),
-      normGamma2: find(`${h}.post_attention_layernorm.weight`, `${p}.post_attention_layernorm.weight`),
-      ffnWeights: find(`${h}.mlp.gate_up_proj.q_weight`, `${p}.mlp.gate_up_proj.q_weight`),
-      ffnScales: find(`${h}.mlp.gate_up_proj.q_scale`, `${p}.mlp.gate_up_proj.q_scale`),
-      ffnDownWeights: find(`${h}.mlp.down_proj.q_weight`, `${p}.mlp.down_proj.q_weight`),
-      ffnDownScales: find(`${h}.mlp.down_proj.q_scale`, `${p}.mlp.down_proj.q_scale`),
+      qkvWeights: find(...n.qkvWeight),
+      qkvScales: find(...n.qkvScale),
+      oProjWeights: find(...n.oProjWeight),
+      oProjScales: find(...n.oProjScale),
+      normGamma1: find(...n.norm1),
+      normGamma2: find(...n.norm2),
+      ffnWeights: find(...n.ffnWeight),
+      ffnScales: find(...n.ffnScale),
+      ffnDownWeights: find(...n.ffnDownWeight),
+      ffnDownScales: find(...n.ffnDownScale),
+      // Per-head q/k RMSNorm gammas (Qwen3) — only when the naming declares them.
+      qNormGamma: n.qNorm ? find(...n.qNorm) : undefined,
+      kNormGamma: n.kNorm ? find(...n.kNorm) : undefined,
     })
   }
 
@@ -462,5 +484,7 @@ export interface LoadedWeights {
     ffnScales: GPUBuffer
     ffnDownWeights: GPUBuffer
     ffnDownScales: GPUBuffer
+    qNormGamma?: GPUBuffer   // per-head q RMSNorm over head_dim (Qwen3 only)
+    kNormGamma?: GPUBuffer   // per-head k RMSNorm over head_dim (Qwen3 only)
   }>
 }
