@@ -12,6 +12,7 @@
  */
 
 import { PHI3, type ModelSpec } from '../compiler/model-spec.js'
+import { mapLimited, backoffMs } from './map-limited.js'
 
 // ============================================================
 // Model URL + cache dir
@@ -48,8 +49,18 @@ export function opfsDirFor(spec: ModelSpec): string {
  *  hold ~2 GB of in-flight ArrayBuffers on low-RAM devices. */
 const FETCH_CONCURRENCY = 8
 
-/** Per-shard retry budget. Exponential backoff: 500ms, 1.5s, 4.5s. */
-const FETCH_RETRIES = 3
+/** Concurrency after the first mid-stream network failure of the session.
+ *  HTTP/2 stream resets on HF's Xet CDN correlate with high parallelism, so
+ *  once a transfer dies we finish the download at a gentler pace. */
+const DEGRADED_FETCH_CONCURRENCY = 3
+
+/** Per-shard network retry budget (attempts = FETCH_RETRIES + 1).
+ *  Exponential backoff with jitter: ~0.5s, 1s, 2s, 4s (see backoffMs). */
+const FETCH_RETRIES = 4
+
+/** Set on the first mid-stream network failure; sticky for the page session
+ *  so a retried loadWeights also runs at the reduced concurrency. */
+let networkDegraded = false
 
 // ============================================================
 // ndarray-cache.json types
@@ -168,27 +179,113 @@ async function opfsWrite(dir: OPFSDir, dataPath: string, data: ArrayBuffer): Pro
 }
 
 // ============================================================
-// Fetch with retry + backoff
+// Fetch with retry + backoff + mid-stream resume
 // ============================================================
 
-async function fetchWithRetry(url: string, retries = FETCH_RETRIES): Promise<Response> {
+/**
+ * Fetch a URL's full body with retry, exponential backoff + jitter, and
+ * mid-stream resume.
+ *
+ * The body is streamed inside the retry loop, so a connection that dies
+ * partway through the transfer (e.g. the HTTP/2 stream resets HF's Xet CDN
+ * produces when ad-blockers block its AWS-WAF telemetry) is retried instead
+ * of fatal. Every retry re-requests the ORIGINAL `url` — HF's signed CDN
+ * redirect URLs expire, so a resume must re-resolve the redirect — with a
+ * Range header to continue from the bytes already received when the server
+ * honors it (206). A 200 answer to a Range request restarts cleanly.
+ *
+ * The first mid-stream failure flips the session-wide `networkDegraded` flag
+ * (concurrency drops from FETCH_CONCURRENCY to DEGRADED_FETCH_CONCURRENCY).
+ */
+async function fetchBufWithRetry(
+  url: string,
+  signal?: AbortSignal,
+  onRetry?: (msg: string) => void,
+  retries = FETCH_RETRIES,
+): Promise<ArrayBuffer> {
+  const leaf = url.split('/').at(-1)
+  let chunks: Uint8Array<ArrayBuffer>[] = []
+  let received = 0
   let lastErr: unknown
-  for (let i = 0; i <= retries; i++) {
+  // A mid-stream / connection failure — degrade session concurrency once.
+  const transient = (e: unknown) => {
+    lastErr = e
+    if (!networkDegraded) {
+      networkDegraded = true
+      onRetry?.(`network unstable — dropping shard concurrency ${FETCH_CONCURRENCY} → ${DEGRADED_FETCH_CONCURRENCY}`)
+    }
+  }
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) {
+      onRetry?.(`[retry ${attempt}/${retries}] ${leaf}` +
+        (received > 0 ? ` — resuming at ${(received / 1e6).toFixed(1)} MB` : '') +
+        ` (${lastErr})`)
+      await new Promise((r) => setTimeout(r, backoffMs(attempt - 1)))
+    }
+    if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError')
+
+    let resp: Response
     try {
-      const resp = await fetch(url, { credentials: 'omit' })
-      if (resp.ok) return resp
-      // 4xx other than 429 is not worth retrying.
-      if (resp.status < 500 && resp.status !== 429) {
-        throw new Error(`HTTP ${resp.status} ${resp.statusText}`)
-      }
-      lastErr = new Error(`HTTP ${resp.status} ${resp.statusText}`)
+      const headers: Record<string, string> = {}
+      if (received > 0) headers.Range = `bytes=${received}-`
+      resp = await fetch(url, { credentials: 'omit', signal, headers })
     } catch (e) {
-      lastErr = e
+      if (signal?.aborted) throw e
+      // Connection failed before headers. If this was a Range attempt it may
+      // be a preflight/proxy that dislikes Range — restart plain next time.
+      if (received > 0) { chunks = []; received = 0 }
+      transient(e)
+      continue
     }
-    if (i < retries) {
-      const delayMs = 500 * Math.pow(3, i) // 500, 1500, 4500
-      await new Promise((r) => setTimeout(r, delayMs))
+    if (resp.status === 416) {
+      // Our resume offset confused the server — restart from scratch.
+      chunks = []; received = 0
+      lastErr = new Error(`HTTP 416 ${resp.statusText}`)
+      continue
     }
+    if (!resp.ok) {
+      const err = new Error(`HTTP ${resp.status} ${resp.statusText}`)
+      // 4xx other than 429/408 is not worth retrying.
+      if (resp.status < 500 && resp.status !== 429 && resp.status !== 408) throw err
+      lastErr = err
+      continue
+    }
+    // Server ignored our Range (200, or an OPFS-hit from the weight-cache SW)
+    // — the body is the whole file, drop the partial bytes.
+    if (resp.status !== 206 && received > 0) { chunks = []; received = 0 }
+    const lenHeader = resp.headers.get('content-length')
+    const expectTotal = lenHeader ? received + Number(lenHeader) : null
+    try {
+      if (resp.body) {
+        const reader = resp.body.getReader()
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(value as Uint8Array<ArrayBuffer>)
+          received += value.byteLength
+        }
+      } else {
+        const buf = await resp.arrayBuffer()
+        chunks.push(new Uint8Array(buf))
+        received += buf.byteLength
+      }
+    } catch (e) {
+      if (signal?.aborted) throw e
+      transient(e) // mid-stream death — next attempt resumes via Range
+      continue
+    }
+    if (expectTotal !== null && received !== expectTotal) {
+      transient(new Error(`truncated body: got ${received} of ${expectTotal} bytes`))
+      continue
+    }
+    const only = chunks.length === 1 ? chunks[0] : null
+    if (only && only.byteOffset === 0 && only.byteLength === only.buffer.byteLength) {
+      return only.buffer
+    }
+    const out = new Uint8Array(received)
+    let off = 0
+    for (const c of chunks) { out.set(c, off); off += c.byteLength }
+    return out.buffer
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
 }
@@ -216,6 +313,7 @@ async function fetchShard(
   cacheStores: Cache[],
   pendingWrites: Promise<void>[],
   onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
 ): Promise<ArrayBuffer> {
   const leaf = url.split('/').at(-1)
   const cache = (buf: ArrayBuffer) => { pendingWrites.push(opfsWrite(opfs, dataPath, buf)) }
@@ -223,7 +321,7 @@ async function fetchShard(
   // Tier 0: dev-only local mirror served by Vite from .weights-local / HF cache
   if (mirrorBase) {
     try {
-      const resp = await fetch(mirrorBase + dataPath)
+      const resp = await fetch(mirrorBase + dataPath, { signal })
       if (resp.ok) {
         onProgress?.(`[local] ${leaf}`)
         const buf = await resp.arrayBuffer()
@@ -254,10 +352,9 @@ async function fetchShard(
     } catch { /* store closed / unreachable — continue */ }
   }
 
-  // Tier 3: network (with retry/backoff)
+  // Tier 3: network (retry/backoff + mid-stream Range resume)
   onProgress?.(`[fetch] ${leaf}`)
-  const resp = await fetchWithRetry(url)
-  const buf = await resp.arrayBuffer()
+  const buf = await fetchBufWithRetry(url, signal, onProgress)
   cache(buf)
   return buf
 }
@@ -270,27 +367,6 @@ async function openAllCacheStores(): Promise<Cache[]> {
   } catch {
     return []
   }
-}
-
-// ============================================================
-// Bounded concurrency helper
-// ============================================================
-
-async function mapLimited<T, R>(
-  items: T[],
-  limit: number,
-  worker: (item: T, idx: number) => Promise<R>,
-): Promise<R[]> {
-  const out: R[] = new Array(items.length)
-  let next = 0
-  const runOne = async () => {
-    while (next < items.length) {
-      const i = next++
-      out[i] = await worker(items[i], i)
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runOne))
-  return out
 }
 
 // ============================================================
@@ -409,21 +485,51 @@ export async function loadWeights(
 
   const shardEntries = [...byShard.entries()]
 
-  await mapLimited(shardEntries, FETCH_CONCURRENCY, async ([dataPath, records]) => {
-    const shard = await fetchShard(baseUrl + dataPath, dataPath, mirrorBase, opfs, cacheStores, pendingWrites, onProgress)
-    for (const rec of records) {
-      gpuBuffers.set(rec.name, uploadRecord(device, shard, rec))
-    }
-    shardsLoaded++
-    bytesLoaded += shard.byteLength
-    const elapsedSec = (performance.now() - startMs) / 1000
-    const mbPerSec = (bytesLoaded / 1e6) / Math.max(elapsedSec, 0.1)
-    const etaSec = mbPerSec > 0 ? (totalBytes - bytesLoaded) / (mbPerSec * 1e6) : 0
-    const mb = (bytesLoaded / 1e6).toFixed(0)
-    const total = (totalBytes / 1e6).toFixed(0)
-    onProgress?.(`[${shardsLoaded}/${totalShards}] ${dataPath} · ${mb}/${total} MB · ${mbPerSec.toFixed(1)} MB/s · ETA ${formatEta(etaSec)}`)
-    onStats?.({ shardsLoaded, totalShards, bytesLoaded, totalBytes, mbPerSec, etaSec, persisted })
-  })
+  try {
+    // Concurrency is re-read between shards so the first mid-stream network
+    // failure (networkDegraded) drops parallelism for the rest of the session.
+    // Per-shard failures are non-fatal until that shard exhausts its own
+    // retries (FETCH_RETRIES+1 network attempts inside fetchBufWithRetry, ×2
+    // full tier walks via mapLimited's retries) — only then does the shared
+    // AbortSignal cancel the sibling fetches still in flight.
+    await mapLimited(
+      shardEntries,
+      () => (networkDegraded ? DEGRADED_FETCH_CONCURRENCY : FETCH_CONCURRENCY),
+      async ([dataPath, records], _idx, signal) => {
+        let shard: ArrayBuffer
+        try {
+          shard = await fetchShard(baseUrl + dataPath, dataPath, mirrorBase, opfs, cacheStores, pendingWrites, onProgress, signal)
+        } catch (e) {
+          if (signal.aborted) throw e
+          throw new Error(`Shard '${dataPath}' failed: ${e instanceof Error ? e.message : e}`)
+        }
+        for (const rec of records) {
+          gpuBuffers.set(rec.name, uploadRecord(device, shard, rec))
+        }
+        shardsLoaded++
+        bytesLoaded += shard.byteLength
+        const elapsedSec = (performance.now() - startMs) / 1000
+        const mbPerSec = (bytesLoaded / 1e6) / Math.max(elapsedSec, 0.1)
+        const etaSec = mbPerSec > 0 ? (totalBytes - bytesLoaded) / (mbPerSec * 1e6) : 0
+        const mb = (bytesLoaded / 1e6).toFixed(0)
+        const total = (totalBytes / 1e6).toFixed(0)
+        onProgress?.(`[${shardsLoaded}/${totalShards}] ${dataPath} · ${mb}/${total} MB · ${mbPerSec.toFixed(1)} MB/s · ETA ${formatEta(etaSec)}`)
+        onStats?.({ shardsLoaded, totalShards, bytesLoaded, totalBytes, mbPerSec, etaSec, persisted })
+      },
+      { retries: 1 },
+    )
+  } catch (e) {
+    // Make "partial progress is cached" true before reporting it: completed
+    // shards' OPFS writes are already in flight — let them land.
+    await Promise.allSettled(pendingWrites)
+    const msg = e instanceof Error ? e.message : String(e)
+    throw new Error(
+      `${msg} — ${shardsLoaded}/${totalShards} shards (${(bytesLoaded / 1e6).toFixed(0)} MB) are safely cached (OPFS); ` +
+      `reloading resumes from cache and only re-downloads what's missing. ` +
+      `If you use an ad/privacy blocker, allow huggingface.co and hf.co — ` +
+      `HF's bot protection can kill downloads when blocked.`,
+    )
+  }
 
   function find(...candidates: string[]): GPUBuffer {
     for (const c of candidates) {
