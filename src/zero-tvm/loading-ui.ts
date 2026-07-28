@@ -1,10 +1,13 @@
 /**
  * SHARED LOADING UI + BOOT FLOW
  *
- * Both chat.ts and validate.ts need to do the same thing before they can run
- * anything: request the GPU, load the tokenizer, download the weights with a
- * visible progress bar, allocate the KV cache, and compile the shaders. This
- * module owns that pipeline so the two pages cannot drift in how they boot.
+ * Booting an engine means: request the GPU, load the tokenizer, download the
+ * weights with a visible progress bar, allocate the KV cache, and compile the
+ * shaders. This module owns that pipeline. Both shipped pages boot through
+ * bootEngine: validate.ts takes the defaults (reference engine, blocking
+ * generate), chat.ts passes BootEngineOptions to request extra GPU features
+ * (subgroups + timestamp-query), probe the subgroup size, and build the fused
+ * variant-selected engine.
  *
  * Pages must include the standard progress markup (see zero-tvm.html /
  * validate.html): #badge, #progress-wrap, #progress-status, #progress-bar,
@@ -33,7 +36,11 @@ export type BadgeState = 'idle' | 'loading' | 'ready' | 'error'
 export function setBadge(text: string, state: BadgeState = 'idle'): void {
   const badge = document.getElementById('badge')
   if (!badge) return
-  badge.textContent = text
+  // The chat page nests the label in #badge-text (keeping a status dot span);
+  // validate's badge is a bare element. Support both.
+  const txt = document.getElementById('badge-text')
+  if (txt) txt.textContent = text
+  else badge.textContent = text
   badge.className = `badge ${state}`
 }
 
@@ -62,6 +69,45 @@ export function formatBytes(b: number): string {
 }
 
 // ============================================================
+// Subgroup-size probe
+// ============================================================
+
+/**
+ * Our _sg shaders assume subgroup size == 32 (full 32-thread workgroup in one
+ * subgroup). Apple M-series and most shipping WebGPU subgroup backends report
+ * 32; the JS limit is unreliable across Chromium versions so we probe via a
+ * one-shot compute dispatch. Requires the 'subgroups' feature on `device`.
+ */
+async function probeSubgroupSize(device: GPUDevice): Promise<boolean> {
+  try {
+    const probeBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+    const probeRb  = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const probeMod = device.createShaderModule({ code: `enable subgroups;
+      @group(0) @binding(0) var<storage, read_write> out : array<u32>;
+      @compute @workgroup_size(32, 1, 1)
+      fn probe(@builtin(local_invocation_id) tid : vec3<u32>, @builtin(subgroup_size) s : u32) {
+        if (tid.x == 0u) { out[0] = s; }
+      }` })
+    const probePipe = device.createComputePipeline({ layout: 'auto', compute: { module: probeMod, entryPoint: 'probe' } })
+    const probeBg = device.createBindGroup({ layout: probePipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: probeBuf } }] })
+    const pe = device.createCommandEncoder()
+    const pp = pe.beginComputePass(); pp.setPipeline(probePipe); pp.setBindGroup(0, probeBg); pp.dispatchWorkgroups(1); pp.end()
+    pe.copyBufferToBuffer(probeBuf, 0, probeRb, 0, 16)
+    device.queue.submit([pe.finish()])
+    await probeRb.mapAsync(GPUMapMode.READ)
+    const sg = new Uint32Array(probeRb.getMappedRange().slice(0))[0]
+    probeRb.unmap()
+    const sgSizeOk = sg === 32
+    log(`subgroups feature: yes · probed size: ${sg} · path: ${sgSizeOk ? '_sg' : 'scalar'}`)
+    probeBuf.destroy(); probeRb.destroy()
+    return sgSizeOk
+  } catch (e) {
+    log(`subgroups probe failed: ${e} · falling back to scalar`)
+    return false
+  }
+}
+
+// ============================================================
 // Boot pipeline
 // ============================================================
 
@@ -80,15 +126,31 @@ export interface BootError {
 }
 export type BootResult = ({ ok: true } & BootedEngine) | BootError
 
+export interface BootEngineOptions {
+  /** GPU features to request in addition to the required 'shader-f16', each
+   * only if the adapter supports it (e.g. 'subgroups', 'timestamp-query'). */
+  optionalFeatures?: GPUFeatureName[]
+  /** Probe the device's subgroup size with a one-shot dispatch (no-op unless
+   * 'subgroups' was granted). The result is passed to buildEngine. */
+  probeSubgroups?: boolean
+  /** Called on unexpected device loss, in addition to the standard badge /
+   * progress / log surfaces (which fire regardless). */
+  onDeviceLost?: (info: GPUDeviceLostInfo) => void
+  /** Allocate the KV cache and build the engine. Default: f16 KV pages +
+   * buildDecodeEngine defaults (unfused reference path, scalar shaders). */
+  buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean }) => DecodeEngine
+  /** Warm the lazily-JIT'd pipelines. Default: one forwardLogits pass. */
+  warmup?: (engine: DecodeEngine, tokenizer: Tokenizer) => Promise<void>
+}
+
 /**
  * Run the full boot sequence with progress reporting wired into the standard
  * markup. Returns either the live engine or a structured failure.
  *
- * The percent budget mirrors what chat.ts originally used: GPU+tokenizer take
- * the first 10%, weight download takes 80% (the long pole), and KV alloc +
- * shader compile take the last 10%.
+ * The percent budget: GPU+tokenizer take the first 10%, weight download takes
+ * 80% (the long pole), and KV alloc + shader compile take the last 10%.
  */
-export async function bootEngine(): Promise<BootResult> {
+export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResult> {
   if (!navigator.gpu) {
     setBadge('No WebGPU', 'error')
     setProgress(0, 'No WebGPU available')
@@ -106,17 +168,38 @@ export async function bootEngine(): Promise<BootResult> {
     return { ok: false, reason: 'No GPU adapter found' }
   }
 
+  const wantFeatures: GPUFeatureName[] = ['shader-f16' as GPUFeatureName]
+  for (const f of opts.optionalFeatures ?? []) {
+    if (adapter.features.has(f)) wantFeatures.push(f)
+  }
   let device: GPUDevice
   try {
-    device = await adapter.requestDevice({
-      requiredFeatures: ['shader-f16' as GPUFeatureName],
-    })
+    device = await adapter.requestDevice({ requiredFeatures: wantFeatures })
   } catch {
     setBadge('shader-f16 missing', 'error')
     setProgress(0, 'GPU does not support shader-f16 — Chrome or Edge required')
     return { ok: false, reason: 'shader-f16 unsupported — Chrome/Edge required' }
   }
-  log('GPU: shader-f16 enabled')
+  log(`GPU ready — features: ${wantFeatures.join(', ')}`)
+  // Surface device loss (driver reset, OOM, GPU process crash) instead of
+  // letting every later submit fail silently. No retry — a reload is the fix.
+  void device.lost.then((info) => {
+    if (info.reason === 'destroyed') return  // intentional teardown
+    setBadge('GPU lost', 'error')
+    setProgress(0, `GPU device lost: ${info.message || info.reason} — reload the page to recover`)
+    log(`ERROR: GPU device lost (${info.reason}): ${info.message}`)
+    opts.onDeviceLost?.(info)
+  })
+
+  let sgSizeOk = false
+  if (opts.probeSubgroups) {
+    if ((device.features as ReadonlySet<string>).has('subgroups')) {
+      setProgress(3, 'Probing GPU subgroups...')
+      sgSizeOk = await probeSubgroupSize(device)
+    } else {
+      log('subgroups feature: no · path: scalar')
+    }
+  }
   setProgress(5, 'Loading tokenizer...')
 
   setBadge('Tokenizer...', 'loading')
@@ -140,8 +223,8 @@ export async function bootEngine(): Promise<BootResult> {
       const match = /Loading layer (\d+)/.exec(m)
       if (match) {
         const layer = parseInt(match[1], 10)
-        const pct = (layer / 32) * 100
-        setProgress(10 + pct * 0.8, `Loading layer ${layer} / 32`)
+        const pct = (layer / PHI3.LAYERS) * 100
+        setProgress(10 + pct * 0.8, `Loading layer ${layer} / ${PHI3.LAYERS}`, `${Math.round(pct)}%`)
         setBadge(`${Math.round(pct)}%`, 'loading')
       }
     })
@@ -153,12 +236,19 @@ export async function bootEngine(): Promise<BootResult> {
   }
   setProgress(92, 'Allocating KV cache...')
 
-  log(`Allocating KV cache (${PHI3.LAYERS} layers × ${PHI3.MAX_PAGES} pages)`)
-  const kvPages = allocKVPages(device)
-  setProgress(96, 'Compiling shaders...')
-
-  log('Compiling 27 WGSL files (10 kernel roles)')
-  const engine = buildDecodeEngine(device, weights, kvPages)
+  let engine: DecodeEngine
+  if (opts.buildEngine) {
+    // The page allocates its own KV cache (f16 or int8) and picks the engine
+    // mode + shader variants. It may call log() for its own alloc messages.
+    setProgress(96, 'Compiling shaders...')
+    engine = opts.buildEngine({ device, weights, sgSizeOk })
+  } else {
+    log(`Allocating KV cache (${PHI3.LAYERS} layers × ${PHI3.MAX_PAGES} pages)`)
+    const kvPages = allocKVPages(device)
+    setProgress(96, 'Compiling shaders...')
+    log('Compiling 27 WGSL kernels (10 roles; 18 files + 9 generated)')
+    engine = buildDecodeEngine(device, weights, kvPages)
+  }
 
   // Pipeline warmup. createComputePipeline only registers shaders — Chrome's
   // Dawn backend lazily JITs them on first dispatch, which empirically costs
@@ -167,15 +257,19 @@ export async function bootEngine(): Promise<BootResult> {
   // message and validate's first prompt are both honest steady-state.
   setProgress(98, 'Warming up GPU pipelines...')
   const warmupT0 = performance.now()
-  const warmupIds = buildChatPrompt(
-    [{ role: 'user', content: 'Hi.' }],
-    tokenizer
-  )
-  await engine.forwardLogits(warmupIds)
+  if (opts.warmup) {
+    await opts.warmup(engine, tokenizer)
+  } else {
+    const warmupIds = buildChatPrompt(
+      [{ role: 'user', content: 'Hi.' }],
+      tokenizer
+    )
+    await engine.forwardLogits(warmupIds)
+  }
   log(`Warmup forward: ${Math.round(performance.now() - warmupT0)} ms`)
 
   setProgress(100, 'Ready')
-  log('Ready. Zero TVM. 10 kernels across 27 WGSL files.')
+  log('Ready. Zero TVM. 10 kernel roles across 27 WGSL kernels.')
   setBadge('Ready', 'ready')
 
   return { ok: true, device, tokenizer, weights, engine }

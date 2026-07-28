@@ -256,17 +256,17 @@ The per-decode dispatch table for this repo ([`src/zero-tvm/chat.ts`](src/zero-t
 | **Per layer (×32):** | | |
 | Fused QKV proj + RoPE + KV append | 1 | `qkv_fused.wgsl` |
 | Paged attention | 1 | `attention.wgsl` |
-| O projection | 1 | `int4_matmul.wgsl` |
+| O projection | 1 | `int4_matmul` (generated) |
 | AddNorm #1 | 1 | `add_norm.wgsl` |
 | Fused FFN (gate+up+SiLU) | 1 | `fused_ffn.wgsl` |
-| FFN down | 1 | `int4_matmul.wgsl` |
+| FFN down | 1 | `int4_matmul` (generated) |
 | AddNorm #2 | 1 | `add_norm.wgsl` |
 | Final RMSNorm | 1 | `rms_norm.wgsl` |
-| LM head | 1 | `int4_matmul_f32.wgsl` |
+| LM head | 1 | `int4_matmul_f32` (generated) |
 | Argmax | 1 | `argmax.wgsl` |
 | **Total** | **228** | |
 
-Eleven unique WGSL files (`int4_matmul` and `int4_matmul_f32` are two bindings of the same kernel shape, one f16-out, one f32-out for stable argmax; `qkv_fused` is the decode-path fusion; `rope.wgsl` and `kv_append.wgsl` are retained for prefill and parity testing).
+Eleven unique kernels (`int4_matmul` and `int4_matmul_f32` are two variants of the same generated kernel shape — see `src/compiler/shaders/int4_matmul.gen.ts` — one f16-out, one f32-out for stable argmax; `qkv_fused` is the decode-path fusion; `rope.wgsl` and `kv_append.wgsl` are retained for prefill and parity testing).
 
 ## Three-Way Comparison (April 2026)
 
@@ -282,7 +282,7 @@ Eleven unique WGSL files (`int4_matmul` and `int4_matmul_f32` are two bindings o
 
 Transformers.js v4 is the right choice for most production work. Zero-TVM is not trying to replace it. The point of the contrast is that when a stack can assume a single model/precision, most of the compiler and runtime surface is optional.
 
-Speed (post-M1–M5): Zero-TVM decode measures ~40 tok/s on an M2 Pro; WebLLM on the same hardware measures ~51 tok/s (head-to-head via `webllm-bench.html` and recorded in `BENCH.md`). Zero-TVM is ~22% behind the autotuned compiler — the remaining gap is open work (batched prefill, further fusion), not a shipped claim.
+Speed (2026-07-25 head-to-head): Zero-TVM decode measures 66.33 tok/s on an Apple M2 Max; WebLLM on the same machine, same run, same weights measures 51.98 tok/s (via `webllm-bench.html` / `npm run bench`, recorded in `BENCH.md`). Zero-TVM is ~28% faster than the autotuned compiler on that machine — one machine, one model, one browser, decode-only. An earlier M2 Pro measurement with a since-fixed engine read ~22% behind; the history is preserved in `BENCH.md`.
 
 ## What This Repo Is NOT
 
@@ -330,7 +330,7 @@ same shape) — they are read once per tile and reused across all M rows.
 | `rms_norm.wgsl` | per-row norm across M rows |
 | `qkv_fused*.wgsl` | matmul yields `[M, QKV_DIM]`; RoPE reads per-row position; writes M new slots to KV pages |
 | `attention.wgsl` / `_sg` | each of M queries attends to its own history slice; naturally a grid of (M, HEADS) workgroups |
-| `int4_matmul*.wgsl` | GEMM `[M, K] × [K, N]` instead of GEMV — the key shape change. Each output WG tiles both M and N rows |
+| `int4_matmul*` (generated) | GEMM `[M, K] × [K, N]` instead of GEMV — the key shape change. Each output WG tiles both M and N rows |
 | `fused_ffn*.wgsl` | gate/up GEMM `[M, D] × [D, FFN]`; per-row SiLU and elementwise multiply |
 | `add_norm.wgsl` | per-row residual add + norm across M rows |
 | `argmax*.wgsl` | per-row argmax → M token ids |

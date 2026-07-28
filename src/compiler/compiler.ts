@@ -10,22 +10,18 @@
  *   KV cache: page_size=16, max_pages=257
  */
 
-// Shader sources imported as strings by Vite
-import int4MatmulSrc from './shaders/int4_matmul.wgsl?raw'
-import int4MatmulSgSrc from './shaders/int4_matmul_sg.wgsl?raw'
-import int4MatmulTiledSrc from './shaders/int4_matmul_tiled.wgsl?raw'
-import int4MatmulTiled8Src from './shaders/int4_matmul_tiled8.wgsl?raw'
-import int4MatmulF32Src from './shaders/int4_matmul_f32.wgsl?raw'
-import int4MatmulF32SgSrc from './shaders/int4_matmul_f32_sg.wgsl?raw'
-import int4MatmulF32TiledSrc from './shaders/int4_matmul_f32_tiled.wgsl?raw'
-import int4MatmulF32Tiled8Src from './shaders/int4_matmul_f32_tiled8.wgsl?raw'
-import int4MatmulBatchedM4Src from './shaders/int4_matmul_batched_m4.wgsl?raw'
+// Shader sources imported as strings by Vite; the int4_matmul family is
+// generated (see shaders/int4_matmul.gen.ts). Every source is piped through
+// withPrelude() so model-shape constants come from one place (shader-prelude.ts).
+import { withPrelude } from './shader-prelude'
+import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
 import kvAppendSrc from './shaders/kv_append.wgsl?raw'
 import qkvFusedSrc from './shaders/qkv_fused.wgsl?raw'
 import qkvFusedSgSrc from './shaders/qkv_fused_sg.wgsl?raw'
+import qkvFusedSgVec4Src from './shaders/qkv_fused_sg_vec4.wgsl?raw'
 import qkvFusedTiledSgSrc from './shaders/qkv_fused_tiled_sg.wgsl?raw'
 import qkvFusedTiled2SgSrc from './shaders/qkv_fused_tiled2sg.wgsl?raw'
 import qkvFusedScratchSrc from './shaders/qkv_fused_scratch.wgsl?raw'
@@ -33,8 +29,14 @@ import kvQuantizeInt8Src from './shaders/kv_quantize_int8.wgsl?raw'
 import attentionInt8Src from './shaders/attention_int8.wgsl?raw'
 import attentionSrc from './shaders/attention.wgsl?raw'
 import attentionSgSrc from './shaders/attention_sg.wgsl?raw'
+import attentionSplitkSrc from './shaders/attention_splitk.wgsl?raw'
+import attentionSplitkSgSrc from './shaders/attention_splitk_sg.wgsl?raw'
+import attentionCombineSrc from './shaders/attention_combine.wgsl?raw'
 import fusedFfnSrc from './shaders/fused_ffn.wgsl?raw'
 import fusedFfnTiledSgSrc from './shaders/fused_ffn_tiled_sg.wgsl?raw'
+import fusedFfnPrologueSrc from './shaders/fused_ffn_prologue.wgsl?raw'
+import fusedFfnTiledSgPrologueSrc from './shaders/fused_ffn_tiled_sg_prologue.wgsl?raw'
+import add3NormSrc from './shaders/add3_norm.wgsl?raw'
 import embeddingSrc from './shaders/embedding.wgsl?raw'
 import argmaxSrc from './shaders/argmax.wgsl?raw'
 import argmaxSgSrc from './shaders/argmax_sg.wgsl?raw'
@@ -43,31 +45,15 @@ import argmaxSgSrc from './shaders/argmax_sg.wgsl?raw'
 // Constants
 // ============================================================
 
-export const PHI3 = {
-  D: 3072,
-  HEADS: 32,
-  HEAD_DIM: 96,
-  LAYERS: 32,
-  FFN: 8192,
-  VOCAB: 32064,
-  QKV_DIM: 9216,     // 3 * 32 * 96
-  PAGE_SIZE: 16,
-  MAX_PAGES: 257,
-  MAX_SEQ: 4096,
-} as const
+// PHI3 lives in shader-prelude.ts (single source of truth for TS and WGSL);
+// re-exported here so existing importers keep working.
+export { PHI3 } from './shader-prelude'
 
 // ============================================================
 // Types
 // ============================================================
 
-export interface CompiledModel {
-  device: GPUDevice
-  pipelines: Pipelines
-  buffers: Buffers
-  layerWeights: LayerWeights[]
-}
-
-interface Pipelines {
+export interface Pipelines {
   embedding: GPUComputePipeline
   rmsNorm: GPUComputePipeline
   qkvMatmul: GPUComputePipeline      // int4 matmul, K=3072→9216
@@ -79,10 +65,17 @@ interface Pipelines {
   int4MatmulF32Tiled: GPUComputePipeline | null  // tiled subgroup variant of LM head matmul
   int4MatmulF32Tiled8: GPUComputePipeline | null // wider tile variant of LM head matmul
   int4MatmulBatchedM4: GPUComputePipeline | null // M=4 batched GEMM (for spec decode / prefill chunks)
+  // vec4-load variants — default ON since 2026-07-25 (+7.1% with the qkv
+  // sibling on M2 Max, BENCH.md); ?vec4=0 opts out:
+  int4MatmulSgVec4: GPUComputePipeline | null       // vec4-load _sg variant
+  int4MatmulTiledVec4: GPUComputePipeline | null    // vec4-load tiled variant (4 rows/WG)
+  int4MatmulF32SgVec4: GPUComputePipeline | null    // vec4-load _sg LM-head variant
+  int4MatmulF32TiledVec4: GPUComputePipeline | null // vec4-load tiled LM-head variant
   rope: GPUComputePipeline
   kvAppend: GPUComputePipeline
   qkvFused: GPUComputePipeline       // decode-path fusion: QKV matmul + RoPE + KV append
   qkvFusedSg: GPUComputePipeline | null  // subgroup variant of qkvFused
+  qkvFusedSgVec4: GPUComputePipeline | null  // ?vec4qkv=1 vec4-load variant (32-thread)
   qkvFusedTiledSg: GPUComputePipeline | null  // tiled+subgroup variant (input cache, 4 pairs/WG)
   qkvFusedTiled2Sg: GPUComputePipeline | null  // 2-subgroup, 2-pair tile (keeps 64 threads/WG)
   qkvFusedScratch: GPUComputePipeline  // int8-KV variant: writes K,V to scratch f16
@@ -90,10 +83,20 @@ interface Pipelines {
   attentionInt8: GPUComputePipeline    // int8-KV variant of paged attention
   attention: GPUComputePipeline
   attentionSg: GPUComputePipeline | null  // subgroup variant; null if `subgroups` feature absent
+  // ?splitk=N experiment (measured ~+3% at short context on M2 Max,
+  // 2026-07-25; opt-in until a long-context A/B — BENCH.md):
+  attentionSplitK: GPUComputePipeline     // split-K partial pass (tree reduction)
+  attentionSplitKSg: GPUComputePipeline | null  // split-K partial pass (subgroupAdd)
+  attentionCombine: GPUComputePipeline    // merges split-K partials per head
   oProjMatmul: GPUComputePipeline     // int4 matmul, K=3072→3072
   addNorm: GPUComputePipeline
   fusedFfn: GPUComputePipeline        // gate+up+SiLU fused
   fusedFfnTiledSg: GPUComputePipeline | null  // tiled subgroup variant (4 rows/WG)
+  // ?fuseprologue=1 experiment (measured −13.7% on M2 Max, 2026-07-25 —
+  // falsified there; kept for A/B on other GPUs — BENCH.md):
+  fusedFfnPrologue: GPUComputePipeline          // add_norm folded into the FFN's phase 1
+  fusedFfnTiledSgPrologue: GPUComputePipeline | null  // same, on the tiled_sg kernel
+  add3Norm: GPUComputePipeline        // 3-way residual merge + norm (layer tail)
   ffnDownMatmul: GPUComputePipeline   // int4 matmul, K=8192→3072
   lmHead: GPUComputePipeline          // int4 matmul f32 output
   argmax: GPUComputePipeline
@@ -115,55 +118,12 @@ export interface LayerWeights {
   kvPages: GPUBuffer        // 50.53MB per layer (257 pages × 98304 f16)
 }
 
-/** Shared buffers (not per-layer) */
-interface Buffers {
-  // Activation scratch (ping-pong)
-  hidden1: GPUBuffer       // 3072 f16 = 6KB
-  hidden2: GPUBuffer       // 3072 f16 = 6KB
-  residual: GPUBuffer      // 3072 f16 = 6KB
-
-  // QKV / attention intermediates
-  qkvOut: GPUBuffer        // 9216 f16 = 18KB
-  qOut: GPUBuffer          // 3072 f16 = 6KB
-  kOut: GPUBuffer          // 3072 f16 = 6KB
-  vOut: GPUBuffer          // 3072 f16 = 6KB
-  attnOut: GPUBuffer       // 3072 f16 = 6KB
-
-  // FFN intermediates
-  ffnOut: GPUBuffer        // 8192 f16 = 16KB (SiLU output)
-
-  // Logits + sampling
-  logits: GPUBuffer        // 32064 f32 = 125KB
-  tokenResult: GPUBuffer   // 1 i32 = 4B
-
-  // Embedding + position
-  inputIds: GPUBuffer      // MAX_SEQ i32 = 16KB
-  positionMap: GPUBuffer   // MAX_SEQ i32 = 16KB
-
-  // KV cache page tables
-  pageTable: GPUBuffer     // indptr + values
-  pageIndptr: GPUBuffer    // (B+1) i32
-  pageValues: GPUBuffer    // max_pages i32
-  lengthInfo: GPUBuffer    // 3*B i32
-
-  // Embedding weights
-  embdWeights: GPUBuffer
-  embdScales: GPUBuffer
-
-  // LM head weights
-  lmHeadWeights: GPUBuffer
-  lmHeadScales: GPUBuffer
-
-  // Initial norm gamma
-  initNormGamma: GPUBuffer
-}
-
 // ============================================================
 // Compile
 // ============================================================
 
 function createPipeline(device: GPUDevice, src: string, entry: string): GPUComputePipeline {
-  const module = device.createShaderModule({ code: src })
+  const module = device.createShaderModule({ code: withPrelude(src) })
   return device.createComputePipeline({
     layout: 'auto',
     compute: { module, entryPoint: entry },
@@ -183,7 +143,7 @@ const STORAGE = GPUBufferUsage.STORAGE
 export function compile(
   device: GPUDevice,
   opts: { subgroups?: boolean } = {},
-): { pipelines: Pipelines; buffers: Buffers } {
+): { pipelines: Pipelines } {
   console.log('[compiler] Creating pipelines...')
   const subgroups = !!opts.subgroups
   if (subgroups) console.log('[compiler] subgroups feature enabled — compiling _sg variants')
@@ -191,19 +151,24 @@ export function compile(
   const pipelines: Pipelines = {
     embedding: createPipeline(device, embeddingSrc, 'embedding'),
     rmsNorm: createPipeline(device, rmsNormSrc, 'rms_norm'),
-    qkvMatmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
-    int4Matmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
-    int4MatmulSg: subgroups ? createPipeline(device, int4MatmulSgSrc, 'int4_matmul_sg') : null,
-    int4MatmulTiled: subgroups ? createPipeline(device, int4MatmulTiledSrc, 'int4_matmul_tiled') : null,
-    int4MatmulTiled8: subgroups ? createPipeline(device, int4MatmulTiled8Src, 'int4_matmul_tiled8') : null,
-    int4MatmulF32Sg: subgroups ? createPipeline(device, int4MatmulF32SgSrc, 'int4_matmul_f32_sg') : null,
-    int4MatmulF32Tiled: subgroups ? createPipeline(device, int4MatmulF32TiledSrc, 'int4_matmul_f32_tiled') : null,
-    int4MatmulF32Tiled8: subgroups ? createPipeline(device, int4MatmulF32Tiled8Src, 'int4_matmul_f32_tiled8') : null,
-    int4MatmulBatchedM4: subgroups ? createPipeline(device, int4MatmulBatchedM4Src, 'int4_matmul_batched_m4') : null,
+    qkvMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
+    int4Matmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
+    int4MatmulSg: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true }), 'int4_matmul_sg') : null,
+    int4MatmulTiled: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4 }), 'int4_matmul_tiled') : null,
+    int4MatmulTiled8: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 8 }), 'int4_matmul_tiled8') : null,
+    int4MatmulF32Sg: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true }), 'int4_matmul_f32_sg') : null,
+    int4MatmulF32Tiled: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4 }), 'int4_matmul_f32_tiled') : null,
+    int4MatmulF32Tiled8: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 8 }), 'int4_matmul_f32_tiled8') : null,
+    int4MatmulBatchedM4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, m: 4 }), 'int4_matmul_batched_m4') : null,
+    int4MatmulSgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4') : null,
+    int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
+    int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,
+    int4MatmulF32TiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_f32_tiled_vec4') : null,
     rope: createPipeline(device, ropeSrc, 'rope_kernel'),
     kvAppend: createPipeline(device, kvAppendSrc, 'kv_append'),
     qkvFused: createPipeline(device, qkvFusedSrc, 'qkv_fused'),
     qkvFusedSg: subgroups ? createPipeline(device, qkvFusedSgSrc, 'qkv_fused_sg') : null,
+    qkvFusedSgVec4: subgroups ? createPipeline(device, qkvFusedSgVec4Src, 'qkv_fused_sg_vec4') : null,
     qkvFusedTiledSg: subgroups ? createPipeline(device, qkvFusedTiledSgSrc, 'qkv_fused_tiled_sg') : null,
     qkvFusedTiled2Sg: subgroups ? createPipeline(device, qkvFusedTiled2SgSrc, 'qkv_fused_tiled2sg') : null,
     qkvFusedScratch: createPipeline(device, qkvFusedScratchSrc, 'qkv_fused_scratch'),
@@ -211,57 +176,28 @@ export function compile(
     attentionInt8: createPipeline(device, attentionInt8Src, 'attention_int8'),
     attention: createPipeline(device, attentionSrc, 'attention'),
     attentionSg: subgroups ? createPipeline(device, attentionSgSrc, 'attention_sg') : null,
-    oProjMatmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
+    attentionSplitK: createPipeline(device, attentionSplitkSrc, 'attention_splitk'),
+    attentionSplitKSg: subgroups ? createPipeline(device, attentionSplitkSgSrc, 'attention_splitk_sg') : null,
+    attentionCombine: createPipeline(device, attentionCombineSrc, 'attention_combine'),
+    oProjMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
     addNorm: createPipeline(device, addNormSrc, 'add_norm'),
     fusedFfn: createPipeline(device, fusedFfnSrc, 'fused_ffn_kernel'),
     fusedFfnTiledSg: subgroups ? createPipeline(device, fusedFfnTiledSgSrc, 'fused_ffn_tiled_sg') : null,
-    ffnDownMatmul: createPipeline(device, int4MatmulSrc, 'int4_matmul'),
-    lmHead: createPipeline(device, int4MatmulF32Src, 'int4_matmul_f32'),
+    fusedFfnPrologue: createPipeline(device, fusedFfnPrologueSrc, 'fused_ffn_prologue'),
+    fusedFfnTiledSgPrologue: subgroups ? createPipeline(device, fusedFfnTiledSgPrologueSrc, 'fused_ffn_tiled_sg_prologue') : null,
+    add3Norm: createPipeline(device, add3NormSrc, 'add3_norm'),
+    ffnDownMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
+    lmHead: createPipeline(device, int4MatmulWGSL({ outF32: true }), 'int4_matmul_f32'),
     argmax: createPipeline(device, argmaxSrc, 'argmax_kernel'),
     argmaxSg: subgroups ? createPipeline(device, argmaxSgSrc, 'argmax_sg') : null,
   }
 
-  console.log('[compiler] Allocating buffers...')
+  console.log(`[compiler] Done: ${Object.keys(pipelines).length} pipelines`)
 
-  const f16 = 2  // bytes per f16
-  const D = PHI3.D
-
-  const buffers: Buffers = {
-    // Activations
-    hidden1: createBuf(device, D * f16, STORAGE, 'hidden1'),
-    hidden2: createBuf(device, D * f16, STORAGE, 'hidden2'),
-    residual: createBuf(device, D * f16, STORAGE, 'residual'),
-
-    qkvOut: createBuf(device, PHI3.QKV_DIM * f16, STORAGE, 'qkvOut'),
-    qOut: createBuf(device, D * f16, STORAGE, 'qOut'),
-    kOut: createBuf(device, D * f16, STORAGE, 'kOut'),
-    vOut: createBuf(device, D * f16, STORAGE, 'vOut'),
-    attnOut: createBuf(device, D * f16, STORAGE, 'attnOut'),
-
-    ffnOut: createBuf(device, PHI3.FFN * f16, STORAGE, 'ffnOut'),
-
-    logits: createBuf(device, PHI3.VOCAB * 4, STORAGE, 'logits'),
-    tokenResult: createBuf(device, 4, STORAGE, 'tokenResult'),
-
-    inputIds: createBuf(device, PHI3.MAX_SEQ * 4, STORAGE, 'inputIds'),
-    positionMap: createBuf(device, PHI3.MAX_SEQ * 4, STORAGE, 'positionMap'),
-
-    pageTable: createBuf(device, PHI3.MAX_PAGES * 4, STORAGE, 'pageTable'),
-    pageIndptr: createBuf(device, 8, STORAGE, 'pageIndptr'),       // [0, nnz_pages]
-    pageValues: createBuf(device, PHI3.MAX_PAGES * 4, STORAGE, 'pageValues'),
-    lengthInfo: createBuf(device, 12, STORAGE, 'lengthInfo'),      // 3 × B=1
-
-    // These will be populated by model.ts
-    embdWeights: createBuf(device, 4, STORAGE, 'embdWeights_placeholder'),
-    embdScales: createBuf(device, 4, STORAGE, 'embdScales_placeholder'),
-    lmHeadWeights: createBuf(device, 4, STORAGE, 'lmHeadWeights_placeholder'),
-    lmHeadScales: createBuf(device, 4, STORAGE, 'lmHeadScales_placeholder'),
-    initNormGamma: createBuf(device, D * f16, STORAGE, 'initNormGamma'),
-  }
-
-  console.log(`[compiler] Done: ${Object.keys(pipelines).length} pipelines, ${Object.keys(buffers).length} buffers`)
-
-  return { pipelines, buffers }
+  // Activation buffers are NOT allocated here — the engine
+  // (src/zero-tvm/engine-core.ts) allocates its own, sized per mode
+  // (fused/unfused, f16/int8 KV). compile() returns only the pipelines.
+  return { pipelines }
 }
 
 /** Allocate per-layer weight buffers */

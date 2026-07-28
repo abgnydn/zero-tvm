@@ -23,7 +23,7 @@ const RESULTS = resolve(ROOT, 'bench/results.json')
 
 if (!existsSync(RESULTS)) {
   console.error(`No ${RESULTS}. Run \`npm run bench\` on a GPU machine first, or write it by hand:`)
-  console.error('  { "ztDecode": 42.14, "webllmDecode": 51.5, "hardware": "M2 Pro", "date": "2026-06-23" }')
+  console.error('  { "ztDecode": 66.33, "webllmDecode": 51.98, "hardware": "Apple M2 Max", "date": "2026-07-25" }')
   process.exit(1)
 }
 

@@ -126,7 +126,10 @@ export async function newPage(path: string): Promise<Page> {
   const page = await browser.newPage()
   // Surface page-side errors so a crash inside the engine isn't silently
   // swallowed by puppeteer.
-  page.on('pageerror', (e) => console.error(`[pageerror] ${e.message}\n${e.stack}`))
+  page.on('pageerror', (e) => {
+    const err = e instanceof Error ? e : new Error(String(e))
+    console.error(`[pageerror] ${err.message}\n${err.stack}`)
+  })
   page.on('console', (m) => {
     if (m.type() === 'error') console.error(`[console.error] ${m.text()}`)
   })
@@ -137,7 +140,10 @@ export async function newPage(path: string): Promise<Page> {
   // path) chat.ts skips the gate entirely — wait briefly and don't fail if
   // it never shows up.
   try {
-    await page.waitForSelector('#start-btn', { timeout: 8_000 })
+    // visible: true — on zero-tvm.html the button sits inside a closed
+    // <dialog> until the async cache check calls showModal(); an
+    // existence-only wait resolves too early and the later click is lost.
+    await page.waitForSelector('#start-btn', { visible: true, timeout: 8_000 })
   } catch {
     // No gate — auto-boot (cached) path. bootAndWaitReady handles both.
   }

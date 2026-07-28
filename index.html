@@ -735,8 +735,8 @@
 
   <div class="hero-stats">
     <div class="hero-stat">
-      <div class="val g">~40</div>
-      <div class="lbl">tok/s on M2 Pro</div>
+      <div class="val g">~66</div>
+      <div class="lbl">tok/s on M2 Max</div>
     </div>
     <div class="hero-stat">
       <div class="val p">10 / 27</div>
@@ -781,7 +781,7 @@
       <div>      <span class="t-white">It was selected as the capital in 1908 as a</span></div>
       <div>      <span class="t-white">compromise between rivals Sydney and Melbourne.</span></div>
       <br>
-      <div><span class="t-dim">88 tokens · ~40 tok/s (M2 Pro) · 100% local · zero server</span> <span class="t-cursor"></span></div>
+      <div><span class="t-dim">88 tokens · ~66 tok/s (M2 Max) · 100% local · zero server</span> <span class="t-cursor"></span></div>
     </div>
   </div>
 </div>
@@ -1011,9 +1011,9 @@
             <td>~10 MB JS + native</td>
           </tr>
           <tr>
-            <td>Decode speed (Phi-3, M2 Pro)</td>
-            <td class="ours">~40 tok/s</td>
-            <td>~51 tok/s</td>
+            <td>Decode speed (Phi-3, M2 Max)</td>
+            <td class="ours">66.3 tok/s</td>
+            <td>52.0 tok/s</td>
             <td>not measured here</td>
           </tr>
           <tr>
@@ -1052,7 +1052,7 @@
         <li><strong>Not cross-architecture.</strong> Hard-coded to Phi-3 Mini with Q4F16_1 weights. No Llama / Qwen / Gemma path without shader work.</li>
         <li><strong>Not cross-runtime.</strong> Browser WebGPU only. No Node / Bun / Deno target.</li>
         <li><strong>Not a production replacement for Transformers.js v4.</strong> It does fewer things, on purpose.</li>
-        <li><strong>Not faster than WebLLM on Apple Silicon.</strong> ~22% behind on M2 Pro (~40 vs ~51 tok/s). Closing that gap is work-in-progress, not a shipped claim.</li>
+        <li><strong>Not a benchmark sweep.</strong> The ~28%-faster-than-WebLLM result (66.3 vs 52.0 tok/s, 2026-07-25) is one machine (M2 Max), one model, one browser, decode-only, short context. An earlier M2 Pro measurement with an older engine read 22% <em>behind</em> — both numbers live in BENCH.md.</li>
       </ul>
       <p style="margin-top:1rem;margin-bottom:0;color:var(--text);">
         It <strong>is</strong> a minimal-surface-area demonstration that for one fixed model shape, the
@@ -1086,7 +1086,7 @@
         <span class="shader-icon-lg">📊</span>
         <div>
           <h4>WebLLM Bench</h4>
-          <p>Head-to-head against the same Phi-3 Q4F16 weights. Measured ~51 vs ~40 tok/s on M2 Pro.</p>
+          <p>Head-to-head against the same Phi-3 Q4F16 weights. Measured 66.3 (Zero-TVM) vs 52.0 (WebLLM) tok/s on M2 Max.</p>
           <span class="shader-tag">/webllm-bench.html</span>
         </div>
       </a>
@@ -1243,22 +1243,22 @@
 
     <a class="share-option" target="_blank" rel="noopener" id="share-x">
       <span class="platform">X / Twitter</span>
-      <span class="msg">Zero-TVM: Phi-3-mini decoding at ~40 tok/s in a browser on 10 hand-written WGSL kernels (27 files, 3,078 LOC). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 22% behind the autotuned compiler on M2 Pro — fully readable in one sitting.</span>
+      <span class="msg">Zero-TVM: Phi-3-mini decoding at ~66 tok/s in a browser on 10 hand-written WGSL kernels (27 files, 3,078 LOC). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. ~28% faster than the autotuned compiler on M2 Max — fully readable in one sitting.</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-linkedin">
       <span class="platform">LinkedIn</span>
-      <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3-mini (3.8B params) entirely in the browser using 10 hand-written WebGPU kernel roles (27 WGSL files total). It replaces the 85 auto-generated shaders and WASM scheduler from Apache TVM / WebLLM with ~2,000 lines of TypeScript. Measured ~40 tok/s vs WebLLM's ~51 on M2 Pro — 22% behind on the same weights. The whole forward pass (32 layers, paged KV cache, int4 dequant, fused QKV+RoPE+KV-append, fused FFN, attention, argmax) is readable end-to-end.</span>
+      <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3-mini (3.8B params) entirely in the browser using 10 hand-written WebGPU kernel roles (27 WGSL files total). It replaces the 85 auto-generated shaders and WASM scheduler from Apache TVM / WebLLM with ~2,000 lines of TypeScript. Measured 66.3 tok/s vs WebLLM's 52.0 on an M2 Max — ~28% faster on the same weights. The whole forward pass (32 layers, paged KV cache, int4 dequant, fused QKV+RoPE+KV-append, fused FFN, attention, argmax) is readable end-to-end.</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-hn">
       <span class="platform">Hacker News</span>
-      <span class="msg">Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (22% behind WebLLM)</span>
+      <span class="msg">Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (~28% faster than WebLLM)</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-reddit">
       <span class="platform">Reddit</span>
-      <span class="msg">I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini decodes at ~40 tok/s in the browser — 22% behind WebLLM on the same weights.</span>
+      <span class="msg">I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini decodes at ~66 tok/s in the browser — ~28% faster than WebLLM on the same weights.</span>
     </a>
 
     <a class="share-option" id="share-copy" style="cursor:pointer;">
@@ -1275,14 +1275,14 @@
   var url = window.location.origin + '/';
   var repo = 'https://github.com/abgnydn/zero-tvm';
 
-  var xText = "Zero-TVM: Phi-3-mini decoding at ~40 tok/s in a browser on 10 hand-written WGSL kernels (27 files). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 22% behind the autotuned compiler, fully readable in one sitting.\n\n" + url;
+  var xText = "Zero-TVM: Phi-3-mini decoding at ~66 tok/s in a browser on 10 hand-written WGSL kernels (27 files). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. ~28% faster than the autotuned compiler, fully readable in one sitting.\n\n" + url;
   document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(xText);
 
   document.getElementById('share-linkedin').href = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(url);
 
-  document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent("Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (22% behind WebLLM)");
+  document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent("Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (~28% faster than WebLLM)");
 
-  document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent("I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini decodes at ~40 tok/s in the browser, 22% behind WebLLM on the same weights.");
+  document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent("I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini decodes at ~66 tok/s in the browser, ~28% faster than WebLLM on the same weights.");
 
   document.getElementById('share-url').textContent = url;
 

@@ -7,17 +7,38 @@
 //
 //   npm run test:kernels
 //
-// This is the automated net the project previously lacked — kernel
-// correctness was only checkable by hand via test-shaders.html.
+// Covers the scalar kernels AND the shipped `_sg` subgroup variants. The
+// subgroup tests need the WebGPU 'subgroups' feature and (for most kernels)
+// a 32-lane subgroup; when the adapter can't provide that (lavapipe in CI
+// often can't) they SKIP loudly with the reason instead of passing silently.
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { getDevice, buffer, runCompute, runComputeReads, pipelineFor, BU } from './gpu.mjs'
-import { toF16, f16Array, f16BitsToF32, f16fma, f16add } from './half.mjs'
+import {
+  getDevice,
+  probeSubgroupSize,
+  buffer,
+  runCompute,
+  runComputeReads,
+  pipelineFor,
+  BU,
+  MM,
+} from './gpu.mjs'
+import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
+// Node ≥23 strips TS types on import, so the tests share the exact prelude
+// and int4 generator the app compiles with — no duplicated logic.
+import { withPrelude } from '../../src/compiler/shader-prelude.ts'
+import {
+  int4MatmulWGSL,
+  int4MatmulEntry,
+  INT4_MATMUL_VARIANTS,
+} from '../../src/compiler/shaders/int4_matmul.gen.ts'
 
 const SHADERS = resolve(dirname(fileURLToPath(import.meta.url)), '../../src/compiler/shaders')
-const wgsl = (name) => readFileSync(resolve(SHADERS, name), 'utf8')
+// Same render step as every app-side createShaderModule site: inject the
+// model-shape prelude after any `enable` directives.
+const wgsl = (name) => withPrelude(readFileSync(resolve(SHADERS, name), 'utf8'))
 
 // Small deterministic PRNG (mulberry32) so runs are reproducible.
 function rng(seed) {
@@ -31,41 +52,67 @@ function rng(seed) {
 }
 const arr = (n, f) => Array.from({ length: n }, f)
 
-// ── int4_matmul.wgsl : out[r] = dot(input, dequant(weights[r])) ──────────────
-function testInt4Matmul(device) {
-  const r = rng(1)
-  const K = 512, M = 8, KP = K / 8, SPR = K / 32 // K must be a multiple of 512
-  const input = arr(K, () => toF16(r() * 2 - 1))
-  const scales = arr(M * SPR, () => toF16(r() * 0.05 + 0.01))
-  const weights = Uint32Array.from(arr(M * KP, () => (r() * 0xffffffff) >>> 0))
+// Pack a PODArgs-style uniform: ints then optional trailing f32/u32 fields.
+// `fields` is [{ i32: n } | { f32: x } | { u32: n }, ...]; buffer is padded
+// to 16 bytes.
+function podBuffer(device, fields) {
+  const size = Math.max(16, Math.ceil((fields.length * 4) / 16) * 16)
+  const buf = new ArrayBuffer(size)
+  const dv = new DataView(buf)
+  fields.forEach((f, i) => {
+    if (f.f32 !== undefined) dv.setFloat32(i * 4, f.f32, true)
+    else if (f.u32 !== undefined) dv.setUint32(i * 4, f.u32, true)
+    else dv.setInt32(i * 4, f.i32, true)
+  })
+  return buffer(device, new Uint8Array(buf), BU.UNIFORM | BU.COPY_DST)
+}
 
-  const ref = arr(M, (_, row) => {
-    let acc = 0
-    for (let w = 0; w < KP; w++) {
-      const packed = weights[row * KP + w]
-      const scale = scales[row * SPR + (w >> 2)]
-      for (let n = 0; n < 8; n++) {
-        const nib = (packed >>> (4 * n)) & 15
-        acc += input[w * 8 + n] * (nib - 7) * scale
+// ── int4_matmul[_sg|_tiled][_f32][_vec4] (generated) ─────────────────────────
+// out[r] = dot(input, dequant(weights[r])). Options:
+//   K         — reduction dim; scalar/sg variants need K % 512 == 0, the
+//               _vec4 variants need K % 1024 == 0 (32 K-elements per thread
+//               per iteration)
+//   rowsPerWG — output rows per workgroup (dispatch M / rowsPerWG)
+//   outF32    — read the output as f32 (LM-head variants)
+function makeInt4MatmulTest(src, entry, { K = 512, rowsPerWG = 1, outF32 = false } = {}) {
+  return function int4MatmulTest(device) {
+    const r = rng(1)
+    const M = 8, KP = K / 8, SPR = K / 32
+    const input = arr(K, () => toF16(r() * 2 - 1))
+    const scales = arr(M * SPR, () => toF16(r() * 0.05 + 0.01))
+    const weights = Uint32Array.from(arr(M * KP, () => (r() * 0xffffffff) >>> 0))
+
+    const ref = arr(M, (_, row) => {
+      let acc = 0
+      for (let w = 0; w < KP; w++) {
+        const packed = weights[row * KP + w]
+        const scale = scales[row * SPR + (w >> 2)]
+        for (let n = 0; n < 8; n++) {
+          const nib = (packed >>> (4 * n)) & 15
+          acc += input[w * 8 + n] * (nib - 7) * scale
+        }
       }
-    }
-    return toF16(acc)
-  })
+      return outF32 ? acc : toF16(acc)
+    })
 
-  const pipe = pipelineFor(device, wgsl('int4_matmul.wgsl'), 'int4_matmul')
-  const out = device.createBuffer({ size: M * 2, usage: BU.STORAGE | BU.COPY_SRC })
-  const buffers = [
-    out,
-    buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST),
-    buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
-    buffer(device, weights, BU.STORAGE | BU.COPY_DST),
-    buffer(device, new Uint32Array([KP, SPR, M, 0]), BU.UNIFORM | BU.COPY_DST),
-  ]
-  return runCompute(device, pipe, buffers, [M], 0, M * 2).then((bytes) => {
-    const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
-    const maxRel = Math.max(...got.map((g, i) => Math.abs(g - ref[i]) / (Math.abs(ref[i]) + 1e-3)))
-    return { name: 'int4_matmul', pass: maxRel < 0.02, detail: `max rel err ${maxRel.toExponential(2)}` }
-  })
+    const outBytes = M * (outF32 ? 4 : 2)
+    const pipe = pipelineFor(device, withPrelude(src), entry)
+    const out = device.createBuffer({ size: outBytes, usage: BU.STORAGE | BU.COPY_SRC })
+    const buffers = [
+      out,
+      buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
+      buffer(device, weights, BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Uint32Array([KP, SPR, M, 0]), BU.UNIFORM | BU.COPY_DST),
+    ]
+    return runCompute(device, pipe, buffers, [M / rowsPerWG], 0, outBytes).then((bytes) => {
+      const got = outF32
+        ? Array.from(new Float32Array(bytes))
+        : Array.from(new Uint16Array(bytes), f16BitsToF32)
+      const maxRel = Math.max(...got.map((g, i) => Math.abs(g - ref[i]) / (Math.abs(ref[i]) + 1e-3)))
+      return { name: entry, pass: maxRel < 0.02, detail: `max rel err ${maxRel.toExponential(2)}` }
+    })
+  }
 }
 
 // ── rms_norm.wgsl : out[i] = input[i] / sqrt(mean(input^2)+1e-5) * gamma[i] ──
@@ -95,25 +142,27 @@ function testRmsNorm(device) {
   })
 }
 
-// ── argmax.wgsl : index of the (first) maximum logit ─────────────────────────
-function testArgmax(device) {
-  const r = rng(3)
-  const V = 32064 // Phi-3 vocab
-  const logits = Float32Array.from(arr(V, () => r() * 20 - 10))
-  let refIdx = 0
-  for (let i = 1; i < V; i++) if (logits[i] > logits[refIdx]) refIdx = i
+// ── argmax[_sg].wgsl : index of the (first) maximum logit ────────────────────
+function makeArgmaxTest(file, entry) {
+  return function argmaxTest(device) {
+    const r = rng(3)
+    const V = 32064 // Phi-3 vocab
+    const logits = Float32Array.from(arr(V, () => r() * 20 - 10))
+    let refIdx = 0
+    for (let i = 1; i < V; i++) if (logits[i] > logits[refIdx]) refIdx = i
 
-  const pipe = pipelineFor(device, wgsl('argmax.wgsl'), 'argmax_kernel')
-  const result = device.createBuffer({ size: 4, usage: BU.STORAGE | BU.COPY_SRC })
-  const buffers = [
-    buffer(device, logits, BU.STORAGE | BU.COPY_DST),
-    result,
-    buffer(device, new Uint32Array([V]), BU.UNIFORM | BU.COPY_DST),
-  ]
-  return runCompute(device, pipe, buffers, [1], 1, 4).then((bytes) => {
-    const got = new Int32Array(bytes)[0]
-    return { name: 'argmax', pass: got === refIdx, detail: `gpu=${got} ref=${refIdx}` }
-  })
+    const pipe = pipelineFor(device, wgsl(file), entry)
+    const result = device.createBuffer({ size: 4, usage: BU.STORAGE | BU.COPY_SRC })
+    const buffers = [
+      buffer(device, logits, BU.STORAGE | BU.COPY_DST),
+      result,
+      buffer(device, new Uint32Array([V]), BU.UNIFORM | BU.COPY_DST),
+    ]
+    return runCompute(device, pipe, buffers, [1], 1, 4).then((bytes) => {
+      const got = new Int32Array(bytes)[0]
+      return { name: entry, pass: got === refIdx, detail: `gpu=${got} ref=${refIdx}` }
+    })
+  }
 }
 
 // ── embedding.wgsl : out[i] = dequant(embd_weight[token_id, i]) ──────────────
@@ -251,65 +300,555 @@ function testKvAppend(device) {
   })
 }
 
-// ── fused_ffn.wgsl : out[i] = SiLU(gate·x) * (up·x), f16 accumulation ────────
-function testFusedFfn(device) {
-  const r = rng(8)
-  const D = 3072, DP = D / 8, SPR = D / 32, ROWS = 8
-  const maxRow = ROWS - 1 + 8192
-  const input = arr(D, () => toF16(r() * 1.5 - 0.75))
-  const scales = arr((maxRow + 1) * SPR, () => toF16(r() * 0.05 + 0.01))
-  const weights = Uint32Array.from(arr((maxRow + 1) * DP, () => (r() * 0xffffffff) >>> 0))
-  // Reference replicates the kernel's f16 accumulation structure: 64 lanes,
-  // each doing 6 chunks of fma, then a pairwise f16 tree reduction.
-  const dot = (row) => {
-    const lane = new Array(64)
-    for (let l = 0; l < 64; l++) {
+// ── fused_ffn[.wgsl|_tiled_sg.wgsl] : out[i] = SiLU(gate·x) * (up·x) ─────────
+// Both variants accumulate the dot products in f32 (the scalar kernel was
+// converted from f16 accumulation), so the reference is a plain f32 loop.
+function makeFusedFfnTest(file, entry, wgPerDispatch) {
+  return function fusedFfnTest(device) {
+    const r = rng(8)
+    const D = 3072, DP = D / 8, SPR = D / 32, ROWS = 8
+    const maxRow = ROWS - 1 + 8192
+    const input = arr(D, () => toF16(r() * 1.5 - 0.75))
+    const scales = arr((maxRow + 1) * SPR, () => toF16(r() * 0.05 + 0.01))
+    const weights = Uint32Array.from(arr((maxRow + 1) * DP, () => (r() * 0xffffffff) >>> 0))
+    const dot = (row) => {
       let acc = 0
-      for (let chunk = 0; chunk < 6; chunk++) {
-        const w = l + chunk * 64, base = w * 8
-        const packed = weights[row * DP + w], scale = scales[row * SPR + (w >> 2)]
+      for (let w = 0; w < DP; w++) {
+        const packed = weights[row * DP + w]
+        const scale = scales[row * SPR + (w >> 2)]
         for (let n = 0; n < 8; n++) {
           const nib = (packed >>> (4 * n)) & 15
-          acc = f16fma(input[base + n], toF16((nib - 7) * scale), acc)
+          acc += input[w * 8 + n] * (nib - 7) * scale
         }
       }
-      lane[l] = acc
+      return acc
     }
-    for (const stride of [32, 16, 8, 4, 2, 1])
-      for (let t = 0; t < stride; t++) lane[t] = f16add(lane[t], lane[t + stride])
-    return lane[0]
+    const ref = arr(ROWS, (_, i) => {
+      const g = dot(i), u = dot(i + 8192)
+      const silu = g * (1 / (1 + Math.exp(-g)))
+      return toF16(u * silu)
+    })
+    const pipe = pipelineFor(device, wgsl(file), entry)
+    const out = device.createBuffer({ size: ROWS * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const buffers = [
+      out,
+      buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
+      buffer(device, weights, BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Uint32Array([ROWS]), BU.UNIFORM | BU.COPY_DST),
+    ]
+    return runCompute(device, pipe, buffers, [wgPerDispatch(ROWS)], 0, ROWS * 2).then((bytes) => {
+      const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
+      const maxRel = Math.max(...got.map((g, i) => Math.abs(g - ref[i]) / (Math.abs(ref[i]) + 1e-3)))
+      return { name: entry, pass: maxRel < 0.02, detail: `max rel err ${maxRel.toExponential(2)}` }
+    })
   }
-  const ref = arr(ROWS, (_, i) => {
-    const g = dot(i), u = dot(i + 8192)
-    const silu = toF16(g * (1 / (1 + Math.exp(-g))))
-    return toF16(u * silu)
-  })
-  const pipe = pipelineFor(device, wgsl('fused_ffn.wgsl'), 'fused_ffn_kernel')
-  const out = device.createBuffer({ size: ROWS * 2, usage: BU.STORAGE | BU.COPY_SRC })
+}
+
+// ── attention[_sg].wgsl : paged-KV decode attention (FlashDecoding) ──────────
+// Seeds a 3-page KV cache with a deliberately shuffled page table, runs 2
+// heads of single-token decode, and compares against a standard (non-online)
+// CPU softmax-attention reference.
+function makeAttentionTest(file, entry) {
+  return function attentionTest(device) {
+    const r = rng(9)
+    const HEADS = 2, HD = 96, PAGE = 98304, NUM_PAGES = 3
+    const KV_LEN = 40 // 3 pages: 16 + 16 + 8 slots
+    const smScale = 1 / Math.sqrt(HD)
+    const pageOrder = [2, 0, 1] // logical page → physical page (exercises the table)
+
+    const q = arr(32 * HD, () => toF16(r() * 2 - 1)) // full Q buffer; heads 0..1 checked
+    const pages = new Uint16Array(NUM_PAGES * PAGE)
+    // kRef[h][t][d], vRef[h][t][d]
+    const kRef = arr(HEADS, () => arr(KV_LEN, () => new Array(HD)))
+    const vRef = arr(HEADS, () => arr(KV_LEN, () => new Array(HD)))
+    for (let h = 0; h < HEADS; h++) {
+      for (let t = 0; t < KV_LEN; t++) {
+        const phys = pageOrder[t >> 4], slot = t & 15
+        const base = phys * PAGE + h * 1536 + slot * 96
+        for (let d = 0; d < HD; d++) {
+          const kv = toF16(r() * 2 - 1)
+          const vv = toF16(r() * 2 - 1)
+          kRef[h][t][d] = kv
+          vRef[h][t][d] = vv
+          pages[base + d] = f32ToF16Bits(kv)
+          pages[base + 49152 + d] = f32ToF16Bits(vv)
+        }
+      }
+    }
+
+    // CPU reference: standard softmax attention per head.
+    const ref = []
+    for (let h = 0; h < HEADS; h++) {
+      const scores = arr(KV_LEN, (_, t) => {
+        let dot = 0
+        for (let d = 0; d < HD; d++) dot += q[h * HD + d] * kRef[h][t][d]
+        return dot * smScale
+      })
+      const m = Math.max(...scores)
+      const exps = scores.map((s) => Math.exp(s - m))
+      const sum = exps.reduce((a, b) => a + b, 0)
+      for (let d = 0; d < HD; d++) {
+        let o = 0
+        for (let t = 0; t < KV_LEN; t++) o += (exps[t] / sum) * vRef[h][t][d]
+        ref.push(toF16(o))
+      }
+    }
+
+    const pipe = pipelineFor(device, wgsl(file), entry)
+    const out = device.createBuffer({ size: 3072 * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const buffers = [
+      buffer(device, f16Array(q), BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Int32Array([0, NUM_PAGES]), BU.STORAGE | BU.COPY_DST), // indptr
+      buffer(device, new Int32Array(pageOrder), BU.STORAGE | BU.COPY_DST),      // values
+      buffer(device, pages, BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Int32Array([KV_LEN]), BU.STORAGE | BU.COPY_DST),       // length_info
+      out,
+      podBuffer(device, [
+        { i32: 1 },            // B
+        { i32: NUM_PAGES },    // max_num_pages
+        { i32: NUM_PAGES },    // nnz_pages
+        { i32: 0 }, { i32: 0 }, { i32: 0 }, { i32: 0 }, // elem offsets
+        { f32: smScale },
+        { u32: 1 },            // packGridDimX
+      ]),
+    ]
+    // One workgroup per (batch, head): dispatch (1, HEADS).
+    return runComputeReads(device, pipe, buffers, [1, HEADS], [
+      { index: 5, bytes: HEADS * HD * 2 },
+    ]).then(([bytes]) => {
+      const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
+      const maxAbs = Math.max(...got.map((g, i) => Math.abs(g - ref[i])))
+      return { name: entry, pass: maxAbs < 5e-3, detail: `max abs err ${maxAbs.toExponential(2)}` }
+    })
+  }
+}
+
+// ── qkv_fused[_sg].wgsl : QKV int4 matmul + RoPE + paged KV append ──────────
+// Full 9216-row projection on the GPU; the CPU reference spot-checks all
+// three groups (Q / K / V) on a subset of heads, including the RoPE pair
+// rotation and the paged-cache write position.
+function makeQkvFusedTest(file, entry) {
+  return function qkvFusedTest(device) {
+    const r = rng(10)
+    const D = 3072, ROWS = 9216, KP = 384, SPR = 96
+    const POS = 20, NUM_PAGES = 2, PAGE = 98304
+    const pageNo = (POS / 16) | 0, slot = POS % 16
+    const PAIRS = 4608
+
+    const hidden = new Float32Array(D)
+    for (let i = 0; i < D; i++) hidden[i] = toF16(r() * 2 - 1)
+    const scales = new Float32Array(ROWS * SPR)
+    for (let i = 0; i < scales.length; i++) scales[i] = toF16(r() * 0.05 + 0.01)
+    const weights = new Uint32Array(ROWS * KP)
+    for (let i = 0; i < weights.length; i++) weights[i] = (r() * 0xffffffff) >>> 0
+
+    const dot = (row) => {
+      let acc = 0
+      for (let w = 0; w < KP; w++) {
+        const packed = weights[row * KP + w]
+        const scale = scales[row * SPR + (w >> 2)]
+        const base = w * 8
+        for (let n = 0; n < 8; n++) acc += hidden[base + n] * (((packed >>> (4 * n)) & 15) - 7) * scale
+      }
+      return acc
+    }
+
+    const pipe = pipelineFor(device, wgsl(file), entry)
+    const qOut = device.createBuffer({ size: D * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const kvPages = device.createBuffer({
+      size: NUM_PAGES * PAGE * 2,
+      usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC,
+    })
+    device.queue.writeBuffer(kvPages, 0, new Uint16Array(NUM_PAGES * PAGE)) // zero-fill
+    const buffers = [
+      qOut,
+      kvPages,
+      buffer(device, f16Array(Array.from(hidden)), BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(Array.from(scales)), BU.STORAGE | BU.COPY_DST),
+      buffer(device, weights, BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Int32Array([POS]), BU.STORAGE | BU.COPY_DST),
+      // position_map_elem_offset, pages_elem_offset, packGridDimX
+      buffer(device, new Uint32Array([0, 0, PAIRS, 0]), BU.UNIFORM | BU.COPY_DST),
+    ]
+    return runComputeReads(device, pipe, buffers, [PAIRS], [
+      { index: 0, bytes: D * 2 },
+      { index: 1, bytes: NUM_PAGES * PAGE * 2 },
+    ]).then(([qBytes, pageBytes]) => {
+      const gotQ = Array.from(new Uint16Array(qBytes), f16BitsToF32)
+      const gotPages = Array.from(new Uint16Array(pageBytes), f16BitsToF32)
+      let maxRel = 0
+      const check = (got, want) => {
+        maxRel = Math.max(maxRel, Math.abs(got - want) / (Math.abs(want) + 1e-3))
+      }
+      for (const head of [0, 13, 31]) {
+        for (let dimLo = 0; dimLo < 48; dimLo++) {
+          const freq = POS / Math.pow(10000, (dimLo * 2) / 96)
+          const c = Math.cos(freq), s = Math.sin(freq)
+          for (let group = 0; group < 3; group++) {
+            const rowLo = group * 3072 + head * 96 + dimLo
+            const vLo = dot(rowLo), vHi = dot(rowLo + 48)
+            if (group === 2) {
+              const vBase = pageNo * PAGE + head * 1536 + slot * 96 + 49152 + dimLo
+              check(gotPages[vBase], toF16(vLo))
+              check(gotPages[vBase + 48], toF16(vHi))
+            } else {
+              const rotLo = toF16(c * vLo - s * vHi)
+              const rotHi = toF16(c * vHi + s * vLo)
+              if (group === 0) {
+                check(gotQ[head * 96 + dimLo], rotLo)
+                check(gotQ[head * 96 + dimLo + 48], rotHi)
+              } else {
+                const kBase = pageNo * PAGE + head * 1536 + slot * 96 + dimLo
+                check(gotPages[kBase], rotLo)
+                check(gotPages[kBase + 48], rotHi)
+              }
+            }
+          }
+        }
+      }
+      return { name: entry, pass: maxRel < 0.02, detail: `max rel err ${maxRel.toExponential(2)}` }
+    })
+  }
+}
+
+// ── attention_splitk[_sg] + attention_combine : split-K flash-decode ─────────
+// Same setup as the attention test (shuffled page table), but the KV range is
+// partitioned across N workgroups per head writing (m, d, o[96]) partials,
+// then a combine pass merges them. Parametrized over N and kv_len to cover:
+// page count not divisible by N, empty partitions (fewer pages than N), and
+// kv_len < N. Compared against the same standard-softmax CPU reference.
+function makeAttentionSplitkTest(file, entry, N, KV_LEN) {
+  return function attentionSplitkTest(device) {
+    const r = rng(9)
+    const HEADS = 2, HD = 96, PAGE = 98304
+    const NUM_PAGES = Math.ceil(KV_LEN / 16)
+    const smScale = 1 / Math.sqrt(HD)
+    // Deterministic shuffle: logical page i → physical page (i-1) mod P
+    // (same [2,0,1] order as the attention test when P=3).
+    const pageOrder = arr(NUM_PAGES, (_, i) => (i + NUM_PAGES - 1) % NUM_PAGES)
+
+    const q = arr(32 * HD, () => toF16(r() * 2 - 1))
+    const pages = new Uint16Array(NUM_PAGES * PAGE)
+    const kRef = arr(HEADS, () => arr(KV_LEN, () => new Array(HD)))
+    const vRef = arr(HEADS, () => arr(KV_LEN, () => new Array(HD)))
+    for (let h = 0; h < HEADS; h++) {
+      for (let t = 0; t < KV_LEN; t++) {
+        const phys = pageOrder[t >> 4], slot = t & 15
+        const base = phys * PAGE + h * 1536 + slot * 96
+        for (let d = 0; d < HD; d++) {
+          const kv = toF16(r() * 2 - 1)
+          const vv = toF16(r() * 2 - 1)
+          kRef[h][t][d] = kv
+          vRef[h][t][d] = vv
+          pages[base + d] = f32ToF16Bits(kv)
+          pages[base + 49152 + d] = f32ToF16Bits(vv)
+        }
+      }
+    }
+
+    // CPU reference: standard softmax attention per head.
+    const ref = []
+    for (let h = 0; h < HEADS; h++) {
+      const scores = arr(KV_LEN, (_, t) => {
+        let dot = 0
+        for (let d = 0; d < HD; d++) dot += q[h * HD + d] * kRef[h][t][d]
+        return dot * smScale
+      })
+      const m = Math.max(...scores)
+      const exps = scores.map((s) => Math.exp(s - m))
+      const sum = exps.reduce((a, b) => a + b, 0)
+      for (let d = 0; d < HD; d++) {
+        let o = 0
+        for (let t = 0; t < KV_LEN; t++) o += (exps[t] / sum) * vRef[h][t][d]
+        ref.push(toF16(o))
+      }
+    }
+
+    const splitPipe = pipelineFor(device, wgsl(file), entry)
+    const combinePipe = pipelineFor(device, wgsl('attention_combine.wgsl'), 'attention_combine')
+    // Partials sized for the full 32-head layout the engine uses (the kernel
+    // indexes by absolute head id) — 98 f32 per (head, partition).
+    const partials = device.createBuffer({
+      size: 32 * N * 98 * 4,
+      usage: BU.STORAGE | BU.COPY_SRC,
+    })
+    const out = device.createBuffer({ size: 3072 * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const qBuf = buffer(device, f16Array(q), BU.STORAGE | BU.COPY_DST)
+    const indptr = buffer(device, new Int32Array([0, NUM_PAGES]), BU.STORAGE | BU.COPY_DST)
+    const values = buffer(device, new Int32Array(pageOrder), BU.STORAGE | BU.COPY_DST)
+    const pagesBuf = buffer(device, pages, BU.STORAGE | BU.COPY_DST)
+    const lengthInfo = buffer(device, new Int32Array([KV_LEN]), BU.STORAGE | BU.COPY_DST)
+    const splitU = podBuffer(device, [
+      { i32: 1 },            // B
+      { i32: NUM_PAGES },    // max_num_pages
+      { i32: NUM_PAGES },    // nnz_pages
+      { i32: 0 }, { i32: 0 }, { i32: 0 }, { i32: 0 }, // elem offsets
+      { f32: smScale },
+      { u32: N },            // num_splits
+    ])
+    const combineU = podBuffer(device, [{ u32: N }])
+
+    const splitBG = device.createBindGroup({
+      layout: splitPipe.getBindGroupLayout(0),
+      entries: [qBuf, indptr, values, pagesBuf, lengthInfo, partials, splitU]
+        .map((b, i) => ({ binding: i, resource: { buffer: b } })),
+    })
+    const combineBG = device.createBindGroup({
+      layout: combinePipe.getBindGroupLayout(0),
+      entries: [partials, out, combineU]
+        .map((b, i) => ({ binding: i, resource: { buffer: b } })),
+    })
+
+    // Two sequential passes: partial (N, HEADS) then combine (1, HEADS).
+    const enc = device.createCommandEncoder()
+    const p1 = enc.beginComputePass()
+    p1.setPipeline(splitPipe); p1.setBindGroup(0, splitBG)
+    p1.dispatchWorkgroups(N, HEADS, 1); p1.end()
+    const p2 = enc.beginComputePass()
+    p2.setPipeline(combinePipe); p2.setBindGroup(0, combineBG)
+    p2.dispatchWorkgroups(1, HEADS, 1); p2.end()
+    const read = device.createBuffer({ size: HEADS * HD * 2, usage: BU.COPY_DST | BU.MAP_READ })
+    enc.copyBufferToBuffer(out, 0, read, 0, HEADS * HD * 2)
+    device.queue.submit([enc.finish()])
+
+    return read.mapAsync(MM.READ).then(() => {
+      const got = Array.from(new Uint16Array(read.getMappedRange().slice(0)), f16BitsToF32)
+      read.unmap()
+      const maxAbs = Math.max(...got.map((g, i) => Math.abs(g - ref[i])))
+      const name = `${entry} N=${N} kv=${KV_LEN}`
+      return { name, pass: maxAbs < 5e-3, detail: `max abs err ${maxAbs.toExponential(2)}` }
+    })
+  }
+}
+
+// ── add3_norm.wgsl : residual = (A+B)+C ; out = rmsnorm(residual) * gamma ────
+function testAdd3Norm(device) {
+  const r = rng(6)
+  const D = 3072
+  const A = arr(D, () => toF16(r() * 2 - 1))
+  const B = arr(D, () => toF16(r() * 2 - 1))
+  const C = arr(D, () => toF16(r() * 2 - 1))
+  const gamma = arr(D, () => toF16(r() * 0.5 + 0.75))
+  // Sequential f16 rounding, matching the two-step add_norm ping-pong.
+  const resid = A.map((a, i) => toF16(toF16(a + B[i]) + C[i]))
+  let ss = 0
+  for (const x of resid) ss += x * x
+  const rinv = 1 / Math.sqrt(ss / D + 1e-5)
+  const refOut = resid.map((x, i) => toF16(x * rinv * gamma[i]))
+  const pipe = pipelineFor(device, wgsl('add3_norm.wgsl'), 'add3_norm')
+  const out = device.createBuffer({ size: D * 2, usage: BU.STORAGE | BU.COPY_SRC })
+  const residBuf = device.createBuffer({ size: D * 2, usage: BU.STORAGE | BU.COPY_SRC })
   const buffers = [
-    out,
-    buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST),
-    buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
-    buffer(device, weights, BU.STORAGE | BU.COPY_DST),
-    buffer(device, new Uint32Array([ROWS]), BU.UNIFORM | BU.COPY_DST),
+    buffer(device, f16Array(A), BU.STORAGE | BU.COPY_DST),
+    buffer(device, f16Array(B), BU.STORAGE | BU.COPY_DST),
+    buffer(device, f16Array(C), BU.STORAGE | BU.COPY_DST),
+    buffer(device, f16Array(gamma), BU.STORAGE | BU.COPY_DST),
+    out, residBuf,
+    buffer(device, new Uint32Array([1]), BU.UNIFORM | BU.COPY_DST),
   ]
-  return runCompute(device, pipe, buffers, [ROWS], 0, ROWS * 2).then((bytes) => {
-    const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
-    const maxRel = Math.max(...got.map((g, i) => Math.abs(g - ref[i]) / (Math.abs(ref[i]) + 1e-3)))
-    return { name: 'fused_ffn', pass: maxRel < 0.03, detail: `max rel err ${maxRel.toExponential(2)}` }
+  return runComputeReads(device, pipe, buffers, [1], [
+    { index: 4, bytes: D * 2 },
+    { index: 5, bytes: D * 2 },
+  ]).then(([outBytes, residBytes]) => {
+    const gotOut = Array.from(new Uint16Array(outBytes), f16BitsToF32)
+    const gotResid = Array.from(new Uint16Array(residBytes), f16BitsToF32)
+    let bad = 0
+    for (let i = 0; i < D; i++) {
+      bad = Math.max(bad, Math.abs(gotOut[i] - refOut[i]), Math.abs(gotResid[i] - resid[i]))
+    }
+    return { name: 'add3_norm', pass: bad < 5e-3, detail: `max abs err ${bad.toExponential(2)}` }
   })
 }
 
+// ── fused_ffn[_tiled_sg]_prologue : add_norm folded into the FFN's phase 1 ───
+// CPU reference is the SEQUENTIAL path: add_norm (f16 residual add, f16
+// normed store) followed by the fused-FFN dots on the normed f16 vector —
+// exactly what the addNorm1 → fused_ffn dispatch pair computes.
+function makeFusedFfnPrologueTest(file, entry, wgPerDispatch) {
+  return function fusedFfnPrologueTest(device) {
+    const r = rng(8)
+    const D = 3072, DP = D / 8, SPR = D / 32, ROWS = 8
+    const maxRow = ROWS - 1 + 8192
+    const residual = arr(D, () => toF16(r() * 1.5 - 0.75))
+    const delta = arr(D, () => toF16(r() * 1.5 - 0.75))
+    const gamma = arr(D, () => toF16(r() * 0.5 + 0.75))
+    const scales = arr((maxRow + 1) * SPR, () => toF16(r() * 0.05 + 0.01))
+    const weights = Uint32Array.from(arr((maxRow + 1) * DP, () => (r() * 0xffffffff) >>> 0))
+
+    // Reference add_norm (matches testAddNorm's math).
+    const summed = residual.map((a, i) => toF16(a + delta[i]))
+    let ss = 0
+    for (const x of summed) ss += x * x
+    const rinv = 1 / Math.sqrt(ss / D + 1e-5)
+    const normed = summed.map((x, i) => toF16(x * rinv * gamma[i]))
+
+    const dot = (row) => {
+      let acc = 0
+      for (let w = 0; w < DP; w++) {
+        const packed = weights[row * DP + w]
+        const scale = scales[row * SPR + (w >> 2)]
+        for (let n = 0; n < 8; n++) {
+          const nib = (packed >>> (4 * n)) & 15
+          acc += normed[w * 8 + n] * (nib - 7) * scale
+        }
+      }
+      return acc
+    }
+    const ref = arr(ROWS, (_, i) => {
+      const g = dot(i), u = dot(i + 8192)
+      const silu = g * (1 / (1 + Math.exp(-g)))
+      return toF16(u * silu)
+    })
+    const pipe = pipelineFor(device, wgsl(file), entry)
+    const out = device.createBuffer({ size: ROWS * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const buffers = [
+      out,
+      buffer(device, f16Array(residual), BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(delta), BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(gamma), BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
+      buffer(device, weights, BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Uint32Array([ROWS]), BU.UNIFORM | BU.COPY_DST),
+    ]
+    return runCompute(device, pipe, buffers, [wgPerDispatch(ROWS)], 0, ROWS * 2).then((bytes) => {
+      const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
+      const maxRel = Math.max(...got.map((g, i) => Math.abs(g - ref[i]) / (Math.abs(ref[i]) + 1e-3)))
+      return { name: entry, pass: maxRel < 0.02, detail: `max rel err ${maxRel.toExponential(2)}` }
+    })
+  }
+}
+
+// ── test roster ──────────────────────────────────────────────────────────────
+// Baseline tests run on any f16-capable adapter. Subgroup (`_sg`) variants
+// additionally require the 'subgroups' feature and a minimum subgroup size
+// (most kernels lay out their cross-lane reduction for 32-lane subgroups —
+// same gate chat.ts applies before shipping them to a real GPU).
 const TESTS = [
-  testInt4Matmul,
-  testRmsNorm,
-  testArgmax,
-  testEmbedding,
-  testRope,
-  testAddNorm,
-  testKvAppend,
-  testFusedFfn,
+  { label: 'int4_matmul', fn: makeInt4MatmulTest(int4MatmulWGSL(), 'int4_matmul') },
+  { label: 'rms_norm', fn: testRmsNorm },
+  { label: 'argmax', fn: makeArgmaxTest('argmax.wgsl', 'argmax_kernel') },
+  { label: 'embedding', fn: testEmbedding },
+  { label: 'rope', fn: testRope },
+  { label: 'add_norm', fn: testAddNorm },
+  { label: 'kv_append', fn: testKvAppend },
+  { label: 'fused_ffn', fn: makeFusedFfnTest('fused_ffn.wgsl', 'fused_ffn_kernel', (rows) => rows) },
+  { label: 'attention', fn: makeAttentionTest('attention.wgsl', 'attention') },
+  { label: 'qkv_fused', fn: makeQkvFusedTest('qkv_fused.wgsl', 'qkv_fused') },
+  { label: 'int4_matmul_sg', fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true }), 'int4_matmul_sg'), minSg: 32 },
+  { label: 'argmax_sg', fn: makeArgmaxTest('argmax_sg.wgsl', 'argmax_sg'), minSg: 16 },
+  { label: 'attention_sg', fn: makeAttentionTest('attention_sg.wgsl', 'attention_sg'), minSg: 32 },
+  { label: 'qkv_fused_sg', fn: makeQkvFusedTest('qkv_fused_sg.wgsl', 'qkv_fused_sg'), minSg: 32 },
+  {
+    label: 'fused_ffn_tiled_sg',
+    fn: makeFusedFfnTest('fused_ffn_tiled_sg.wgsl', 'fused_ffn_tiled_sg', (rows) => Math.ceil(rows / 4)),
+    minSg: 32,
+  },
+  // ── opt-in experiment variants (?vec4 / ?vec4qkv / ?splitk / ?fuseprologue)
+  // — built + correctness-tested here, throughput not yet measured ──────────
+  // vec4 int4 matmuls: every knob combo variants.ts can resolve to
+  // (tiled/sg × f16/f32 out). K=1024: the vec4 layout needs K % 1024 == 0.
+  {
+    label: 'int4_matmul_sg_vec4',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4', { K: 1024 }),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_tiled_vec4',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4', { K: 1024, rowsPerWG: 4 }),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_f32_sg_vec4',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4', { K: 1024, outF32: true }),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_f32_tiled_vec4',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_f32_tiled_vec4', { K: 1024, rowsPerWG: 4, outF32: true }),
+    minSg: 32,
+  },
+  { label: 'qkv_fused_sg_vec4', fn: makeQkvFusedTest('qkv_fused_sg_vec4.wgsl', 'qkv_fused_sg_vec4'), minSg: 32 },
+  // split-K attention + combine. kv=40 is 3 pages: N=2 splits them 2+1
+  // (pages not divisible by N); N=4 leaves one partition empty. kv=2 with
+  // N=4 covers kv_len < N (three empty partitions).
+  { label: 'attn_splitk2', fn: makeAttentionSplitkTest('attention_splitk.wgsl', 'attention_splitk', 2, 40) },
+  { label: 'attn_splitk4', fn: makeAttentionSplitkTest('attention_splitk.wgsl', 'attention_splitk', 4, 40) },
+  { label: 'attn_splitk4_short', fn: makeAttentionSplitkTest('attention_splitk.wgsl', 'attention_splitk', 4, 2) },
+  {
+    label: 'attn_splitk_sg',
+    fn: makeAttentionSplitkTest('attention_splitk_sg.wgsl', 'attention_splitk_sg', 4, 40),
+    minSg: 32,
+  },
+  // prologue fusion: add_norm folded into the FFN kernel + the 3-way
+  // residual merge that replaces addNorm2.
+  { label: 'add3_norm', fn: testAdd3Norm },
+  {
+    label: 'fused_ffn_prologue',
+    fn: makeFusedFfnPrologueTest('fused_ffn_prologue.wgsl', 'fused_ffn_prologue', (rows) => rows),
+  },
+  {
+    label: 'ffn_tiled_sg_prologue',
+    fn: makeFusedFfnPrologueTest('fused_ffn_tiled_sg_prologue.wgsl', 'fused_ffn_tiled_sg_prologue', (rows) => Math.ceil(rows / 4)),
+    minSg: 32,
+  },
 ]
+
+// ── compile-all gate ─────────────────────────────────────────────────────────
+// Creates a shader module + compute pipeline for EVERY .wgsl file (through
+// the same prelude path the app uses) and every shipped generator variant,
+// and fails loudly on any compilation/validation error. This protects the
+// shaders the correctness tests above don't execute.
+async function compileAll(device, subgroups) {
+  const sources = readdirSync(SHADERS)
+    .filter((f) => f.endsWith('.wgsl'))
+    .sort()
+    .map((f) => ({ name: f, code: wgsl(f) }))
+  for (const v of INT4_MATMUL_VARIANTS) {
+    sources.push({ name: `gen:${int4MatmulEntry(v)}`, code: withPrelude(int4MatmulWGSL(v)) })
+  }
+
+  const errors = []
+  let compiled = 0
+  let skippedSg = 0
+  for (const s of sources) {
+    if (!subgroups && /^\s*enable subgroups;/m.test(s.code)) {
+      skippedSg++
+      continue
+    }
+    const entryMatch = s.code.match(/@compute[\s\S]*?fn\s+([A-Za-z0-9_]+)/)
+    if (!entryMatch) {
+      errors.push(`${s.name}: no @compute entry point found`)
+      continue
+    }
+    device.pushErrorScope('validation')
+    const module = device.createShaderModule({ code: s.code })
+    const info = module.getCompilationInfo ? await module.getCompilationInfo() : { messages: [] }
+    const msgs = [...info.messages].filter((m) => m.type === 'error')
+    if (msgs.length) {
+      errors.push(`${s.name}: ${msgs.map((m) => `${m.lineNum}:${m.linePos} ${m.message}`).join(' | ')}`)
+      await device.popErrorScope()
+      continue
+    }
+    device.createComputePipeline({
+      layout: 'auto',
+      compute: { module, entryPoint: entryMatch[1] },
+    })
+    const scopeErr = await device.popErrorScope()
+    if (scopeErr) {
+      errors.push(`${s.name}: ${String(scopeErr.message).split('\n')[0]}`)
+      continue
+    }
+    compiled++
+  }
+  for (const e of errors) console.error(`      ${e}`)
+  const skipNote = skippedSg ? `, ${skippedSg} sg-only skipped (no 'subgroups' feature)` : ''
+  return {
+    name: 'compile_all',
+    pass: errors.length === 0,
+    detail: `${compiled} shaders compile clean (${sources.length - INT4_MATMUL_VARIANTS.length} .wgsl + ${INT4_MATMUL_VARIANTS.length} generated${skipNote})`,
+  }
+}
 
 async function main() {
   let env
@@ -325,25 +864,69 @@ async function main() {
     )
     process.exit(1)
   }
-  const { device, info, f16 } = env
-  console.log(`adapter: ${info.description || info.vendor || 'unknown'} | shader-f16: ${f16}`)
+  const { device, info, f16, subgroups } = env
+  let sgSize = 0
+  if (subgroups) {
+    try {
+      sgSize = await probeSubgroupSize(device)
+    } catch (e) {
+      console.error(`WARN: subgroup-size probe failed (${String(e).split('\n')[0]}); treating as no subgroups`)
+    }
+  }
+  const sgLabel = subgroups ? (sgSize ? `yes (size ${sgSize})` : 'yes (size unknown)') : 'no'
+  console.log(
+    `adapter: ${info.description || info.vendor || 'unknown'} | shader-f16: ${f16} | subgroups: ${sgLabel}`,
+  )
   if (!f16) {
     console.error('FAIL: adapter lacks shader-f16; cannot exercise the f16 kernels')
     process.exit(1)
   }
 
   let failed = 0
+  let ran = 0
+  let skipped = 0
   for (const t of TESTS) {
+    const name = t.label
+    if (t.minSg) {
+      if (!subgroups) {
+        console.log(`SKIP  ${name.padEnd(18)} adapter lacks the 'subgroups' WebGPU feature`)
+        skipped++
+        continue
+      }
+      if (sgSize < t.minSg) {
+        console.log(
+          `SKIP  ${name.padEnd(18)} needs subgroup size >= ${t.minSg}, adapter reports ${sgSize || 'unknown'}`,
+        )
+        skipped++
+        continue
+      }
+    }
     let res
     try {
-      res = await t(device)
+      res = await t.fn(device)
     } catch (e) {
-      res = { name: t.name, pass: false, detail: String(e).split('\n')[0] }
+      res = { pass: false, detail: String(e).split('\n')[0] }
     }
-    console.log(`${res.pass ? 'PASS' : 'FAIL'}  ${res.name.padEnd(13)} ${res.detail}`)
+    console.log(`${res.pass ? 'PASS' : 'FAIL'}  ${name.padEnd(18)} ${res.detail}`)
+    ran++
     if (!res.pass) failed++
   }
-  console.log(`\n${TESTS.length - failed}/${TESTS.length} kernels correct`)
+
+  // Compile-all gate: every shader must at least build on this adapter.
+  {
+    let res
+    try {
+      res = await compileAll(device, subgroups)
+    } catch (e) {
+      res = { pass: false, detail: String(e).split('\n')[0] }
+    }
+    console.log(`${res.pass ? 'PASS' : 'FAIL'}  ${'compile_all'.padEnd(18)} ${res.detail}`)
+    ran++
+    if (!res.pass) failed++
+  }
+
+  const skipNote = skipped ? ` (${skipped} skipped — see SKIP lines above)` : ''
+  console.log(`\n${ran - failed}/${ran} kernels correct${skipNote}`)
   process.exit(failed ? 1 : 0)
 }
 

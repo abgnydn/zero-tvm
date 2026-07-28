@@ -23,6 +23,7 @@ const EXTRA_FILES = [
   'ndarray-cache.json',
   'tokenizer.json',
   'tokenizer_config.json',
+  'mlc-chat-config.json',
 ]
 
 // ── helpers ──────────────────────────────────────────────────────────────────

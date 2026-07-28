@@ -3,7 +3,7 @@
  *
  * Why this file exists:
  *   The per-shader test-harness (src/compiler/test-harness.ts) compares each
- *   of our 10 kernels (27 WGSL files) against TVM's ground truth — but only on a single
+ *   of our 10 kernels (27 WGSL kernels) against TVM's ground truth — but only on a single
  *   hard-coded prompt ("What is the capital of France?"). That tests shader
  *   correctness in isolation; it does not test the live chat path on diverse
  *   inputs.
@@ -39,7 +39,7 @@ interface TestPrompt {
   user: string
   /** Optional sanity hint — string the top-1 continuation should plausibly contain.
    * This is informational only; the test doesn't fail if it's missing, since
-   * Phi-3's greedy decode is occasionally weird. */
+   * a correct greedy continuation can legitimately phrase things differently. */
   hint?: string
 }
 

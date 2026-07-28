@@ -14,7 +14,10 @@
  * Subsequent visits to either page hit OPFS instantly.
  */
 
-const SHARED_DIR = "zero-tvm-weights"; // must match weight-loader.ts
+// KEEP IN SYNC with WEIGHTS_OPFS_DIR in src/zero-tvm/weight-loader.ts — this
+// SW is plain JS and cannot import the exported constant, so the two
+// definitions are paired by hand.
+const SHARED_DIR = "zero-tvm-weights";
 const HF_PHI3_HOST = "huggingface.co";
 const HF_PHI3_PATH_RE = /^\/mlc-ai\/Phi-3-mini-4k-instruct-q4f16_1-MLC\/resolve\/[^/]+\//;
 

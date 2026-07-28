@@ -5,6 +5,47 @@ format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/) starting
 from `0.1.0`.
 
+## [Unreleased]
+
+Correctness fixes, the first measured optimization promoted to default, and a
+new headline number. The engine now measures **faster than WebLLM** on the
+one machine benchmarked.
+
+### Fixed
+
+- **fused_ffn f32 accumulation** — the fused FFN now accumulates in f32
+  throughout instead of f16.
+- **Attention workgroup-barrier bug** — a missing barrier in the attention
+  kernel.
+- **Decode off-by-one** — the decode loop was off by one token position.
+
+### Changed
+
+- **vec4 loads are now the default** (`?vec4=0` / `?vec4qkv=0` to opt out).
+  Measured 2026-07-25 on Apple M2 Max vs the same-day pre-vec4 baseline of
+  60.96 tok/s: `?vec4=1` +4.5%, `?vec4qkv=1` +4.2%, both together **+7.1%**
+  (65.27 tok/s). Full A/B table in BENCH.md.
+- **New headline head-to-head** (2026-07-25, Apple M2 Max, Chrome
+  150.0.7871.182, identical local Phi-3-mini q4f16_1 weights, 128 tokens ×
+  5 runs, median): Zero-TVM **66.33 tok/s** vs WebLLM v0.2.80 **51.98 tok/s**
+  — **~28% faster**. Supersedes the "22% behind" M2 Pro numbers (different
+  machine AND a since-fixed engine — the delta is not all optimization; the
+  same-run WebLLM figure is the valid comparator). Best measured opt-in
+  config `?vec4=1&vec4qkv=1&splitk=8`: 68.36 tok/s. Old M2 Pro numbers kept
+  in BENCH.md "Prior measurements".
+- README / BENCH.md / site copy rewritten around the measured result; the
+  split-K attention flag (`?splitk=N`, ~+3% at short context) stays opt-in
+  pending a long-context A/B.
+
+### Falsified (measured and not shipped)
+
+- **FFN prologue fusion** (`?fuseprologue=1`) — folding the FFN-entry
+  add_norm into the FFN kernel's shared-memory phase measured **−13.7%**
+  (52.62 tok/s) on M2 Max: the redundant per-workgroup RMSNorm recompute
+  costs far more than the −32 dispatch bubbles save. Flag + shaders kept
+  for A/B on other GPUs, documented as a negative result in BENCH.md —
+  same treatment as the tiling and spec-decode negatives.
+
 ## [0.2.0] — 2026-06-25
 
 Tooling, tests, and docs pass. Engine behavior is unchanged; this release adds

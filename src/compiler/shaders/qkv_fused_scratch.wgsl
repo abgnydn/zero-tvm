@@ -7,15 +7,17 @@
 // dispatch reads those scratches and writes the int8 + scale cache.
 //
 // Decode-only (ntoken=1). Prefill still uses the legacy 3-dispatch path.
+//
+// Model-shape constants are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
-@group(0) @binding(0) var<storage, read_write> q_out        : array<f16>;  // 3072 Q
-@group(0) @binding(1) var<storage, read_write> k_slot       : array<f16>;  // 3072 K (scratch)
-@group(0) @binding(2) var<storage, read_write> v_slot       : array<f16>;  // 3072 V (scratch)
-@group(0) @binding(3) var<storage, read>       hidden       : array<f16>;  // 3072 hidden
-@group(0) @binding(4) var<storage, read>       scales       : array<f16>;  // 9216 × 96 f16
-@group(0) @binding(5) var<storage, read>       weights      : array<u32>;  // 9216 × 384 u32
+@group(0) @binding(0) var<storage, read_write> q_out        : array<f16>;  // D-wide Q
+@group(0) @binding(1) var<storage, read_write> k_slot       : array<f16>;  // D-wide K (scratch)
+@group(0) @binding(2) var<storage, read_write> v_slot       : array<f16>;  // D-wide V (scratch)
+@group(0) @binding(3) var<storage, read>       hidden       : array<f16>;  // D-wide hidden
+@group(0) @binding(4) var<storage, read>       scales       : array<f16>;  // QKV_DIM × D_SCALES f16
+@group(0) @binding(5) var<storage, read>       weights      : array<u32>;  // QKV_DIM × D_PACKED u32
 @group(0) @binding(6) var<storage, read>       position_map : array<i32>;
 
 struct PODArgs {
@@ -23,9 +25,6 @@ struct PODArgs {
   packGridDimX             : u32,
 }
 @group(0) @binding(7) var<uniform> podArgs : PODArgs;
-
-const K_PACKED       : i32 = 384;
-const SCALES_PER_ROW : i32 = 96;
 
 var<workgroup> red0 : array<f32, 64>;
 var<workgroup> red1 : array<f32, 64>;
@@ -41,23 +40,24 @@ fn qkv_fused_scratch(
 
   let tid : i32 = i32(threadIdx.x);
 
-  let group         : i32 = pair_idx / 1536;
-  let pair_in_group : i32 = pair_idx - group * 1536;
-  let head          : i32 = pair_in_group / 48;
-  let dim_lo        : i32 = pair_in_group - head * 48;
+  let group         : i32 = pair_idx / QKV_GROUP_PAIRS;
+  let pair_in_group : i32 = pair_idx - group * QKV_GROUP_PAIRS;
+  let head          : i32 = pair_in_group / HALF_HEAD_DIM;
+  let dim_lo        : i32 = pair_in_group - head * HALF_HEAD_DIM;
 
-  let row_lo : i32 = group * 3072 + head * 96 + dim_lo;
-  let row_hi : i32 = row_lo + 48;
+  let row_lo : i32 = group * D + head * HEAD_DIM + dim_lo;
+  let row_hi : i32 = row_lo + HALF_HEAD_DIM;
 
   var acc0 : f32 = 0.0;
   var acc1 : f32 = 0.0;
 
-  for (var chunk : i32 = 0; chunk < K_PACKED / 64; chunk = chunk + 1) {
+  // Per-group scale factored out of the 8 unpacked terms.
+  for (var chunk : i32 = 0; chunk < D_PACKED / 64; chunk = chunk + 1) {
     let w_offset : i32 = tid + chunk * 64;
-    let packed_lo : u32 = weights[row_lo * K_PACKED + w_offset];
-    let packed_hi : u32 = weights[row_hi * K_PACKED + w_offset];
-    let scale_lo : f32 = f32(scales[row_lo * SCALES_PER_ROW + (w_offset >> 2)]);
-    let scale_hi : f32 = f32(scales[row_hi * SCALES_PER_ROW + (w_offset >> 2)]);
+    let packed_lo : u32 = weights[row_lo * D_PACKED + w_offset];
+    let packed_hi : u32 = weights[row_hi * D_PACKED + w_offset];
+    let scale_lo : f32 = f32(scales[row_lo * D_SCALES + (w_offset >> 2)]);
+    let scale_hi : f32 = f32(scales[row_hi * D_SCALES + (w_offset >> 2)]);
     let base : i32 = w_offset * 8;
 
     let x0 = f32(hidden[base    ]);
@@ -69,23 +69,25 @@ fn qkv_fused_scratch(
     let x6 = f32(hidden[base + 6]);
     let x7 = f32(hidden[base + 7]);
 
-    acc0 = acc0 + x0 * (f32((packed_lo >>  0u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x1 * (f32((packed_lo >>  4u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x2 * (f32((packed_lo >>  8u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x3 * (f32((packed_lo >> 12u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x4 * (f32((packed_lo >> 16u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x5 * (f32((packed_lo >> 20u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x6 * (f32((packed_lo >> 24u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x7 * (f32((packed_lo >> 28u) & 15u) - 7.0) * scale_lo;
+    acc0 = acc0 + scale_lo * (
+        x0 * (f32((packed_lo >>  0u) & 15u) - 7.0)
+      + x1 * (f32((packed_lo >>  4u) & 15u) - 7.0)
+      + x2 * (f32((packed_lo >>  8u) & 15u) - 7.0)
+      + x3 * (f32((packed_lo >> 12u) & 15u) - 7.0)
+      + x4 * (f32((packed_lo >> 16u) & 15u) - 7.0)
+      + x5 * (f32((packed_lo >> 20u) & 15u) - 7.0)
+      + x6 * (f32((packed_lo >> 24u) & 15u) - 7.0)
+      + x7 * (f32((packed_lo >> 28u) & 15u) - 7.0));
 
-    acc1 = acc1 + x0 * (f32((packed_hi >>  0u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x1 * (f32((packed_hi >>  4u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x2 * (f32((packed_hi >>  8u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x3 * (f32((packed_hi >> 12u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x4 * (f32((packed_hi >> 16u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x5 * (f32((packed_hi >> 20u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x6 * (f32((packed_hi >> 24u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x7 * (f32((packed_hi >> 28u) & 15u) - 7.0) * scale_hi;
+    acc1 = acc1 + scale_hi * (
+        x0 * (f32((packed_hi >>  0u) & 15u) - 7.0)
+      + x1 * (f32((packed_hi >>  4u) & 15u) - 7.0)
+      + x2 * (f32((packed_hi >>  8u) & 15u) - 7.0)
+      + x3 * (f32((packed_hi >> 12u) & 15u) - 7.0)
+      + x4 * (f32((packed_hi >> 16u) & 15u) - 7.0)
+      + x5 * (f32((packed_hi >> 20u) & 15u) - 7.0)
+      + x6 * (f32((packed_hi >> 24u) & 15u) - 7.0)
+      + x7 * (f32((packed_hi >> 28u) & 15u) - 7.0));
   }
 
   red0[tid] = acc0;
@@ -108,27 +110,27 @@ fn qkv_fused_scratch(
 
   // V: no RoPE, write to v_slot scratch.
   if (group == 2) {
-    let base = head * 96 + dim_lo;
-    v_slot[base     ] = f16(v_lo);
-    v_slot[base + 48] = f16(v_hi);
+    let base = head * HEAD_DIM + dim_lo;
+    v_slot[base                ] = f16(v_lo);
+    v_slot[base + HALF_HEAD_DIM] = f16(v_hi);
     return;
   }
 
   // Q / K: apply RoPE.
   let pos  : f32 = f32(position_map[podArgs.position_map_elem_offset]);
-  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / 96.0);
+  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / f32(HEAD_DIM));
   let c    : f32 = cos(freq);
   let s    : f32 = sin(freq);
 
   let rot_lo : f32 = c * v_lo + s * (-v_hi);
   let rot_hi : f32 = c * v_hi + s * ( v_lo);
 
-  let base = head * 96 + dim_lo;
+  let base = head * HEAD_DIM + dim_lo;
   if (group == 0) {
-    q_out[base     ] = f16(rot_lo);
-    q_out[base + 48] = f16(rot_hi);
+    q_out[base                ] = f16(rot_lo);
+    q_out[base + HALF_HEAD_DIM] = f16(rot_hi);
   } else {
-    k_slot[base     ] = f16(rot_lo);
-    k_slot[base + 48] = f16(rot_hi);
+    k_slot[base                ] = f16(rot_lo);
+    k_slot[base + HALF_HEAD_DIM] = f16(rot_hi);
   }
 }

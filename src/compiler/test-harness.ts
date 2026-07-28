@@ -11,8 +11,8 @@
 import { LLMEngine, MODELS } from '../engine.js'
 import { patchForCapture, getCaptureResult, CapturedDispatch, CaptureResult } from '../capture.js'
 
-import int4MatmulSrc from './shaders/int4_matmul.wgsl?raw'
-import int4MatmulF32Src from './shaders/int4_matmul_f32.wgsl?raw'
+import { withPrelude } from './shader-prelude'
+import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
@@ -118,7 +118,7 @@ async function runTvm(device: GPUDevice, d: CapturedDispatch): Promise<void> {
 }
 
 function makePipeline(device: GPUDevice, src: string, entry: string): GPUComputePipeline {
-  return device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: src }), entryPoint: entry } })
+  return device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code: withPrelude(src) }), entryPoint: entry } })
 }
 
 function makeUniform(device: GPUDevice, values: number[]): GPUBuffer {
@@ -212,7 +212,7 @@ async function testQkvMatmul(cap: CaptureResult): Promise<void> {
   log(`  TVM: ${showF16(tvmOut)}`)
 
   const out = makeBuf(dev, d.entries[0].buffer.size)
-  const p = makePipeline(dev, int4MatmulSrc, 'int4_matmul')
+  const p = makePipeline(dev, int4MatmulWGSL(), 'int4_matmul')
   const u = makeUniform(dev, [384, 96, 9216])
   dispatchOur(dev, p, [out, d.entries[1].buffer, d.entries[2].buffer, d.entries[3].buffer, u], 9216)
   await dev.queue.onSubmittedWorkDone()
@@ -313,7 +313,7 @@ async function testOProj(cap: CaptureResult): Promise<void> {
 
   // Same shader as QKV matmul, different dimensions: K=3072→3072
   const out = makeBuf(dev, d.entries[0].buffer.size)
-  const p = makePipeline(dev, int4MatmulSrc, 'int4_matmul')
+  const p = makePipeline(dev, int4MatmulWGSL(), 'int4_matmul')
   const u = makeUniform(dev, [384, 96, 3072])  // K_PACKED=384, SCALES=96, N=3072
   dispatchOur(dev, p, [out, d.entries[1].buffer, d.entries[2].buffer, d.entries[3].buffer, u], 3072)
   await dev.queue.onSubmittedWorkDone()
@@ -422,7 +422,7 @@ async function testFfnDown(cap: CaptureResult): Promise<void> {
 
   // FFN down: K=8192→3072, K_PACKED=1024, SCALES_PER_ROW=256
   const out = makeBuf(dev, d.entries[0].buffer.size)
-  const p = makePipeline(dev, int4MatmulSrc, 'int4_matmul')
+  const p = makePipeline(dev, int4MatmulWGSL(), 'int4_matmul')
   const u = makeUniform(dev, [1024, 256, 3072])
   dispatchOur(dev, p, [out, d.entries[1].buffer, d.entries[2].buffer, d.entries[3].buffer, u], 3072)
   await dev.queue.onSubmittedWorkDone()
@@ -450,7 +450,7 @@ async function testLmHead(cap: CaptureResult): Promise<void> {
   // Our int4_matmul_f32: @0=output(rw,f32), @1=input(r), @2=scales(r), @3=weights(r), @4=uniform
   // NOTE: TVM has input at @3, scales at @1, weights at @2 — different order!
   const out = makeBuf(dev, tvmOutBuf.size)
-  const p = makePipeline(dev, int4MatmulF32Src, 'int4_matmul_f32')
+  const p = makePipeline(dev, int4MatmulWGSL({ outF32: true }), 'int4_matmul_f32')
   const u = makeUniform(dev, [384, 96, 32064])
   // Map TVM bindings → our bindings: TVM @3=input → our @1, TVM @1=scales → our @2, TVM @2=weights → our @3
   dispatchOur(dev, p, [out, d.entries[3].buffer, d.entries[1].buffer, d.entries[2].buffer, u], 32064)

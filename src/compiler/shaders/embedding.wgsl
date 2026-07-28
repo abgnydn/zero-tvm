@@ -1,8 +1,11 @@
 // EMBEDDING — int4 dequant + token lookup.
-// output[seq * 3072 + i] = dequant(embd_weight[token_id, i])
+// output[seq * D + i] = dequant(embd_weight[token_id, i])
 // Same int4 format: (nibble - 7) * scale, group_size=32
 //
 // Matches TVM's fused_dequantize_take1_kernel.
+//
+// Model-shape constants (D, D_PACKED, D_SCALES, ...) are injected by
+// src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -27,21 +30,21 @@ fn embedding(
   if (u32(global_id) >= podArgs.packGridDimX) { return; }
 
   let flat : i32 = global_id * 256 + i32(threadIdx.x);
-  // flat covers seq_len * 3072 elements
+  // flat covers seq_len * D elements
   // Each workgroup block covers 256 contiguous output elements
-  // 3072 / 256 = 12 blocks per token
+  // (D / 256 blocks per token)
 
-  let token_idx : i32 = flat / 3072;
+  let token_idx : i32 = flat / D;
   if (token_idx >= podArgs.seq_len) { return; }
 
-  let dim : i32 = flat % 3072;
+  let dim : i32 = flat % D;
   let token_id : i32 = input_ids[token_idx];
 
   // Dequantize: 8 nibbles per u32, group_size=32
-  let packed_idx : i32 = token_id * 384 + (dim / 8);  // 384 = 3072/8
+  let packed_idx : i32 = token_id * D_PACKED + (dim / 8);
   let nibble_idx : u32 = u32(dim % 8);
   let packed : u32 = weights[packed_idx];
-  let scale : f16 = scales[token_id * 96 + (dim / 32)]; // 96 = 3072/32
+  let scale : f16 = scales[token_id * D_SCALES + (dim / 32)]; // D_SCALES = D/32 scales per row
 
   let nibble : u32 = (packed >> (nibble_idx * 4u)) & 15u;
   output_buf[flat] = (f16(nibble) - 7.0h) * scale;

@@ -5,20 +5,27 @@
  * Reads MLC's ndarray-cache.json, fetches shard binaries with bounded
  * concurrency + retry/backoff, uploads to GPU as each shard arrives.
  *
- * Tiered cache: OPFS (versioned, persisted when granted) → browser Cache API
- * (populated by prior WebLLM sessions) → HuggingFace fetch.
+ * Tiered cache: OPFS (shared with the weight-cache service worker, persisted
+ * when granted) → browser Cache API (populated by prior WebLLM sessions) →
+ * HuggingFace fetch.
  */
 
 // ============================================================
-// Model URL + cache version
+// Model URL + cache dir
 // ============================================================
 
 export const PHI3_MODEL_BASE =
   'https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC/resolve/main/'
 
-/** Bump when the on-disk weight layout changes so stale OPFS dirs are abandoned. */
-const WEIGHTS_REV = 'phi3-q4f16_1-v1'
-const OPFS_DIR_NAME = `zero-tvm-weights-${WEIGHTS_REV}`
+/**
+ * Canonical shared OPFS dir for the Phi-3 weights. The weight-cache service
+ * worker pre-seeds this dir and compiler-chat / webllm-bench read it, so all
+ * pages download the ~1.8 GB once.
+ *
+ * KEEP IN SYNC with SHARED_DIR in public/weights-cache-sw.js — the SW is plain
+ * JS and cannot import this constant, so the two definitions are paired by hand.
+ */
+export const WEIGHTS_OPFS_DIR = 'zero-tvm-weights'
 
 /** Max concurrent shard fetches. HTTP/2 multiplexes fine but we don't want to
  *  hold ~2 GB of in-flight ArrayBuffers on low-RAM devices. */
@@ -93,20 +100,21 @@ async function openOPFS(): Promise<OpenedOPFS> {
       if (!persisted) persisted = await navigator.storage.persist?.() ?? false
     } catch { /* no-op */ }
     const root = await navigator.storage.getDirectory()
-    // Opportunistic cleanup of old revisions so stale weights don't hog quota.
+    // Opportunistic cleanup of old versioned dirs (`zero-tvm-weights-<rev>`)
+    // left behind by earlier loader revisions, so stale weights don't hog
+    // quota. The `-` in the prefix is load-bearing: it can never match the
+    // canonical shared dir the SW writes and other pages read.
     try {
       const stale: string[] = []
       for await (const [name, handle] of (root as unknown as AsyncIterable<[string, FileSystemHandle]>)) {
-        if (handle.kind === 'directory' &&
-            name.startsWith('zero-tvm-weights') &&
-            name !== OPFS_DIR_NAME) {
+        if (handle.kind === 'directory' && name.startsWith(`${WEIGHTS_OPFS_DIR}-`)) {
           stale.push(name)
         }
       }
       const remove = (root as unknown as { removeEntry(n: string, o?: { recursive: boolean }): Promise<void> })
       await Promise.all(stale.map((n) => remove.removeEntry(n, { recursive: true })))
     } catch { /* iteration unsupported or in-use — skip */ }
-    const dir = await root.getDirectoryHandle(OPFS_DIR_NAME, { create: true })
+    const dir = await root.getDirectoryHandle(WEIGHTS_OPFS_DIR, { create: true })
     return { dir, persisted }
   } catch {
     return { dir: null, persisted: false }
@@ -323,7 +331,7 @@ export async function loadWeights(
   onProgress?.('Loading ndarray-cache.json…')
   const { dir: opfs, persisted } = await openOPFS()
   onProgress?.(opfs
-    ? `OPFS ready (${OPFS_DIR_NAME}, ${persisted ? 'persistent' : 'best-effort'})`
+    ? `OPFS ready (${WEIGHTS_OPFS_DIR}, ${persisted ? 'persistent' : 'best-effort'})`
     : 'OPFS unavailable')
   const cacheStores = await openAllCacheStores()
   if (cacheStores.length > 0) onProgress?.(`Cache API: ${cacheStores.length} store(s) open`)

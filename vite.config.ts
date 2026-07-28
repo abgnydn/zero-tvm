@@ -18,6 +18,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
  * isn't primed.
  */
 function findMlcSnapshotDir(): string | null {
+  // Repo-local: where scripts/download-weights.mjs puts the snapshot.
+  const repoLocal = join(__dirname, 'public', 'weights', 'Phi-3-mini-4k-instruct-q4f16_1-MLC')
+  if (existsSync(join(repoLocal, 'ndarray-cache.json'))) return repoLocal
+
   // Preferred: a flat mirror dir populated via parallel curl (fastest to prime).
   const flatMirror = join(homedir(), 'mlc-weights', 'Phi-3-mini-4k-instruct-q4f16_1-MLC')
   if (existsSync(join(flatMirror, 'ndarray-cache.json'))) return flatMirror
@@ -100,9 +104,10 @@ export default defineConfig({
     },
   },
   build: {
-    // Deploy all user-facing entries. Dev-only pages (shaders, test-*,
-    // standalone-test) are intentionally excluded — they're in-repo for
-    // debugging and not linked from the main site.
+    // Deploy all user-facing entries, including the shader-inspection pages
+    // (dump, shaders) which README documents as part of the build. Dev-only
+    // pages (test-shaders, test-chain) are intentionally excluded — they're
+    // in-repo for debugging and not linked from the site.
     rollupOptions: {
       input: {
         index:         resolve(__dirname, 'index.html'),

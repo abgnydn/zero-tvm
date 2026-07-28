@@ -3,22 +3,27 @@
 // Replaces 2 TVM dispatches:
 //   fused_dequantize3_NT_matmul12_kernel (16384 workgroups, 64 threads)
 //   fused_split2_silu2_multiply2_kernel  (32 workgroups, 256 threads)
-// With: 8192 workgroups, 64 threads each
+// With: FFN_DIM workgroups, 64 threads each
 //
 // Weight layout (confirmed from TVM source):
-//   Rows 0..8191    = gate weights
-//   Rows 8192..16383 = up weights
+//   Rows 0..FFN_DIM-1          = gate weights
+//   Rows FFN_DIM..2*FFN_DIM-1  = up weights
 //   output[i] = SiLU(gate[i]) * up[i]
 //
-// CRITICAL: input and output are the SAME buffer (BUF#730 in decode).
-// We cache the 3072 f16 input in shared memory to avoid the race condition.
+// Input and output are separate buffers (compiler.ts binds hidden1 as input
+// and ffnOut as output; chat.ts / engine-core.ts do the same). The shared-
+// memory input cache below is purely a bandwidth optimization: load the D
+// f16 input once per workgroup instead of once per thread.
 //
 // Bindings (match TVM's matmul pattern):
-//   @binding(0): output  array<f16>  (read_write) — SiLU result, 8192 elements
-//   @binding(1): input   array<f16>  (read)       — normed hidden state, 3072 elements
+//   @binding(0): output  array<f16>  (read_write) — SiLU result, FFN_DIM elements
+//   @binding(1): input   array<f16>  (read)       — normed hidden state, D elements
 //   @binding(2): scales  array<f16>  (read)       — weight scales
 //   @binding(3): weights array<u32>  (read)       — int4 packed weights
 //   @binding(4): podArgs uniform     — {packGridDimX}
+//
+// Model-shape constants (D, D_PACKED, D_SCALES, FFN_DIM) are injected by
+// src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -30,10 +35,12 @@ enable f16;
 struct PODArgs { packGridDimX: u32 }
 @group(0) @binding(4) var<uniform> podArgs : PODArgs;
 
-// Cache input (3072 f16 = 6KB) + reduction buffers for gate and up
-var<workgroup> shared_input : array<f16, 3072>;
-var<workgroup> red_gate : array<f16, 64>;
-var<workgroup> red_up : array<f16, 64>;
+// Cache input (D f16 = 6KB) + reduction buffers for gate and up.
+// Reductions accumulate in f32 (see int4_matmul.gen.ts) — f16 accumulation
+// over a K=D dot product loses too much precision.
+var<workgroup> shared_input : array<f16, D>;
+var<workgroup> red_gate : array<f32, 64>;
+var<workgroup> red_up : array<f32, 64>;
 
 @compute @workgroup_size(64, 1, 1)
 fn fused_ffn_kernel(
@@ -41,57 +48,60 @@ fn fused_ffn_kernel(
   @builtin(num_workgroups) gridDim : vec3<u32>,
   @builtin(local_invocation_id) threadIdx : vec3<u32>
 ) {
-  if (blockIdx.z * gridDim.x + blockIdx.x > podArgs.packGridDimX) { return; }
+  if (blockIdx.z * gridDim.x + blockIdx.x >= podArgs.packGridDimX) { return; }
   let output_idx : i32 = i32(blockIdx.z * gridDim.x + blockIdx.x);
 
-  // Phase 1: Cooperatively load input into shared memory (48 elements per thread)
-  for (var i : u32 = 0u; i < 48u; i = i + 1u) {
-    let idx : u32 = threadIdx.x * 48u + i;
-    if (idx < 3072u) {
+  // Phase 1: Cooperatively load input into shared memory (D/64 elements per thread)
+  for (var i : u32 = 0u; i < D / 64u; i = i + 1u) {
+    let idx : u32 = threadIdx.x * (D / 64u) + i;
+    if (idx < D) {
       shared_input[idx] = input_buf[idx];
     }
   }
   workgroupBarrier();
 
-  // Phase 2: Dual dot product — gate (row i) and up (row i+8192)
+  // Phase 2: Dual dot product — gate (row i) and up (row i+FFN_DIM)
   let gate_row : i32 = output_idx;
-  let up_row : i32 = output_idx + 8192i;
-  let D_PACKED : i32 = 384i;       // 3072 / 8
-  let SCALES_PER_ROW : i32 = 96i;  // 3072 / 32
+  let up_row : i32 = output_idx + FFN_DIM;
 
-  var gate_acc : f16 = 0.000000e+00h;
-  var up_acc : f16 = 0.000000e+00h;
+  var gate_acc : f32 = 0.0;
+  var up_acc : f32 = 0.0;
 
-  // 6 chunks × 64 threads × 8 nibbles = 3072 elements (matches TVM's unrolled structure)
-  for (var chunk : i32 = 0i; chunk < 6i; chunk = chunk + 1i) {
+  // D_PACKED/64 chunks × 64 threads × 8 nibbles = D elements (matches TVM's
+  // unrolled structure). The per-group scale is factored out of the 8 terms.
+  for (var chunk : i32 = 0i; chunk < D_PACKED / 64; chunk = chunk + 1i) {
     let w_offset : i32 = i32(threadIdx.x) + chunk * 64i;
 
     let gate_packed : u32 = weights[gate_row * D_PACKED + w_offset];
-    let gate_scale : f16 = scales[gate_row * SCALES_PER_ROW + (w_offset >> 2u)];
+    let gate_scale : f32 = f32(scales[gate_row * D_SCALES + (w_offset >> 2u)]);
 
     let up_packed : u32 = weights[up_row * D_PACKED + w_offset];
-    let up_scale : f16 = scales[up_row * SCALES_PER_ROW + (w_offset >> 2u)];
+    let up_scale : f32 = f32(scales[up_row * D_SCALES + (w_offset >> 2u)]);
 
     let base : i32 = w_offset * 8i;
 
     // Unpack 8 int4 values, accumulate both gate and up using shared_input
-    gate_acc = fma(shared_input[base],     (f16(((gate_packed >>  0u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
-    gate_acc = fma(shared_input[base + 1], (f16(((gate_packed >>  4u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
-    gate_acc = fma(shared_input[base + 2], (f16(((gate_packed >>  8u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
-    gate_acc = fma(shared_input[base + 3], (f16(((gate_packed >> 12u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
-    gate_acc = fma(shared_input[base + 4], (f16(((gate_packed >> 16u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
-    gate_acc = fma(shared_input[base + 5], (f16(((gate_packed >> 20u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
-    gate_acc = fma(shared_input[base + 6], (f16(((gate_packed >> 24u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
-    gate_acc = fma(shared_input[base + 7], (f16(((gate_packed >> 28u) & 15u)) - 7.000000e+00h) * gate_scale, gate_acc);
+    gate_acc = fma(gate_scale,
+        f32(shared_input[base])     * (f32((gate_packed >>  0u) & 15u) - 7.0)
+      + f32(shared_input[base + 1]) * (f32((gate_packed >>  4u) & 15u) - 7.0)
+      + f32(shared_input[base + 2]) * (f32((gate_packed >>  8u) & 15u) - 7.0)
+      + f32(shared_input[base + 3]) * (f32((gate_packed >> 12u) & 15u) - 7.0)
+      + f32(shared_input[base + 4]) * (f32((gate_packed >> 16u) & 15u) - 7.0)
+      + f32(shared_input[base + 5]) * (f32((gate_packed >> 20u) & 15u) - 7.0)
+      + f32(shared_input[base + 6]) * (f32((gate_packed >> 24u) & 15u) - 7.0)
+      + f32(shared_input[base + 7]) * (f32((gate_packed >> 28u) & 15u) - 7.0),
+      gate_acc);
 
-    up_acc = fma(shared_input[base],     (f16(((up_packed >>  0u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
-    up_acc = fma(shared_input[base + 1], (f16(((up_packed >>  4u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
-    up_acc = fma(shared_input[base + 2], (f16(((up_packed >>  8u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
-    up_acc = fma(shared_input[base + 3], (f16(((up_packed >> 12u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
-    up_acc = fma(shared_input[base + 4], (f16(((up_packed >> 16u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
-    up_acc = fma(shared_input[base + 5], (f16(((up_packed >> 20u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
-    up_acc = fma(shared_input[base + 6], (f16(((up_packed >> 24u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
-    up_acc = fma(shared_input[base + 7], (f16(((up_packed >> 28u) & 15u)) - 7.000000e+00h) * up_scale, up_acc);
+    up_acc = fma(up_scale,
+        f32(shared_input[base])     * (f32((up_packed >>  0u) & 15u) - 7.0)
+      + f32(shared_input[base + 1]) * (f32((up_packed >>  4u) & 15u) - 7.0)
+      + f32(shared_input[base + 2]) * (f32((up_packed >>  8u) & 15u) - 7.0)
+      + f32(shared_input[base + 3]) * (f32((up_packed >> 12u) & 15u) - 7.0)
+      + f32(shared_input[base + 4]) * (f32((up_packed >> 16u) & 15u) - 7.0)
+      + f32(shared_input[base + 5]) * (f32((up_packed >> 20u) & 15u) - 7.0)
+      + f32(shared_input[base + 6]) * (f32((up_packed >> 24u) & 15u) - 7.0)
+      + f32(shared_input[base + 7]) * (f32((up_packed >> 28u) & 15u) - 7.0),
+      up_acc);
   }
 
   // Phase 3: Tree reduction (64 → 1) for both gate and up
@@ -112,11 +122,12 @@ fn fused_ffn_kernel(
   if (threadIdx.x < 1u) { red_gate[threadIdx.x] = red_gate[threadIdx.x] + red_gate[threadIdx.x + 1u]; red_up[threadIdx.x] = red_up[threadIdx.x] + red_up[threadIdx.x + 1u]; }
   workgroupBarrier();
 
-  // Phase 4: SiLU(gate) * up — matches TVM's formula exactly
+  // Phase 4: SiLU(gate) * up — matches TVM's formula exactly.
+  // Everything stays f32; the only f16 rounding is the final store.
   if (threadIdx.x == 0u) {
-    let gate_val : f32 = f32(red_gate[0]);
-    let up_val : f16 = red_up[0];
-    let silu_gate : f16 = f16(gate_val * (1.0 / (1.0 + exp(-gate_val))));
-    output_buf[output_idx] = up_val * silu_gate;
+    let gate_val : f32 = red_gate[0];
+    let up_val : f32 = red_up[0];
+    let silu_gate : f32 = gate_val * (1.0 / (1.0 + exp(-gate_val)));
+    output_buf[output_idx] = f16(up_val * silu_gate);
   }
 }

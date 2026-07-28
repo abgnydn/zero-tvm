@@ -18,21 +18,42 @@ import gpu from '@kmamal/gpu'
 export const BU = gpu.GPUBufferUsage
 export const MM = gpu.GPUMapMode
 
-/** Request a Dawn device, opting into shader-f16 when the adapter has it. */
+/** Request a Dawn device, opting into shader-f16 and subgroups when the
+ *  adapter has them. `subgroups` is what the engine's `_sg` shader variants
+ *  need; lavapipe in CI may lack it, so callers must gate on the flag. */
 export async function getDevice() {
   const instance = gpu.create(['enable-dawn-features=allow_unsafe_apis'])
   const adapter = await instance.requestAdapter()
   if (!adapter) throw new Error('no WebGPU adapter (is a Vulkan ICD visible?)')
   const features = new Set(adapter.features)
   const f16 = features.has('shader-f16')
-  const device = await adapter.requestDevice({
-    requiredFeatures: f16 ? ['shader-f16'] : [],
-  })
+  const subgroups = features.has('subgroups')
+  const requiredFeatures = []
+  if (f16) requiredFeatures.push('shader-f16')
+  if (subgroups) requiredFeatures.push('subgroups')
+  const device = await adapter.requestDevice({ requiredFeatures })
   let lastError = null
   device.addEventListener?.('uncapturederror', (e) => {
     lastError = e.error?.message ?? String(e.error)
   })
-  return { device, info: adapter.info ?? {}, f16, getLastError: () => lastError }
+  return { device, info: adapter.info ?? {}, f16, subgroups, getLastError: () => lastError }
+}
+
+/** Actual subgroup size, probed on-device: the `_sg` kernels hard-assume 32
+ *  lanes (see e.g. qkv_fused_sg.wgsl), and adapters are allowed to pick any
+ *  power of two — so we ask the hardware rather than trusting a constant. */
+export async function probeSubgroupSize(device) {
+  const probeWgsl = `
+    enable subgroups;
+    @group(0) @binding(0) var<storage, read_write> out : array<u32>;
+    @compute @workgroup_size(32, 1, 1)
+    fn probe(@builtin(subgroup_size) sg : u32, @builtin(local_invocation_id) tid : vec3<u32>) {
+      if (tid.x == 0u) { out[0] = sg; }
+    }`
+  const pipe = pipelineFor(device, probeWgsl, 'probe')
+  const out = device.createBuffer({ size: 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const bytes = await runCompute(device, pipe, [out], [1], 0, 4)
+  return new Uint32Array(bytes)[0]
 }
 
 /** Create a buffer pre-filled with a typed array. */

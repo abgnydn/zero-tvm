@@ -1,13 +1,20 @@
 // ROPE — Rotary Position Embedding + QKV split.
 //
-// Input: QKV projection output [9216 f16] = Q[3072] + K[3072] + V[3072]
-// Output: Q buffer [3072], K buffer [3072], V buffer [3072]
+// PREFILL-ONLY: the decode path fuses this into qkv_fused.wgsl (QKV matmul +
+// RoPE + KV append in one dispatch); this kernel is kept for the sequential
+// prefill path and for parity testing.
+//
+// Input: QKV projection output [QKV_DIM f16] = Q[D] + K[D] + V[D]
+// Output: Q buffer [D], K buffer [D], V buffer [D]
 //
 // Q and K get RoPE applied (sin/cos rotation of pairs).
 // V is just copied.
 //
-// head_dim=96, so rotation pairs are at distance 48.
-// theta = position / (10000 ^ (2i/96))
+// Rotation pairs are at distance HALF_HEAD_DIM within each head.
+// theta = position / (10000 ^ (2i/HEAD_DIM))
+//
+// Model-shape constants (D, QKV_DIM, HEADS, HEAD_DIM, HALF_HEAD_DIM) are
+// injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -34,60 +41,61 @@ fn rope_kernel(
   let global_id : i32 = i32(blockIdx.z * gridDim.x + blockIdx.x);
   if (u32(global_id) >= podArgs.packGridDimX) { return; }
 
-  // Decompose: global_id covers seq_len * 36 workgroups
-  // 36 = 32 Q heads * 96/256 + ... = (32+32+32) heads * 96 / 256
-  // Simpler: each element is one f16 in the QKV tensor
+  // Decompose: global_id covers seq_len * (QKV_DIM / 256) workgroups.
+  // Each element is one f16 in the QKV tensor.
   let tid : i32 = i32(threadIdx.x);
   let flat : i32 = global_id * 256 + tid;
 
-  let seq_idx : i32 = flat / 9216;
-  let within : i32 = flat % 9216;
+  let seq_idx : i32 = flat / QKV_DIM;
+  let within : i32 = flat % QKV_DIM;
 
-  let head_idx : i32 = within / 96;
-  let dim_idx : i32 = within % 96;
+  // head_idx runs over 3 * HEADS stacked heads: Q [0, HEADS), K [HEADS,
+  // 2*HEADS), V [2*HEADS, 3*HEADS).
+  let head_idx : i32 = within / HEAD_DIM;
+  let dim_idx : i32 = within % HEAD_DIM;
 
   let qkv_val : f16 = qkv[flat];
 
-  if (head_idx < 32) {
+  if (head_idx < HEADS) {
     // Q head — apply RoPE
     var out_val : f16 = qkv_val;
     if (podArgs.apply_rope != 0) {
       let pos : f32 = f32(position_map[seq_idx + podArgs.position_map_elem_offset]);
-      let freq : f32 = pos / pow(10000.0, f32(((dim_idx % 48) * 2)) / 96.0);
+      let freq : f32 = pos / pow(10000.0, f32((dim_idx % HALF_HEAD_DIM) * 2) / f32(HEAD_DIM));
       let cos_f : f32 = cos(freq);
       let sin_f : f32 = sin(freq);
 
       var pair_val : f16;
-      if (dim_idx < 48) {
-        pair_val = qkv[seq_idx * 9216 + head_idx * 96 + dim_idx + 48] * -1.0h;
+      if (dim_idx < HALF_HEAD_DIM) {
+        pair_val = qkv[seq_idx * QKV_DIM + head_idx * HEAD_DIM + dim_idx + HALF_HEAD_DIM] * -1.0h;
       } else {
-        pair_val = qkv[seq_idx * 9216 + head_idx * 96 + dim_idx - 48];
+        pair_val = qkv[seq_idx * QKV_DIM + head_idx * HEAD_DIM + dim_idx - HALF_HEAD_DIM];
       }
       out_val = f16(cos_f * f32(qkv_val) + sin_f * f32(pair_val));
     }
-    q_out[seq_idx * 3072 + head_idx * 96 + dim_idx] = out_val;
-  } else if (head_idx < 64) {
+    q_out[seq_idx * D + head_idx * HEAD_DIM + dim_idx] = out_val;
+  } else if (head_idx < 2 * HEADS) {
     // K head — apply RoPE
-    let k_head : i32 = head_idx - 32;
+    let k_head : i32 = head_idx - HEADS;
     var out_val : f16 = qkv_val;
     if (podArgs.apply_rope != 0) {
       let pos : f32 = f32(position_map[seq_idx + podArgs.position_map_elem_offset]);
-      let freq : f32 = pos / pow(10000.0, f32(((dim_idx % 48) * 2)) / 96.0);
+      let freq : f32 = pos / pow(10000.0, f32((dim_idx % HALF_HEAD_DIM) * 2) / f32(HEAD_DIM));
       let cos_f : f32 = cos(freq);
       let sin_f : f32 = sin(freq);
 
       var pair_val : f16;
-      if (dim_idx < 48) {
-        pair_val = qkv[seq_idx * 9216 + head_idx * 96 + dim_idx + 48] * -1.0h;
+      if (dim_idx < HALF_HEAD_DIM) {
+        pair_val = qkv[seq_idx * QKV_DIM + head_idx * HEAD_DIM + dim_idx + HALF_HEAD_DIM] * -1.0h;
       } else {
-        pair_val = qkv[seq_idx * 9216 + head_idx * 96 + dim_idx - 48];
+        pair_val = qkv[seq_idx * QKV_DIM + head_idx * HEAD_DIM + dim_idx - HALF_HEAD_DIM];
       }
       out_val = f16(cos_f * f32(qkv_val) + sin_f * f32(pair_val));
     }
-    k_out[seq_idx * 3072 + k_head * 96 + dim_idx] = out_val;
+    k_out[seq_idx * D + k_head * HEAD_DIM + dim_idx] = out_val;
   } else {
     // V head — just copy
-    let v_head : i32 = head_idx - 64;
-    v_out[seq_idx * 3072 + v_head * 96 + dim_idx] = qkv_val;
+    let v_head : i32 = head_idx - 2 * HEADS;
+    v_out[seq_idx * D + v_head * HEAD_DIM + dim_idx] = qkv_val;
   }
 }

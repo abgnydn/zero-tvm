@@ -1,20 +1,24 @@
 import { defineConfig } from 'vitest/config'
 
-// Vitest is used here exclusively as a runner for Puppeteer-driven e2e tests
-// (see tests/e2e). There are no unit tests in this repo — the model is too
-// stateful to test in isolation, and the per-shader correctness harness lives
-// in test-shaders.html. The e2e tests boot a real Vite dev server, launch real
-// Chrome with WebGPU, and exercise the full chat + validate pages.
+// Vitest runs two very different suites:
+//   tests/tokenizer — offline unit tests for the hand-rolled BPE tokenizer,
+//                     pinned against HuggingFace-generated fixtures
+//                     (`npm run test:unit`).
+//   tests/e2e       — Puppeteer-driven e2e tests that boot a real Vite dev
+//                     server + Chrome with WebGPU and exercise the full
+//                     chat + validate pages (`npm run test:e2e`).
+// Per-kernel GPU correctness lives outside vitest in tests/kernels
+// (`npm run test:kernels`).
 export default defineConfig({
   test: {
-    include: ['tests/e2e/**/*.test.ts'],
-    // First run downloads ~2GB of Phi-3 weights from HuggingFace into the
+    include: ['tests/tokenizer/**/*.test.ts', 'tests/e2e/**/*.test.ts'],
+    // First e2e run downloads ~2GB of Phi-3 weights from HuggingFace into the
     // test browser profile. Subsequent runs use the cached profile and finish
-    // in well under a minute.
+    // in well under a minute. (The tokenizer unit tests finish in seconds.)
     testTimeout: 6 * 60 * 1000,
     hookTimeout: 6 * 60 * 1000,
-    // The tests share a single browser + dev server, so they cannot run in
-    // parallel against each other.
+    // The e2e tests share a single browser + dev server, so they cannot run
+    // in parallel against each other.
     fileParallelism: false,
     sequence: { concurrent: false },
     // Print console.log from tests so cold-start timings are visible in the

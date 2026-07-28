@@ -7,6 +7,8 @@
 // single workgroupBarrier + lane-0 finalisation.
 //
 // Requires sg_size = 32 (gated in chat.ts).
+//
+// Model-shape constants are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 enable subgroups;
@@ -24,9 +26,6 @@ struct PODArgs {
   packGridDimX             : u32,
 }
 @group(0) @binding(6) var<uniform> podArgs : PODArgs;
-
-const K_PACKED       : i32 = 384;
-const SCALES_PER_ROW : i32 = 96;
 
 // Two subgroups per workgroup (64 threads / 32 lanes). Store per-subgroup
 // partial sums so lane 0 can finalise.
@@ -46,23 +45,24 @@ fn qkv_fused_sg(
 
   let tid : i32 = i32(threadIdx.x);
 
-  let group         : i32 = pair_idx / 1536;
-  let pair_in_group : i32 = pair_idx - group * 1536;
-  let head          : i32 = pair_in_group / 48;
-  let dim_lo        : i32 = pair_in_group - head * 48;
+  let group         : i32 = pair_idx / QKV_GROUP_PAIRS;
+  let pair_in_group : i32 = pair_idx - group * QKV_GROUP_PAIRS;
+  let head          : i32 = pair_in_group / HALF_HEAD_DIM;
+  let dim_lo        : i32 = pair_in_group - head * HALF_HEAD_DIM;
 
-  let row_lo : i32 = group * 3072 + head * 96 + dim_lo;
-  let row_hi : i32 = row_lo + 48;
+  let row_lo : i32 = group * D + head * HEAD_DIM + dim_lo;
+  let row_hi : i32 = row_lo + HALF_HEAD_DIM;
 
   var acc0 : f32 = 0.0;
   var acc1 : f32 = 0.0;
 
-  for (var chunk : i32 = 0; chunk < K_PACKED / 64; chunk = chunk + 1) {
+  // Per-group scale factored out of the 8 unpacked terms.
+  for (var chunk : i32 = 0; chunk < D_PACKED / 64; chunk = chunk + 1) {
     let w_offset : i32 = tid + chunk * 64;
-    let packed_lo : u32 = weights[row_lo * K_PACKED + w_offset];
-    let packed_hi : u32 = weights[row_hi * K_PACKED + w_offset];
-    let scale_lo : f32 = f32(scales[row_lo * SCALES_PER_ROW + (w_offset >> 2)]);
-    let scale_hi : f32 = f32(scales[row_hi * SCALES_PER_ROW + (w_offset >> 2)]);
+    let packed_lo : u32 = weights[row_lo * D_PACKED + w_offset];
+    let packed_hi : u32 = weights[row_hi * D_PACKED + w_offset];
+    let scale_lo : f32 = f32(scales[row_lo * D_SCALES + (w_offset >> 2)]);
+    let scale_hi : f32 = f32(scales[row_hi * D_SCALES + (w_offset >> 2)]);
     let base : i32 = w_offset * 8;
 
     let x0 = f32(hidden[base    ]);
@@ -74,23 +74,25 @@ fn qkv_fused_sg(
     let x6 = f32(hidden[base + 6]);
     let x7 = f32(hidden[base + 7]);
 
-    acc0 = acc0 + x0 * (f32((packed_lo >>  0u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x1 * (f32((packed_lo >>  4u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x2 * (f32((packed_lo >>  8u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x3 * (f32((packed_lo >> 12u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x4 * (f32((packed_lo >> 16u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x5 * (f32((packed_lo >> 20u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x6 * (f32((packed_lo >> 24u) & 15u) - 7.0) * scale_lo;
-    acc0 = acc0 + x7 * (f32((packed_lo >> 28u) & 15u) - 7.0) * scale_lo;
+    acc0 = acc0 + scale_lo * (
+        x0 * (f32((packed_lo >>  0u) & 15u) - 7.0)
+      + x1 * (f32((packed_lo >>  4u) & 15u) - 7.0)
+      + x2 * (f32((packed_lo >>  8u) & 15u) - 7.0)
+      + x3 * (f32((packed_lo >> 12u) & 15u) - 7.0)
+      + x4 * (f32((packed_lo >> 16u) & 15u) - 7.0)
+      + x5 * (f32((packed_lo >> 20u) & 15u) - 7.0)
+      + x6 * (f32((packed_lo >> 24u) & 15u) - 7.0)
+      + x7 * (f32((packed_lo >> 28u) & 15u) - 7.0));
 
-    acc1 = acc1 + x0 * (f32((packed_hi >>  0u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x1 * (f32((packed_hi >>  4u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x2 * (f32((packed_hi >>  8u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x3 * (f32((packed_hi >> 12u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x4 * (f32((packed_hi >> 16u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x5 * (f32((packed_hi >> 20u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x6 * (f32((packed_hi >> 24u) & 15u) - 7.0) * scale_hi;
-    acc1 = acc1 + x7 * (f32((packed_hi >> 28u) & 15u) - 7.0) * scale_hi;
+    acc1 = acc1 + scale_hi * (
+        x0 * (f32((packed_hi >>  0u) & 15u) - 7.0)
+      + x1 * (f32((packed_hi >>  4u) & 15u) - 7.0)
+      + x2 * (f32((packed_hi >>  8u) & 15u) - 7.0)
+      + x3 * (f32((packed_hi >> 12u) & 15u) - 7.0)
+      + x4 * (f32((packed_hi >> 16u) & 15u) - 7.0)
+      + x5 * (f32((packed_hi >> 20u) & 15u) - 7.0)
+      + x6 * (f32((packed_hi >> 24u) & 15u) - 7.0)
+      + x7 * (f32((packed_hi >> 28u) & 15u) - 7.0));
   }
 
   // One subgroup-wide add per accumulator (all 32 lanes hold the same sum).
@@ -111,17 +113,17 @@ fn qkv_fused_sg(
 
   if (group == 2) {
     let position : i32 = position_map[podArgs.position_map_elem_offset];
-    let page_no : i32 = position / 16;
-    let slot : i32 = position - page_no * 16;
-    let v_base : i32 = page_no * 98304 + head * 1536 + slot * 96 + 49152
-                       + podArgs.pages_elem_offset;
-    kv_pages[v_base + dim_lo]      = f16(v_lo);
-    kv_pages[v_base + dim_lo + 48] = f16(v_hi);
+    let page_no : i32 = position / PAGE_SIZE;
+    let slot : i32 = position - page_no * PAGE_SIZE;
+    let v_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
+                       + V_PAGE_OFFSET + podArgs.pages_elem_offset;
+    kv_pages[v_base + dim_lo]                 = f16(v_lo);
+    kv_pages[v_base + dim_lo + HALF_HEAD_DIM] = f16(v_hi);
     return;
   }
 
   let pos  : f32 = f32(position_map[podArgs.position_map_elem_offset]);
-  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / 96.0);
+  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / f32(HEAD_DIM));
   let c    : f32 = cos(freq);
   let s    : f32 = sin(freq);
 
@@ -129,16 +131,16 @@ fn qkv_fused_sg(
   let rot_hi : f32 = c * v_hi + s * ( v_lo);
 
   if (group == 0) {
-    let base = head * 96 + dim_lo;
-    q_out[base     ] = f16(rot_lo);
-    q_out[base + 48] = f16(rot_hi);
+    let base = head * HEAD_DIM + dim_lo;
+    q_out[base                ] = f16(rot_lo);
+    q_out[base + HALF_HEAD_DIM] = f16(rot_hi);
   } else {
     let position : i32 = position_map[podArgs.position_map_elem_offset];
-    let page_no : i32 = position / 16;
-    let slot : i32 = position - page_no * 16;
-    let k_base : i32 = page_no * 98304 + head * 1536 + slot * 96
+    let page_no : i32 = position / PAGE_SIZE;
+    let slot : i32 = position - page_no * PAGE_SIZE;
+    let k_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
                        + podArgs.pages_elem_offset;
-    kv_pages[k_base + dim_lo]      = f16(rot_lo);
-    kv_pages[k_base + dim_lo + 48] = f16(rot_hi);
+    kv_pages[k_base + dim_lo]                 = f16(rot_lo);
+    kv_pages[k_base + dim_lo + HALF_HEAD_DIM] = f16(rot_hi);
   }
 }

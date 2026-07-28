@@ -5,11 +5,14 @@
 // accuracy close to f16.
 //
 // Layout of pages_i8 (u32 words; 4 int8 per u32):
-//   word_idx = page_no * (32*16*2*24) + head * (16*2*24)
-//            + slot * (2*24) + side * 24 + (dim/4)
+//   word_idx = page_no * KV_I8_PAGE_WORDS + head * KV_I8_HEAD_WORDS
+//            + slot * KV_I8_SLOT_WORDS + side * KV_I8_ROW_WORDS + (dim/4)
 //
 // Layout of scales (f16):
-//   scale_idx = page_no * (32*16*2) + head * (16*2) + slot * 2 + side
+//   scale_idx = page_no * KV_SCALES_PER_PAGE + head * KV_SCALES_PER_HEAD
+//             + slot * KV_SCALES_PER_SLOT + side
+//
+// Model-shape constants are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -55,10 +58,10 @@ fn attention_int8(
 
   if (batch >= podArgs.B) { return; }
 
-  // Each thread owns 3 elements of head_dim=96.
-  var q0 : f32 = f32(Q[batch * 3072 + head * 96 + tid * 3]);
-  var q1 : f32 = f32(Q[batch * 3072 + head * 96 + tid * 3 + 1]);
-  var q2 : f32 = f32(Q[batch * 3072 + head * 96 + tid * 3 + 2]);
+  // Each thread owns 3 elements of HEAD_DIM (32 threads × 3 = HEAD_DIM).
+  var q0 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]);
+  var q1 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1]);
+  var q2 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2]);
 
   let indptr_begin : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset];
   let indptr_end   : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset + 1];
@@ -70,10 +73,10 @@ fn attention_int8(
   var o1 : f32 = 0.0;
   var o2 : f32 = 0.0;
 
-  // tid * 3 in [0, 96). The 3 dims span either 1 u32 word (aligned) or
+  // tid * 3 in [0, HEAD_DIM). The 3 dims span either 1 u32 word (aligned) or
   // straddle 2 words. Precompute byte layout:
-  let byte_0 : i32 = tid * 3;                 // 0..95
-  let word_0 : i32 = byte_0 / 4;              // 0..23
+  let byte_0 : i32 = tid * 3;                 // 0..HEAD_DIM-1
+  let word_0 : i32 = byte_0 / 4;              // 0..KV_I8_ROW_WORDS-1
   let lane_0 : u32 = u32(byte_0 - word_0 * 4);
   let word_1 : i32 = (byte_0 + 1) / 4;
   let lane_1 : u32 = u32((byte_0 + 1) - word_1 * 4);
@@ -82,32 +85,32 @@ fn attention_int8(
 
   for (var page_idx : i32 = indptr_begin; page_idx < indptr_end; page_idx = page_idx + 1) {
     let page_no : i32 = page_table_values[page_idx + podArgs.page_values_elem_offset];
-    let page_start : i32 = (page_idx - indptr_begin) * 16;
-    let slots_in_page : i32 = min(16, kv_len - page_start);
+    let page_start : i32 = (page_idx - indptr_begin) * PAGE_SIZE;
+    let slots_in_page : i32 = min(PAGE_SIZE, kv_len - page_start);
 
     for (var slot : i32 = 0; slot < slots_in_page; slot = slot + 1) {
       // Base word indices for K and V within this (page, head, slot).
-      let kv_word_base : i32 = page_no * (32 * 16 * 2 * 24)
-                             + head * (16 * 2 * 24)
-                             + slot * (2 * 24)
+      let kv_word_base : i32 = page_no * KV_I8_PAGE_WORDS
+                             + head * KV_I8_HEAD_WORDS
+                             + slot * KV_I8_SLOT_WORDS
                              + podArgs.pages_elem_offset;
-      let k_word_base : i32 = kv_word_base;          // side=0
-      let v_word_base : i32 = kv_word_base + 24;     // side=1
+      let k_word_base : i32 = kv_word_base;                    // side=0
+      let v_word_base : i32 = kv_word_base + KV_I8_ROW_WORDS;  // side=1
 
       // Per-(head, slot, side) scales.
-      let scale_base : i32 = page_no * (32 * 16 * 2)
-                           + head * (16 * 2)
-                           + slot * 2
+      let scale_base : i32 = page_no * KV_SCALES_PER_PAGE
+                           + head * KV_SCALES_PER_HEAD
+                           + slot * KV_SCALES_PER_SLOT
                            + podArgs.scales_elem_offset;
       let k_scale : f32 = f32(scales[scale_base]);
       let v_scale : f32 = f32(scales[scale_base + 1]);
 
-      // K dequant: read 3 int8 values, multiply by k_scale.
-      let k0 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_0], lane_0)) * k_scale;
-      let k1 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_1], lane_1)) * k_scale;
-      let k2 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_2], lane_2)) * k_scale;
+      // K dequant: read 3 int8 values; k_scale factored out of the dot.
+      let k0 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_0], lane_0));
+      let k1 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_1], lane_1));
+      let k2 : f32 = f32(unpack_i8(pages_i8[k_word_base + word_2], lane_2));
 
-      let partial : f32 = q0 * k0 + q1 * k1 + q2 * k2;
+      let partial : f32 = (q0 * k0 + q1 * k1 + q2 * k2) * k_scale;
 
       score_reduce[tid] = partial;
       workgroupBarrier();
@@ -123,6 +126,9 @@ fn attention_int8(
       workgroupBarrier();
 
       let s : f32 = score_reduce[0] * podArgs.sm_scale;
+      // All threads must finish reading score_reduce[0] before the next slot
+      // iteration overwrites score_reduce[tid] (see attention.wgsl).
+      workgroupBarrier();
 
       let m_prev : f32 = m;
       m = max(m, s);
@@ -131,21 +137,22 @@ fn attention_int8(
 
       d = d * scale_prev + scale_new;
 
-      // V dequant + online softmax accumulate.
-      let vv0 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_0], lane_0)) * v_scale;
-      let vv1 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_1], lane_1)) * v_scale;
-      let vv2 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_2], lane_2)) * v_scale;
+      // V dequant + online softmax accumulate; hoist scale_new * v_scale.
+      let sv : f32 = scale_new * v_scale;
+      let vv0 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_0], lane_0));
+      let vv1 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_1], lane_1));
+      let vv2 : f32 = f32(unpack_i8(pages_i8[v_word_base + word_2], lane_2));
 
-      o0 = o0 * scale_prev + scale_new * vv0;
-      o1 = o1 * scale_prev + scale_new * vv1;
-      o2 = o2 * scale_prev + scale_new * vv2;
+      o0 = o0 * scale_prev + sv * vv0;
+      o1 = o1 * scale_prev + sv * vv1;
+      o2 = o2 * scale_prev + sv * vv2;
     }
   }
 
   if (d > 0.0) {
     let inv_d : f32 = 1.0 / d;
-    output_buf[batch * 3072 + head * 96 + tid * 3]     = f16(o0 * inv_d);
-    output_buf[batch * 3072 + head * 96 + tid * 3 + 1] = f16(o1 * inv_d);
-    output_buf[batch * 3072 + head * 96 + tid * 3 + 2] = f16(o2 * inv_d);
+    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]     = f16(o0 * inv_d);
+    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1] = f16(o1 * inv_d);
+    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2] = f16(o2 * inv_d);
   }
 }

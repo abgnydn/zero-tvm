@@ -500,7 +500,7 @@
   <p class="lead">
     A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
     10 hand-written WGSL kernel roles (27 files, 3,078 LOC), a BPE tokenizer, and raw WebGPU.
-    ~40 tok/s on M2 Pro, 22% behind WebLLM's TVM-autotuned 85 kernels on identical weights.
+    66.3 tok/s on M2 Max — ~28% faster than WebLLM's TVM-autotuned 85 kernels on identical weights, same run.
   </p>
 
   <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
@@ -551,7 +551,7 @@
     <div class="step-line"><div class="step-dot">3</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Chat</h5>
-      <p>Phi-3-mini runs at ~40 tok/s on M2 Pro (vs ~51 tok/s WebLLM on identical weights). Your conversation never leaves the browser. No API calls during inference.</p>
+      <p>Phi-3-mini runs at ~66 tok/s on M2 Max (vs ~52 tok/s WebLLM on identical weights, same run). Your conversation never leaves the browser. No API calls during inference.</p>
     </div>
   </div>
   <div class="step-row">
@@ -1101,33 +1101,33 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <!-- VS WEBLLM -->
 <h2 id="vs-webllm">vs WebLLM</h2>
 
-<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same browser (Chrome with WebGPU), Apple M2 Pro:</p>
+<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same run, same browser (Chrome 150 with WebGPU), Apple M2 Max, 2026-07-25 — <code>npm run bench</code>, 128 decode tokens × 5 runs, median:</p>
 
 <table>
   <thead><tr><th></th><th>Zero-TVM</th><th>WebLLM</th></tr></thead>
   <tbody>
-    <tr><td>Decode speed</td><td>~40 tok/s</td><td>~51 tok/s</td></tr>
-    <tr><td>Gap</td><td colspan="2">Zero-TVM is 22% behind WebLLM</td></tr>
+    <tr><td>Decode speed</td><td>66.33 tok/s</td><td>51.98 tok/s</td></tr>
+    <tr><td>Gap</td><td colspan="2">Zero-TVM is ~28% faster than WebLLM</td></tr>
     <tr><td>Dispatches / token</td><td>228 (260 with <code>?int8kv=1</code>)</td><td>342</td></tr>
     <tr><td>Distinct shaders</td><td>10 kernel roles · 27 .wgsl files · 3,078 LOC</td><td>85 TVM-generated shaders · 12,962 LOC</td></tr>
     <tr><td>Shipped JS bundle</td><td>157 kB / 33 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (<code>compiler-chat.html</code>)</td></tr>
-    <tr><td>Bandwidth utilization</td><td>~36% of 111 tok/s ceiling</td><td>~46% of same ceiling</td></tr>
+    <tr><td>Bandwidth utilization</td><td>~30% of 222 tok/s ceiling</td><td>~23% of same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
     <tr><td>Readable kernels?</td><td>✓ Yes — all 27 .wgsl files in repo</td><td>✗ No — emitted by the TVM compiler</td></tr>
   </tbody>
 </table>
 
-<h3>Where the 22% gap comes from</h3>
-<p>At ~40 tok/s Zero-TVM already wins on dispatch overhead (228 vs 342 submissions per token). The remaining gap is inside the matmul and attention kernels themselves:</p>
+<h3>How the result flipped (22% behind &rarr; ~28% ahead)</h3>
+<p>An earlier head-to-head (M2 Pro, 2026-06) read 42.14 vs ~51.5 tok/s — Zero-TVM 22% <em>behind</em>. Both the hardware and the engine changed since, so the two Zero-TVM numbers are not a pure optimization delta; the same-day, same-machine WebLLM number (51.98) is the valid comparator for 66.33. What changed in the engine:</p>
 <ul>
-  <li><strong>Matmul tiling</strong>. WebLLM's <code>fused_dequantize_NT_matmul</code> kernels are TVM-autotuned with aggressive shared-memory tiling and 2D thread blocks. Our <code>int4_matmul_tiled</code> / <code>_tiled8</code> / <code>_sg</code> variants close some of this, but the default <code>int4_matmul</code> loses ~15% here.</li>
-  <li><strong>Attention reduction</strong>. TVM's <code>batch_decode_paged_kv_kernel</code> splits the softmax reduction across more workgroups with a follow-up <code>attention_merge_state</code> pass. Our single-workgroup-per-head design is simpler but leaves M2 Pro's 20 SMs partly idle.</li>
-  <li><strong>Subgroup ops</strong>. Recent WebGPU supports subgroup reductions; we have <code>_sg</code> variants but they aren't default. WebLLM compiles with subgroup ops turned on.</li>
+  <li><strong>Correctness fixes</strong>. f32 accumulation in the fused FFN, a workgroup-barrier fix in attention, and a decode off-by-one fix — the old number understates even the old hardware.</li>
+  <li><strong>vec4 loads, now default</strong>. Re-declaring weight + activation buffers as <code>array&lt;vec4&lt;u32&gt;&gt;</code> in the int4 matmuls and <code>qkv_fused</code> measured +7.1% on M2 Max; opt out with <code>?vec4=0</code> / <code>?vec4qkv=0</code>.</li>
+  <li><strong>Tiled + subgroup kernels</strong>. The 4-row tiled subgroup FFN and the <code>_sg</code> matmul/attention/argmax variants are the default path on Apple sg32 hardware.</li>
 </ul>
-<p>What is <em>not</em> in the gap: dispatch submission overhead, command-encoder build time, or framework marshalling. Those all favor Zero-TVM and are already measured out.</p>
+<p>Still opt-in: split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured config <code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code> reaches 68.36 tok/s. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (228 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
 
 <h3>The memory-bandwidth ceiling</h3>
-<p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Pro's 200 GB/s memory bus that's 9 ms/token, or ~111 tok/s theoretical max. Zero-TVM at ~40 tok/s hits 36% of that ceiling; WebLLM at ~51 tok/s hits 46%. Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
+<p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Max's 400 GB/s memory bus that's ~4.5 ms/token, or ~222 tok/s theoretical max. Zero-TVM at 66.3 tok/s hits ~30% of that ceiling; WebLLM at 52.0 tok/s hits ~23%. Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
 
 </main>
 </div>
