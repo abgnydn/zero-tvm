@@ -1,4 +1,4 @@
-# Zero-TVM decode benchmarks (Phi-3 headline + Qwen3-4B v1)
+# Zero-TVM decode benchmarks (Phi-3 headline + Qwen3-4B / Qwen3.5-4B v1)
 
 All numbers are decode-only (prefill excluded via warmup runs), measured with
 `npm run bench` (128 decode tokens × 5 runs, median) or `bench(128, 3)` in
@@ -94,6 +94,60 @@ as "the Qwen port is tuned". The caveats, up front:
 
 This is the recorded baseline for the Qwen tuning phase (fused-path work,
 vec4 builds for K≡512 (mod 1024) shapes, int8-KV), not a headline claim.
+
+## Qwen3.5-4B hybrid (2026-07-28, Apple M2 Max) — v1 scalar-GDN, same-weights A/B vs WebLLM
+
+First cross-engine measurement of the Qwen3.5-4B hybrid port
+(`?model=qwen35`: 24 gated-DeltaNet layers + 8 gated-attention layers).
+Same protocol as the other pairs: same machine, same session (halves
+back-to-back), same Qwen3.5-4B-q4f16_1 weight bytes served from the local
+mirror (`/local-weights/Qwen3.5-4B-q4f16_1-MLC/`, `tensor-cache.json`
+manifest), greedy decoding, Chrome 150.0.7871.187. Zero-TVM half:
+`BENCH_QUERY="?model=qwen35" npm run bench`, 128-token target × 5 runs,
+median (the model emits its stop token at 94 tokens on the bench prompt, so
+each run measures 94 decode tokens). WebLLM half: `webllm-bench.html?model=qwen35`
+— **WebLLM 0.2.84** (dep bumped from the 0.2.80-era lib set: the Qwen3.5
+hybrid first ships in WebLLM's v0_2_84 prebuilt libs) running its own
+prebuilt `Qwen3.5-4B-q4f16_1_cs1k-webgpu.wasm` model_lib, its fixed protocol
+(3 × 120-token completions + warmup, median, wall-clock — identical
+accounting to the other WebLLM halves). `bench/results.json` untouched — it
+remains the Phi-3 headline artifact.
+
+| Engine (Qwen3.5-4B q4f16_1)                 | decode tok/s (median) |
+|--------------------------------------------:|----------------------:|
+| **Zero-TVM (`?model=qwen35`, defaults)**     | **47.99** |
+| WebLLM 0.2.84 (prebuilt Qwen3.5-4B lib)      | **31.99** |
+
+Raw runs — Zero-TVM: 47.85, 47.99, 48.02, 48.16, 47.97 (unusually tight —
+±0.3 tok/s). WebLLM: 32.24, 31.99, 31.74; WebLLM's own reported
+`decode_tokens_per_s` was 34.03 (the wall-clock figure includes its ~0.2 s
+prefill, same as every number in this file). One protocol wart on the WebLLM
+half, stated for completeness: the upstream repo's `mlc-chat-config.json`
+ships stale Qwen3 stop ids (151643/151645 — ordinary BPE tokens in the 248k
+vocab), so WebLLM generates to its 120-token budget instead of stopping at
+`<|im_end|>`; that does not affect per-token decode-rate accounting.
+
+Zero-TVM measures **+50.0% over WebLLM on this pair**. The caveats, up
+front:
+
+- **The Zero-TVM path is v1-scalar-GDN — this number is a floor.** The 24
+  DeltaNet layers run scalar (non-subgroup) kernels; there is no chunked
+  prefill (the recurrent state means prompts replay token-by-token through
+  the sequential `generate` path); and the GDN projections (qkv/z/a/b) are
+  separate unfused dispatches. None of the Phi-3 fusion story has been
+  applied to the GDN half yet.
+- **One machine, one pair, short-context, decode-only** — same scope limits
+  as every other section, with single-pair replication.
+- Notable but unweighted observation: the hybrid runs much closer to the
+  Phi-3 rate than Qwen3-4B does on both engines (Zero-TVM 62.9 → 48.0 vs
+  → 25.4; WebLLM 47.9 → 32.0 vs → 14.2). The 24 recurrent layers avoid both
+  engines' attention/KV costs; draw no stronger conclusion from one pair.
+
+Split-K spot check on the hybrid (single run each, same session —
+`?splitk=0` 47.72 vs default `splitk=8` 48.17 tok/s, +0.9%): split-K
+compiles and runs correctly at head_dim 256, and its effect is within noise
+here — expected, since only 8 of 32 layers run attention at all. Kept at
+the default (`splitk=8` where sg32 exists), same as the other models.
 
 ## Measured 2026-07-25 (M2 Max) — flag A/B series
 

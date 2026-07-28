@@ -51,6 +51,21 @@ Add a kernel by writing one `testX(device)` function (or a `makeXTest`
 factory when a scalar/`_sg` pair shares its reference) in `run.mjs` and
 listing it in `TESTS`.
 
+## Sibling suites
+
+- `npm run test:kernels:qwen` (`compile-qwen.mjs`) — the GQA-sensitive
+  kernels under the `QWEN3_4B` prelude, plus a compile-all gate.
+- `npm run test:kernels:qwen35` (`compile-qwen35.mjs`) — the Qwen3.5
+  GatedDeltaNet family (`gdn_conv`, `gdn_gates`, `gdn_recur`,
+  `gdn_norm_out`) and the gated-attention pieces (`gated_qkv_split`,
+  partial-RoPE `rope`, `attn_gate`) under the `QWEN35_4B` prelude, against
+  `ref-gdn.mjs` — a formula-by-formula CPU transcription of HF
+  `modeling_qwen3_5.py` / mlc-llm `qwen35_model.py` (citations inline).
+  Includes full-block chain tests with state carry, a bit-exact conv
+  ring-buffer check, a bit-exact seq=8-vs-8×seq=1 recurrence carryover
+  check, a wrong-K→V-head-pairing NEGATIVE control, and its own
+  compile-all gate.
+
 ## WebGPU without a GPU (CI / this sandbox)
 
 Chrome's GPU process **blocklists WebGPU on software rasterizers**, so headless

@@ -476,6 +476,7 @@
     <a href="#quantization" class="sidebar-link">Q4F16 format</a>
     <a href="#weights" class="sidebar-link">Weight naming</a>
     <a href="#qwen3" class="sidebar-link">Qwen3-4B port</a>
+    <a href="#qwen35" class="sidebar-link">Qwen3.5-4B hybrid</a>
   </div>
 
   <div class="sidebar-section">
@@ -1039,6 +1040,41 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <p>QK-norm must run between the QKV matmul and RoPE, which is incompatible with the fused QKV+RoPE+KV-append kernel — so Qwen runs the unfused reference composition, 10 dispatches/layer vs the Phi-3 chat path's 7. And both engines run Qwen3-4B far below their Phi-3 rates on this machine (62.9 → 25.4; 47.9 → 14.2), so the gap says as much about WebLLM's prebuilt Qwen3 lib on this GPU as about the port. One machine, one pair; full protocol and caveats in BENCH.md.</p>
 </div>
 
+<!-- QWEN35 -->
+<h2 id="qwen35">Qwen3.5-4B hybrid (<code>?model=qwen35</code>)</h2>
+
+<p>
+  The third model, and the first <em>hybrid</em> architecture on the engine: 24 gated-DeltaNet (linear-attention)
+  layers interleaved with 8 gated full-attention layers (attention on every 4th layer). To our knowledge this is
+  the first hand-written-kernel int4 implementation of a gated-DeltaNet hybrid running in a browser. Append
+  <code>?model=qwen35</code> to <code>zero-tvm.html</code> or <code>validate.html</code>;
+  <code>node scripts/download-weights.mjs --model qwen35</code> primes the local dev mirror (~2.6 GB).
+</p>
+
+<p>What the hybrid adds over Qwen3-4B:</p>
+
+<table>
+  <thead><tr><th></th><th>Qwen3-4B</th><th>Qwen3.5-4B</th></tr></thead>
+  <tbody>
+    <tr><td>Layer stack</td><td>36 × attention</td><td>24 × gated DeltaNet + 8 × gated attention (every 4th layer)</td></tr>
+    <tr><td>Sequence mixer (most layers)</td><td>GQA attention + KV cache</td><td>delta-rule recurrent state (16 k-heads / 32 v-heads, head dims 128, short conv K=4) — no KV cache on those layers</td></tr>
+    <tr><td>Attention layers</td><td>GQA 32/8, head_dim 128, full RoPE</td><td>GQA 16/4, head_dim 256, partial RoPE (64 of 256 dims), sigmoid output gate per head</td></tr>
+    <tr><td>Vocab</td><td>151,936</td><td>248,320 (renumbered specials — the shipped <code>mlc-chat-config.json</code> still lists stale Qwen3 stop ids; stops resolve from <code>tokenizer.json</code>)</td></tr>
+    <tr><td>Weight manifest</td><td><code>ndarray-cache.json</code></td><td><code>tensor-cache.json</code> (MLC renamed it)</td></tr>
+  </tbody>
+</table>
+
+<p>
+  Measured 2026-07-28 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
+  <strong>47.99 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at <strong>31.99 tok/s</strong> —
+  +50% on that pair. Static dated text, not synced from <code>bench/results.json</code>.
+</p>
+
+<div class="callout warning">
+  <div class="callout-title">Read the +50% cautiously — the v1 scalar-GDN number is a floor</div>
+  <p>The 24 DeltaNet layers run scalar (non-subgroup) kernels; there is no chunked prefill — the recurrent state means prompts replay token-by-token through the sequential generate path; and the GDN projections are separate unfused dispatches. None of the Phi-3 fusion story has been applied to the GDN half yet. One machine, one pair; full protocol and caveats in BENCH.md.</p>
+</div>
+
 <!-- PORTING -->
 <h2 id="porting">Port to Phi-4-mini or Qwen3</h2>
 
@@ -1159,7 +1195,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <li><strong>vec4 loads, now default</strong>. Re-declaring weight + activation buffers as <code>array&lt;vec4&lt;u32&gt;&gt;</code> in the int4 matmuls and <code>qkv_fused</code> measured +7.1% on M2 Max; opt out with <code>?vec4=0</code> / <code>?vec4qkv=0</code>.</li>
   <li><strong>Tiled + subgroup kernels</strong>. The 4-row tiled subgroup FFN and the <code>_sg</code> matmul/attention/argmax variants are the default path on Apple sg32 hardware.</li>
 </ul>
-<p>Still opt-in: split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured config <code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code> reaches 68.36 tok/s. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (228 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
+<p>Still default since 2026-07-27 (`?splitk=0` to disable): split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured config <code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code> reaches 68.36 tok/s. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (228 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
 
 <h3>The memory-bandwidth ceiling</h3>
 <p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Max's 400 GB/s memory bus that's ~4.5 ms/token, or ~222 tok/s theoretical max. Zero-TVM's measured decode median sits at roughly 30% of that ceiling; WebLLM's at roughly 23% (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>

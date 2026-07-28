@@ -100,6 +100,27 @@ BENCH_QUERY="?model=qwen3" npm run bench          # same-session A/B vs WebLLM's
                                                   # prebuilt Qwen3-4B; never writes results.json
 ```
 
+## Qwen3.5-4B hybrid (`?model=qwen35`)
+
+Third model, first hybrid: 24 gated-DeltaNet layers + 8 gated-attention
+layers (GQA 16/4, head_dim 256, partial RoPE 64/256, sigmoid attention
+gate), 248k vocab, tied lm_head; `model-select.ts` maps `?model=qwen35` →
+`QWEN35_4B`. The path is **v1-scalar-GDN** (scalar DeltaNet kernels, no
+chunked prefill — prompts replay token-by-token, unfused GDN projections),
+so its BENCH.md number is a floor. WebLLM A/B needs `@mlc-ai/web-llm`
+≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84 prebuilt libs).
+
+```bash
+node scripts/download-weights.mjs --model qwen35  # ~2.6 GB → .weights-local/
+npm run dev                                       # then zero-tvm.html?model=qwen35
+                                                  #  or validate.html?model=qwen35
+npm run test:kernels:qwen35                       # 13/13 GDN kernel family vs CPU reference
+npm run test:e2e                                  # includes tests/e2e/qwen35.test.ts —
+                                                  # skips loudly if the mirror isn't primed
+BENCH_QUERY="?model=qwen35" npm run bench         # same-session A/B vs WebLLM's
+                                                  # prebuilt Qwen3.5-4B; never writes results.json
+```
+
 ## Cross-site context
 
 `sites.json` is synced from `~/sites-shared/sites.ts`. Edit URLs,

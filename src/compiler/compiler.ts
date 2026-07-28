@@ -21,6 +21,12 @@ import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
 import kvAppendSrc from './shaders/kv_append.wgsl?raw'
 import qkNormSrc from './shaders/qk_norm.wgsl?raw'
+import gatedQkvSplitSrc from './shaders/gated_qkv_split.wgsl?raw'
+import attnGateSrc from './shaders/attn_gate.wgsl?raw'
+import gdnConvSrc from './shaders/gdn_conv.wgsl?raw'
+import gdnGatesSrc from './shaders/gdn_gates.wgsl?raw'
+import gdnRecurSrc from './shaders/gdn_recur.wgsl?raw'
+import gdnNormOutSrc from './shaders/gdn_norm_out.wgsl?raw'
 import qkvFusedSrc from './shaders/qkv_fused.wgsl?raw'
 import qkvFusedSgSrc from './shaders/qkv_fused_sg.wgsl?raw'
 import qkvFusedSgVec4Src from './shaders/qkv_fused_sg_vec4.wgsl?raw'
@@ -50,7 +56,7 @@ import argmaxSgSrc from './shaders/argmax_sg.wgsl?raw'
 // PHI3 / QWEN3_4B live in model-spec.ts (single source of truth for TS and
 // WGSL, via shader-prelude.ts); re-exported here so existing importers keep
 // working.
-export { PHI3, QWEN3_4B } from './shader-prelude'
+export { PHI3, QWEN3_4B, QWEN35_4B } from './shader-prelude'
 export type { ModelSpec } from './shader-prelude'
 
 // ============================================================
@@ -78,6 +84,14 @@ export interface Pipelines {
   rope: GPUComputePipeline
   kvAppend: GPUComputePipeline
   qkNorm: GPUComputePipeline           // Qwen3 per-head q/k RMSNorm (in place, pre-RoPE)
+  // Qwen3.5 hybrid kernels — compiled under every spec (the prelude's GDN
+  // consts collapse to attention dims elsewhere); only hybrid specs dispatch.
+  gatedQkvSplit: GPUComputePipeline    // c_attn [Q|gate]‖K‖V unpack → qkv + gate
+  attnGate: GPUComputePipeline         // attn_out *= sigmoid(gate), in place
+  gdnConv: GPUComputePipeline          // depthwise causal conv + SiLU (ring state)
+  gdnGates: GPUComputePipeline         // per-v-head exp(g) decay + beta
+  gdnRecur: GPUComputePipeline         // gated delta rule recurrence (f32 state)
+  gdnNormOut: GPUComputePipeline       // per-head gated RMSNorm · silu(z)
   qkvFused: GPUComputePipeline       // decode-path fusion: QKV matmul + RoPE + KV append
   qkvFusedSg: GPUComputePipeline | null  // subgroup variant of qkvFused
   qkvFusedSgVec4: GPUComputePipeline | null  // ?vec4qkv=1 vec4-load variant (32-thread)
@@ -177,6 +191,12 @@ export function compile(
     rope: createPipeline(device, ropeSrc, 'rope_kernel'),
     kvAppend: createPipeline(device, kvAppendSrc, 'kv_append'),
     qkNorm: createPipeline(device, qkNormSrc, 'qk_norm'),
+    gatedQkvSplit: createPipeline(device, gatedQkvSplitSrc, 'gated_qkv_split'),
+    attnGate: createPipeline(device, attnGateSrc, 'attn_gate'),
+    gdnConv: createPipeline(device, gdnConvSrc, 'gdn_conv'),
+    gdnGates: createPipeline(device, gdnGatesSrc, 'gdn_gates'),
+    gdnRecur: createPipeline(device, gdnRecurSrc, 'gdn_recur'),
+    gdnNormOut: createPipeline(device, gdnNormOutSrc, 'gdn_norm_out'),
     qkvFused: createPipeline(device, qkvFusedSrc, 'qkv_fused'),
     qkvFusedSg: subgroups ? createPipeline(device, qkvFusedSgSrc, 'qkv_fused_sg') : null,
     qkvFusedSgVec4: subgroups ? createPipeline(device, qkvFusedSgVec4Src, 'qkv_fused_sg_vec4') : null,

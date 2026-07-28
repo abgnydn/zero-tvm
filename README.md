@@ -118,6 +118,34 @@ lib on this GPU as about our port. Protocol and caveats in
 Weights: `node scripts/download-weights.mjs --model qwen3` primes the local
 dev mirror (~2.3 GB); without it the page streams from HuggingFace.
 
+**Qwen3.5-4B (q4f16_1) — `?model=qwen35` on `zero-tvm.html` and
+`validate.html`.** The third model, and the first *hybrid*: 24
+gated-DeltaNet (linear-attention) layers interleaved with 8 gated
+full-attention layers, running on the same hand-written kernels. To our
+knowledge this is the first hand-written-kernel int4 implementation of a
+gated-DeltaNet hybrid running in a browser. What it adds over Qwen3-4B:
+
+- **hybrid layer stack** — attention on every 4th layer only; the other 24
+  layers run gated DeltaNet: a recurrent delta-rule state update (16 k-heads,
+  32 v-heads, head dims 128, short conv K=4), no KV cache on those layers
+- **GQA 16/4 at head_dim 256** on the attention layers, with **partial RoPE**
+  (only 64 of 256 dims rotate) and a **sigmoid output gate** per head
+- **248,320-token vocab** with renumbered special tokens (the repo's shipped
+  `mlc-chat-config.json` still lists the stale Qwen3 stop ids — we resolve
+  stops from `tokenizer.json` instead), tied lm_head
+
+Measured same-session pair on an Apple M2 Max (2026-07-28, Chrome
+150.0.7871.187, identical local weight bytes): Zero-TVM **47.99 tok/s**
+decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at **31.99 tok/s** — +50% on
+that pair. Same honest framing as always: one machine, one pair, and the
+Zero-TVM path is **v1-scalar-GDN** — scalar (non-subgroup) DeltaNet kernels,
+no chunked prefill (prompts replay token-by-token), unfused GDN projections
+— so the number is a floor, not a tuned result. Protocol and caveats in
+[BENCH.md](BENCH.md).
+
+Weights: `node scripts/download-weights.mjs --model qwen35` primes the local
+dev mirror (~2.6 GB); without it the page streams from HuggingFace.
+
 ## The repository as an argument
 
 The directory layout is the narrative arc of the project. Each page is a milestone.

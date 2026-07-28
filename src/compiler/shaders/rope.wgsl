@@ -11,11 +11,16 @@
 // the Phi-3 layout is unchanged). Q and K get RoPE applied (sin/cos rotation
 // of pairs). V is just copied.
 //
-// Rotation pairs are at distance HALF_HEAD_DIM within each head.
-// theta = position / (ROPE_THETA ^ (2i/HEAD_DIM))
+// Partial-RoPE aware (Qwen3.5): only the first ROTARY_DIM dims of each head
+// rotate — pairs at distance HALF_ROTARY inside the rotary slice, per the HF
+// GLM-style non-interleaved convention (modeling_qwen3_5.apply_rotary_pos_emb:
+// q_rot = q[..., :rotary_dim] rotates, q_pass copies through) — with
+//   theta = position / (ROPE_THETA ^ (2i/ROTARY_DIM)),  i = dim % HALF_ROTARY.
+// For full-rotation specs ROTARY_DIM == HEAD_DIM, so Phi-3/Qwen3 behavior is
+// bit-identical to the historical kernel.
 //
-// Model-shape constants (Q_DIM, KV_DIM, QKV_DIM, HEAD_DIM, HALF_HEAD_DIM,
-// ROPE_THETA) are injected by src/compiler/shader-prelude.ts.
+// Model-shape constants (Q_DIM, KV_DIM, QKV_DIM, HEAD_DIM, ROTARY_DIM,
+// HALF_ROTARY, ROPE_THETA) are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -57,38 +62,38 @@ fn rope_kernel(
   let qkv_val : f16 = qkv[flat];
 
   if (within < Q_DIM) {
-    // Q head — apply RoPE
+    // Q head — apply RoPE to the rotary slice (dims >= ROTARY_DIM pass through)
     var out_val : f16 = qkv_val;
-    if (podArgs.apply_rope != 0) {
+    if (podArgs.apply_rope != 0 && dim_idx < ROTARY_DIM) {
       let pos : f32 = f32(position_map[seq_idx + podArgs.position_map_elem_offset]);
-      let freq : f32 = pos / pow(ROPE_THETA, f32((dim_idx % HALF_HEAD_DIM) * 2) / f32(HEAD_DIM));
+      let freq : f32 = pos / pow(ROPE_THETA, f32((dim_idx % HALF_ROTARY) * 2) / f32(ROTARY_DIM));
       let cos_f : f32 = cos(freq);
       let sin_f : f32 = sin(freq);
 
       var pair_val : f16;
-      if (dim_idx < HALF_HEAD_DIM) {
-        pair_val = qkv[seq_idx * QKV_DIM + within + HALF_HEAD_DIM] * -1.0h;
+      if (dim_idx < HALF_ROTARY) {
+        pair_val = qkv[seq_idx * QKV_DIM + within + HALF_ROTARY] * -1.0h;
       } else {
-        pair_val = qkv[seq_idx * QKV_DIM + within - HALF_HEAD_DIM];
+        pair_val = qkv[seq_idx * QKV_DIM + within - HALF_ROTARY];
       }
       out_val = f16(cos_f * f32(qkv_val) + sin_f * f32(pair_val));
     }
     q_out[seq_idx * Q_DIM + within] = out_val;
   } else if (within < Q_DIM + KV_DIM) {
-    // K head — apply RoPE
+    // K head — apply RoPE to the rotary slice (dims >= ROTARY_DIM pass through)
     let k_within : i32 = within - Q_DIM;
     var out_val : f16 = qkv_val;
-    if (podArgs.apply_rope != 0) {
+    if (podArgs.apply_rope != 0 && dim_idx < ROTARY_DIM) {
       let pos : f32 = f32(position_map[seq_idx + podArgs.position_map_elem_offset]);
-      let freq : f32 = pos / pow(ROPE_THETA, f32((dim_idx % HALF_HEAD_DIM) * 2) / f32(HEAD_DIM));
+      let freq : f32 = pos / pow(ROPE_THETA, f32((dim_idx % HALF_ROTARY) * 2) / f32(ROTARY_DIM));
       let cos_f : f32 = cos(freq);
       let sin_f : f32 = sin(freq);
 
       var pair_val : f16;
-      if (dim_idx < HALF_HEAD_DIM) {
-        pair_val = qkv[seq_idx * QKV_DIM + within + HALF_HEAD_DIM] * -1.0h;
+      if (dim_idx < HALF_ROTARY) {
+        pair_val = qkv[seq_idx * QKV_DIM + within + HALF_ROTARY] * -1.0h;
       } else {
-        pair_val = qkv[seq_idx * QKV_DIM + within - HALF_HEAD_DIM];
+        pair_val = qkv[seq_idx * QKV_DIM + within - HALF_ROTARY];
       }
       out_val = f16(cos_f * f32(qkv_val) + sin_f * f32(pair_val));
     }

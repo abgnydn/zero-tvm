@@ -24,14 +24,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
  */
 const PHI3_REPO_NAME = 'Phi-3-mini-4k-instruct-q4f16_1-MLC'
 
+// A primed snapshot carries one of the two MLC weight-manifest names
+// (newer MLC repos, e.g. Qwen3.5, renamed ndarray-cache.json → tensor-cache.json).
+const hasManifest = (dir: string): boolean =>
+  existsSync(join(dir, 'ndarray-cache.json')) || existsSync(join(dir, 'tensor-cache.json'))
+
 function findMlcSnapshotDir(repoName: string = PHI3_REPO_NAME): string | null {
   // Repo-local: where scripts/download-weights.mjs puts the snapshot.
   const repoLocal = join(__dirname, '.weights-local', repoName)
-  if (existsSync(join(repoLocal, 'ndarray-cache.json'))) return repoLocal
+  if (hasManifest(repoLocal)) return repoLocal
 
   // Preferred: a flat mirror dir populated via parallel curl (fastest to prime).
   const flatMirror = join(homedir(), 'mlc-weights', repoName)
-  if (existsSync(join(flatMirror, 'ndarray-cache.json'))) return flatMirror
+  if (hasManifest(flatMirror)) return flatMirror
 
   // Fallback: HF hub snapshot dir (hf download populates this).
   const cacheRoot = join(
@@ -99,9 +104,17 @@ function localWeightsPlugin() {
             urlPath = ('/' + seg[2]).replace(/^\/resolve\/[^/]+\//, '/')
           }
         }
-        // WebLLM v0.2.80 renamed ndarray-cache.json → tensor-cache.json; our
-        // mirrors still have the old name. Contents/shape are identical.
-        if (urlPath === '/tensor-cache.json') urlPath = '/ndarray-cache.json'
+        // WebLLM v0.2.80 renamed ndarray-cache.json → tensor-cache.json;
+        // mirrors may carry either name (older repos ship ndarray-cache.json,
+        // newer ones like Qwen3.5 ship tensor-cache.json). Contents/shape are
+        // identical — serve whichever the snapshot actually has.
+        if (snapshot) {
+          if (urlPath === '/tensor-cache.json' && !existsSync(resolve(snapshot, './tensor-cache.json'))) {
+            urlPath = '/ndarray-cache.json'
+          } else if (urlPath === '/ndarray-cache.json' && !existsSync(resolve(snapshot, './ndarray-cache.json'))) {
+            urlPath = '/tensor-cache.json'
+          }
+        }
         if (!snapshot) {
           res.statusCode = 404
           res.end('Not found')

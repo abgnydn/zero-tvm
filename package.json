@@ -26,6 +26,7 @@
     "test:e2e": "vitest run tests/e2e",
     "test:kernels": "node tests/kernels/run.mjs",
     "test:kernels:qwen": "node tests/kernels/compile-qwen.mjs",
+    "test:kernels:qwen35": "node tests/kernels/compile-qwen35.mjs",
     "gen:tokenizer-fixtures": "node scripts/gen-tokenizer-fixtures.mjs",
     "gen:tokenizer-fixtures-qwen": "node scripts/gen-tokenizer-fixtures-qwen.mjs",
     "bench": "node bench/run.mjs",
@@ -35,7 +36,7 @@
   "devDependencies": {
     "@huggingface/transformers": "^3.4.0",
     "@kmamal/gpu": "^0.2.1",
-    "@mlc-ai/web-llm": "^0.2.80",
+    "@mlc-ai/web-llm": "^0.2.84",
     "@types/node": "^22.13.0",
     "@webgpu/types": "^0.1.69",
     "puppeteer": "^24.40.0",

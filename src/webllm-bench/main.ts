@@ -9,7 +9,9 @@
  *
  * Default is Phi-3-mini (exact original behavior, bare /local-weights/*
  * mirror route). `?model=qwen3` benches WebLLM's Qwen3-4B-q4f16_1 against
- * the per-model mirror route /local-weights/<repo>/ instead.
+ * the per-model mirror route /local-weights/<repo>/ instead; `?model=qwen35`
+ * does the same for Qwen3.5-4B-q4f16_1 (hybrid GDN+attention — first shipped
+ * in WebLLM's v0_2_84 prebuilt lib set, hence the dep bump to 0.2.84).
  *
  * The WASM `model_lib` (compiled Relax compute graph) still comes from
  * WebLLM's CDN — architecture-matched, URLs taken from WebLLM's own
@@ -18,9 +20,12 @@
 
 import * as webllm from '@mlc-ai/web-llm'
 
-// ?model=qwen3 → WebLLM Qwen3-4B on the per-model mirror route. Anything
-// else (including no flag) keeps the exact Phi-3 default path.
-const QWEN = new URLSearchParams(location.search).get('model') === 'qwen3'
+// ?model=qwen3 → WebLLM Qwen3-4B, ?model=qwen35 → WebLLM Qwen3.5-4B, both on
+// the per-model mirror route. Anything else (including no flag) keeps the
+// exact Phi-3 default path.
+const MODEL = new URLSearchParams(location.search).get('model')
+const QWEN = MODEL === 'qwen3'
+const QWEN35 = MODEL === 'qwen35'
 
 const $ = (id: string) => document.getElementById(id)!
 function log(msg: string) {
@@ -38,9 +43,11 @@ function setStats(text: string) {
   $('stats').textContent = text
 }
 
-const MODEL_ID = QWEN
-  ? 'Qwen3-4B-q4f16_1-MLC-local'
-  : 'Phi-3-mini-4k-instruct-q4f16_1-MLC-local'
+const MODEL_ID = QWEN35
+  ? 'Qwen3.5-4B-q4f16_1-MLC-local'
+  : QWEN
+    ? 'Qwen3-4B-q4f16_1-MLC-local'
+    : 'Phi-3-mini-4k-instruct-q4f16_1-MLC-local'
 
 const BENCH_PROMPT = 'Write a four-sentence explanation of how photosynthesis works.'
 const TARGET_TOKENS = 120
@@ -50,27 +57,35 @@ const NUM_RUNS = 3
 // suffix matches HF-hub shape so WebLLM's cleanModelUrl() leaves it alone;
 // the vite middleware strips it server-side (on the bare Phi-3 route AND
 // after the /<repo>/ segment on per-model routes). WASM model_lib names are
-// copied from WebLLM's own prebuiltAppConfig entries for these model_ids.
-const LOCAL_MODEL_URL = QWEN
-  ? `${location.origin}/local-weights/Qwen3-4B-q4f16_1-MLC/resolve/main/`
-  : `${location.origin}/local-weights/resolve/main/`
+// copied from WebLLM's own prebuiltAppConfig entries for these model_ids
+// (v0_2_84 lib set — the `ctx4k_` name segment was dropped upstream).
+const LOCAL_MODEL_URL = QWEN35
+  ? `${location.origin}/local-weights/Qwen3.5-4B-q4f16_1-MLC/resolve/main/`
+  : QWEN
+    ? `${location.origin}/local-weights/Qwen3-4B-q4f16_1-MLC/resolve/main/`
+    : `${location.origin}/local-weights/resolve/main/`
 const WASM_URL =
   webllm.modelLibURLPrefix +
   webllm.modelVersion +
-  (QWEN
-    ? '/Qwen3-4B-q4f16_1-ctx4k_cs1k-webgpu.wasm'
-    : '/Phi-3-mini-4k-instruct-q4f16_1-ctx4k_cs1k-webgpu.wasm')
+  (QWEN35
+    ? '/Qwen3.5-4B-q4f16_1_cs1k-webgpu.wasm'
+    : QWEN
+      ? '/Qwen3-4B-q4f16_1_cs1k-webgpu.wasm'
+      : '/Phi-3-mini-4k-instruct-q4f16_1_cs1k-webgpu.wasm')
 
 const appConfig: webllm.AppConfig = {
-  useIndexedDBCache: true,
+  // 0.2.84 renamed useIndexedDBCache → cacheBackend (same IndexedDB backend).
+  cacheBackend: 'indexeddb',
   model_list: [
     {
       model: LOCAL_MODEL_URL,
       model_id: MODEL_ID,
       model_lib: WASM_URL,
-      vram_required_MB: QWEN ? 3431.59 : 3672.07,
+      vram_required_MB: QWEN35 ? 3867.82 : QWEN ? 3431.59 : 3672.07,
       low_resource_required: false,
-      overrides: { context_window_size: 4096 },
+      overrides: QWEN35
+        ? { context_window_size: 4096, max_history_size: 1 }
+        : { context_window_size: 4096 },
     },
   ],
 }
@@ -134,11 +149,12 @@ async function main() {
   log(`[summary] WebLLM on ${MODEL_ID}`)
   log(`  median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s`)
   log('')
-  if (QWEN) {
-    // No stored comparison constant for Qwen — run the Zero-TVM half in the
-    // same session (bench/run.mjs BENCH_QUERY="?model=qwen3") and compare
-    // there; cross-session absolute numbers aren't comparable.
-    setStats(`WebLLM ${median.toFixed(1)} tok/s (Qwen3-4B)`)
+  if (QWEN || QWEN35) {
+    // No stored comparison constant for the Qwen models — run the Zero-TVM
+    // half in the same session (bench/run.mjs BENCH_QUERY="?model=qwen3" or
+    // "?model=qwen35") and compare there; cross-session absolute numbers
+    // aren't comparable.
+    setStats(`WebLLM ${median.toFixed(1)} tok/s (${QWEN35 ? 'Qwen3.5-4B' : 'Qwen3-4B'})`)
   } else {
     const ztvm = 62.90 // bench:zt — Zero-TVM decode median (tok/s), updated by `npm run bench`
     log(`[comparison] Zero-TVM (this repo) median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (Apple M2 Max, 2026-07-25 — see bench/results.json)`)

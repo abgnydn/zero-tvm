@@ -4,8 +4,9 @@
  * serves them locally. Run once, never re-download.
  *
  * Usage:
- *   node scripts/download-weights.mjs                # Phi-3-mini (default)
- *   node scripts/download-weights.mjs --model qwen3  # Qwen3-4B
+ *   node scripts/download-weights.mjs                 # Phi-3-mini (default)
+ *   node scripts/download-weights.mjs --model qwen3   # Qwen3-4B
+ *   node scripts/download-weights.mjs --model qwen35  # Qwen3.5-4B
  *
  * Downloads to: .weights-local/<repo-name>/
  * Served at:    http://localhost:5173/local-weights/<repo-name>/
@@ -18,6 +19,15 @@ import { pipeline } from 'stream/promises'
 const MODELS = {
   phi3:  'mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC',
   qwen3: 'mlc-ai/Qwen3-4B-q4f16_1-MLC',
+  qwen35: 'mlc-ai/Qwen3.5-4B-q4f16_1-MLC',
+}
+
+// Weight-manifest filename: newer MLC repos (Qwen3.5) renamed
+// ndarray-cache.json → tensor-cache.json.
+const MANIFEST_NAMES = {
+  phi3:  'ndarray-cache.json',
+  qwen3: 'ndarray-cache.json',
+  qwen35: 'tensor-cache.json',
 }
 
 function parseModelArg(argv) {
@@ -39,10 +49,11 @@ const MODEL_ID   = MODELS[MODEL_KEY]
 const REPO_NAME  = MODEL_ID.split('/')[1]
 const BASE_URL   = `https://huggingface.co/${MODEL_ID}/resolve/main`
 const OUT_DIR    = `.weights-local/${REPO_NAME}`
+const MANIFEST   = MANIFEST_NAMES[MODEL_KEY]
 
 // Extra files needed besides the shards
 const EXTRA_FILES = [
-  'ndarray-cache.json',
+  MANIFEST,
   'tokenizer.json',
   'tokenizer_config.json',
   'mlc-chat-config.json',
@@ -100,9 +111,9 @@ async function main() {
 
   fs.mkdirSync(OUT_DIR, { recursive: true })
 
-  // 1) Fetch ndarray-cache.json first (needed to know shard list)
-  const cacheJsonPath = path.join(OUT_DIR, 'ndarray-cache.json')
-  await downloadFile(`${BASE_URL}/ndarray-cache.json`, cacheJsonPath)
+  // 1) Fetch the weight manifest first (needed to know shard list)
+  const cacheJsonPath = path.join(OUT_DIR, MANIFEST)
+  await downloadFile(`${BASE_URL}/${MANIFEST}`, cacheJsonPath)
   const ndarray = JSON.parse(fs.readFileSync(cacheJsonPath, 'utf8'))
 
   // 2) Collect unique shard filenames
@@ -127,7 +138,7 @@ async function main() {
   // 4) Download extra files
   console.log('\nExtra files:')
   for (const f of EXTRA_FILES) {
-    if (f === 'ndarray-cache.json') continue // already done
+    if (f === MANIFEST) continue // already done
     const dest = path.join(OUT_DIR, f)
     await downloadFile(`${BASE_URL}/${f}`, dest)
   }
