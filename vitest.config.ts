@@ -1,9 +1,11 @@
 import { defineConfig } from 'vitest/config'
 
-// Vitest runs two very different suites:
+// Vitest runs three very different suites:
 //   tests/tokenizer — offline unit tests for the hand-rolled BPE tokenizer,
 //                     pinned against HuggingFace-generated fixtures
 //                     (`npm run test:unit`).
+//   tests/unit      — offline unit tests for pure loader helpers
+//                     (mapLimited download semantics; `npm run test:unit`).
 //   tests/e2e       — Puppeteer-driven e2e tests that boot a real Vite dev
 //                     server + Chrome with WebGPU and exercise the full
 //                     chat + validate pages (`npm run test:e2e`).
@@ -11,7 +13,7 @@ import { defineConfig } from 'vitest/config'
 // (`npm run test:kernels`).
 export default defineConfig({
   test: {
-    include: ['tests/tokenizer/**/*.test.ts', 'tests/e2e/**/*.test.ts'],
+    include: ['tests/tokenizer/**/*.test.ts', 'tests/unit/**/*.test.ts', 'tests/e2e/**/*.test.ts'],
     // First e2e run downloads ~2GB of Phi-3 weights from HuggingFace into the
     // test browser profile. Subsequent runs use the cached profile and finish
     // in well under a minute. (The tokenizer unit tests finish in seconds.)

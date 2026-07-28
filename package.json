@@ -22,7 +22,7 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
     "lint": "npm run typecheck",
     "test": "npm run test:unit",
-    "test:unit": "vitest run tests/tokenizer",
+    "test:unit": "vitest run tests/tokenizer tests/unit",
     "test:e2e": "vitest run tests/e2e",
     "test:kernels": "node tests/kernels/run.mjs",
     "test:kernels:qwen": "node tests/kernels/compile-qwen.mjs",

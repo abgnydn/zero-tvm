@@ -53,10 +53,25 @@ function setStats(text: string) {
 }
 
 function hideLoadingOverlay() { $('loading-overlay')?.classList.remove('active') }
-function showLoadingError(msg: string) {
+function showLoadingError(msg: string, onRetry?: () => void) {
   const el = $('loading-error')
   if (!el) return
   el.textContent = msg
+  if (onRetry) {
+    // Weight downloads resume from OPFS, so a retry is cheap — no reload
+    // needed. Re-runs the whole boot; completed shards come straight from cache.
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.id = 'retry-download-btn'
+    btn.textContent = 'Retry download'
+    btn.style.cssText = 'display:block;margin-top:0.6rem;padding:0.45rem 1.1rem;background:#10b981;color:#000;font-weight:600;font-size:0.8rem;border:none;border-radius:6px;cursor:pointer'
+    btn.addEventListener('click', () => {
+      el.classList.remove('visible')
+      el.replaceChildren()
+      onRetry()
+    }, { once: true })
+    el.appendChild(btn)
+  }
   el.classList.add('visible')
 }
 
@@ -331,7 +346,9 @@ async function main(): Promise<void> {
     },
   })
   if (!boot.ok) {
-    showLoadingError(boot.reason)
+    // Retry re-runs the full boot without a reload — the weight loader's
+    // OPFS tier skips every shard that already completed.
+    showLoadingError(boot.reason, () => { void main() })
     log(`ERROR: ${boot.reason}`)
     return
   }

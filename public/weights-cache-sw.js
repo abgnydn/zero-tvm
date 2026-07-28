@@ -57,7 +57,10 @@ async function handle(req, url) {
 
   // 2. Network fall-through. Stream into OPFS so subsequent visits hit cache.
   const netResp = await fetch(req);
-  if (!netResp.ok || !netResp.body) return netResp;
+  // Only cache complete 200 bodies: a 206 (the weight-loader resumes dead
+  // transfers with Range requests) buffered under the full key would poison
+  // the shared cache with a truncated shard. Pass everything else through.
+  if (netResp.status !== 200 || !netResp.body) return netResp;
 
   const buf = await netResp.clone().arrayBuffer();
   // Best-effort write — failures (quota, no OPFS) are fine; just no caching.
