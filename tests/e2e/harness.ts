@@ -140,7 +140,10 @@ export async function newPage(path: string): Promise<Page> {
   // path) chat.ts skips the gate entirely — wait briefly and don't fail if
   // it never shows up.
   try {
-    await page.waitForSelector('#start-btn', { timeout: 8_000 })
+    // visible: true — on zero-tvm.html the button sits inside a closed
+    // <dialog> until the async cache check calls showModal(); an
+    // existence-only wait resolves too early and the later click is lost.
+    await page.waitForSelector('#start-btn', { visible: true, timeout: 8_000 })
   } catch {
     // No gate — auto-boot (cached) path. bootAndWaitReady handles both.
   }

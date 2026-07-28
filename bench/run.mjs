@@ -93,8 +93,11 @@ async function bootReady(page, path) {
   console.log(`[webgpu] ${JSON.stringify(gpu)}`)
 
   // Click the download gate if present; cached-skip path won't show it.
+  // visible: true matters — #start-btn lives inside a closed <dialog> until
+  // chat.ts's async cache check calls showModal(), so an existence-only wait
+  // clicks a hidden node and the click is silently lost.
   try {
-    await page.waitForSelector('#start-btn', { timeout: 8_000 })
+    await page.waitForSelector('#start-btn', { visible: true, timeout: 8_000 })
     await page.click('#start-btn')
   } catch {
     /* auto-boot */

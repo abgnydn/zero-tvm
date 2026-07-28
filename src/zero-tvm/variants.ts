@@ -24,11 +24,11 @@
  *   ?vec4qkv=0  opt OUT of the vec4-load qkv_fused sibling (32-thread;
  *               default ON with sg32; measured +4.2% alone)
  *
- * Opt-in experiments — measured 2026-07-25 on M2 Max (see BENCH.md):
- *   ?splitk=N      split-K flash-decode attention, N ∈ 2..16 partitions
- *                  per head + a combine pass (f16 KV only; ignored w/ ?kv8=1).
- *                  ~+3% at short context; needs a long-context A/B before
- *                  becoming default.
+ * Measured experiments (2026-07-25/27 on M2 Max — see BENCH.md):
+ *   ?splitk=N      split-K flash-decode attention, N partitions per head +
+ *                  a combine pass (f16 KV only; ignored w/ ?kv8=1).
+ *                  +3.1% at 128-token / +4.0% at 1024-token decode —
+ *                  default N=8 with sg32; ?splitk=0 disables.
  *   ?fuseprologue=1  fold the FFN-entry add_norm into the FFN kernel's
  *                  shared-memory prologue; layer tail becomes add3_norm.
  *                  Measured −13.7% on M2 Max (falsified there; kept for
@@ -113,11 +113,13 @@ export function parseVariantFlags(
     // default ON where the sg32 builds exist; ?vec4=0 / ?vec4qkv=0 to A/B off.
     vec4: sgAll && q.get('vec4') !== '0',
     vec4Qkv: sgAll && q.get('vec4qkv') !== '0',
-    // Still opt-in: split-K measured +3% at short context (win should grow
-    // with context — needs a long-context A/B before defaulting); prologue
-    // fusion measured -14% on M2 Max (falsified there; flag kept for other
-    // GPUs). BENCH.md "Measured experiments".
-    splitK: parseSplitK(q.get('splitk')),
+    // split-K attention: measured +3.1% at 128-token decode and +4.0% at
+    // 1024-token decode on M2 Max (the win grows with KV depth, as the
+    // occupancy hypothesis predicts) — default N=8 where the sg32 path
+    // exists; ?splitk=0 to disable, ?splitk=N to re-tune. Prologue fusion
+    // measured -14% on M2 Max (falsified there; flag kept for other GPUs).
+    // BENCH.md "Measured experiments".
+    splitK: parseSplitK(q.get('splitk') ?? (sgAll ? '8' : '0')),
     fusePrologue: q.get('fuseprologue') === '1',
   }
 }

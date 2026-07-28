@@ -15,26 +15,34 @@ engine differs.
 
 | Engine                         | decode tok/s (median) |
 |-------------------------------:|----------------------:|
-| **Zero-TVM (this repo, defaults)** | **<!--bench:zt-->66.33<!--/bench:zt-->** |
-| WebLLM 0.2.80 (`tensor-cache`) |   **<!--bench:webllm-->52.0<!--/bench:webllm-->** |
+| **Zero-TVM (this repo, defaults)** | **<!--bench:zt-->62.90<!--/bench:zt-->** |
+| WebLLM 0.2.80 (`tensor-cache`) |   **<!--bench:webllm-->47.9<!--/bench:webllm-->** |
 
 **Zero-TVM is ~28% faster than WebLLM on decode** on this machine with our
 own weights (auto-synced gap — Zero-TVM's deficit as a share of WebLLM's
-throughput, negative = ahead: <!--bench:gap-->-28<!--/bench:gap-->%).
-Zero-TVM runs: 66.33, 66.42, 66.42, 65.58, 65.79 tok/s.
+throughput, negative = ahead: <!--bench:gap-->-31<!--/bench:gap-->%).
+Zero-TVM runs (latest artifact, 2026-07-27): 62.79, 63.11, 63.14, 62.90, 62.88 tok/s.
+
+Absolute numbers are machine-state-dependent — across three same-run pairs
+taken over two days the medians were 66.33/51.98 (−28%), 62.90/47.92 (−31%),
+and one clearly-degraded pair (62.63/41.51, taken immediately after ~10
+back-to-back GPU bench sessions) that depressed both engines and is not used
+for any claim. **The ratio is the stable quantity: −28% to −31% in healthy
+sessions.** Every quoted pair is same-run, same-weights.
 
 Scope caveats, stated up front: one machine (M2 Max), one model
 (Phi-3-mini q4f16_1), one browser (Chrome 150), decode-only, short-context
-bench. The defaults now include the vec4-load kernels measured below.
+bench. The defaults now include the vec4-load kernels measured below and,
+since 2026-07-27, split-K attention (long-context A/B below).
 
 **This supersedes the old "22% behind" story** (42.14 vs ~51.5 tok/s on an
 M2 Pro, 2026-06). That comparison was a different machine AND an older
 engine — three correctness bugs have been fixed since (fused_ffn f32
 accumulation, an attention workgroup-barrier bug, a decode off-by-one), plus
 the unified engine and the vec4 defaults. The +24 tok/s delta over the old
-number is NOT all optimization; the valid comparator for 66.33 is the
-same-day, same-machine WebLLM figure of 51.98. The old numbers are preserved
-in "Prior measurements" below.
+number is NOT all optimization; the valid comparator for each Zero-TVM
+median is the WebLLM figure from the same run (66.33 ↔ 51.98; 62.90 ↔ 47.92).
+The old numbers are preserved in "Prior measurements" below.
 
 Entry point: `webllm-bench.html` + `src/webllm-bench/main.ts` — wires a custom
 `AppConfig` with `model: ${origin}/local-weights/resolve/main/` and the
@@ -54,8 +62,8 @@ medians varied 60.5–61.8 across boots, so treat **±1 tok/s as noise**.
 | `?vec4=1` (oProj/ffnDown/LM-head)      | 63.73 |      +4.5% | win |
 | `?vec4qkv=1` (qkv_fused vec4 sibling)  | 63.55 |      +4.2% | win |
 | both vec4 flags                        | 65.27 |      +7.1% | **promoted to default** |
-| `?splitk=4`                            | 62.70 |      ~+3%  | stays opt-in (see below) |
-| `?splitk=8`                            | 62.82 |      ~+3%  | stays opt-in (see below) |
+| `?splitk=4`                            | 62.70 |      ~+3%  | **promoted to default** (long-context A/B below) |
+| `?splitk=8`                            | 62.82 |      ~+3%  | **promoted to default** (long-context A/B below) |
 | `?fuseprologue=1`                      | 52.62 |     −13.7% | **falsified on Apple** |
 | `?vec4=1&vec4qkv=1&splitk=8`           | 68.36 |       +12% | best measured config |
 
@@ -64,15 +72,26 @@ Outcomes:
 1. **Vectorized loads — promoted to default.** Both vec4 experiments won
    individually and compose (+7.1% together). They are now the default path
    where the sg32 builds exist; opt OUT with `?vec4=0` / `?vec4qkv=0` for
-   A/B. The 66.33 headline number is with these defaults on.
+   A/B. The headline pairs run with these defaults on (plus split-K after
+   its 2026-07-27 promotion).
 
-2. **Split-K attention — stays opt-in.** ~+3% measured, but at short context
-   (~tens of tokens of KV). The hypothesis says the win grows with context
-   length (attention's serial tail is linear in KV length), so this needs a
-   long-context A/B before it can earn default status. `?splitk=2|4|8`
-   remains available. The best measured config overall stacks it on the vec4
-   defaults: 68.36 tok/s (+12% over the old defaults, ~+32% vs WebLLM's
-   51.98).
+2. **Split-K attention — promoted to default (N=8) after the long-context
+   A/B.** The short-context result was ~+3%; the promotion gate was "does
+   the win grow with KV depth, as the occupancy hypothesis predicts?" It
+   does. 1024-token decode (KV growing to ~1k), median of 3 × 1024 on the
+   same M2 Max, 2026-07-27:
+
+   | Config (1024-token decode) | tok/s | Δ |
+   |---|---:|---:|
+   | `?splitk=0` (off)          | 60.21 |   — |
+   | `?splitk=4`                | 62.27 | +3.4% |
+   | `?splitk=8`                | 62.62 | **+4.0%** |
+
+   +3.1% at 128 tokens → +4.0% at 1024, tight variance, no measured regime
+   where it loses. Default is now `splitk=8` where the sg32 path exists;
+   `?splitk=0` opts out, `?splitk=N` re-tunes. The best measured short-run
+   config stacks all promoted flags: 68.36 tok/s (+12% over the old
+   defaults, ~+32% vs the same-session WebLLM 51.98).
 
 3. **FFN prologue fusion — falsified on Apple.** −13.7%. The hypothesis was
    that removing 32 dispatch bubbles (addNorm1 folded into the FFN's
@@ -339,9 +358,9 @@ Simulator: `src/zero-tvm/spec-sim.ts`. Window helper: `await specSim(160, N, K)`
 
 ### Remaining levers (updated after the 2026-07-25 measurements)
 
-1. **Split-K attention at long context** — the +3% short-context result
-   needs a long-context A/B; the hypothesis predicts the win grows with KV
-   length. This is the gate on promoting `?splitk` to default.
+1. **Split-K attention** — ~~long-context A/B~~ done 2026-07-27: +4.0% at
+   1024-token decode, promoted to default (N=8). Remaining: an int8-KV
+   split-K variant (`?kv8=1` currently ignores splitk) and per-GPU N tuning.
 2. **Fuse addNorm into the matmul that feeds it** (addNorm1 ← oproj output,
    addNorm2 ← ffnDown output) — still open, but the prologue-fusion negative
    above says the fold must not duplicate the norm work per workgroup;
@@ -379,7 +398,8 @@ URL toggles for A/B bisection:
 
 Opt-in experiments (measured 2026-07-25 on M2 Max — see the A/B table above):
 
-- `?splitk=2|4|8`   — split-K attention + combine (f16 KV only): ~+3% at
-  short context, awaiting a long-context A/B before defaulting
+- `?splitk=N`       — split-K attention + combine (f16 KV only): +3.1% at
+  128-token / +4.0% at 1024-token decode — **default N=8 since 2026-07-27**;
+  `?splitk=0` to disable
 - `?fuseprologue=1` — add_norm folded into the FFN prologue: −13.7% on Apple
   (falsified there; kept for A/B on other GPUs)

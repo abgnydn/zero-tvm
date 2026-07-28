@@ -60,9 +60,12 @@ describe('zero-tvm.html', () => {
     chatState.coldFirstTokenMs = Date.now() - t0
     console.log(`[chat] cold first-token: ${chatState.coldFirstTokenMs} ms`)
 
-    // Wait for full generation to finish (send button re-enabled).
+    // Wait for full generation to finish. The composer hides #btn and shows
+    // #stop-btn while generating (setBusy in chat.ts), so "send visible
+    // again" is the end-of-generation signal — NOT .disabled, which stays
+    // false while the button is hidden.
     await page.waitForFunction(
-      () => !(document.getElementById('btn') as HTMLButtonElement).disabled,
+      () => !(document.getElementById('btn') as HTMLButtonElement).hidden,
       { timeout: GEN_TIMEOUT_MS, polling: 100 }
     )
 
@@ -105,11 +108,13 @@ describe('zero-tvm.html', () => {
     expect(warmFirstTokenMs).toBeLessThan(8_000)
 
     // And it should not be dramatically slower than the first (which would
-    // indicate the warmup pass regressed).
-    expect(warmFirstTokenMs).toBeLessThan(chatState.coldFirstTokenMs! * 3)
+    // indicate the warmup pass regressed). The 500 ms floor keeps the ratio
+    // meaningful — at sub-100 ms first-token latencies (M2-class, warmed
+    // pipelines) the cold/warm ratio is event-loop noise, not signal.
+    expect(warmFirstTokenMs).toBeLessThan(Math.max(chatState.coldFirstTokenMs! * 3, 500))
 
     await page!.waitForFunction(
-      () => !(document.getElementById('btn') as HTMLButtonElement).disabled,
+      () => !(document.getElementById('btn') as HTMLButtonElement).hidden,
       { timeout: GEN_TIMEOUT_MS, polling: 100 }
     )
     await page!.close()

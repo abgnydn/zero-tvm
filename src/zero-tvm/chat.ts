@@ -220,6 +220,21 @@ async function hasWeightsCached(): Promise<boolean> {
 
 function showDownloadGate(): Promise<void> {
   return new Promise((resolve) => {
+    // Prefer the page's own styled <dialog id="start-dialog"> (zero-tvm.html).
+    // Its #start-btn must leave the DOM entirely once the gate is passed —
+    // the e2e contract is "#start-btn present iff the gate is showing".
+    const staticDialog = document.getElementById('start-dialog') as HTMLDialogElement | null
+    if (staticDialog?.showModal) {
+      setBadge('Waiting')
+      const btn = staticDialog.querySelector<HTMLButtonElement>('#start-btn')
+      btn?.addEventListener('click', () => {
+        staticDialog.close()
+        staticDialog.remove()
+        resolve()
+      }, { once: true })
+      staticDialog.showModal()
+      return
+    }
     const chat = document.getElementById('chat')
     if (!chat) { resolve(); return }
     // Same #start-screen / #start-btn IDs as compiler-chat.html so existing
@@ -504,7 +519,13 @@ async function boot(): Promise<void> {
   await registerWeightsSW()
   // Skip the gate when weights are already in OPFS — returning visitors
   // (or visitors who started from compiler-chat) should boot straight in.
-  if (!(await hasWeightsCached())) await showDownloadGate()
+  // Remove the static dialog so no hidden #start-btn lingers in the DOM
+  // (the gate e2e asserts "#start-btn present iff the gate is showing").
+  if (await hasWeightsCached()) {
+    document.getElementById('start-dialog')?.remove()
+  } else {
+    await showDownloadGate()
+  }
   await main()
 }
 boot().catch((e) => { console.error(e); log(`FATAL: ${e}`) })
