@@ -2,9 +2,10 @@
  * MODEL SELECT — URL → ModelSpec, plus the per-spec tokenizer factory and
  * chat-template dispatch.
  *
- * Both shipped pages accept `?model=qwen3` to boot Qwen3-4B; anything else
- * (including no flag) boots Phi-3, so all existing URLs keep their exact
- * behavior. This module is the one place that maps a spec to:
+ * Both shipped pages accept `?model=qwen3` (Qwen3-4B) and `?model=qwen35`
+ * (Qwen3.5-4B hybrid GDN+attention); anything else (including no flag) boots
+ * Phi-3, so all existing URLs keep their exact behavior. This module is the
+ * one place that maps a spec to:
  *
  *   - the tokenizer implementation (SPM for Phi-3, byte-level BPE for Qwen3),
  *     fetching tokenizer.json from the spec's own HF repo
@@ -15,20 +16,27 @@
  *   - display copy (model name + approximate download size) for gate/header UI
  */
 
-import { PHI3, QWEN3_4B, type ModelSpec } from '../compiler/model-spec.js'
+import { PHI3, QWEN3_4B, QWEN35_4B, type ModelSpec } from '../compiler/model-spec.js'
 import { modelBaseUrl } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
 import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt } from './tokenizer-bpe.js'
 
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
 
-/** `?model=qwen3` selects QWEN3_4B; default (and anything else) is PHI3. */
+/** `?model=qwen3` selects QWEN3_4B, `?model=qwen35` selects QWEN35_4B;
+ *  default (and anything else) is PHI3. */
 export function specFromSearch(search: string): ModelSpec {
-  return new URLSearchParams(search).get('model') === 'qwen3' ? QWEN3_4B : PHI3
+  const model = new URLSearchParams(search).get('model')
+  if (model === 'qwen35') return QWEN35_4B
+  if (model === 'qwen3') return QWEN3_4B
+  return PHI3
 }
 
 /** Page-facing copy for the active model (gate dialog, header, hints). */
 export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: string; rateLabel: string } {
+  if (spec.id === QWEN35_4B.id) {
+    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '—' }  // rate unmeasured — update from BENCH.md once profiled
+  }
   return spec.id === QWEN3_4B.id
     ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~25 t/s' }  // v1 unfused path, M2 Max (BENCH.md)
     : { name: 'Phi-3-mini', sizeLabel: '~2 GB', rateLabel: '60+ t/s' }

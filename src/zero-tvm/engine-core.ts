@@ -22,7 +22,7 @@
 
 import { LoadedWeights } from './weight-loader.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
-import { SCALAR_VARIANTS, resolveVariantPipelines, type VariantFlags } from './variants.js'
+import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
 
 // ============================================================
 // GPU helpers
@@ -79,7 +79,11 @@ interface ProfileState {
 export function allocKVPages(device: GPUDevice, spec: ModelSpec = PHI3): GPUBuffer[] {
   const bytesPerPage = spec.kvPageStride * 2  // kvHeads * pageSize slots * headDim * 2 (K+V) * 2 bytes
   const pages = spec.maxPages * bytesPerPage  // Phi-3: 257 * 196608 ≈ 50MB
-  return Array.from({ length: spec.layers }, (_, i) =>
+  // One pages buffer per ATTENTION layer: hybrid specs (Qwen3.5) have KV only
+  // on their 'attn' layers and the engine indexes by attention-layer ordinal.
+  // Pure-attention specs have layerKinds all 'attn' → one per layer, as before.
+  const attnLayers = spec.layerKinds.filter((k) => k === 'attn').length
+  return Array.from({ length: attnLayers }, (_, i) =>
     makeBuf(device, pages, `kvPages_${i}`)
   )
 }
@@ -204,6 +208,20 @@ export function buildDecodeEngine(
   if (int8Mode && (!fused || !kvScales)) {
     throw new Error('buildDecodeEngine: int8KV requires fused mode and a KV cache with scales buffers')
   }
+  // Hybrid specs (Qwen3.5): layerKinds mixes 'gdn' and 'attn' layers. GDN
+  // layers run the GatedDeltaNet chain; attention layers run the unfused
+  // gated-attention chain (c_attn → split → qk_norm → rope → append →
+  // attention → sigmoid gate). KV pages exist only for 'attn' layers,
+  // indexed by attention-layer ordinal.
+  const hybrid = S.layerKinds.includes('gdn')
+  if (hybrid && (fused || int8Mode)) {
+    throw new Error('buildDecodeEngine: hybrid (GDN) specs require the unfused f16-KV composition')
+  }
+  const kvIndex: number[] = []
+  {
+    let ord = 0
+    for (const k of S.layerKinds) kvIndex.push(k === 'attn' ? ord++ : -1)
+  }
   // QK-norm specs (Qwen3) must run the unfused composition: qkv_fused folds
   // RoPE+KV-append into the projection, leaving nowhere to normalize Q/K
   // between the matmul and the rotation. Pages gate `fused` off per spec.
@@ -241,7 +259,7 @@ export function buildDecodeEngine(
   console.log(
     `[engine] attention=${R.attentionLabel} argmax=${R.argmaxLabel} qkv=${R.qkvLabel} ` +
     `ffn=${R.ffnLabel} matmul=${R.matmulLabel} rowsPerWG=${R.matmulRowsPerWG} ` +
-    `mode=${fused ? (int8Mode ? 'fused+int8KV' : 'fused') : 'unfused'}`
+    `mode=${fused ? (int8Mode ? 'fused+int8KV' : 'fused') : hybrid ? 'hybrid-unfused' : 'unfused'}`
   )
 
   // Activation buffers. The per-layer QKV stage differs by mode:
@@ -277,6 +295,17 @@ export function buildDecodeEngine(
     // ?splitk=N: per-(head, partition) online-softmax partials
     // [m, d, o[HEAD_DIM]] in f32, merged by attention_combine.
     attnPartials: null as GPUBuffer | null,
+    // Hybrid (Qwen3.5) activation scratch — allocated only for hybrid specs.
+    cAttnOut:   null as GPUBuffer | null,  // c_attn projection [C_ATTN_DIM f16]
+    attnGateRaw: null as GPUBuffer | null, // raw per-head gate rows [Q_DIM f16]
+    gdnQkvOut:  null as GPUBuffer | null,  // in_proj_qkv raw [GDN_QKV_DIM f16]
+    gdnConvOut: null as GPUBuffer | null,  // conv+SiLU output [GDN_QKV_DIM f16]
+    gdnZOut:    null as GPUBuffer | null,  // in_proj_z [GDN_V_DIM f16]
+    gdnAOut:    null as GPUBuffer | null,  // in_proj_a [GDN_V_HEADS f16]
+    gdnBOut:    null as GPUBuffer | null,  // in_proj_b [GDN_V_HEADS f16]
+    gdnGates:   null as GPUBuffer | null,  // [exp(g) | beta] [2*GDN_V_HEADS f32]
+    gdnRecurOut: null as GPUBuffer | null, // recurrence readout [GDN_V_DIM f32]
+    gdnNormed:  null as GPUBuffer | null,  // gated-norm output [GDN_V_DIM f16]
   }
   if (!fused) {
     B.qkvOut = makeBuf(device, S.qkvDim * 2, 'qkvOut')
@@ -292,6 +321,37 @@ export function buildDecodeEngine(
   }
   if (splitK) {
     B.attnPartials = makeBuf(device, S.heads * splitK * (S.headDim + 2) * 4, 'attnPartials')
+  }
+  // Per-GDN-layer persistent state: conv ring ((convK-1) × GDN_QKV_DIM f16)
+  // and the recurrent state matrix (GDN_V_HEADS × headK × headV f32 ≈ 2 MB).
+  // Both are zeroed on the GPU whenever a forward pass runs at position 0
+  // (fresh conversation / fresh prefill) — see clearGdnState().
+  const gdnConvState: (GPUBuffer | null)[] = []
+  const gdnRecurState: (GPUBuffer | null)[] = []
+  const gdnStateBufs: GPUBuffer[] = []
+  if (hybrid) {
+    B.cAttnOut   = makeBuf(device, S.cAttnDim * 2, 'cAttnOut')
+    B.attnGateRaw = makeBuf(device, S.qDim * 2, 'attnGateRaw')
+    B.gdnQkvOut  = makeBuf(device, S.gdnQkvDim * 2, 'gdnQkvOut')
+    B.gdnConvOut = makeBuf(device, S.gdnQkvDim * 2, 'gdnConvOut')
+    B.gdnZOut    = makeBuf(device, S.gdnVDim * 2, 'gdnZOut')
+    B.gdnAOut    = makeBuf(device, S.gdnVHeads * 2, 'gdnAOut')
+    B.gdnBOut    = makeBuf(device, S.gdnVHeads * 2, 'gdnBOut')
+    B.gdnGates   = makeBuf(device, 2 * S.gdnVHeads * 4, 'gdnGates')
+    B.gdnRecurOut = makeBuf(device, S.gdnVDim * 4, 'gdnRecurOut')
+    B.gdnNormed  = makeBuf(device, S.gdnVDim * 2, 'gdnNormed')
+    for (let L = 0; L < S.layers; L++) {
+      if (S.layerKinds[L] === 'gdn') {
+        const conv = makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `gdnConvState_${L}`)
+        const recur = makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `gdnRecurState_${L}`)
+        gdnConvState.push(conv)
+        gdnRecurState.push(recur)
+        gdnStateBufs.push(conv, recur)
+      } else {
+        gdnConvState.push(null)
+        gdnRecurState.push(null)
+      }
+    }
   }
 
   // Static uniforms — matmul shapes (K_packed, scales_per_row, M)
@@ -316,6 +376,27 @@ export function buildDecodeEngine(
   const qkvFusedU = (fused && !int8Mode) ? uniformBuf(device, [i32(0), i32(0), u32(S.qkvPairs)]) : null      // f16-KV mode
   const qkvFusedScratchU = int8Mode ? uniformBuf(device, [i32(0), u32(S.qkvPairs)]) : null                   // int8-KV mode
   const kvQuantU = int8Mode ? uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]) : null  // pos_off, pages_off, scales_off, kvHeads*2 WG
+
+  // Hybrid (Qwen3.5) uniforms + grids. All static except gdnConvU.pos, which
+  // writeStepState rewrites per token (queue-ordered like attnU.nnz_pages).
+  const GDN_CONV_WGS = hybrid ? Math.ceil(S.gdnQkvDim / WG_SIZE_D) : 0
+  const C_ATTN_WGS   = hybrid ? Math.ceil(S.cAttnDim / WG_SIZE_D) : 0
+  const ATTN_GATE_WGS = hybrid ? Math.ceil(S.qDim / WG_SIZE_D) : 0
+  const gdnQkvU  = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnQkvDim)]) : null
+  const gdnZU    = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnVDim)]) : null
+  const gdnAbU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnVHeads)]) : null
+  const gdnOutU  = hybrid ? uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / GROUP), u32(S.d)]) : null
+  const cAttnU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.cAttnDim)]) : null
+  const gdnConvU = hybrid ? uniformBuf(device, [i32(0), u32(GDN_CONV_WGS)]) : null  // pos rewritten per token
+  const gdnGatesU = hybrid ? uniformBuf(device, [u32(1)]) : null
+  const gdnRecurU = hybrid ? uniformBuf(device, [i32(1), u32(S.gdnVHeads)]) : null  // seq_len = 1 (decode/step prefill)
+  const gdnNormU  = hybrid ? uniformBuf(device, [i32(1), u32(S.gdnVHeads)]) : null
+  const gatedSplitU = hybrid ? uniformBuf(device, [i32(1), u32(C_ATTN_WGS)]) : null
+  const attnGateU = hybrid ? uniformBuf(device, [u32(ATTN_GATE_WGS)]) : null
+  // GDN out_proj is a K = GDN_V_DIM matmul instance — resolve its own
+  // pipeline so the vec4 K-divisibility gate applies to the right K
+  // (== R.matmulOProj on Qwen3.5, where gdnVDim == qDim == 4096).
+  const matmulGdnOut = hybrid ? resolveMatmul(variants.matmul, P, variants.vec4, S.gdnVDim).pipeline : null
 
   const SM_SCALE = 1.0 / Math.sqrt(S.headDim)
 
@@ -392,6 +473,7 @@ export function buildDecodeEngine(
     device.queue.writeBuffer(attnI8U, 0, tmpl)
   }
   const nnzPagesScratch = new Uint32Array(1)   // reused per token for writeBuffer
+  const gdnPosScratch = new Int32Array(1)      // reused per token for gdnConvU.pos
 
   // Token readback buffer for the blocking path — allocated once, reused
   // every decode step.
@@ -448,70 +530,125 @@ export function buildDecodeEngine(
 
   // Per-layer bind groups
   interface LayerBG {
-    qkv: GPUBindGroup           // unfused: qkv matmul | fused: qkv_fused / qkv_fused_scratch
-    qkNorm?: GPUBindGroup       // qkNorm specs (Qwen3) only — in-place Q/K RMSNorm on qkvOut
+    qkv?: GPUBindGroup          // unfused: qkv matmul | fused: qkv_fused / qkv_fused_scratch | hybrid attn: c_attn matmul
+    qkNorm?: GPUBindGroup       // qkNorm specs (Qwen3/Qwen3.5) only — in-place Q/K RMSNorm on qkvOut
+    gatedSplit?: GPUBindGroup   // hybrid attn layers: c_attn → qkvOut + attnGateRaw unpack
+    attnGate?: GPUBindGroup     // hybrid attn layers: attnOut *= sigmoid(gate), in place
     kvApp?: GPUBindGroup        // unfused only
     kvQuantize?: GPUBindGroup   // int8 mode only
-    attn: GPUBindGroup          // splitK: the partial pass (writes attnPartials)
-    oProj: GPUBindGroup
+    attn?: GPUBindGroup         // splitK: the partial pass (writes attnPartials)
+    // Hybrid GDN layers: the whole GatedDeltaNet chain replaces qkv/attn.
+    gdn?: {
+      qkv: GPUBindGroup         // in_proj_qkv matmul → gdnQkvOut
+      z: GPUBindGroup           // in_proj_z matmul → gdnZOut
+      a: GPUBindGroup           // in_proj_a matmul → gdnAOut
+      b: GPUBindGroup           // in_proj_b matmul → gdnBOut
+      conv: GPUBindGroup        // causal conv + SiLU (ring state)
+      gates: GPUBindGroup       // exp(g) decay + beta
+      recur: GPUBindGroup       // gated delta rule (f32 state)
+      normOut: GPUBindGroup     // gated RMSNorm · silu(z) → gdnNormed
+    }
+    oProj: GPUBindGroup         // attn: o_proj | gdn: out_proj (both → hidden2)
     addNorm1?: GPUBindGroup     // post-attention: reads residual, writes residual2 (absent w/ ?fuseprologue=1)
     ffn: GPUBindGroup           // prologue mode: reads (rIn, hidden2, gamma) instead of hidden1
     ffnDown: GPUBindGroup       // prologue mode: writes hidden3 (hidden2 must survive for add3_norm)
     addNorm2: GPUBindGroup      // post-FFN: reads residual2, writes residual (prologue mode: add3_norm)
   }
+  if (hybrid && R.ffnPrologue) {
+    throw new Error('buildDecodeEngine: ?fuseprologue=1 is not supported for hybrid (GDN) specs')
+  }
   const layerBGs: LayerBG[] = []
   for (let L = 0; L < S.layers; L++) {
     const lw = weights.layers[L]
+    const isGdn = S.layerKinds[L] === 'gdn'
     const nextGamma = L < S.layers - 1
       ? weights.layers[L + 1].normGamma1
       : weights.finalNormGamma
 
-    let qkvBG: GPUBindGroup
-    let attnBG: GPUBindGroup
+    let qkvBG: GPUBindGroup | undefined
+    let attnBG: GPUBindGroup | undefined
     let qkNormBG: GPUBindGroup | undefined
+    let gatedSplitBG: GPUBindGroup | undefined
+    let attnGateBG: GPUBindGroup | undefined
     let kvAppBG: GPUBindGroup | undefined
     let kvQuantizeBG: GPUBindGroup | undefined
+    let gdnBG: LayerBG['gdn']
+    let oProjBG: GPUBindGroup
+    // KV pages for this layer's attention-layer ordinal (== L for
+    // pure-attention specs).
+    const kvL = () => kvPages[kvIndex[L]]
     // Split-K partial pass replaces the single-WG-per-head attention bind
     // group in the f16-KV modes (int8 has no split-K variant).
     const attnF16BG = () => splitK
       ? bg(device, R.attentionSplitK!, [
-          B.qOut, B.pageIndptr, B.pageValues, kvPages[L], B.lengthInfo, B.attnPartials!, attnSkU!,
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), B.lengthInfo, B.attnPartials!, attnSkU!,
         ])
       : bg(device, R.attention, [
-          B.qOut, B.pageIndptr, B.pageValues, kvPages[L], B.lengthInfo, B.attnOut, attnU,
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), B.lengthInfo, B.attnOut, attnU,
         ])
-    if (!fused) {
-      qkvBG = bg(device, R.matmul, [
-        B.qkvOut!, B.hidden1, lw.qkvScales, lw.qkvWeights, qkvU!,
-      ])
-      if (S.qkNorm) {
-        // q_norm/k_norm gammas are HEAD_DIM f16 vectors in the MLC layout —
-        // same dtype as every other norm gamma, uploaded raw by the loader.
-        if (!lw.qNormGamma || !lw.kNormGamma) {
-          throw new Error(`buildDecodeEngine: spec ${S.id} sets qkNorm but layer ${L} has no q_norm/k_norm weights`)
-        }
-        qkNormBG = bg(device, P.qkNorm, [B.qkvOut!, lw.qNormGamma, lw.kNormGamma, qkNormU!])
+    const qkNormBGFor = () => {
+      // q_norm/k_norm gammas are HEAD_DIM f16 vectors in the MLC layout —
+      // same dtype as every other norm gamma, uploaded raw by the loader.
+      if (!lw.qNormGamma || !lw.kNormGamma) {
+        throw new Error(`buildDecodeEngine: spec ${S.id} sets qkNorm but layer ${L} has no q_norm/k_norm weights`)
       }
+      return bg(device, P.qkNorm, [B.qkvOut!, lw.qNormGamma, lw.kNormGamma, qkNormU!])
+    }
+    if (isGdn) {
+      const gw = lw.gdn
+      if (!gw) throw new Error(`buildDecodeEngine: spec ${S.id} marks layer ${L} 'gdn' but the loader has no GDN weights for it`)
+      gdnBG = {
+        qkv: bg(device, R.matmul, [B.gdnQkvOut!, B.hidden1, gw.qkvScales, gw.qkvWeights, gdnQkvU!]),
+        z: bg(device, R.matmul, [B.gdnZOut!, B.hidden1, gw.zScales, gw.zWeights, gdnZU!]),
+        a: bg(device, R.matmul, [B.gdnAOut!, B.hidden1, gw.aScales, gw.aWeights, gdnAbU!]),
+        b: bg(device, R.matmul, [B.gdnBOut!, B.hidden1, gw.bScales, gw.bWeights, gdnAbU!]),
+        conv: bg(device, P.gdnConv, [B.gdnConvOut!, B.gdnQkvOut!, gdnConvState[L]!, gw.convWeight, gdnConvU!]),
+        gates: bg(device, P.gdnGates, [B.gdnGates!, B.gdnAOut!, B.gdnBOut!, gw.aLog, gw.dtBias, gdnGatesU!]),
+        recur: bg(device, P.gdnRecur, [B.gdnRecurOut!, B.gdnConvOut!, B.gdnGates!, gdnRecurState[L]!, gdnRecurU!]),
+        normOut: bg(device, P.gdnNormOut, [B.gdnNormed!, B.gdnRecurOut!, gw.normGamma, B.gdnZOut!, gdnNormU!]),
+      }
+      oProjBG = bg(device, matmulGdnOut!, [B.hidden2, B.gdnNormed!, gw.outScales, gw.outWeights, gdnOutU!])
+    } else if (hybrid) {
+      // Gated attention layer: c_attn packs per-head [Q|gate] before K‖V.
+      qkvBG = bg(device, R.matmul, [
+        B.cAttnOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, cAttnU!,
+      ])
+      gatedSplitBG = bg(device, P.gatedQkvSplit, [B.qkvOut!, B.attnGateRaw!, B.cAttnOut!, gatedSplitU!])
+      if (S.qkNorm) qkNormBG = qkNormBGFor()
       kvAppBG = bg(device, P.kvAppend, [
-        B.kOut!, B.vOut!, kvPages[L], B.posMap, kvAppU!,
+        B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!,
       ])
       attnBG = attnF16BG()
+      attnGateBG = bg(device, P.attnGate, [B.attnOut, B.attnGateRaw!, attnGateU!])
+      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
+    } else if (!fused) {
+      qkvBG = bg(device, R.matmul, [
+        B.qkvOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, qkvU!,
+      ])
+      if (S.qkNorm) qkNormBG = qkNormBGFor()
+      kvAppBG = bg(device, P.kvAppend, [
+        B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!,
+      ])
+      attnBG = attnF16BG()
+      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
     } else if (int8Mode) {
       qkvBG = bg(device, P.qkvFusedScratch, [
-        B.qOut, B.kSlot!, B.vSlot!, B.hidden1, lw.qkvScales, lw.qkvWeights, B.posMap, qkvFusedScratchU!,
+        B.qOut, B.kSlot!, B.vSlot!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, B.posMap, qkvFusedScratchU!,
       ])
       kvQuantizeBG = bg(device, P.kvQuantizeInt8, [
-        B.kSlot!, B.vSlot!, kvPages[L], kvScales![L], B.posMap, kvQuantU!,
+        B.kSlot!, B.vSlot!, kvL(), kvScales![L], B.posMap, kvQuantU!,
       ])
       attnBG = bg(device, P.attentionInt8, [
-        B.qOut, B.pageIndptr, B.pageValues, kvPages[L], kvScales![L],
+        B.qOut, B.pageIndptr, B.pageValues, kvL(), kvScales![L],
         B.lengthInfo, B.attnOut, attnI8U!,
       ])
+      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
     } else {
       qkvBG = bg(device, R.qkvFused, [
-        B.qOut, kvPages[L], B.hidden1, lw.qkvScales, lw.qkvWeights, B.posMap, qkvFusedU!,
+        B.qOut, kvL(), B.hidden1, lw.qkvScales!, lw.qkvWeights!, B.posMap, qkvFusedU!,
       ])
       attnBG = attnF16BG()
+      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
     }
 
     if (R.ffnPrologue) {
@@ -529,7 +666,7 @@ export function buildDecodeEngine(
         kvApp: kvAppBG,
         kvQuantize: kvQuantizeBG,
         attn: attnBG,
-        oProj: bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
+        oProj: oProjBG,
         ffn: bg(device, R.ffn, [B.ffnOut, rIn, B.hidden2, lw.normGamma2, lw.ffnScales, lw.ffnWeights, ffnU]),
         ffnDown: bg(device, R.matmulFfnDown, [B.hidden3!, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
         addNorm2: bg(device, P.add3Norm, [rIn, B.hidden2, B.hidden3!, nextGamma, B.hidden1, rOut, normU]),
@@ -540,10 +677,13 @@ export function buildDecodeEngine(
     layerBGs.push({
       qkv: qkvBG,
       qkNorm: qkNormBG,
+      gatedSplit: gatedSplitBG,
+      attnGate: attnGateBG,
       kvApp: kvAppBG,
       kvQuantize: kvQuantizeBG,
       attn: attnBG,
-      oProj: bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
+      gdn: gdnBG,
+      oProj: oProjBG,
       addNorm1: bg(device, P.addNorm, [B.hidden2, B.residual, lw.normGamma2, B.hidden1, B.residual2, normU]),
       ffn: bg(device, R.ffn, [B.ffnOut, B.hidden1, lw.ffnScales, lw.ffnWeights, ffnU]),
       ffnDown: bg(device, R.matmulFfnDown, [B.hidden2, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
@@ -611,16 +751,43 @@ export function buildDecodeEngine(
       // plus a per-head combine over the partials scratch.
       const attentionF16 = () => {
         if (splitK) {
-          dispatch(enc, R.attentionSplitK!, blk.attn, splitK, S.heads, 1, 'attention')
+          dispatch(enc, R.attentionSplitK!, blk.attn!, splitK, S.heads, 1, 'attention')
           dispatch(enc, R.attentionCombine!, bgAttnCombine!, 1, S.heads, 1, 'attnCombine')
         } else {
-          dispatch(enc, R.attention, blk.attn, 1, S.heads, 1, 'attention')
+          dispatch(enc, R.attention, blk.attn!, 1, S.heads, 1, 'attention')
         }
       }
 
-      if (!fused) {
+      if (blk.gdn) {
+        // GatedDeltaNet layer (Qwen3.5 linear_attn): 4 projections off the
+        // normed hidden state, then conv → gates → recurrence → gated norm.
+        const g = blk.gdn
+        dispatch(enc, R.matmul, g.qkv, S.gdnQkvDim / R.matmulRowsPerWG, 1, 1, 'gdnQkvMatmul')
+        dispatch(enc, R.matmul, g.z, S.gdnVDim / R.matmulRowsPerWG, 1, 1, 'gdnZMatmul')
+        // Tiny N = GDN_V_HEADS (32) matmuls: still row-per-WG kernels — the
+        // grid is just ceil(32 / rowsPerWG) workgroups.
+        dispatch(enc, R.matmul, g.a, Math.ceil(S.gdnVHeads / R.matmulRowsPerWG), 1, 1, 'gdnAMatmul')
+        dispatch(enc, R.matmul, g.b, Math.ceil(S.gdnVHeads / R.matmulRowsPerWG), 1, 1, 'gdnBMatmul')
+        dispatch(enc, P.gdnConv, g.conv, GDN_CONV_WGS, 1, 1, 'gdnConv')
+        dispatch(enc, P.gdnGates, g.gates, 1, 1, 1, 'gdnGates')
+        dispatch(enc, P.gdnRecur, g.recur, S.gdnVHeads, 1, 1, 'gdnRecur')
+        dispatch(enc, P.gdnNormOut, g.normOut, S.gdnVHeads, 1, 1, 'gdnNormOut')
+        // out_proj: B.gdnNormed → B.hidden2 (K = GDN_V_DIM instance)
+        dispatch(enc, matmulGdnOut!, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'gdnOutProj')
+      } else if (hybrid) {
+        // Gated attention layer (Qwen3.5): c_attn → per-head [Q|gate] split →
+        // qk_norm → partial RoPE → KV append → attention → sigmoid gate.
+        dispatch(enc, R.matmul, blk.qkv!, S.cAttnDim / R.matmulRowsPerWG, 1, 1, 'cAttnMatmul')
+        dispatch(enc, P.gatedQkvSplit, blk.gatedSplit!, C_ATTN_WGS, 1, 1, 'gatedQkvSplit')
+        if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
+        dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
+        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+        attentionF16()
+        dispatch(enc, P.attnGate, blk.attnGate!, ATTN_GATE_WGS, 1, 1, 'attnGate')
+        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+      } else if (!fused) {
         // QKV matmul: B.hidden1 → B.qkvOut
-        dispatch(enc, R.matmul, blk.qkv, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
+        dispatch(enc, R.matmul, blk.qkv!, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
         // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
         if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
         // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
@@ -629,18 +796,18 @@ export function buildDecodeEngine(
         dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
         // Attention: Q + kvPages[L] → B.attnOut
         attentionF16()
+        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
       } else if (int8Mode) {
-        dispatch(enc, P.qkvFusedScratch, blk.qkv, S.qkvPairs, 1, 1, 'qkvFused')
+        dispatch(enc, P.qkvFusedScratch, blk.qkv!, S.qkvPairs, 1, 1, 'qkvFused')
         dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
-        dispatch(enc, P.attentionInt8, blk.attn, 1, S.heads, 1, 'attention')
+        dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
+        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
       } else {
         // Fused QKV+RoPE+KV-append: B.hidden1 → B.qOut + kvPages[L]
-        dispatch(enc, R.qkvFused, blk.qkv, S.qkvPairs / R.qkvPairsPerWG, 1, 1, 'qkvFused')
+        dispatch(enc, R.qkvFused, blk.qkv!, S.qkvPairs / R.qkvPairsPerWG, 1, 1, 'qkvFused')
         attentionF16()
+        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
       }
-
-      // O projection: B.attnOut → B.hidden2 (K = qDim instance)
-      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
       if (R.ffnPrologue) {
         // ?fuseprologue=1: no addNorm1 dispatch. The FFN kernel computes
         // rIn + hidden2 and its RMSNorm in its own prologue; ffnDown lands
@@ -698,6 +865,22 @@ export function buildDecodeEngine(
     device.queue.writeBuffer(int8Mode ? attnI8U! : attnU, 8, nnzPagesScratch)
     // The split-K partial-pass uniform mirrors the same layout (offset 8).
     if (attnSkU) device.queue.writeBuffer(attnSkU, 8, nnzPagesScratch)
+    // gdn_conv selects its ring slots from the absolute position (pos at
+    // byte offset 0 of its PODArgs).
+    if (gdnConvU) {
+      gdnPosScratch[0] = position
+      device.queue.writeBuffer(gdnConvU, 0, gdnPosScratch)
+    }
+  }
+
+  /**
+   * Zero every GDN layer's conv ring + recurrent state. Recorded into the
+   * step's own command encoder whenever a forward pass runs at position 0, so
+   * a fresh prefill (new conversation, validation prompt, replay) never sees
+   * stale state — and the clear is queue-ordered before the pass that reads it.
+   */
+  function clearGdnState(enc: GPUCommandEncoder): void {
+    for (const b of gdnStateBufs) enc.clearBuffer(b)
   }
 
   // ============================================================
@@ -715,6 +898,7 @@ export function buildDecodeEngine(
     writeStepState(tokenId, position)
 
     const enc = device.createCommandEncoder()
+    if (position === 0) clearGdnState(enc)
     recordForward(enc)
     // Fold the argmax readback into the same command encoder → one submit per token.
     enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
@@ -770,11 +954,21 @@ export function buildDecodeEngine(
     // before). The last call's return is the argmax over the final prefill
     // step's logits — that *is* the first generated token.
     let tokenId = 0
-    if (startPos >= promptIds.length) {
+    if (hybrid) {
+      // GDN layers are stateful and NOT idempotent: re-running a token
+      // double-applies it to the recurrent state and rotates the conv ring
+      // past it. KV reuse via startPos therefore can't skip work here —
+      // always replay the whole prompt from position 0, which also re-zeroes
+      // the GDN state (clearGdnState fires at position 0).
+      for (let i = 0; i < promptIds.length; i++) {
+        tokenId = await decodeToken(promptIds[i], i)
+      }
+    } else if (startPos >= promptIds.length) {
       // The new prompt is a strict prefix of the previous one (or identical).
       // No new tokens to prefill — but we still need a valid `tokenId` to
       // start decoding from. Run the last prompt token through decodeToken at
-      // its existing position to re-read the logits.
+      // its existing position to re-read the logits (idempotent for pure
+      // attention: the KV slot is simply rewritten with the same values).
       tokenId = await decodeToken(promptIds[promptIds.length - 1], promptIds.length - 1)
     } else {
       for (let i = startPos; i < promptIds.length; i++) {
@@ -856,6 +1050,7 @@ export function buildDecodeEngine(
     writeStepState(writeInputId, position)
 
     const enc = device.createCommandEncoder()
+    if (position === 0) clearGdnState(enc)
     recordForward(enc)
     // GPU chain: next decode step reads inputIds[0] without a CPU round-trip.
     enc.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
@@ -976,9 +1171,10 @@ export function buildDecodeEngine(
     await warmA; await warmB
     const nextPos = warmupIds.length + 2
 
-    // 2 slots per pass; worst case is the unfused qkNorm path (10/layer) plus
-    // embedding, init norm, LM head, argmax and a little headroom.
-    const CAPACITY = 2 * (S.layers * 10 + 8)
+    // 2 slots per pass; worst case is the hybrid GDN path (13/layer: 4
+    // projections + 4 GDN kernels + out_proj + FFN tail) plus embedding,
+    // init norm, LM head, argmax and a little headroom.
+    const CAPACITY = 2 * (S.layers * 14 + 8)
     const querySet = device.createQuerySet({ type: 'timestamp', count: CAPACITY })
     const resolveBuf = device.createBuffer({
       size: CAPACITY * 8,
@@ -1069,8 +1265,13 @@ export function buildDecodeEngine(
     const K = isFfnDown ? S.ffn : S.qDim
     const N = S.d
     const uniformBufForTarget = isFfnDown ? ffnDnU : oProjU
-    const scalesBuf = isFfnDown ? weights.layers[0].ffnDownScales : weights.layers[0].oProjScales
-    const weightsBuf = isFfnDown ? weights.layers[0].ffnDownWeights : weights.layers[0].oProjWeights
+    const oprojLayer = weights.layers.find((l) => l.oProjScales)  // first attention layer (hybrid: layer 0 may be GDN)
+    if (!isFfnDown && !oprojLayer) {
+      console.warn('[batched-bench] no attention layer with o_proj weights')
+      return null
+    }
+    const scalesBuf = isFfnDown ? weights.layers[0].ffnDownScales : oprojLayer!.oProjScales!
+    const weightsBuf = isFfnDown ? weights.layers[0].ffnDownWeights : oprojLayer!.oProjWeights!
     const batchedPipeline = P.int4MatmulBatchedM4
     // Per-instance vec4 gating: compare against the pipeline the engine
     // actually dispatches for this K (identical to R.matmul on Phi-3).

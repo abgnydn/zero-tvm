@@ -100,6 +100,10 @@ export interface ModelSpecBase {
   chatTemplateId: 'phi3' | 'chatml'
   tokenizerKind: 'spm' | 'byteLevel'  // which tokenizer pipeline tokenizer.json needs
   hfRepo: string           // HuggingFace repo with the MLC q4f16_1 layout
+  /** Weight-manifest filename in the repo. Older MLC repos ship
+   *  ndarray-cache.json (the default); repos built with newer MLC ship the
+   *  renamed tensor-cache.json (Qwen3.5). */
+  manifestName?: string
   paramNaming: ParamNaming
   // ── Qwen3.5 hybrid-architecture fields (all optional; absent = pure attention)
   /** Every Nth layer is full attention, the rest are GDN. HF layer_types:
@@ -349,8 +353,8 @@ export const QWEN3_4B: ModelSpec = makeModelSpec({
 //     q/k_norm[256] (+1.0 offset pre-baked by the MLC loader); output gated
 //     by sigmoid(gate) before o_proj.
 //   - lm_head tied to the 248320-row embedding.
-// No kernel is wired to this spec yet — the GDN kernel family compiles and
-// tests against it (tests/kernels/compile-qwen35.mjs).
+// The GDN kernel family is pinned against tests/kernels/compile-qwen35.mjs;
+// the engine's hybrid path (engine-core.ts) dispatches per layerKinds[L].
 // ============================================================
 
 export const QWEN35_4B: ModelSpec = makeModelSpec({
@@ -369,10 +373,16 @@ export const QWEN35_4B: ModelSpec = makeModelSpec({
   rmsEps: 1e-6,
   tiedEmbeddings: true,
   qkNorm: true,
-  stops: [151645, 151643], // <|im_end|>, <|endoftext|> (mlc-chat-config stop_token_ids)
+  // <|im_end|>, <|endoftext|> — resolved from the repo's OWN tokenizer.json
+  // added_tokens (Qwen3.5 renumbered the specials for the 248320 vocab:
+  // <|endoftext|>=248044, <|im_start|>=248045, <|im_end|>=248046). The
+  // mlc-chat-config stop_token_ids [151643, 151645] are stale Qwen3 ids that
+  // map to ORDINARY BPE tokens in this vocab — do not use them.
+  stops: [248046, 248044],
   chatTemplateId: 'chatml',
   tokenizerKind: 'byteLevel',
   hfRepo: 'mlc-ai/Qwen3.5-4B-q4f16_1-MLC',
+  manifestName: 'tensor-cache.json',  // MLC renamed ndarray-cache.json; tensor-cache-b16.json also exists — ignore it
   fullAttnInterval: 4,
   gdn: { kHeads: 16, vHeads: 32, headK: 128, headV: 128, convK: 4 },
   partialRotaryFactor: 0.25,  // rotary_dim = 64 of 256 dims per head

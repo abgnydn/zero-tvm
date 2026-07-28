@@ -408,23 +408,37 @@ function formatEta(sec: number): string {
 }
 
 function uploadRecord(device: GPUDevice, shard: ArrayBuffer, rec: FlatRecord): GPUBuffer {
+  // MLC's "f32-to-bf16" shard format stores float32 tensors as bf16 (the
+  // upper 16 bits of each f32) — nbytes is the STORED size (numel × 2).
+  // Expand to real f32 on upload: the GDN gate kernel binds A_log/dt_bias as
+  // array<f32> (they must stay f32 — -exp(A_log) can overflow in f16).
+  // float16/uint32 records in the same shards are stored raw.
+  const bf16AsF32 = rec.dtype === 'float32' && rec.format === 'f32-to-bf16'
+  const uploadBytes = bf16AsF32 ? rec.nbytes * 2 : rec.nbytes
   // A record larger than the device's storage-binding ceiling uploads fine but
   // fails bind-group creation later, which invalidates every submit touching
   // it — the engine then runs "successfully" with all-zero outputs. Fail loudly
   // at load time instead (fix: raise requiredLimits at requestDevice(), see
   // bootEngine in loading-ui.ts / tests/kernels/gpu.mjs).
-  if (rec.nbytes > device.limits.maxStorageBufferBindingSize) {
+  if (uploadBytes > device.limits.maxStorageBufferBindingSize) {
     throw new Error(
-      `Weight record '${rec.name}' (${rec.nbytes} bytes) exceeds ` +
+      `Weight record '${rec.name}' (${uploadBytes} bytes) exceeds ` +
       `device.limits.maxStorageBufferBindingSize (${device.limits.maxStorageBufferBindingSize}). ` +
       `Request a higher requiredLimits.maxStorageBufferBindingSize at device creation.`
     )
   }
   const gpuBuf = device.createBuffer({
-    size: Math.max(rec.nbytes, 4),
+    size: Math.max(uploadBytes, 4),
     usage: USAGE,
     label: rec.name,
   })
+  if (bf16AsF32) {
+    const src = new Uint16Array(shard, rec.byteOffset, rec.nbytes / 2)
+    const expanded = new Uint32Array(src.length)
+    for (let i = 0; i < src.length; i++) expanded[i] = src[i] << 16  // bf16 → f32
+    device.queue.writeBuffer(gpuBuf, 0, expanded)
+    return gpuBuf
+  }
   // Uint8Array view avoids the ArrayBuffer.slice() copy before writeBuffer.
   device.queue.writeBuffer(gpuBuf, 0, new Uint8Array(shard, rec.byteOffset, rec.nbytes))
   return gpuBuf
@@ -440,8 +454,10 @@ export async function loadWeights(
   const opfsDir = opfsDirFor(spec)
   const mirrorBase = localMirrorBase(spec)
 
-  // Manifest
-  onProgress?.('Loading ndarray-cache.json…')
+  // Manifest — newer MLC repos renamed ndarray-cache.json → tensor-cache.json
+  // (the spec says which name its repo ships).
+  const manifestName = spec.manifestName ?? 'ndarray-cache.json'
+  onProgress?.(`Loading ${manifestName}…`)
   const { dir: opfs, persisted } = await openOPFS(opfsDir)
   onProgress?.(opfs
     ? `OPFS ready (${opfsDir}, ${persisted ? 'persistent' : 'best-effort'})`
@@ -454,8 +470,8 @@ export async function loadWeights(
   const pendingWrites: Promise<void>[] = []
 
   const manifestBytes = await fetchShard(
-    baseUrl + 'ndarray-cache.json',
-    'ndarray-cache.json',
+    baseUrl + manifestName,
+    manifestName,
     mirrorBase,
     opfs,
     cacheStores,
@@ -555,20 +571,43 @@ export async function loadWeights(
   const layers: LoadedWeights['layers'] = []
   for (let L = 0; L < spec.layers; L++) {
     const n = N.layer(L)
+    // Hybrid specs (Qwen3.5): self_attn records exist only on attention
+    // layers, linear_attn records only on GDN layers — resolve per
+    // layerKinds[L]. Pure-attention specs have layerKinds all 'attn'.
+    const kind = spec.layerKinds[L]
     layers.push({
-      qkvWeights: find(...n.qkvWeight),
-      qkvScales: find(...n.qkvScale),
-      oProjWeights: find(...n.oProjWeight),
-      oProjScales: find(...n.oProjScale),
       normGamma1: find(...n.norm1),
       normGamma2: find(...n.norm2),
       ffnWeights: find(...n.ffnWeight),
       ffnScales: find(...n.ffnScale),
       ffnDownWeights: find(...n.ffnDownWeight),
       ffnDownScales: find(...n.ffnDownScale),
-      // Per-head q/k RMSNorm gammas (Qwen3) — only when the naming declares them.
-      qNormGamma: n.qNorm ? find(...n.qNorm) : undefined,
-      kNormGamma: n.kNorm ? find(...n.kNorm) : undefined,
+      ...(kind === 'attn' ? {
+        qkvWeights: find(...n.qkvWeight),
+        qkvScales: find(...n.qkvScale),
+        oProjWeights: find(...n.oProjWeight),
+        oProjScales: find(...n.oProjScale),
+        // Per-head q/k RMSNorm gammas (Qwen3) — only when the naming declares them.
+        qNormGamma: n.qNorm ? find(...n.qNorm) : undefined,
+        kNormGamma: n.kNorm ? find(...n.kNorm) : undefined,
+      } : {
+        gdn: {
+          qkvWeights: find(...n.gdnQkvWeight!),
+          qkvScales: find(...n.gdnQkvScale!),
+          zWeights: find(...n.gdnZWeight!),
+          zScales: find(...n.gdnZScale!),
+          aWeights: find(...n.gdnAWeight!),
+          aScales: find(...n.gdnAScale!),
+          bWeights: find(...n.gdnBWeight!),
+          bScales: find(...n.gdnBScale!),
+          aLog: find(...n.gdnALog!),        // f32 (bf16-expanded by uploadRecord)
+          dtBias: find(...n.gdnDtBias!),    // f32 (bf16-expanded by uploadRecord)
+          convWeight: find(...n.gdnConvWeight!),  // f16 [C,1,K] — channel-major flat, gdn_conv's layout
+          normGamma: find(...n.gdnNormWeight!),
+          outWeights: find(...n.gdnOutWeight!),
+          outScales: find(...n.gdnOutScale!),
+        },
+      }),
     })
   }
 
@@ -599,10 +638,12 @@ export interface LoadedWeights {
   initNormGamma: GPUBuffer     // layer 0 input_layernorm
   finalNormGamma: GPUBuffer    // model.norm (after all layers)
   layers: Array<{
-    qkvWeights: GPUBuffer
-    qkvScales: GPUBuffer
-    oProjWeights: GPUBuffer
-    oProjScales: GPUBuffer
+    // Attention-layer records — present iff spec.layerKinds[L] === 'attn'
+    // (always, for pure-attention specs like Phi-3/Qwen3).
+    qkvWeights?: GPUBuffer
+    qkvScales?: GPUBuffer
+    oProjWeights?: GPUBuffer
+    oProjScales?: GPUBuffer
     normGamma1: GPUBuffer    // input_layernorm (pre-attention)
     normGamma2: GPUBuffer    // post_attention_layernorm (pre-FFN)
     ffnWeights: GPUBuffer
@@ -611,5 +652,22 @@ export interface LoadedWeights {
     ffnDownScales: GPUBuffer
     qNormGamma?: GPUBuffer   // per-head q RMSNorm over head_dim (Qwen3 only)
     kNormGamma?: GPUBuffer   // per-head k RMSNorm over head_dim (Qwen3 only)
+    // GatedDeltaNet records — present iff spec.layerKinds[L] === 'gdn' (Qwen3.5).
+    gdn?: {
+      qkvWeights: GPUBuffer  // in_proj_qkv int4 [gdnQkvDim, d]
+      qkvScales: GPUBuffer
+      zWeights: GPUBuffer    // in_proj_z int4 [gdnVDim, d]
+      zScales: GPUBuffer
+      aWeights: GPUBuffer    // in_proj_a int4 [gdnVHeads, d]
+      aScales: GPUBuffer
+      bWeights: GPUBuffer    // in_proj_b int4 [gdnVHeads, d]
+      bScales: GPUBuffer
+      aLog: GPUBuffer        // A_log f32 [gdnVHeads]
+      dtBias: GPUBuffer      // dt_bias f32 [gdnVHeads]
+      convWeight: GPUBuffer  // conv1d_weight f16 [gdnQkvDim * gdnConvK]
+      normGamma: GPUBuffer   // gated-RMSNorm gamma f16 [gdnHeadV]
+      outWeights: GPUBuffer  // out_proj int4 [d, gdnVDim]
+      outScales: GPUBuffer
+    }
   }>
 }
