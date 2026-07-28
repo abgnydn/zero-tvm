@@ -83,6 +83,41 @@ The build produces a multi-page Vite output: `index.html` (landing page — proj
 
 Open DevTools and `window.specSim(160, 3, 3)` runs the CPU-side prompt-lookup speculative-decoding acceptance simulator over three prompt types — see `src/zero-tvm/spec-sim.ts`.
 
+## Models
+
+**Phi-3-mini-4k-instruct (3.8B, q4f16_1) — the default.** Everything above —
+the headline numbers, the kernel counts, the fusion story — is about Phi-3.
+No URL flag needed; all existing URLs keep their exact behavior.
+
+**Qwen3-4B (q4f16_1) — `?model=qwen3` on `zero-tvm.html` and
+`validate.html`.** A v1 port that exercises the spec-parameterized engine on
+a genuinely different architecture:
+
+- **GQA 32/8** — 32 query heads over 8 KV heads (Phi-3 is 32/32 MHA), with
+  `qDim = 4096 ≠ d = 2560`
+- **QK-norm** — per-head RMSNorm on Q and K between the projection and RoPE
+- **byte-level BPE tokenizer** (Qwen2-style `tokenizer.json`; Phi-3 is SPM)
+- **tied lm_head** — logits reuse the quantized embedding matrix
+- ChatML template, run in the non-thinking form (`<think>` rendering is not
+  built)
+
+Honest performance framing: the Qwen path is **v1-unfused** — QK-norm is
+incompatible with the fused QKV+RoPE+KV-append kernel, so it runs the
+unfused reference composition (10 dispatches/layer vs the Phi-3 chat path's
+7), and the vec4-load matmuls only engage where K is a multiple of 1024
+(o_proj's K=4096 qualifies; d=2560 and ffn=9728 do not). No int8-KV.
+Measured same-session pair on an Apple M2 Max (2026-07-28, Chrome
+150.0.7871.187, identical local weight bytes): Zero-TVM **25.4 tok/s**
+decode vs WebLLM's prebuilt Qwen3-4B at **14.2 tok/s** — ~1.8× on that pair.
+Read that gap cautiously: it is one pair on one machine, and both engines
+run Qwen3-4B far below their Phi-3 rates here (62.9 → 25.4 for Zero-TVM,
+47.9 → 14.2 for WebLLM), so it says as much about WebLLM's prebuilt Qwen3
+lib on this GPU as about our port. Protocol and caveats in
+[BENCH.md](BENCH.md).
+
+Weights: `node scripts/download-weights.mjs --model qwen3` primes the local
+dev mirror (~2.3 GB); without it the page streams from HuggingFace.
+
 ## The repository as an argument
 
 The directory layout is the narrative arc of the project. Each page is a milestone.

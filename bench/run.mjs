@@ -30,7 +30,14 @@ const N_RUNS = Number(process.env.BENCH_RUNS ?? 5)
 // BENCH_QUERY="?vec4=1" A/Bs a shader-variant flag: appended to /zero-tvm.html,
 // skips the WebLLM half and does NOT touch results.json (A/B runs are for
 // comparing flags, not for updating the headline numbers).
+//
+// BENCH_QUERY="?model=qwen3" is the cross-ENGINE A/B: it runs BOTH halves —
+// zero-tvm.html with the query AND webllm-bench.html with the same model
+// param — and prints both medians + the gap, but still does NOT touch
+// results.json (that file is the Phi-3 headline artifact; Qwen numbers live
+// in BENCH.md's Qwen section).
 const QUERY = process.env.BENCH_QUERY ?? ''
+const AB_MODEL = QUERY ? new URLSearchParams(QUERY.replace(/^\?/, '')).get('model') : null
 const HARDWARE = process.env.BENCH_HW ?? 'unknown GPU'
 const READY_MS = 12 * 60 * 1000 // first run downloads ~2 GB
 // headless:false matches the e2e harness (most reliable on a desktop GPU under
@@ -165,7 +172,27 @@ try {
   const zt = await ztPage.evaluate((n, runs) => window.bench(n, runs), N_TOKENS, N_RUNS)
   console.log(`→ Zero-TVM median: ${zt.median.toFixed(2)} tok/s${QUERY ? `  (${QUERY})` : ''}`)
 
-  if (QUERY) {
+  if (QUERY && AB_MODEL) {
+    // Cross-engine A/B (?model=…): run the WebLLM half too, same model, same
+    // session — but never write results.json (Phi-3 headline artifact).
+    console.log(`[a/b] zt runs: ${zt.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
+    const wlPage = await browser.newPage()
+    attachDiagnostics(wlPage, 'wl')
+    await bootReady(wlPage, `/webllm-bench.html?model=${AB_MODEL}`)
+    const wl = await wlPage
+      .waitForFunction(() => window.webllmResult, { timeout: READY_MS, polling: 1000 })
+      .then((h) => h.jsonValue())
+    console.log(`→ WebLLM median: ${wl.median.toFixed(2)} tok/s  (model=${AB_MODEL})`)
+    console.log(`[a/b] wl runs: ${wl.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
+    const gap = ((zt.median - wl.median) / wl.median) * 100
+    console.log(
+      `\n[a/b] model=${AB_MODEL} same-session pair: ` +
+      `Zero-TVM ${zt.median.toFixed(2)} vs WebLLM ${wl.median.toFixed(2)} tok/s — ` +
+      `Zero-TVM is ${gap >= 0 ? '+' : ''}${gap.toFixed(1)}% vs WebLLM ` +
+      `(results.json NOT written)`,
+    )
+    ok = true
+  } else if (QUERY) {
     // A/B mode: one engine config, no WebLLM half, no results.json.
     console.log(`[a/b] runs: ${zt.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
     ok = true

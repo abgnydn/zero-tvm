@@ -80,6 +80,26 @@ npm run check        # typecheck + test
 Deploy: `npx wrangler pages deploy dist --project-name=zerotvm --branch=main` (CF Pages, project
 `zerotvm`).
 
+## Qwen3-4B (`?model=qwen3`)
+
+Second architecture on the same engine (GQA 32/8, QK-norm, byte-level BPE,
+tied lm_head, ChatML non-thinking). Phi-3 stays the default everywhere;
+`model-select.ts` maps `?model=qwen3` → `QWEN3_4B`. The Qwen chat path is
+**v1-unfused** (QK-norm is incompatible with the fused QKV kernel → 10
+dispatches/layer; vec4 loads only where K % 1024 == 0; no int8-KV) — see
+BENCH.md's Qwen section for the measured WebLLM gap.
+
+```bash
+node scripts/download-weights.mjs --model qwen3   # ~2.3 GB → .weights-local/
+npm run dev                                       # then zero-tvm.html?model=qwen3
+                                                  #  or validate.html?model=qwen3
+npm run test:kernels:qwen                         # 21/21 compile+shape gate (no GPU)
+npm run test:e2e                                  # includes tests/e2e/qwen.test.ts —
+                                                  # skips loudly if the mirror isn't primed
+BENCH_QUERY="?model=qwen3" npm run bench          # same-session A/B vs WebLLM's
+                                                  # prebuilt Qwen3-4B; never writes results.json
+```
+
 ## Cross-site context
 
 `sites.json` is synced from `~/sites-shared/sites.ts`. Edit URLs,

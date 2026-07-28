@@ -92,7 +92,11 @@ function localWeightsPlugin() {
           const modelSnap = snapshotFor(seg[1])
           if (modelSnap) {
             snapshot = modelSnap
-            urlPath = '/' + seg[2]
+            // Per-model WebLLM URLs are /<repo-name>/resolve/main/<file>
+            // (webllm-bench points AppConfig.model at the repo route, and
+            // cleanModelUrl() leaves the resolve/main/ suffix alone) — strip
+            // the HF-shape prefix again now that the repo segment is gone.
+            urlPath = ('/' + seg[2]).replace(/^\/resolve\/[^/]+\//, '/')
           }
         }
         // WebLLM v0.2.80 renamed ndarray-cache.json → tensor-cache.json; our

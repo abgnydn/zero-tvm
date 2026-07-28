@@ -1,18 +1,26 @@
 /**
  * WebLLM head-to-head bench.
  *
- * Loads @mlc-ai/web-llm against the EXACT same Phi-3-mini-q4f16_1 weights
- * Zero-TVM uses, served from our local mirror at /local-weights/*. This is
- * a true apples-to-apples: identical bytes on disk, identical prompt,
- * identical hardware (whatever machine runs the bench — the recorded
- * head-to-head is on an Apple M2 Max, see BENCH.md). Only the inference
- * engine differs.
+ * Loads @mlc-ai/web-llm against the EXACT same q4f16_1 weights Zero-TVM
+ * uses, served from our local mirror at /local-weights/*. This is a true
+ * apples-to-apples: identical bytes on disk, identical prompt, identical
+ * hardware (whatever machine runs the bench — the recorded head-to-head is
+ * on an Apple M2 Max, see BENCH.md). Only the inference engine differs.
+ *
+ * Default is Phi-3-mini (exact original behavior, bare /local-weights/*
+ * mirror route). `?model=qwen3` benches WebLLM's Qwen3-4B-q4f16_1 against
+ * the per-model mirror route /local-weights/<repo>/ instead.
  *
  * The WASM `model_lib` (compiled Relax compute graph) still comes from
- * WebLLM's CDN — it's architecture-matched for Phi-3-mini-4k-instruct.
+ * WebLLM's CDN — architecture-matched, URLs taken from WebLLM's own
+ * prebuiltAppConfig entries.
  */
 
 import * as webllm from '@mlc-ai/web-llm'
+
+// ?model=qwen3 → WebLLM Qwen3-4B on the per-model mirror route. Anything
+// else (including no flag) keeps the exact Phi-3 default path.
+const QWEN = new URLSearchParams(location.search).get('model') === 'qwen3'
 
 const $ = (id: string) => document.getElementById(id)!
 function log(msg: string) {
@@ -30,20 +38,28 @@ function setStats(text: string) {
   $('stats').textContent = text
 }
 
-const MODEL_ID = 'Phi-3-mini-4k-instruct-q4f16_1-MLC-local'
+const MODEL_ID = QWEN
+  ? 'Qwen3-4B-q4f16_1-MLC-local'
+  : 'Phi-3-mini-4k-instruct-q4f16_1-MLC-local'
 
 const BENCH_PROMPT = 'Write a four-sentence explanation of how photosynthesis works.'
 const TARGET_TOKENS = 120
 const NUM_RUNS = 3
 
-// Point WebLLM at our already-on-disk Phi-3-mini-q4f16_1 mirror. The
-// `resolve/main/` suffix matches HF-hub shape so WebLLM's cleanModelUrl()
-// leaves it alone; the vite middleware strips it server-side.
-const LOCAL_MODEL_URL = `${location.origin}/local-weights/resolve/main/`
+// Point WebLLM at our already-on-disk q4f16_1 mirror. The `resolve/main/`
+// suffix matches HF-hub shape so WebLLM's cleanModelUrl() leaves it alone;
+// the vite middleware strips it server-side (on the bare Phi-3 route AND
+// after the /<repo>/ segment on per-model routes). WASM model_lib names are
+// copied from WebLLM's own prebuiltAppConfig entries for these model_ids.
+const LOCAL_MODEL_URL = QWEN
+  ? `${location.origin}/local-weights/Qwen3-4B-q4f16_1-MLC/resolve/main/`
+  : `${location.origin}/local-weights/resolve/main/`
 const WASM_URL =
   webllm.modelLibURLPrefix +
   webllm.modelVersion +
-  '/Phi-3-mini-4k-instruct-q4f16_1-ctx4k_cs1k-webgpu.wasm'
+  (QWEN
+    ? '/Qwen3-4B-q4f16_1-ctx4k_cs1k-webgpu.wasm'
+    : '/Phi-3-mini-4k-instruct-q4f16_1-ctx4k_cs1k-webgpu.wasm')
 
 const appConfig: webllm.AppConfig = {
   useIndexedDBCache: true,
@@ -52,7 +68,7 @@ const appConfig: webllm.AppConfig = {
       model: LOCAL_MODEL_URL,
       model_id: MODEL_ID,
       model_lib: WASM_URL,
-      vram_required_MB: 3672.07,
+      vram_required_MB: QWEN ? 3431.59 : 3672.07,
       low_resource_required: false,
       overrides: { context_window_size: 4096 },
     },
@@ -118,12 +134,18 @@ async function main() {
   log(`[summary] WebLLM on ${MODEL_ID}`)
   log(`  median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s`)
   log('')
-  const ztvm = 62.90 // bench:zt — Zero-TVM decode median (tok/s), updated by `npm run bench`
-  log(`[comparison] Zero-TVM (this repo) median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (Apple M2 Max, 2026-07-25 — see bench/results.json)`)
-  const delta = ((median - ztvm) / ztvm) * 100
-  log(`  → Zero-TVM is ${delta < 0 ? '+' : '-'}${Math.abs(delta).toFixed(1)}% ${delta < 0 ? 'faster' : 'slower'} than WebLLM on this machine`)
-
-  setStats(`WebLLM ${median.toFixed(1)} tok/s · Zero-TVM ${ztvm} tok/s`)
+  if (QWEN) {
+    // No stored comparison constant for Qwen — run the Zero-TVM half in the
+    // same session (bench/run.mjs BENCH_QUERY="?model=qwen3") and compare
+    // there; cross-session absolute numbers aren't comparable.
+    setStats(`WebLLM ${median.toFixed(1)} tok/s (Qwen3-4B)`)
+  } else {
+    const ztvm = 62.90 // bench:zt — Zero-TVM decode median (tok/s), updated by `npm run bench`
+    log(`[comparison] Zero-TVM (this repo) median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (Apple M2 Max, 2026-07-25 — see bench/results.json)`)
+    const delta = ((median - ztvm) / ztvm) * 100
+    log(`  → Zero-TVM is ${delta < 0 ? '+' : '-'}${Math.abs(delta).toFixed(1)}% ${delta < 0 ? 'faster' : 'slower'} than WebLLM on this machine`)
+    setStats(`WebLLM ${median.toFixed(1)} tok/s · Zero-TVM ${ztvm} tok/s`)
+  }
 
   ;(window as Window & typeof globalThis & { webllmResult?: unknown }).webllmResult = {
     model: MODEL_ID,
