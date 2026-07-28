@@ -177,9 +177,21 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   for (const f of opts.optionalFeatures ?? []) {
     if (adapter.features.has(f)) wantFeatures.push(f)
   }
+  // Lift the storage-binding/buffer ceilings to whatever the adapter offers
+  // (same as tests/kernels/gpu.mjs — RESEARCH_STANDARDS.md §13). The default
+  // 128 MiB maxStorageBufferBindingSize is smaller than Qwen3-4B's tied
+  // embedding/LM-head q_weight (151936 × 320 u32 ≈ 194 MB); binding it fails
+  // validation, which invalidates every submit that touches it and reads back
+  // as silent all-zero logits. Requesting the adapter's own limits is always
+  // valid per spec.
+  const requiredLimits: Record<string, number> = {}
+  if (adapter.limits) {
+    requiredLimits.maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize
+    requiredLimits.maxBufferSize = adapter.limits.maxBufferSize
+  }
   let device: GPUDevice
   try {
-    device = await adapter.requestDevice({ requiredFeatures: wantFeatures })
+    device = await adapter.requestDevice({ requiredFeatures: wantFeatures, requiredLimits })
   } catch {
     setBadge('shader-f16 missing', 'error')
     setProgress(0, 'GPU does not support shader-f16 — Chrome or Edge required')

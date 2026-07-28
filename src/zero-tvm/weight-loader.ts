@@ -332,6 +332,18 @@ function formatEta(sec: number): string {
 }
 
 function uploadRecord(device: GPUDevice, shard: ArrayBuffer, rec: FlatRecord): GPUBuffer {
+  // A record larger than the device's storage-binding ceiling uploads fine but
+  // fails bind-group creation later, which invalidates every submit touching
+  // it — the engine then runs "successfully" with all-zero outputs. Fail loudly
+  // at load time instead (fix: raise requiredLimits at requestDevice(), see
+  // bootEngine in loading-ui.ts / tests/kernels/gpu.mjs).
+  if (rec.nbytes > device.limits.maxStorageBufferBindingSize) {
+    throw new Error(
+      `Weight record '${rec.name}' (${rec.nbytes} bytes) exceeds ` +
+      `device.limits.maxStorageBufferBindingSize (${device.limits.maxStorageBufferBindingSize}). ` +
+      `Request a higher requiredLimits.maxStorageBufferBindingSize at device creation.`
+    )
+  }
   const gpuBuf = device.createBuffer({
     size: Math.max(rec.nbytes, 4),
     usage: USAGE,
