@@ -214,10 +214,11 @@ export function buildDecodeEngine(
   // Elementwise workgroup counts (one wg per WG_SIZE_D elements).
   const D_WGS   = S.d / WG_SIZE_D             // Phi-3: 12   (3072/256)
   const QKV_WGS = S.qkvDim / WG_SIZE_D        // Phi-3: 36   (9216/256)
+  const KV_WGS  = S.kvDim / WG_SIZE_D         // kv_append grid — Phi-3: 12, Qwen3: 4
 
   const { pipelines } = compile(device, { subgroups: variants.subgroups }, S)
   const P = pipelines
-  const R = resolveVariantPipelines(variants, P)
+  const R = resolveVariantPipelines(variants, P, S)
   // Split-K attention (?splitk=N) exists only for the f16 KV layout;
   // attention_int8 has no split-K variant.
   if (int8Mode && R.splitK) {
@@ -293,7 +294,7 @@ export function buildDecodeEngine(
   // Hoisted per-layer uniforms — all fields are constant across tokens.
   // Unfused: rope + kv_append. Fused: qkv_fused (f16) or scratch + quantize (int8).
   const ropeU  = fused ? null : uniformBuf(device, [i32(1), i32(0), i32(1), u32(QKV_WGS)])
-  const kvAppU = fused ? null : uniformBuf(device, [i32(1), i32(S.maxPages), i32(0), i32(0), u32(D_WGS)])
+  const kvAppU = fused ? null : uniformBuf(device, [i32(1), i32(S.maxPages), i32(0), i32(0), u32(KV_WGS)])
   const qkvFusedU = (fused && !int8Mode) ? uniformBuf(device, [i32(0), i32(0), u32(S.qkvPairs)]) : null      // f16-KV mode
   const qkvFusedScratchU = int8Mode ? uniformBuf(device, [i32(0), u32(S.qkvPairs)]) : null                   // int8-KV mode
   const kvQuantU = int8Mode ? uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]) : null  // pos_off, pages_off, scales_off, kvHeads*2 WG
@@ -499,9 +500,9 @@ export function buildDecodeEngine(
         kvApp: kvAppBG,
         kvQuantize: kvQuantizeBG,
         attn: attnBG,
-        oProj: bg(device, R.matmul, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
+        oProj: bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
         ffn: bg(device, R.ffn, [B.ffnOut, rIn, B.hidden2, lw.normGamma2, lw.ffnScales, lw.ffnWeights, ffnU]),
-        ffnDown: bg(device, R.matmul, [B.hidden3!, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
+        ffnDown: bg(device, R.matmulFfnDown, [B.hidden3!, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
         addNorm2: bg(device, P.add3Norm, [rIn, B.hidden2, B.hidden3!, nextGamma, B.hidden1, rOut, normU]),
       })
       continue
@@ -512,10 +513,10 @@ export function buildDecodeEngine(
       kvApp: kvAppBG,
       kvQuantize: kvQuantizeBG,
       attn: attnBG,
-      oProj: bg(device, R.matmul, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
+      oProj: bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales, lw.oProjWeights, oProjU]),
       addNorm1: bg(device, P.addNorm, [B.hidden2, B.residual, lw.normGamma2, B.hidden1, B.residual2, normU]),
       ffn: bg(device, R.ffn, [B.ffnOut, B.hidden1, lw.ffnScales, lw.ffnWeights, ffnU]),
-      ffnDown: bg(device, R.matmul, [B.hidden2, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
+      ffnDown: bg(device, R.matmulFfnDown, [B.hidden2, B.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, ffnDnU]),
       addNorm2: bg(device, P.addNorm, [B.hidden2, B.residual2, nextGamma, B.hidden1, B.residual, normU]),
     })
   }
@@ -590,8 +591,8 @@ export function buildDecodeEngine(
         dispatch(enc, R.matmul, blk.qkv, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
         // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
         dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
-        // KV append: kOut, vOut → kvPages[L]
-        dispatch(enc, P.kvAppend, blk.kvApp!, D_WGS, 1, 1, 'kvAppend')
+        // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
+        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
         // Attention: Q + kvPages[L] → B.attnOut
         attentionF16()
       } else if (int8Mode) {
@@ -604,22 +605,22 @@ export function buildDecodeEngine(
         attentionF16()
       }
 
-      // O projection: B.attnOut → B.hidden2
-      dispatch(enc, R.matmul, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+      // O projection: B.attnOut → B.hidden2 (K = qDim instance)
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
       if (R.ffnPrologue) {
         // ?fuseprologue=1: no addNorm1 dispatch. The FFN kernel computes
         // rIn + hidden2 and its RMSNorm in its own prologue; ffnDown lands
         // in hidden3; add3_norm merges rIn + hidden2 + hidden3 at the tail.
         dispatch(enc, R.ffn, blk.ffn, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
-        dispatch(enc, R.matmul, blk.ffnDown, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+        dispatch(enc, R.matmulFfnDown, blk.ffnDown, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
         dispatch(enc, P.add3Norm, blk.addNorm2, 1, 1, 1, 'addNorm2')
       } else {
         // AddNorm (attention): residual += hidden2; hidden1 = RMSNorm(residual)
         dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
         // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
         dispatch(enc, R.ffn, blk.ffn, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
-        // FFN down: B.ffnOut → B.hidden2
-        dispatch(enc, R.matmul, blk.ffnDown, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+        // FFN down: B.ffnOut → B.hidden2 (K = ffn instance)
+        dispatch(enc, R.matmulFfnDown, blk.ffnDown, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
         // AddNorm (FFN): residual += hidden2; hidden1 = RMSNorm(residual)
         //   For last layer the bind group binds finalNormGamma instead of next
         //   layer's normGamma1, so hidden1 is ready for the LM head.
@@ -628,8 +629,17 @@ export function buildDecodeEngine(
     }
 
     // --- LM HEAD: B.hidden1 (already normalized with model.norm) → B.logits ---
-    // vocab (Phi-3: 32064) is divisible by 4, so rowsPerWG=4 works exactly.
-    dispatch(enc, R.matmulF32, bgLmHead, S.vocab / R.matmulRowsPerWG, 1, 1, 'lmHead')
+    // vocab (Phi-3: 32064, Qwen3: 151936) is divisible by 4, so rowsPerWG=4
+    // works exactly. Grids past maxComputeWorkgroupsPerDimension (65535 —
+    // Qwen3's 151936-row scalar case) are folded into z; the kernels index by
+    // blockIdx.z * gridDim.x + blockIdx.x and guard on packGridDimX.
+    const lmWGs = S.vocab / R.matmulRowsPerWG
+    if (lmWGs > 65535) {
+      const lmX = 16384
+      dispatch(enc, R.matmulF32, bgLmHead, lmX, 1, Math.ceil(lmWGs / lmX), 'lmHead')
+    } else {
+      dispatch(enc, R.matmulF32, bgLmHead, lmWGs, 1, 1, 'lmHead')
+    }
     // --- ARGMAX: B.logits → B.tokenOut ---
     dispatch(enc, R.argmax, bgArgmax, 1, 1, 1, 'argmax')
   }
@@ -1026,6 +1036,9 @@ export function buildDecodeEngine(
     const scalesBuf = isFfnDown ? weights.layers[0].ffnDownScales : weights.layers[0].oProjScales
     const weightsBuf = isFfnDown ? weights.layers[0].ffnDownWeights : weights.layers[0].oProjWeights
     const batchedPipeline = P.int4MatmulBatchedM4
+    // Per-instance vec4 gating: compare against the pipeline the engine
+    // actually dispatches for this K (identical to R.matmul on Phi-3).
+    const tiledPipeline = isFfnDown ? R.matmulFfnDown : R.matmulOProj
 
     const inBuf  = makeBuf(device, M * K * 2, 'batchedBench.in')
     const outBuf = makeBuf(device, M * N * 2, 'batchedBench.out')
@@ -1037,7 +1050,7 @@ export function buildDecodeEngine(
 
     const batchedBG = bg(device, batchedPipeline,
       [outBuf, inBuf, scalesBuf, weightsBuf, uniformBufForTarget])
-    const tiledBG = bg(device, R.matmul,
+    const tiledBG = bg(device, tiledPipeline,
       [tiledOutBuf, inBuf, scalesBuf, weightsBuf, uniformBufForTarget])
 
     const batchedWGs = N / 4
@@ -1050,7 +1063,7 @@ export function buildDecodeEngine(
         p1.setPipeline(batchedPipeline); p1.setBindGroup(0, batchedBG)
         p1.dispatchWorkgroups(batchedWGs); p1.end()
         const p2 = enc.beginComputePass()
-        p2.setPipeline(R.matmul); p2.setBindGroup(0, tiledBG)
+        p2.setPipeline(tiledPipeline); p2.setBindGroup(0, tiledBG)
         p2.dispatchWorkgroups(tiledWGs); p2.end()
       }
       device.queue.submit([enc.finish()])
@@ -1075,7 +1088,7 @@ export function buildDecodeEngine(
       const enc = device.createCommandEncoder()
       for (let i = 0; i < iters * M; i++) {
         const pass = enc.beginComputePass()
-        pass.setPipeline(R.matmul); pass.setBindGroup(0, tiledBG)
+        pass.setPipeline(tiledPipeline); pass.setBindGroup(0, tiledBG)
         pass.dispatchWorkgroups(tiledWGs); pass.end()
       }
       device.queue.submit([enc.finish()])

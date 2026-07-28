@@ -26,6 +26,8 @@ struct PODArgs {
 }
 @group(0) @binding(7) var<uniform> podArgs : PODArgs;
 
+const KV_GROUP_PAIRS = KV_DIM / 2;   // KV_HEADS * HALF_HEAD_DIM
+
 var<workgroup> red0 : array<f32, 64>;
 var<workgroup> red1 : array<f32, 64>;
 
@@ -40,12 +42,24 @@ fn qkv_fused_scratch(
 
   let tid : i32 = i32(threadIdx.x);
 
-  let group         : i32 = pair_idx / QKV_GROUP_PAIRS;
-  let pair_in_group : i32 = pair_idx - group * QKV_GROUP_PAIRS;
-  let head          : i32 = pair_in_group / HALF_HEAD_DIM;
-  let dim_lo        : i32 = pair_in_group - head * HALF_HEAD_DIM;
+  // Unequal [Q | K | V] groups under GQA (see qkv_fused.wgsl).
+  var group : i32 = 0;
+  var pair_in_group : i32 = pair_idx;
+  var row_base : i32 = 0;
+  if (pair_in_group >= QKV_GROUP_PAIRS) {
+    group = 1;
+    pair_in_group = pair_in_group - QKV_GROUP_PAIRS;
+    row_base = Q_DIM;
+    if (pair_in_group >= KV_GROUP_PAIRS) {
+      group = 2;
+      pair_in_group = pair_in_group - KV_GROUP_PAIRS;
+      row_base = Q_DIM + KV_DIM;
+    }
+  }
+  let head   : i32 = pair_in_group / HALF_HEAD_DIM;
+  let dim_lo : i32 = pair_in_group - head * HALF_HEAD_DIM;
 
-  let row_lo : i32 = group * D + head * HEAD_DIM + dim_lo;
+  let row_lo : i32 = row_base + head * HEAD_DIM + dim_lo;
   let row_hi : i32 = row_lo + HALF_HEAD_DIM;
 
   var acc0 : f32 = 0.0;
@@ -118,7 +132,7 @@ fn qkv_fused_scratch(
 
   // Q / K: apply RoPE.
   let pos  : f32 = f32(position_map[podArgs.position_map_elem_offset]);
-  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / f32(HEAD_DIM));
+  let freq : f32 = pos / pow(ROPE_THETA, f32(dim_lo * 2) / f32(HEAD_DIM));
   let c    : f32 = cos(freq);
   let s    : f32 = sin(freq);
 

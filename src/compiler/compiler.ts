@@ -20,6 +20,7 @@ import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
 import kvAppendSrc from './shaders/kv_append.wgsl?raw'
+import qkNormSrc from './shaders/qk_norm.wgsl?raw'
 import qkvFusedSrc from './shaders/qkv_fused.wgsl?raw'
 import qkvFusedSgSrc from './shaders/qkv_fused_sg.wgsl?raw'
 import qkvFusedSgVec4Src from './shaders/qkv_fused_sg_vec4.wgsl?raw'
@@ -76,6 +77,7 @@ export interface Pipelines {
   int4MatmulF32TiledVec4: GPUComputePipeline | null // vec4-load tiled LM-head variant
   rope: GPUComputePipeline
   kvAppend: GPUComputePipeline
+  qkNorm: GPUComputePipeline           // Qwen3 per-head q/k RMSNorm (in place, pre-RoPE)
   qkvFused: GPUComputePipeline       // decode-path fusion: QKV matmul + RoPE + KV append
   qkvFusedSg: GPUComputePipeline | null  // subgroup variant of qkvFused
   qkvFusedSgVec4: GPUComputePipeline | null  // ?vec4qkv=1 vec4-load variant (32-thread)
@@ -174,6 +176,7 @@ export function compile(
     int4MatmulF32TiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_f32_tiled_vec4') : null,
     rope: createPipeline(device, ropeSrc, 'rope_kernel'),
     kvAppend: createPipeline(device, kvAppendSrc, 'kv_append'),
+    qkNorm: createPipeline(device, qkNormSrc, 'qk_norm'),
     qkvFused: createPipeline(device, qkvFusedSrc, 'qkv_fused'),
     qkvFusedSg: subgroups ? createPipeline(device, qkvFusedSgSrc, 'qkv_fused_sg') : null,
     qkvFusedSgVec4: subgroups ? createPipeline(device, qkvFusedSgVec4Src, 'qkv_fused_sg_vec4') : null,

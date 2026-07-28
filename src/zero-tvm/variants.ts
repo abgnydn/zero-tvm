@@ -36,6 +36,11 @@
  */
 
 import type { Pipelines } from '../compiler/compiler.js'
+// Value imports come from model-spec (dependency-free) so this module stays
+// importable under plain Node type stripping (tests) — compiler.ts pulls in
+// Vite `?raw` shader imports. The explicit .ts extension is load-bearing
+// (see shader-prelude.ts).
+import { PHI3, type ModelSpec } from '../compiler/model-spec.ts'
 
 export type MatmulVariant = 'tiled8' | 'tiled' | 'sg' | 'scalar'
 
@@ -136,15 +141,23 @@ function parseSplitK(raw: string | null): number {
 // rows-per-workgroup count the caller needs for dispatch. Falls back to
 // scalar when a requested _sg/_tiled pipeline isn't compiled (subgroups
 // feature disabled or variant name unknown).
+//
+// `k` is the reduction dim of the matmul INSTANCE this resolution serves:
+// the vec4 layout consumes 32 K-elements per thread per iteration, so it
+// requires K % 1024 == 0 (Phi-3: every K qualifies; Qwen3: K=2560/9728
+// fail, K=4096 passes) — instances that fail fall back to the non-vec4
+// pipeline of the same variant, keeping rowsPerWG identical.
 export function resolveMatmul(
   variant: MatmulVariant,
   P: Pipelines,
   vec4 = false,
+  k?: number,
 ): { pipeline: GPUComputePipeline; pipelineF32: GPUComputePipeline; rowsPerWG: number; label: string } {
   // ?vec4=1 experiment: vec4-load builds exist for the tiled and sg shapes.
   // tiled8 has no vec4 build (known-regressed tile size) and scalar can't
-  // have one (64-thread WG breaks K=3072 divisibility) — those fall through
+  // have one (64-thread WG breaks K divisibility) — those fall through
   // to their non-vec4 pipelines.
+  if (k !== undefined && k % 1024 !== 0) vec4 = false
   if (vec4 && variant === 'tiled' && P.int4MatmulTiledVec4 && P.int4MatmulF32TiledVec4) {
     return { pipeline: P.int4MatmulTiledVec4, pipelineF32: P.int4MatmulF32TiledVec4, rowsPerWG: 4, label: 'tiled_vec4' }
   }
@@ -165,8 +178,15 @@ export function resolveMatmul(
 
 /** The concrete per-role pipeline picks the engine dispatches with. */
 export interface ResolvedPipelines {
+  /** K = d instances (unfused QKV projection; also the LM head via matmulF32). */
   matmul: GPUComputePipeline
   matmulF32: GPUComputePipeline
+  /** K = qDim instance (o_proj) — differs from `matmul` only when the vec4
+   *  K-divisibility gate splits the instances (Qwen3: d=2560 fails, qDim=4096
+   *  passes). Same rowsPerWG as `matmul`. */
+  matmulOProj: GPUComputePipeline
+  /** K = ffn instance (down_proj); same rowsPerWG as `matmul`. */
+  matmulFfnDown: GPUComputePipeline
   matmulRowsPerWG: number
   matmulLabel: string
   attention: GPUComputePipeline
@@ -196,9 +216,14 @@ export interface ResolvedPipelines {
  * same bind group. Every pick falls back to scalar when the requested _sg
  * pipeline wasn't compiled (subgroups feature off).
  */
-export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines): ResolvedPipelines {
+export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines, spec: ModelSpec = PHI3): ResolvedPipelines {
+  // Per-instance vec4 gating: each matmul role passes its own K, so vec4
+  // survives exactly on the instances whose K % 1024 == 0 (all of them for
+  // Phi-3 — resolution unchanged there).
   const { pipeline: matmul, pipelineF32: matmulF32, rowsPerWG: matmulRowsPerWG, label: matmulLabel } =
-    resolveMatmul(flags.matmul, P, flags.vec4)
+    resolveMatmul(flags.matmul, P, flags.vec4, spec.d)
+  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim)
+  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn)
   const attention = (flags.sgAttn && P.attentionSg) ? P.attentionSg : P.attention
   // ?splitk=N experiment: partial pass follows the sgAttn toggle (subgroup
   // reduce when available), combine is feature-free.
@@ -211,7 +236,11 @@ export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines): Reso
     ? `splitk${splitK}${attentionSplitK === P.attentionSplitKSg ? '_sg' : ''}`
     : attention === P.attentionSg ? '_sg' : 'scalar'
   const argmax = (flags.sgArgmax && P.argmaxSg) ? P.argmaxSg : P.argmax
-  const qkvFused = (flags.vec4Qkv && P.qkvFusedSgVec4) ? P.qkvFusedSgVec4
+  // The vec4 qkv sibling loads 32 K-elements (K = d) per thread per
+  // iteration — same K % 1024 gate as the vec4 matmuls (Qwen3's d=2560
+  // fails → falls back to qkv_fused_sg).
+  const vec4QkvOk = flags.vec4Qkv && spec.d % 1024 === 0
+  const qkvFused = (vec4QkvOk && P.qkvFusedSgVec4) ? P.qkvFusedSgVec4
                  : (flags.qkvTile2 && P.qkvFusedTiled2Sg) ? P.qkvFusedTiled2Sg
                  : (flags.qkvTile && P.qkvFusedTiledSg) ? P.qkvFusedTiledSg
                  : (flags.sgQkv && P.qkvFusedSg) ? P.qkvFusedSg
@@ -235,7 +264,7 @@ export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines): Reso
                  : ffn === P.fusedFfnTiledSg ? 'tiled_sg'
                  : 'scalar'
   return {
-    matmul, matmulF32, matmulRowsPerWG, matmulLabel,
+    matmul, matmulF32, matmulOProj, matmulFfnDown, matmulRowsPerWG, matmulLabel,
     attention, attentionLabel,
     attentionSplitK, attentionCombine, splitK: attentionSplitK ? splitK : 0,
     argmax, argmaxLabel: argmax === P.argmaxSg ? '_sg' : 'scalar',

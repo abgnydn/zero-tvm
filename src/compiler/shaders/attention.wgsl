@@ -2,7 +2,10 @@
 //
 // For single-token decode: Q has 1 token, K/V are in paged cache.
 // One workgroup per (batch, head) pair.
-// 32 threads, each owns 3 elements of HEAD_DIM=96.
+// 32 threads, each owns EPT = HEAD_DIM/32 elements of HEAD_DIM.
+//
+// GQA-aware: query head h reads the KV pages of head h / GQA_GROUP
+// (== h for MHA, where GQA_GROUP = 1 — the Phi-3 path is unchanged).
 //
 // Algorithm: online softmax (FlashAttention)
 //   for each page of KV cache:
@@ -11,7 +14,7 @@
 //       update running (max, sum, output) with online softmax
 //   normalize output
 //
-// Pages layout: pages[page * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM + dim]
+// Pages layout: pages[page * KV_PAGE_STRIDE + kv_head * HEAD_PAGE_STRIDE + slot * HEAD_DIM + dim]
 //   K at offset 0, V at offset V_PAGE_OFFSET
 //
 // Model-shape constants are injected by src/compiler/shader-prelude.ts.
@@ -38,6 +41,8 @@ struct PODArgs {
 }
 @group(0) @binding(6) var<uniform> podArgs : PODArgs;
 
+const EPT = HEAD_DIM / 32;   // elements per thread (Phi-3: 3, Qwen3: 4)
+
 var<workgroup> score_reduce : array<f32, 32>;
 
 @compute @workgroup_size(32, 1, 1)
@@ -51,11 +56,15 @@ fn attention(
 
   if (batch >= podArgs.B) { return; }
 
-  // Each thread owns 3 elements of Q (32 threads × 3 = HEAD_DIM).
-  // Q rows are HEADS * HEAD_DIM wide.
-  var q0 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]);
-  var q1 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1]);
-  var q2 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2]);
+  // GQA: this query head's KV pages live under its KV head.
+  let kv_head : i32 = head / GQA_GROUP;
+
+  // Each thread owns EPT elements of Q (32 threads × EPT = HEAD_DIM).
+  // Q rows are Q_DIM (= HEADS * HEAD_DIM) wide.
+  var q : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) {
+    q[e] = f32(Q[batch * Q_DIM + head * HEAD_DIM + tid * EPT + e]);
+  }
 
   // Page range for this batch
   let indptr_begin : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset];
@@ -65,9 +74,8 @@ fn attention(
   // Online softmax state
   var m : f32 = -50000.0;
   var d : f32 = 0.0;
-  var o0 : f32 = 0.0;
-  var o1 : f32 = 0.0;
-  var o2 : f32 = 0.0;
+  var o : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) { o[e] = 0.0; }
 
   // Iterate over all KV positions
   for (var page_idx : i32 = indptr_begin; page_idx < indptr_end; page_idx = page_idx + 1) {
@@ -76,13 +84,14 @@ fn attention(
     let slots_in_page : i32 = min(PAGE_SIZE, kv_len - page_start);
 
     for (var slot : i32 = 0; slot < slots_in_page; slot = slot + 1) {
-      let k_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
+      let k_base : i32 = page_no * KV_PAGE_STRIDE + kv_head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
                          + podArgs.pages_elem_offset;
 
-      // Partial dot product: each thread computes 3 multiplies
-      let partial : f32 = q0 * f32(pages[k_base + tid * 3])
-                        + q1 * f32(pages[k_base + tid * 3 + 1])
-                        + q2 * f32(pages[k_base + tid * 3 + 2]);
+      // Partial dot product: each thread computes EPT multiplies
+      var partial : f32 = 0.0;
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        partial = partial + q[e] * f32(pages[k_base + tid * EPT + e]);
+      }
 
       // Tree reduction across 32 threads to get full dot product
       score_reduce[tid] = partial;
@@ -114,17 +123,17 @@ fn attention(
 
       // Load V and accumulate
       let v_base : i32 = k_base + V_PAGE_OFFSET;
-      o0 = o0 * scale_prev + scale_new * f32(pages[v_base + tid * 3]);
-      o1 = o1 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 1]);
-      o2 = o2 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 2]);
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        o[e] = o[e] * scale_prev + scale_new * f32(pages[v_base + tid * EPT + e]);
+      }
     }
   }
 
   // Normalize and write output
   if (d > 0.0) {
     let inv_d : f32 = 1.0 / d;
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3] = f16(o0 * inv_d);
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1] = f16(o1 * inv_d);
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2] = f16(o2 * inv_d);
+    for (var e : i32 = 0; e < EPT; e = e + 1) {
+      output_buf[batch * Q_DIM + head * HEAD_DIM + tid * EPT + e] = f16(o[e] * inv_d);
+    }
   }
 }

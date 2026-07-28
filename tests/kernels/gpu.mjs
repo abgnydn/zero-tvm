@@ -31,7 +31,17 @@ export async function getDevice() {
   const requiredFeatures = []
   if (f16) requiredFeatures.push('shader-f16')
   if (subgroups) requiredFeatures.push('subgroups')
-  const device = await adapter.requestDevice({ requiredFeatures })
+  // Lift the storage-binding/buffer ceilings to whatever the adapter offers:
+  // the default 128MB maxStorageBufferBindingSize is smaller than Qwen3's
+  // tied-embedding LM-head weight matrix (151936 × 320 u32 ≈ 195MB).
+  // Requesting the adapter's own limits is always valid; tests that need
+  // more than the granted limit must check device.limits and SKIP.
+  const requiredLimits = {}
+  if (adapter.limits) {
+    requiredLimits.maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize
+    requiredLimits.maxBufferSize = adapter.limits.maxBufferSize
+  }
+  const device = await adapter.requestDevice({ requiredFeatures, requiredLimits })
   let lastError = null
   device.addEventListener?.('uncapturederror', (e) => {
     lastError = e.error?.message ?? String(e.error)

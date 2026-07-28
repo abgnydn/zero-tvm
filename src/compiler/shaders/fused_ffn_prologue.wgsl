@@ -85,7 +85,7 @@ fn fused_ffn_prologue(
   if (tid < 1u) { red_gate[tid] = red_gate[tid] + red_gate[tid + 1u]; }
   workgroupBarrier();
 
-  let rms_inv : f32 = 1.0 / sqrt(red_gate[0] / f32(D) + 1e-5);
+  let rms_inv : f32 = 1.0 / sqrt(red_gate[0] / f32(D) + RMS_EPS);
 
   // Phase 1c: normalize in place. Each thread rewrites the elements it
   // loaded, rounding to f16 — exactly what the hidden1 store used to do.

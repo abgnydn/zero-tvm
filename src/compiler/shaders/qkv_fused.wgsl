@@ -8,10 +8,12 @@
 // rotated in registers, and K/V are written straight into the paged KV cache
 // — the intermediate qkv/kOut/vOut buffers are skipped entirely.
 //
-// Workgroup index layout (pair_idx):
-//     [0, QKV_GROUP_PAIRS)                    — Q heads: HEADS × HALF_HEAD_DIM dim-pairs, write to q_out
-//     [QKV_GROUP_PAIRS, 2*QKV_GROUP_PAIRS)    — K heads: write K into kv_pages
-//     [2*QKV_GROUP_PAIRS, 3*QKV_GROUP_PAIRS)  — V heads: write V into kv_pages
+// Workgroup index layout (pair_idx) — GQA-aware unequal [Q | K | V] groups:
+//     [0, QKV_GROUP_PAIRS)             — Q: HEADS × HALF_HEAD_DIM dim-pairs, write to q_out
+//     [.., + KV_GROUP_PAIRS)           — K: KV_HEADS heads, write K into kv_pages
+//     [.., + KV_GROUP_PAIRS)           — V: KV_HEADS heads, write V into kv_pages
+// (heads == kvHeads for Phi-3, so the historical equal-thirds layout is a
+// special case of this decomposition.)
 //
 // Decode-only (ntoken=1). Prefill still uses the 3-dispatch path.
 //
@@ -33,6 +35,8 @@ struct PODArgs {
 }
 @group(0) @binding(6) var<uniform> podArgs : PODArgs;
 
+const KV_GROUP_PAIRS = KV_DIM / 2;   // KV_HEADS * HALF_HEAD_DIM
+
 var<workgroup> red0 : array<f32, 64>;
 var<workgroup> red1 : array<f32, 64>;
 
@@ -48,13 +52,26 @@ fn qkv_fused(
   let tid : i32 = i32(threadIdx.x);
 
   // Decompose pair_idx → (group, head, dim_lo) where group ∈ {0:Q, 1:K, 2:V}.
-  let group         : i32 = pair_idx / QKV_GROUP_PAIRS;
-  let pair_in_group : i32 = pair_idx - group * QKV_GROUP_PAIRS;
-  let head          : i32 = pair_in_group / HALF_HEAD_DIM;
-  let dim_lo        : i32 = pair_in_group - head * HALF_HEAD_DIM;
+  // Groups are unequal under GQA: Q holds QKV_GROUP_PAIRS pairs, K and V hold
+  // KV_GROUP_PAIRS each. `head` is a KV-head index inside the K/V groups.
+  var group : i32 = 0;
+  var pair_in_group : i32 = pair_idx;
+  var row_base : i32 = 0;
+  if (pair_in_group >= QKV_GROUP_PAIRS) {
+    group = 1;
+    pair_in_group = pair_in_group - QKV_GROUP_PAIRS;
+    row_base = Q_DIM;
+    if (pair_in_group >= KV_GROUP_PAIRS) {
+      group = 2;
+      pair_in_group = pair_in_group - KV_GROUP_PAIRS;
+      row_base = Q_DIM + KV_DIM;
+    }
+  }
+  let head   : i32 = pair_in_group / HALF_HEAD_DIM;
+  let dim_lo : i32 = pair_in_group - head * HALF_HEAD_DIM;
 
   // Absolute rows in the QKV_DIM-wide QKV projection.
-  let row_lo : i32 = group * D + head * HEAD_DIM + dim_lo;
+  let row_lo : i32 = row_base + head * HEAD_DIM + dim_lo;
   let row_hi : i32 = row_lo + HALF_HEAD_DIM;
 
   // Two dot products in parallel: acc0 = row_lo · hidden, acc1 = row_hi · hidden.
@@ -152,7 +169,7 @@ fn qkv_fused(
   //   dim < HALF_HEAD_DIM  : out = cos*x + sin*(-x_pair_hi)
   //   dim >= HALF_HEAD_DIM : out = cos*x + sin*( x_pair_lo)
   let pos  : f32 = f32(position_map[podArgs.position_map_elem_offset]);
-  let freq : f32 = pos / pow(10000.0, f32(dim_lo * 2) / f32(HEAD_DIM));
+  let freq : f32 = pos / pow(ROPE_THETA, f32(dim_lo * 2) / f32(HEAD_DIM));
   let c    : f32 = cos(freq);
   let s    : f32 = sin(freq);
 

@@ -14,7 +14,7 @@
 // m = -50000 sentinel must not enter the max.
 //
 // m_p/d_p are per-partition scalars, so every thread redundantly walks the
-// (tiny) partition list; each thread then owns 3 output dims (32 × 3 = 96).
+// (tiny) partition list; each thread then owns EPT = HEAD_DIM/32 output dims.
 // No cross-thread reduction is needed.
 //
 // Measured 2026-07-25 (M2 Max): ~+3% end-to-end at short context; stays
@@ -31,6 +31,7 @@ struct PODArgs { num_splits: u32 }
 @group(0) @binding(2) var<uniform> podArgs : PODArgs;
 
 const PARTIAL_STRIDE = HEAD_DIM + 2;   // per-(head, partition) f32 stride: m, d, o[HEAD_DIM]
+const EPT = HEAD_DIM / 32;             // elements per thread (Phi-3: 3, Qwen3: 4)
 
 @compute @workgroup_size(32, 1, 1)
 fn attention_combine(
@@ -48,27 +49,26 @@ fn attention_combine(
     if (partials[base + 1] > 0.0) { gm = max(gm, partials[base]); }
   }
 
-  // Pass 2: rescale and accumulate denominators + this thread's 3 dims.
+  // Pass 2: rescale and accumulate denominators + this thread's EPT dims.
   var gd : f32 = 0.0;
-  var o0 : f32 = 0.0;
-  var o1 : f32 = 0.0;
-  var o2 : f32 = 0.0;
+  var o : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) { o[e] = 0.0; }
   for (var p : i32 = 0; p < n; p = p + 1) {
     let base : i32 = (head * n + p) * PARTIAL_STRIDE;
     let d_p : f32 = partials[base + 1];
     if (d_p == 0.0) { continue; }   // empty partition — no mass, skip
     let w : f32 = exp(partials[base] - gm);
     gd = gd + d_p * w;
-    o0 = o0 + partials[base + 2 + tid * 3] * w;
-    o1 = o1 + partials[base + 2 + tid * 3 + 1] * w;
-    o2 = o2 + partials[base + 2 + tid * 3 + 2] * w;
+    for (var e : i32 = 0; e < EPT; e = e + 1) {
+      o[e] = o[e] + partials[base + 2 + tid * EPT + e] * w;
+    }
   }
 
   // Same "write only when there is mass" behavior as attention.wgsl.
   if (gd > 0.0) {
     let inv_d : f32 = 1.0 / gd;
-    output_buf[head * HEAD_DIM + tid * 3] = f16(o0 * inv_d);
-    output_buf[head * HEAD_DIM + tid * 3 + 1] = f16(o1 * inv_d);
-    output_buf[head * HEAD_DIM + tid * 3 + 2] = f16(o2 * inv_d);
+    for (var e : i32 = 0; e < EPT; e = e + 1) {
+      output_buf[head * HEAD_DIM + tid * EPT + e] = f16(o[e] * inv_d);
+    }
   }
 }

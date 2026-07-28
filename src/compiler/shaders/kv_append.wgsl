@@ -4,11 +4,12 @@
 // RoPE + KV append in one dispatch); this kernel is kept for the sequential
 // prefill path and for parity testing.
 //
-// K and V are written to page[position] in the KV cache.
+// K and V are written to page[position] in the KV cache. K/V rows are
+// KV_DIM (= KV_HEADS * HEAD_DIM) wide — == HEADS * HEAD_DIM for MHA.
 // Layout: pages[page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM + dim]
-//   where: KV_PAGE_STRIDE   = HEADS * PAGE_SIZE * HEAD_DIM * 2 (K+V)
+//   where: KV_PAGE_STRIDE   = KV_HEADS * PAGE_SIZE * HEAD_DIM * 2 (K+V)
 //          HEAD_PAGE_STRIDE = PAGE_SIZE * HEAD_DIM
-//          K at offset 0, V at offset V_PAGE_OFFSET (= HEADS * HEAD_PAGE_STRIDE)
+//          K at offset 0, V at offset V_PAGE_OFFSET (= KV_HEADS * HEAD_PAGE_STRIDE)
 //
 // Matches TVM's tir_kv_cache_transpose_append_kernel.
 //
@@ -40,9 +41,9 @@ fn kv_append(
   if (u32(global_id) >= podArgs.packGridDimX) { return; }
 
   let flat : i32 = global_id * 256 + i32(threadIdx.x);
-  // flat covers ntoken * HEADS * HEAD_DIM elements (one K/V row per token)
-  let token_idx : i32 = flat / (HEADS * HEAD_DIM);
-  let within : i32 = flat % (HEADS * HEAD_DIM);
+  // flat covers ntoken * KV_DIM elements (one K/V row per token)
+  let token_idx : i32 = flat / KV_DIM;
+  let within : i32 = flat % KV_DIM;
   let head : i32 = within / HEAD_DIM;
   let dim : i32 = within % HEAD_DIM;
 
@@ -57,9 +58,9 @@ fn kv_append(
   // Write K
   let k_offset : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM + dim
                        + podArgs.pages_elem_offset;
-  pages[k_offset] = k_data[token_idx * (HEADS * HEAD_DIM) + within];
+  pages[k_offset] = k_data[token_idx * KV_DIM + within];
 
-  // Write V (offset by V_PAGE_OFFSET = HEADS * HEAD_PAGE_STRIDE)
+  // Write V (offset by V_PAGE_OFFSET = KV_HEADS * HEAD_PAGE_STRIDE)
   let v_offset : i32 = k_offset + V_PAGE_OFFSET;
-  pages[v_offset] = v_data[token_idx * (HEADS * HEAD_DIM) + within];
+  pages[v_offset] = v_data[token_idx * KV_DIM + within];
 }

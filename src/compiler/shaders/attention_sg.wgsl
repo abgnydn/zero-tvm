@@ -6,6 +6,8 @@
 // one subgroup, so subgroupAdd(partial) returns the full dot product with
 // zero workgroup barriers per slot.
 //
+// GQA-aware: query head h reads the KV pages of head h / GQA_GROUP.
+//
 // Expected win: 6 workgroupBarrier() per KV slot → 0. Attention dominates
 // tail latency on short-context decode; this is pure barrier elimination.
 //
@@ -34,6 +36,8 @@ struct PODArgs {
 }
 @group(0) @binding(6) var<uniform> podArgs : PODArgs;
 
+const EPT = HEAD_DIM / 32;   // elements per thread (Phi-3: 3, Qwen3: 4)
+
 @compute @workgroup_size(32, 1, 1)
 fn attention_sg(
   @builtin(workgroup_id) blockIdx : vec3<u32>,
@@ -45,10 +49,13 @@ fn attention_sg(
 
   if (batch >= podArgs.B) { return; }
 
-  // Each thread owns 3 elements of HEAD_DIM (32 threads × 3 = HEAD_DIM).
-  var q0 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]);
-  var q1 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1]);
-  var q2 : f32 = f32(Q[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2]);
+  let kv_head : i32 = head / GQA_GROUP;
+
+  // Each thread owns EPT elements of HEAD_DIM (32 threads × EPT = HEAD_DIM).
+  var q : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) {
+    q[e] = f32(Q[batch * Q_DIM + head * HEAD_DIM + tid * EPT + e]);
+  }
 
   let indptr_begin : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset];
   let indptr_end : i32 = page_table_indptr[batch + podArgs.page_indptr_elem_offset + 1];
@@ -56,9 +63,8 @@ fn attention_sg(
 
   var m  : f32 = -50000.0;
   var d  : f32 = 0.0;
-  var o0 : f32 = 0.0;
-  var o1 : f32 = 0.0;
-  var o2 : f32 = 0.0;
+  var o : array<f32, EPT>;
+  for (var e : i32 = 0; e < EPT; e = e + 1) { o[e] = 0.0; }
 
   for (var page_idx : i32 = indptr_begin; page_idx < indptr_end; page_idx = page_idx + 1) {
     let page_no : i32 = page_table_values[page_idx + podArgs.page_values_elem_offset];
@@ -66,12 +72,13 @@ fn attention_sg(
     let slots_in_page : i32 = min(PAGE_SIZE, kv_len - page_start);
 
     for (var slot : i32 = 0; slot < slots_in_page; slot = slot + 1) {
-      let k_base : i32 = page_no * KV_PAGE_STRIDE + head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
+      let k_base : i32 = page_no * KV_PAGE_STRIDE + kv_head * HEAD_PAGE_STRIDE + slot * HEAD_DIM
                          + podArgs.pages_elem_offset;
 
-      let partial : f32 = q0 * f32(pages[k_base + tid * 3])
-                        + q1 * f32(pages[k_base + tid * 3 + 1])
-                        + q2 * f32(pages[k_base + tid * 3 + 2]);
+      var partial : f32 = 0.0;
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        partial = partial + q[e] * f32(pages[k_base + tid * EPT + e]);
+      }
 
       // Single subgroupAdd replaces 6 tree-reduction barriers.
       let s : f32 = subgroupAdd(partial) * podArgs.sm_scale;
@@ -84,16 +91,16 @@ fn attention_sg(
       d = d * scale_prev + scale_new;
 
       let v_base : i32 = k_base + V_PAGE_OFFSET;
-      o0 = o0 * scale_prev + scale_new * f32(pages[v_base + tid * 3]);
-      o1 = o1 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 1]);
-      o2 = o2 * scale_prev + scale_new * f32(pages[v_base + tid * 3 + 2]);
+      for (var e : i32 = 0; e < EPT; e = e + 1) {
+        o[e] = o[e] * scale_prev + scale_new * f32(pages[v_base + tid * EPT + e]);
+      }
     }
   }
 
   if (d > 0.0) {
     let inv_d : f32 = 1.0 / d;
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3]     = f16(o0 * inv_d);
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 1] = f16(o1 * inv_d);
-    output_buf[batch * (HEADS * HEAD_DIM) + head * HEAD_DIM + tid * 3 + 2] = f16(o2 * inv_d);
+    for (var e : i32 = 0; e < EPT; e = e + 1) {
+      output_buf[batch * Q_DIM + head * HEAD_DIM + tid * EPT + e] = f16(o[e] * inv_d);
+    }
   }
 }
