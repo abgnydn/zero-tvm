@@ -105,10 +105,16 @@ BENCH_QUERY="?model=qwen3" npm run bench          # same-session A/B vs WebLLM's
 Third model, first hybrid: 24 gated-DeltaNet layers + 8 gated-attention
 layers (GQA 16/4, head_dim 256, partial RoPE 64/256, sigmoid attention
 gate), 248k vocab, tied lm_head; `model-select.ts` maps `?model=qwen35` →
-`QWEN35_4B`. The path is **v1-scalar-GDN** (scalar DeltaNet kernels, no
-chunked prefill — prompts replay token-by-token, unfused GDN projections),
-so its BENCH.md number is a floor. WebLLM A/B needs `@mlc-ai/web-llm`
-≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84 prebuilt libs).
+`QWEN35_4B`. The GDN kernels are **scalar** (no subgroup variants yet) and
+there is no chunked prefill (prompts prefill token-by-token), so its
+BENCH.md number is a floor. Since 2026-07-29 the four GDN input projections
+are **fused into one 12352-row int4 matmul** (loader packs qkv‖z‖a‖b at
+upload; downstream kernels read regions via 256-aligned bind offsets — 340
+dispatches/token), and the blocking `generate()` is **incremental** (a
+`gdnStatePos` tracker reuses the non-idempotent recurrent state when it
+matches `startPos` instead of replaying the prompt). WebLLM A/B needs
+`@mlc-ai/web-llm` ≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84 prebuilt
+libs).
 
 ```bash
 node scripts/download-weights.mjs --model qwen35  # ~2.6 GB → .weights-local/

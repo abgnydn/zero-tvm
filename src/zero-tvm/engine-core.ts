@@ -55,10 +55,18 @@ function uniformBuf(device: GPUDevice, data: (number | ArrayBuffer)[]): GPUBuffe
 function u32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, v, true); return a }
 function i32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setInt32(0, v, true); return a }
 
-function bg(device: GPUDevice, pipeline: GPUComputePipeline, bufs: GPUBuffer[]): GPUBindGroup {
+// Each entry is a whole buffer or a { buffer, offset, size } region view
+// (offset must respect minStorageBufferOffsetAlignment — the GDN packed-
+// projection regions the engine binds are all 256-aligned by construction).
+type BindEntry = GPUBuffer | { buffer: GPUBuffer; offset: number; size: number }
+
+function bg(device: GPUDevice, pipeline: GPUComputePipeline, bufs: BindEntry[]): GPUBindGroup {
   return device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
-    entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
+    entries: bufs.map((b, i) => ({
+      binding: i,
+      resource: 'buffer' in b ? (b as GPUBufferBinding) : { buffer: b as GPUBuffer },
+    })),
   })
 }
 
@@ -298,11 +306,13 @@ export function buildDecodeEngine(
     // Hybrid (Qwen3.5) activation scratch — allocated only for hybrid specs.
     cAttnOut:   null as GPUBuffer | null,  // c_attn projection [C_ATTN_DIM f16]
     attnGateRaw: null as GPUBuffer | null, // raw per-head gate rows [Q_DIM f16]
-    gdnQkvOut:  null as GPUBuffer | null,  // in_proj_qkv raw [GDN_QKV_DIM f16]
+    // Fused GDN input projection output [GDN_PROJ_ROWS f16]: regions
+    // [qkv_raw | z | a | b] at row offsets 0 / gdnQkvDim / +gdnVDim / +vHeads.
+    // gdn_conv reads the qkv region (offset 0, binds the whole buffer);
+    // gdn_norm_out binds the z region and gdn_gates the [a|b] pair via
+    // 256-aligned bind-group offsets — no per-kernel copies.
+    gdnProjOut: null as GPUBuffer | null,
     gdnConvOut: null as GPUBuffer | null,  // conv+SiLU output [GDN_QKV_DIM f16]
-    gdnZOut:    null as GPUBuffer | null,  // in_proj_z [GDN_V_DIM f16]
-    gdnAOut:    null as GPUBuffer | null,  // in_proj_a [GDN_V_HEADS f16]
-    gdnBOut:    null as GPUBuffer | null,  // in_proj_b [GDN_V_HEADS f16]
     gdnGates:   null as GPUBuffer | null,  // [exp(g) | beta] [2*GDN_V_HEADS f32]
     gdnRecurOut: null as GPUBuffer | null, // recurrence readout [GDN_V_DIM f32]
     gdnNormed:  null as GPUBuffer | null,  // gated-norm output [GDN_V_DIM f16]
@@ -332,11 +342,8 @@ export function buildDecodeEngine(
   if (hybrid) {
     B.cAttnOut   = makeBuf(device, S.cAttnDim * 2, 'cAttnOut')
     B.attnGateRaw = makeBuf(device, S.qDim * 2, 'attnGateRaw')
-    B.gdnQkvOut  = makeBuf(device, S.gdnQkvDim * 2, 'gdnQkvOut')
+    B.gdnProjOut = makeBuf(device, S.gdnProjRows * 2, 'gdnProjOut')
     B.gdnConvOut = makeBuf(device, S.gdnQkvDim * 2, 'gdnConvOut')
-    B.gdnZOut    = makeBuf(device, S.gdnVDim * 2, 'gdnZOut')
-    B.gdnAOut    = makeBuf(device, S.gdnVHeads * 2, 'gdnAOut')
-    B.gdnBOut    = makeBuf(device, S.gdnVHeads * 2, 'gdnBOut')
     B.gdnGates   = makeBuf(device, 2 * S.gdnVHeads * 4, 'gdnGates')
     B.gdnRecurOut = makeBuf(device, S.gdnVDim * 4, 'gdnRecurOut')
     B.gdnNormed  = makeBuf(device, S.gdnVDim * 2, 'gdnNormed')
@@ -382,9 +389,9 @@ export function buildDecodeEngine(
   const GDN_CONV_WGS = hybrid ? Math.ceil(S.gdnQkvDim / WG_SIZE_D) : 0
   const C_ATTN_WGS   = hybrid ? Math.ceil(S.cAttnDim / WG_SIZE_D) : 0
   const ATTN_GATE_WGS = hybrid ? Math.ceil(S.qDim / WG_SIZE_D) : 0
-  const gdnQkvU  = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnQkvDim)]) : null
-  const gdnZU    = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnVDim)]) : null
-  const gdnAbU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnVHeads)]) : null
+  // Fused GDN input projection: one 12352-row (Qwen3.5) K=d matmul replaces
+  // the 4 separate in_proj_qkv/z/a/b dispatches (weights packed by the loader).
+  const gdnProjU = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnProjRows)]) : null
   const gdnOutU  = hybrid ? uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / GROUP), u32(S.d)]) : null
   const cAttnU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.cAttnDim)]) : null
   const gdnConvU = hybrid ? uniformBuf(device, [i32(0), u32(GDN_CONV_WGS)]) : null  // pos rewritten per token
@@ -483,6 +490,26 @@ export function buildDecodeEngine(
     label: 'tokenReadback',
   })
 
+  // ── GDN state-position tracker (hybrid specs) ─────────────────────────────
+  // Number of tokens the persistent GDN state (conv rings + recurrent S)
+  // currently has absorbed — i.e. the next position a forward pass may run at
+  // without corrupting the recurrence. Every submitted forward pass at
+  // position p advances it to p+1 (a pass at position 0 first zeroes the
+  // state, so the counter is exact from a fresh prefill onward).
+  //
+  // This is what lets the blocking generate() skip the prompt replay: unlike
+  // the KV cache (idempotent — rewriting a slot with the same K/V is
+  // harmless), a GDN step MUTATES S and rotates the conv ring, so re-running
+  // any already-absorbed token double-applies it. generate() therefore only
+  // trusts `startPos` when gdnStatePos proves the state actually sits at that
+  // boundary; anything else falls back to a full replay from 0 (which
+  // re-zeroes the state). The pipelined path may leave gdnStatePos past the
+  // consumed sequence (up to PIPELINE_DEPTH-1 speculative steps submitted
+  // after a stop token) — those extra mutations are harmless precisely
+  // because no later call trusts state it can't match: pipelined generation
+  // always re-prefills from 0, and the blocking path checks this counter.
+  let gdnStatePos = 0
+
   // Logit readback buffer — used by forwardLogits() for the validation harness only.
   // Allocated lazily on first call.
   let logitsReadBuf: GPUBuffer | null = null
@@ -539,14 +566,11 @@ export function buildDecodeEngine(
     attn?: GPUBindGroup         // splitK: the partial pass (writes attnPartials)
     // Hybrid GDN layers: the whole GatedDeltaNet chain replaces qkv/attn.
     gdn?: {
-      qkv: GPUBindGroup         // in_proj_qkv matmul → gdnQkvOut
-      z: GPUBindGroup           // in_proj_z matmul → gdnZOut
-      a: GPUBindGroup           // in_proj_a matmul → gdnAOut
-      b: GPUBindGroup           // in_proj_b matmul → gdnBOut
-      conv: GPUBindGroup        // causal conv + SiLU (ring state)
-      gates: GPUBindGroup       // exp(g) decay + beta
+      proj: GPUBindGroup        // fused in_proj qkv‖z‖a‖b matmul → gdnProjOut
+      conv: GPUBindGroup        // causal conv + SiLU (ring state; reads the qkv region)
+      gates: GPUBindGroup       // exp(g) decay + beta (reads the [a|b] region)
       recur: GPUBindGroup       // gated delta rule (f32 state)
-      normOut: GPUBindGroup     // gated RMSNorm · silu(z) → gdnNormed
+      normOut: GPUBindGroup     // gated RMSNorm · silu(z region) → gdnNormed
     }
     oProj: GPUBindGroup         // attn: o_proj | gdn: out_proj (both → hidden2)
     addNorm1?: GPUBindGroup     // post-attention: reads residual, writes residual2 (absent w/ ?fuseprologue=1)
@@ -597,15 +621,20 @@ export function buildDecodeEngine(
     if (isGdn) {
       const gw = lw.gdn
       if (!gw) throw new Error(`buildDecodeEngine: spec ${S.id} marks layer ${L} 'gdn' but the loader has no GDN weights for it`)
+      // Region views into the packed projection output [qkv | z | a | b].
+      // Offsets are f16-element row offsets × 2 bytes; both are multiples of
+      // 256 (z at 16384, a|b at 24576 for Qwen3.5) so they satisfy
+      // minStorageBufferOffsetAlignment on every conformant device.
+      const zRegion  = { buffer: B.gdnProjOut!, offset: S.gdnQkvDim * 2, size: S.gdnVDim * 2 }
+      const abRegion = { buffer: B.gdnProjOut!, offset: (S.gdnQkvDim + S.gdnVDim) * 2, size: 2 * S.gdnVHeads * 2 }
       gdnBG = {
-        qkv: bg(device, R.matmul, [B.gdnQkvOut!, B.hidden1, gw.qkvScales, gw.qkvWeights, gdnQkvU!]),
-        z: bg(device, R.matmul, [B.gdnZOut!, B.hidden1, gw.zScales, gw.zWeights, gdnZU!]),
-        a: bg(device, R.matmul, [B.gdnAOut!, B.hidden1, gw.aScales, gw.aWeights, gdnAbU!]),
-        b: bg(device, R.matmul, [B.gdnBOut!, B.hidden1, gw.bScales, gw.bWeights, gdnAbU!]),
-        conv: bg(device, P.gdnConv, [B.gdnConvOut!, B.gdnQkvOut!, gdnConvState[L]!, gw.convWeight, gdnConvU!]),
-        gates: bg(device, P.gdnGates, [B.gdnGates!, B.gdnAOut!, B.gdnBOut!, gw.aLog, gw.dtBias, gdnGatesU!]),
+        proj: bg(device, R.matmul, [B.gdnProjOut!, B.hidden1, gw.projScales, gw.projWeights, gdnProjU!]),
+        // gdn_conv's qkv_raw binding sees the whole packed buffer; it only
+        // reads channels < GDN_QKV_DIM (the qkv region at offset 0).
+        conv: bg(device, P.gdnConv, [B.gdnConvOut!, B.gdnProjOut!, gdnConvState[L]!, gw.convWeight, gdnConvU!]),
+        gates: bg(device, P.gdnGates, [B.gdnGates!, abRegion, gw.aLog, gw.dtBias, gdnGatesU!]),
         recur: bg(device, P.gdnRecur, [B.gdnRecurOut!, B.gdnConvOut!, B.gdnGates!, gdnRecurState[L]!, gdnRecurU!]),
-        normOut: bg(device, P.gdnNormOut, [B.gdnNormed!, B.gdnRecurOut!, gw.normGamma, B.gdnZOut!, gdnNormU!]),
+        normOut: bg(device, P.gdnNormOut, [B.gdnNormed!, B.gdnRecurOut!, gw.normGamma, zRegion, gdnNormU!]),
       }
       oProjBG = bg(device, matmulGdnOut!, [B.hidden2, B.gdnNormed!, gw.outScales, gw.outWeights, gdnOutU!])
     } else if (hybrid) {
@@ -759,15 +788,12 @@ export function buildDecodeEngine(
       }
 
       if (blk.gdn) {
-        // GatedDeltaNet layer (Qwen3.5 linear_attn): 4 projections off the
-        // normed hidden state, then conv → gates → recurrence → gated norm.
+        // GatedDeltaNet layer (Qwen3.5 linear_attn): ONE fused input
+        // projection (qkv‖z‖a‖b rows packed at load time — replaces the 4
+        // separate matmul dispatches), then conv → gates → recurrence →
+        // gated norm.
         const g = blk.gdn
-        dispatch(enc, R.matmul, g.qkv, S.gdnQkvDim / R.matmulRowsPerWG, 1, 1, 'gdnQkvMatmul')
-        dispatch(enc, R.matmul, g.z, S.gdnVDim / R.matmulRowsPerWG, 1, 1, 'gdnZMatmul')
-        // Tiny N = GDN_V_HEADS (32) matmuls: still row-per-WG kernels — the
-        // grid is just ceil(32 / rowsPerWG) workgroups.
-        dispatch(enc, R.matmul, g.a, Math.ceil(S.gdnVHeads / R.matmulRowsPerWG), 1, 1, 'gdnAMatmul')
-        dispatch(enc, R.matmul, g.b, Math.ceil(S.gdnVHeads / R.matmulRowsPerWG), 1, 1, 'gdnBMatmul')
+        dispatch(enc, R.matmul, g.proj, Math.ceil(S.gdnProjRows / R.matmulRowsPerWG), 1, 1, 'gdnProjMatmul')
         dispatch(enc, P.gdnConv, g.conv, GDN_CONV_WGS, 1, 1, 'gdnConv')
         dispatch(enc, P.gdnGates, g.gates, 1, 1, 1, 'gdnGates')
         dispatch(enc, P.gdnRecur, g.recur, S.gdnVHeads, 1, 1, 'gdnRecur')
@@ -903,7 +929,25 @@ export function buildDecodeEngine(
     // Fold the argmax readback into the same command encoder → one submit per token.
     enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     device.queue.submit([enc.finish()])
+    gdnStatePos = position + 1
 
+    await readBuf.mapAsync(GPUMapMode.READ)
+    const result = new DataView(readBuf.getMappedRange()).getInt32(0, true)
+    readBuf.unmap()
+    return result
+  }
+
+  /**
+   * Read back the argmax the LAST submitted forward pass left in B.tokenOut —
+   * no new forward pass. Used by the hybrid generate() when the GDN state
+   * already sits exactly at end-of-prompt (e.g. right after forwardLogits):
+   * the pure-attention path re-runs the final prompt token idempotently to
+   * recover this value, but a GDN re-run would double-apply it to S.
+   */
+  async function readLastToken(): Promise<number> {
+    const enc = device.createCommandEncoder()
+    enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
+    device.queue.submit([enc.finish()])
     await readBuf.mapAsync(GPUMapMode.READ)
     const result = new DataView(readBuf.getMappedRange()).getInt32(0, true)
     readBuf.unmap()
@@ -954,12 +998,28 @@ export function buildDecodeEngine(
     // before). The last call's return is the argmax over the final prefill
     // step's logits — that *is* the first generated token.
     let tokenId = 0
-    if (hybrid) {
+    if (hybrid && startPos >= promptIds.length && gdnStatePos === promptIds.length) {
+      // GDN state + KV sit exactly at end-of-prompt (the caller — e.g.
+      // forwardLogits — already ran every prompt token). Re-running the last
+      // token, as the pure-attention branch below does, would double-apply
+      // it to the non-idempotent recurrent state; instead read back the
+      // argmax that final pass already computed. Zero prompt passes.
+      tokenId = await readLastToken()
+    } else if (hybrid && startPos < promptIds.length && startPos > 0 && gdnStatePos === startPos) {
+      // The state provably sits at startPos — extend incrementally, exactly
+      // one forward pass per NEW prompt token (same contract as the
+      // pure-attention KV reuse below).
+      for (let i = startPos; i < promptIds.length; i++) {
+        tokenId = await decodeToken(promptIds[i], i)
+      }
+    } else if (hybrid) {
       // GDN layers are stateful and NOT idempotent: re-running a token
       // double-applies it to the recurrent state and rotates the conv ring
-      // past it. KV reuse via startPos therefore can't skip work here —
-      // always replay the whole prompt from position 0, which also re-zeroes
-      // the GDN state (clearGdnState fires at position 0).
+      // past it. When gdnStatePos can't prove the state matches startPos
+      // (fresh prompt, or state left mid-sequence by a previous generation),
+      // replay the whole prompt from position 0 — which also re-zeroes the
+      // GDN state (clearGdnState fires at position 0). Within-call decode
+      // below is always incremental: one forward pass per generated token.
       for (let i = 0; i < promptIds.length; i++) {
         tokenId = await decodeToken(promptIds[i], i)
       }
@@ -1060,6 +1120,7 @@ export function buildDecodeEngine(
       readCursor = (readCursor + 1) % readRing.length
       enc.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
       device.queue.submit([enc.finish()])
+      gdnStatePos = position + 1
       return slot.mapAsync(GPUMapMode.READ).then(() => {
         const id = new DataView(slot.getMappedRange()).getInt32(0, true)
         slot.unmap()
@@ -1068,6 +1129,7 @@ export function buildDecodeEngine(
     }
 
     device.queue.submit([enc.finish()])
+    gdnStatePos = position + 1
     return null
   }
 
@@ -1110,6 +1172,17 @@ export function buildDecodeEngine(
     // --- Pipelined decode ---
     // Keep PIPELINE_DEPTH tokens of work in flight so the GPU never waits on
     // a CPU round-trip between tokens. argmax → inputIds[0] is chained on-GPU.
+    //
+    // Hybrid (GDN) note — why the 2-deep ring is safe with non-idempotent
+    // state: the on-GPU chain never *mispredicts* a token (each step consumes
+    // the previous step's real argmax, not a guess), so the only steps whose
+    // state mutations are ever discarded are the ≤ PIPELINE_DEPTH-1 already
+    // submitted when we break (stop token / maxTokens / shouldStop). Those
+    // run positions past the end of the emitted sequence and mutate S/conv
+    // rings there — harmless, because generation ends and no later call
+    // trusts that state: this path always prefills from 0 (position 0 clears
+    // GDN state) and the blocking generate() verifies gdnStatePos before
+    // reusing state (falling back to a full replay on mismatch).
     const inFlight: Promise<number>[] = []
     let pos = promptIds.length
 
@@ -1171,9 +1244,9 @@ export function buildDecodeEngine(
     await warmA; await warmB
     const nextPos = warmupIds.length + 2
 
-    // 2 slots per pass; worst case is the hybrid GDN path (13/layer: 4
-    // projections + 4 GDN kernels + out_proj + FFN tail) plus embedding,
-    // init norm, LM head, argmax and a little headroom.
+    // 2 slots per pass; worst case is the hybrid gated-attention path
+    // (12/layer; GDN layers are 10 with the fused input projection) plus
+    // embedding, init norm, LM head, argmax and a little headroom.
     const CAPACITY = 2 * (S.layers * 14 + 8)
     const querySet = device.createQuerySet({ type: 'timestamp', count: CAPACITY })
     const resolveBuf = device.createBuffer({

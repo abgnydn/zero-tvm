@@ -16,8 +16,9 @@
 //     (h % GDN_K_HEADS, the GGUF tile order) must FAIL against the GPU
 //     output — proving the tests pin the repeat-interleave pairing
 //     (h / GDN_GVA_GROUP) that the MLC weight cache requires.
-//   - full-chain tests: the complete GDN block (4 int4 projections → conv →
-//     gates → recurrence → gated norm → out_proj) over 4 tokens with state
+//   - full-chain tests: the complete GDN block (ONE fused int4 input
+//     projection qkv‖z‖a‖b → conv → gates → recurrence → gated norm →
+//     out_proj, engine-packed layout) over 4 tokens with state
 //     carry, and the complete gated-attention block (c_attn → split →
 //     qk_norm → partial rope → kv_append → attention → sigmoid gate →
 //     o_proj) over 3 decode steps.
@@ -172,8 +173,9 @@ async function testGdnGates(device) {
   const out = device.createBuffer({ size: 2 * H * 4, usage: BU.STORAGE | BU.COPY_SRC })
   const buffers = [
     out,
-    buffer(device, f16Array(aRaw), BU.STORAGE | BU.COPY_DST),
-    buffer(device, f16Array(bRaw), BU.STORAGE | BU.COPY_DST),
+    // Packed [a | b] pair — the engine binds the fused-projection buffer at
+    // the a-region offset, so the kernel sees a at [h], b at [H+h].
+    buffer(device, f16Array([...aRaw, ...bRaw]), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Float32Array(aLog), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Float32Array(dtBias), BU.STORAGE | BU.COPY_DST),
     podBuffer(device, [{ u32: 1 }]),
@@ -318,8 +320,14 @@ async function testGdnNormOut(device) {
   return { name: 'gdn_norm_out gated rmsnorm', pass: maxAbs < 2e-2, detail: `max abs err ${maxAbs.toExponential(2)}` }
 }
 
-// ── full GDN block — 4 int4 projections → conv → gates → recur → norm →
-// out_proj, 4 decode steps with conv + recurrent state carry ────────────────
+// ── full GDN block — ONE fused int4 input projection (qkv‖z‖a‖b rows packed,
+// mirroring the engine/loader layout) → conv → gates → recur → norm →
+// out_proj, 4 decode steps with conv + recurrent state carry. The CPU
+// reference (ref-gdn.mjs refGdnBlock) still computes the four projections
+// separately — row concatenation is exactly equivalent for a row-major
+// q4f16_1 matmul, so the reference stays authoritative for the packed GPU
+// path. Downstream kernels read the z / [a|b] regions via 256-aligned
+// bind-group offsets, exactly as the engine binds them. ─────────────────────
 async function testGdnBlockChain(device) {
   const r = rng(25)
   const d = Q.d, STEPS = 4
@@ -356,10 +364,7 @@ async function testGdnBlockChain(device) {
   const mk = (bytes, extra = 0) =>
     device.createBuffer({ size: bytes, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST | extra })
   const hidden = mk(d * 2)
-  const qkvRaw = mk(Q.gdnQkvDim * 2)
-  const zBuf = mk(Q.gdnVDim * 2)
-  const aBuf = mk(Math.max(64, Q.gdnVHeads * 2))
-  const bBuf = mk(Math.max(64, Q.gdnVHeads * 2))
+  const projOut = mk(Q.gdnProjRows * 2)   // fused projection output [qkv | z | a | b]
   const convState = mk((Q.gdnConvK - 1) * Q.gdnQkvDim * 2)
   device.queue.writeBuffer(convState, 0, new Uint16Array((Q.gdnConvK - 1) * Q.gdnQkvDim))
   const convOut = mk(Q.gdnQkvDim * 2)
@@ -369,40 +374,52 @@ async function testGdnBlockChain(device) {
   const recurOut = mk(Q.gdnVDim * 4)
   const normOut = mk(Q.gdnVDim * 2)
   const blockOut = mk(d * 2)
-  const wBufs = {}
-  for (const [name, rec] of Object.entries(w)) {
-    wBufs[name] = {
-      w: buffer(device, rec.weights, BU.STORAGE | BU.COPY_DST),
-      s: buffer(device, f16Array(Array.from(rec.scales)), BU.STORAGE | BU.COPY_DST),
+
+  // Pack qkv‖z‖a‖b rows into ONE weight/scale buffer pair — byte-for-byte
+  // what the loader's packGdnProj produces (row-major q4f16_1: row concat ==
+  // byte concat).
+  const KP = d / 8, SPR = d / 32
+  const projW = new Uint32Array(Q.gdnProjRows * KP)
+  const projS = new Float32Array(Q.gdnProjRows * SPR)
+  {
+    let row = 0
+    for (const rec of [w.qkv, w.z, w.a, w.b]) {
+      projW.set(rec.weights, row * KP)
+      projS.set(rec.scales, row * SPR)
+      row += rec.weights.length / KP
     }
   }
+  const projWBuf = buffer(device, projW, BU.STORAGE | BU.COPY_DST)
+  const projSBuf = buffer(device, f16Array(Array.from(projS)), BU.STORAGE | BU.COPY_DST)
+  const outWBuf = buffer(device, w.out.weights, BU.STORAGE | BU.COPY_DST)
+  const outSBuf = buffer(device, f16Array(Array.from(w.out.scales)), BU.STORAGE | BU.COPY_DST)
   const convWBuf = buffer(device, f16Array(convW), BU.STORAGE | BU.COPY_DST)
   const gammaBuf = buffer(device, f16Array(gamma), BU.STORAGE | BU.COPY_DST)
   const aLogBuf = buffer(device, new Float32Array(aLog), BU.STORAGE | BU.COPY_DST)
   const dtBiasBuf = buffer(device, new Float32Array(dtBias), BU.STORAGE | BU.COPY_DST)
 
-  const mmPod = (rec, N) => buffer(device, new Uint32Array([rec.KP, rec.SPR, N, 0]), BU.UNIFORM | BU.COPY_DST)
   const pods = {
-    qkv: mmPod(w.qkv, Q.gdnQkvDim),
-    z: mmPod(w.z, Q.gdnVDim),
-    a: mmPod(w.a, Q.gdnVHeads),
-    b: mmPod(w.b, Q.gdnVHeads),
-    out: mmPod(w.out, d),
+    proj: buffer(device, new Uint32Array([KP, SPR, Q.gdnProjRows, 0]), BU.UNIFORM | BU.COPY_DST),
+    out: buffer(device, new Uint32Array([w.out.KP, w.out.SPR, d, 0]), BU.UNIFORM | BU.COPY_DST),
     gates: podBuffer(device, [{ u32: 1 }]),
     recur: podBuffer(device, [{ i32: 1 }, { u32: Q.gdnVHeads }]),
     norm: podBuffer(device, [{ i32: 1 }, { u32: Q.gdnVHeads }]),
   }
 
+  // Region views into projOut — same 256-aligned offsets the engine binds.
+  const zRegion = { buffer: projOut, offset: Q.gdnQkvDim * 2, size: Q.gdnVDim * 2 }
+  const abRegion = { buffer: projOut, offset: (Q.gdnQkvDim + Q.gdnVDim) * 2, size: 2 * Q.gdnVHeads * 2 }
+
   let maxRel = 0
   for (let t = 0; t < STEPS; t++) {
     device.queue.writeBuffer(hidden, 0, f16Array(xs[t]))
     const convPod = podBuffer(device, [{ i32: t }, { u32: Q.gdnQkvDim / 256 }])
-    // One encoder per token: projections → conv → gates → recurrence → norm →
-    // out_proj (same submission ordering the engine will use).
+    // One fused projection → conv → gates → recurrence → norm → out_proj
+    // (same dispatch chain the engine records). Entries may be region views.
     const dispatch = async (pipe, bufs, grid) => {
       const bg = device.createBindGroup({
         layout: pipe.getBindGroupLayout(0),
-        entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
+        entries: bufs.map((b, i) => ({ binding: i, resource: b.buffer ? b : { buffer: b } })),
       })
       const enc = device.createCommandEncoder()
       const pass = enc.beginComputePass()
@@ -412,15 +429,13 @@ async function testGdnBlockChain(device) {
       pass.end()
       device.queue.submit([enc.finish()])
     }
-    await dispatch(mm, [qkvRaw, hidden, wBufs.qkv.s, wBufs.qkv.w, pods.qkv], Q.gdnQkvDim)
-    await dispatch(mm, [zBuf, hidden, wBufs.z.s, wBufs.z.w, pods.z], Q.gdnVDim)
-    await dispatch(mm, [aBuf, hidden, wBufs.a.s, wBufs.a.w, pods.a], Q.gdnVHeads)
-    await dispatch(mm, [bBuf, hidden, wBufs.b.s, wBufs.b.w, pods.b], Q.gdnVHeads)
-    await dispatch(conv, [convOut, qkvRaw, convState, convWBuf, convPod], Q.gdnQkvDim / 256)
-    await dispatch(gatesP, [gatesBuf, aBuf, bBuf, aLogBuf, dtBiasBuf, pods.gates], 1)
+    await dispatch(mm, [projOut, hidden, projSBuf, projWBuf, pods.proj], Q.gdnProjRows)
+    // gdn_conv binds the whole packed buffer; it reads only the qkv region.
+    await dispatch(conv, [convOut, projOut, convState, convWBuf, convPod], Q.gdnQkvDim / 256)
+    await dispatch(gatesP, [gatesBuf, abRegion, aLogBuf, dtBiasBuf, pods.gates], 1)
     await dispatch(recur, [recurOut, convOut, gatesBuf, recurState, pods.recur], Q.gdnVHeads)
-    await dispatch(norm, [normOut, recurOut, gammaBuf, zBuf, pods.norm], Q.gdnVHeads)
-    const bytes = await runCompute(device, mm, [blockOut, normOut, wBufs.out.s, wBufs.out.w, pods.out], [d], 0, d * 2)
+    await dispatch(norm, [normOut, recurOut, gammaBuf, zRegion, pods.norm], Q.gdnVHeads)
+    const bytes = await runCompute(device, mm, [blockOut, normOut, outSBuf, outWBuf, pods.out], [d], 0, d * 2)
     const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
     maxRel = Math.max(maxRel, maxRelDiff(got, refOuts[t], 1e-2))
   }

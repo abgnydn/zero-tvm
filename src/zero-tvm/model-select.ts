@@ -35,7 +35,7 @@ export function specFromSearch(search: string): ModelSpec {
 /** Page-facing copy for the active model (gate dialog, header, hints). */
 export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: string; rateLabel: string } {
   if (spec.id === QWEN35_4B.id) {
-    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~48 t/s' }  // v1 scalar-GDN path, M2 Max (BENCH.md)
+    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~53 t/s' }  // fused-GDN-in_proj path, M2 Max (BENCH.md 2026-07-29)
   }
   return spec.id === QWEN3_4B.id
     ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~25 t/s' }  // v1 unfused path, M2 Max (BENCH.md)

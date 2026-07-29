@@ -568,6 +568,27 @@ export async function loadWeights(
   const lmHeadScales = find(...N.lmHeadScale)
   const finalNormGamma = find(...N.finalNorm)
 
+  // GDN input-projection packing (hybrid specs): in_proj_qkv ‖ z ‖ a ‖ b are
+  // four separate K=d int4 records; concatenating their rows (q4f16_1 is
+  // row-major — [rows, K/8] u32 weights, [rows, K/32] f16 scales, so row
+  // concatenation IS byte concatenation) yields one gdnProjRows-row matmul
+  // the engine runs as a single dispatch. Packed on the GPU with
+  // copyBufferToBuffer (queue-ordered after the writeBuffer uploads); the
+  // four source buffers are destroyed after the copies are submitted.
+  const packEnc = device.createCommandEncoder({ label: 'gdnProjPack' })
+  const packDoomed: GPUBuffer[] = []
+  function packGdnProj(rec: Array<{ buf: GPUBuffer; rows: number }>, bytesPerRow: number, label: string): GPUBuffer {
+    const totalRows = rec.reduce((s, r) => s + r.rows, 0)
+    const packed = device.createBuffer({ size: totalRows * bytesPerRow, usage: USAGE, label })
+    let off = 0
+    for (const r of rec) {
+      packEnc.copyBufferToBuffer(r.buf, 0, packed, off, r.rows * bytesPerRow)
+      off += r.rows * bytesPerRow
+      packDoomed.push(r.buf)
+    }
+    return packed
+  }
+
   const layers: LoadedWeights['layers'] = []
   for (let L = 0; L < spec.layers; L++) {
     const n = N.layer(L)
@@ -592,14 +613,19 @@ export async function loadWeights(
         kNormGamma: n.kNorm ? find(...n.kNorm) : undefined,
       } : {
         gdn: {
-          qkvWeights: find(...n.gdnQkvWeight!),
-          qkvScales: find(...n.gdnQkvScale!),
-          zWeights: find(...n.gdnZWeight!),
-          zScales: find(...n.gdnZScale!),
-          aWeights: find(...n.gdnAWeight!),
-          aScales: find(...n.gdnAScale!),
-          bWeights: find(...n.gdnBWeight!),
-          bScales: find(...n.gdnBScale!),
+          // Fused input projection: rows [qkv | z | a | b] (see packGdnProj).
+          projWeights: packGdnProj([
+            { buf: find(...n.gdnQkvWeight!), rows: spec.gdnQkvDim },
+            { buf: find(...n.gdnZWeight!), rows: spec.gdnVDim },
+            { buf: find(...n.gdnAWeight!), rows: spec.gdnVHeads },
+            { buf: find(...n.gdnBWeight!), rows: spec.gdnVHeads },
+          ], spec.dPacked * 4, `gdnProjWeights_${L}`),
+          projScales: packGdnProj([
+            { buf: find(...n.gdnQkvScale!), rows: spec.gdnQkvDim },
+            { buf: find(...n.gdnZScale!), rows: spec.gdnVDim },
+            { buf: find(...n.gdnAScale!), rows: spec.gdnVHeads },
+            { buf: find(...n.gdnBScale!), rows: spec.gdnVHeads },
+          ], spec.dScales * 2, `gdnProjScales_${L}`),
           aLog: find(...n.gdnALog!),        // f32 (bf16-expanded by uploadRecord)
           dtBias: find(...n.gdnDtBias!),    // f32 (bf16-expanded by uploadRecord)
           convWeight: find(...n.gdnConvWeight!),  // f16 [C,1,K] — channel-major flat, gdn_conv's layout
@@ -610,6 +636,12 @@ export async function loadWeights(
       }),
     })
   }
+
+  // Submit the GDN packing copies (a no-op encoder for pure-attention specs)
+  // and release the unpacked source buffers — WebGPU defers the actual free
+  // until the submitted copies complete.
+  device.queue.submit([packEnc.finish()])
+  for (const b of packDoomed) b.destroy()
 
   // Drain any in-flight OPFS writes so cache is fully persisted before we hand
   // control back. Errors here are non-fatal — opfsWrite already swallows them.
@@ -654,14 +686,11 @@ export interface LoadedWeights {
     kNormGamma?: GPUBuffer   // per-head k RMSNorm over head_dim (Qwen3 only)
     // GatedDeltaNet records — present iff spec.layerKinds[L] === 'gdn' (Qwen3.5).
     gdn?: {
-      qkvWeights: GPUBuffer  // in_proj_qkv int4 [gdnQkvDim, d]
-      qkvScales: GPUBuffer
-      zWeights: GPUBuffer    // in_proj_z int4 [gdnVDim, d]
-      zScales: GPUBuffer
-      aWeights: GPUBuffer    // in_proj_a int4 [gdnVHeads, d]
-      aScales: GPUBuffer
-      bWeights: GPUBuffer    // in_proj_b int4 [gdnVHeads, d]
-      bScales: GPUBuffer
+      /** Fused input projection int4 [gdnProjRows, d] — rows are
+       *  in_proj_qkv ‖ in_proj_z ‖ in_proj_a ‖ in_proj_b, packed by the
+       *  loader so the engine runs ONE matmul dispatch per GDN layer. */
+      projWeights: GPUBuffer
+      projScales: GPUBuffer
       aLog: GPUBuffer        // A_log f32 [gdnVHeads]
       dtBias: GPUBuffer      // dt_bias f32 [gdnVHeads]
       convWeight: GPUBuffer  // conv1d_weight f16 [gdnQkvDim * gdnConvK]

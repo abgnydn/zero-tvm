@@ -13,6 +13,26 @@ one machine benchmarked.
 
 ### Added
 
+- **Qwen3.5 hybrid perf round (2026-07-29)** — two engine changes, measured
+  **53.07** vs WebLLM 0.2.84's **32.36** tok/s on the same-session M2 Max
+  pair (**+64.0%**, up from the v1 floor's 47.99 vs 31.99 / +50.0%):
+  - *Fused GDN input projection* — the four per-DeltaNet-layer in_proj
+    matmuls (qkv 8192 + z 4096 + a 32 + b 32 rows, all K=d) pack into ONE
+    12352-row int4 dispatch. The loader concatenates the q4f16_1 records at
+    upload; downstream kernels read the packed output in place (`gdn_conv`
+    at offset 0, `gdn_norm_out`'s z region and `gdn_gates`' [a|b] pair via
+    256-aligned bind-group offsets). 412 → **340 dispatches/token**.
+  - *Incremental blocking decode* — the blocking `generate()` no longer
+    replays the whole prompt: the engine tracks the GDN state position
+    (`gdnStatePos`) and reuses the non-idempotent recurrent state whenever
+    it provably matches `startPos` (falling back to a full replay — which
+    re-zeroes state — otherwise). After `forwardLogits`, the validate
+    battery's decode now runs zero prompt passes; its reported rate went
+    ~17 → ~40 tok/s. `generatePipelined` (chat/bench) was already
+    incremental; its ≤1-token overrun past a stop is documented as safe.
+  All suites re-verified: kernels 28/28 + 21/21 + 13/13 (gdn_gates/gdn_block
+  updated to the packed layout, CPU reference `ref-gdn.mjs` unchanged),
+  287 unit, e2e 11/11, validate battery lexically correct.
 - **Qwen3.5-4B hybrid port (v1, `?model=qwen35`)** — the first *hybrid*
   architecture on the engine: 24 gated-DeltaNet (linear-attention) layers +
   8 gated full-attention layers (GQA 16/4, head_dim 256, partial RoPE 64 of
