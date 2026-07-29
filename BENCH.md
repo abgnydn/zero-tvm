@@ -149,7 +149,56 @@ compiles and runs correctly at head_dim 256, and its effect is within noise
 here — expected, since only 8 of 32 layers run attention at all. Kept at
 the default (`splitk=8` where sg32 exists), same as the other models.
 
-## Measured 2026-07-25 (M2 Max) — flag A/B series
+## Qwen3.5-4B hybrid perf round (2026-07-29, Apple M2 Max) — fused GDN in_proj + incremental blocking decode
+
+Two changes since the 2026-07-28 v1 floor above (kept as history):
+
+1. **Fused GDN input projection (4 dispatches → 1).** The four separate
+   in_proj matmuls per DeltaNet layer (`in_proj_qkv` 8192 rows + `in_proj_z`
+   4096 + `in_proj_a` 32 + `in_proj_b` 32, all K=d) are now ONE 12352-row
+   int4 matmul: the loader concatenates the four q4f16_1 weight/scale
+   records at upload (row-major, so row concat is byte concat) and the
+   engine runs a single dispatch into a packed output buffer. Downstream
+   kernels read the regions in place — `gdn_conv` reads the qkv region at
+   offset 0, `gdn_norm_out` binds the z region and `gdn_gates` the [a|b]
+   pair via 256-aligned bind-group offsets. 412 → **340 dispatches/token**
+   (24 GDN layers × 3 fewer). The two tiny 32-row matmuls were pure
+   dispatch overhead; the z rows now ride the same weight-scan as qkv.
+2. **Incremental blocking decode (no within-call prompt replay).** The
+   blocking `generate()` used to replay the whole prompt from position 0 on
+   every call because the GDN state (conv ring + recurrent S) is
+   non-idempotent and the engine couldn't prove it matched `startPos`. The
+   engine now tracks the state position (`gdnStatePos`, advanced by every
+   submitted forward pass) and skips the replay when it provably sits at the
+   requested boundary — the validate battery's `generate(prompt, len, 24)`
+   after `forwardLogits` now runs **zero** prompt passes (it reads back the
+   argmax the final prefill pass already produced) + one pass per generated
+   token. This does not touch the chat/bench path (`generatePipelined` was
+   already incremental — one chained pass per token); it fixes the harness
+   path, whose reported decode rate jumped from ~17 to ~40 tok/s (the old
+   figure amortized a full hidden replay). Cross-turn chat still re-prefills
+   from 0 (unchanged, same as Qwen3/Qwen3.5 chat behavior).
+
+Same protocol as above (same machine, same session, halves back-to-back,
+local-mirror weight bytes, greedy, Chrome 150; `BENCH_QUERY="?model=qwen35"
+npm run bench`, 128-token target × 5 runs — the model stops at 94 tokens on
+the bench prompt; WebLLM 0.2.84 on its prebuilt
+`Qwen3.5-4B-q4f16_1_cs1k-webgpu.wasm`, 3 × 120-token completions).
+`bench/results.json` untouched.
+
+| Engine (Qwen3.5-4B q4f16_1)                 | decode tok/s (median) |
+|--------------------------------------------:|----------------------:|
+| **Zero-TVM (`?model=qwen35`, defaults)**     | **53.07** |
+| WebLLM 0.2.84 (prebuilt Qwen3.5-4B lib)      | **32.36** |
+
+Raw runs — Zero-TVM: 53.32, 53.07, 52.87, 53.54, 52.81. WebLLM: 32.46,
+32.15, 32.36 (WebLLM's own reported `decode_tokens_per_s` 34.20 —
+wall-clock accounting as everywhere in this file). **+10.6% over the
+2026-07-28 Zero-TVM floor (47.99 → 53.07); +64.0% over WebLLM on this
+pair** (was +50.0%). The chat-path gain is entirely change 1 — change 2
+moves the validation/blocking path only. Still on the table for the GDN
+half: subgroup/vec4 variants for the GDN kernels, chunked prefill, and a
+fused conv+gates step.
 
 Each cell is the median of 5 × 128-token runs, versus the same-day
 pre-vec4-default baseline of **60.96 tok/s** (old defaults). Run-to-run

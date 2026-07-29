@@ -30,8 +30,13 @@ import { installBenchConsole } from './bench-console.js'
 const SPEC = specFromSearch(location.search)
 const BRAND = modelBranding(SPEC)
 // Dispatches per decode token: Phi-3 runs the fused path (32×7+4 = 228);
-// qkNorm specs (Qwen3) run unfused with qk_norm (36×10+4 = 364).
-const DISPATCHES_PER_TOKEN = SPEC.qkNorm ? SPEC.layers * 10 + 4 : SPEC.layers * 7 + 4
+// qkNorm specs (Qwen3) run unfused with qk_norm (36×10+4 = 364); hybrid
+// (Qwen3.5) mixes GDN layers (10 with the fused input projection) and
+// gated-attention layers (12): 24×10+8×12+4 = 340.
+const GDN_LAYERS = SPEC.layerKinds.filter((k) => k === 'gdn').length
+const DISPATCHES_PER_TOKEN = GDN_LAYERS > 0
+  ? GDN_LAYERS * 10 + (SPEC.layers - GDN_LAYERS) * 12 + 4
+  : SPEC.qkNorm ? SPEC.layers * 10 + 4 : SPEC.layers * 7 + 4
 
 // ============================================================
 // UI helpers

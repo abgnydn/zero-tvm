@@ -164,6 +164,13 @@ export interface ModelSpec extends ModelSpecBase {
   gdnVDim: number       // vHeads * headV (V rows; also z-gate / out_proj width)
   gdnQkvDim: number     // 2*gdnKDim + gdnVDim (in_proj_qkv rows == conv channels)
   gdnStatePerHead: number // headK * headV (f32 recurrent-state cells per v-head)
+  /** Fused GDN input projection: in_proj_qkv ‖ in_proj_z ‖ in_proj_a ‖
+   *  in_proj_b rows concatenated into ONE K=d int4 matmul (Qwen3.5:
+   *  8192+4096+32+32 = 12352). The loader packs the four weight/scale
+   *  records into one buffer pair; the engine runs one dispatch and the
+   *  downstream kernels read the regions at fixed offsets
+   *  (z at gdnQkvDim, a at gdnQkvDim+gdnVDim, b right after a). */
+  gdnProjRows: number
 }
 
 export function makeModelSpec(base: ModelSpecBase): ModelSpec {
@@ -211,6 +218,7 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
     gdnVDim: g.vHeads * g.headV,
     gdnQkvDim: 2 * g.kHeads * g.headK + g.vHeads * g.headV,
     gdnStatePerHead: g.headK * g.headV,
+    gdnProjRows: (2 * g.kHeads * g.headK + g.vHeads * g.headV) + g.vHeads * g.headV + 2 * g.vHeads,
     qDim,
     kvDim,
     qkvDim: qDim + 2 * kvDim,

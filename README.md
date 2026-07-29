@@ -134,13 +134,15 @@ gated-DeltaNet hybrid running in a browser. What it adds over Qwen3-4B:
   `mlc-chat-config.json` still lists the stale Qwen3 stop ids — we resolve
   stops from `tokenizer.json` instead), tied lm_head
 
-Measured same-session pair on an Apple M2 Max (2026-07-28, Chrome
-150.0.7871.187, identical local weight bytes): Zero-TVM **47.99 tok/s**
-decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at **31.99 tok/s** — +50% on
-that pair. Same honest framing as always: one machine, one pair, and the
-Zero-TVM path is **v1-scalar-GDN** — scalar (non-subgroup) DeltaNet kernels,
-no chunked prefill (prompts replay token-by-token), unfused GDN projections
-— so the number is a floor, not a tuned result. Protocol and caveats in
+Measured same-session pair on an Apple M2 Max (2026-07-29, Chrome 150,
+identical local weight bytes): Zero-TVM **53.07 tok/s** decode vs WebLLM
+0.2.84's prebuilt Qwen3.5-4B at **32.36 tok/s** — +64% on that pair (the
+2026-07-28 v1 floor was 47.99 vs 31.99, +50%; the gain since is the fused
+GDN input projection — the four per-layer in_proj matmuls packed into one
+12352-row dispatch — plus an incremental blocking decode with no prompt
+replay). Same honest framing as always: one machine, one pair, and the GDN
+kernels are still scalar (non-subgroup) with no chunked prefill — so the
+number remains a floor, not a tuned result. Protocol and caveats in
 [BENCH.md](BENCH.md).
 
 Weights: `node scripts/download-weights.mjs --model qwen35` primes the local

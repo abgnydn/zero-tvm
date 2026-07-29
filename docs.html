@@ -1065,14 +1065,17 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 </table>
 
 <p>
-  Measured 2026-07-28 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
-  <strong>47.99 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at <strong>31.99 tok/s</strong> —
-  +50% on that pair. Static dated text, not synced from <code>bench/results.json</code>.
+  Measured 2026-07-29 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
+  <strong>53.07 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at <strong>32.36 tok/s</strong> —
+  +64% on that pair (the 2026-07-28 v1 floor was 47.99 vs 31.99, +50%; the gain since is the fused
+  GDN input projection — the four per-layer in_proj matmuls packed into one 12352-row dispatch,
+  340 dispatches/token — plus a no-replay blocking decode). Static dated text, not synced from
+  <code>bench/results.json</code>.
 </p>
 
 <div class="callout warning">
-  <div class="callout-title">Read the +50% cautiously — the v1 scalar-GDN number is a floor</div>
-  <p>The 24 DeltaNet layers run scalar (non-subgroup) kernels; there is no chunked prefill — the recurrent state means prompts replay token-by-token through the sequential generate path; and the GDN projections are separate unfused dispatches. None of the Phi-3 fusion story has been applied to the GDN half yet. One machine, one pair; full protocol and caveats in BENCH.md.</p>
+  <div class="callout-title">Read the +64% cautiously — the GDN kernels are still scalar, so this remains a floor</div>
+  <p>The 24 DeltaNet layers run scalar (non-subgroup) kernels and there is no chunked prefill (prompts still prefill token-by-token). The input projections are now fused 4→1 per GDN layer; the rest of the Phi-3 fusion story has not been applied to the GDN half. One machine, one pair; full protocol and caveats in BENCH.md.</p>
 </div>
 
 <!-- PORTING -->
