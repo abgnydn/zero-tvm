@@ -1,4 +1,4 @@
-# Zero-TVM decode benchmarks (Phi-3 headline + Qwen3-4B / Qwen3.5-4B v1)
+# Zero-TVM decode benchmarks (Phi-3 headline + Qwen3-4B / Qwen3.5-4B)
 
 All numbers are decode-only (prefill excluded via warmup runs), measured with
 `npm run bench` (128 decode tokens × 5 runs, median) or `bench(128, 3)` in
@@ -94,6 +94,115 @@ as "the Qwen port is tuned". The caveats, up front:
 
 This is the recorded baseline for the Qwen tuning phase (fused-path work,
 vec4 builds for K≡512 (mod 1024) shapes, int8-KV), not a headline claim.
+
+## Qwen3-4B tuning round (2026-07-29, Apple M2 Max) — fused qk_norm+RoPE+append + K%512 vec4
+
+Two engine changes to the Qwen3 decode path, each behind its own URL flag so
+the A/B halves run in the same build:
+
+1. **Fused qk_norm+RoPE+KV-append (`?fuseqk=0` opts out).** The qkNorm
+   blocker was never the whole fusion — only folding into `qkv_fused`, whose
+   one-RoPE-pair-per-WG shape has nowhere to run the per-head norm reduction.
+   Keeping the QKV matmul separate and fusing everything AFTER it works: the
+   new `qk_norm_rope_append` kernel runs one 32-thread WG per (token, head)
+   over Q, K **and** V heads — per-head RMSNorm reduction in f32, normalized
+   head staged in workgroup memory so RoPE reads its ±HALF_ROTARY partner
+   from shared, K/V written straight into the paged cache. 4 dispatches
+   (matmul → qk_norm → rope → kv_append) become 2; **10 → 8
+   dispatches/layer** (364 → 292/token). Pinned against a composed CPU
+   reference in the Qwen suite with negative controls (V region must be raw
+   and bit-exact; no stray page writes).
+2. **K%512 vec4 matmul variants (`?vec4h=0` opts out).** The vec4 loads
+   required K % 1024 == 0 (32 threads × 32 K-elements per iteration),
+   excluding Qwen3's two hottest instances (d=2560: qkv/gate_up/LM-head;
+   ffn=9728: down_proj). The `_vec4h` generator siblings halve the
+   per-thread unroll — vec2<u32> weight loads (16 nibbles = half a scale
+   group), activations still vec4<u32> — relaxing the constraint to
+   K % 512 == 0, which both shapes satisfy. `resolveMatmul` now resolves
+   per instance: K%1024 → `_vec4`, else K%512 → `_vec4h`, else scalar-load.
+   4 new pipelines (f16/f32 × sg/tiled), correctness-tested at K=2560 and
+   K=9728.
+
+Also considered, not shipped: (b) restructuring `qkv_fused` to compute a
+whole head per WG with an in-WG norm reduction (4 dispatches → 1). Skipped
+on prior evidence rather than re-measured: it would dispatch HEADS+2·KV_HEADS
+= 48 WGs where the tiled matmul dispatches 1536, and the three qkv-tiling
+negatives above showed that even halving 4608 → 2304 WGs costs ~10% on
+Apple. The optional int8-KV unfused composition was also skipped this round:
+its value is KV memory (not decode speed — it costs an extra dispatch per
+layer) and it cannot ride the new fused kernel (which writes f16 pages).
+
+**Session note — the 2026-07-28 baseline did not reproduce.** Same machine
+(M2 Max, 32 GB), same Chrome 150.0.7871.187, same local weight bytes, and
+the flags-off configuration (dispatch-for-dispatch the 2026-07-28 decode
+chain) measured **71.57 tok/s where 25.43 was recorded the day before —
+and WebLLM's half moved with it (14.15 → 45–46 tok/s, on v0_2_84 libs vs
+0.2.80 then)**. To rule out a repo-side cause, the pre-round commit
+(`7a66144`, before the hybrid-perf and prefill rounds) was re-benched from
+a clean worktree the same day: **56.02 zt / 46.13 WebLLM** — i.e. the exact
+07-28 code also runs ~2.2×/3.3× its recorded numbers today. The two
+Zero-TVM figures even reconcile arithmetically: the old code re-prefills
+the ~35-token bench prompt inside every run's wall clock (no prefix reuse
+yet), and 128/(163/71.57) = 56.2 ≈ 56.02 — so the old commit and today's
+flags-off half measure the SAME underlying decode rate, differing only in
+prefill accounting. Conclusion: the 07-28 session (both engines, both
+recorded sessions that day) was in a degraded machine state — the same
+phenomenon as the "clearly-degraded pair" note in the Phi-3 headline.
+Consequence: the per-item deltas below are computed against the SAME-DAY
+flags-off half, not against 25.43; the 07-28 numbers stay in the section
+above as recorded.
+
+Ladder, same day, same protocol (`BENCH_QUERY="?model=qwen3&…" npm run
+bench`, 128 decode tokens, greedy, local mirror; 3 runs for the A/B halves,
+5 for the headline pair; each config is a separate same-day session):
+
+| Config (Qwen3-4B q4f16_1)              | tok/s (median) | Δ vs flags-off |
+|----------------------------------------|---------------:|---------------:|
+| flags-off (`?fuseqk=0&vec4h=0` — the 07-28 composition) | 71.57 | — |
+| item 1 only (`?vec4h=0`)               | 73.22 | +2.3% |
+| item 2 only (`?fuseqk=0`)              | 75.63 | +5.7% |
+| **both (defaults)**                    | **75.74** | **+5.8%** |
+
+Raw runs — flags-off: 71.42/71.57/71.71; item 1: 73.24/72.95/73.22; item 2:
+74.75/75.63/75.64; defaults: 74.29/75.74/75.91/76.16/75.49. Honest
+composition note: the two wins do NOT stack — with the vec4h matmuls in
+place the fused-qk win shrinks from +2.3% to ~+0.1% (75.63 → 75.74, inside
+the ±0.5 tok/s run spread). Both stay default-on: each is a clean standalone
+win, `?fuseqk` also drops 72 dispatches/token, and neither regresses — but
+the round's throughput is essentially the vec4h number.
+
+Headline same-session pair (defaults, 5 × 128 tokens vs WebLLM 0.2.84's
+prebuilt `Qwen3-4B-q4f16_1_cs1k-webgpu.wasm`, its usual 3 × 120-token
+protocol; `bench/results.json` untouched):
+
+| Engine (Qwen3-4B q4f16_1)                | decode tok/s (median) |
+|-----------------------------------------:|----------------------:|
+| **Zero-TVM (`?model=qwen3`, defaults)**   | **75.74** |
+| WebLLM 0.2.84 (prebuilt Qwen3-4B lib)     | **43.75** |
+
+**+73.1% over WebLLM on this pair.** WebLLM halves across the day's four
+sessions: 45.26/46.24/45.51/43.75 (±3%). Scope: one machine, one day,
+short-context, decode-only — same limits as every section in this file.
+The Qwen3 path remains unfused at the QKV matmul itself (8 dispatches/layer
+vs Phi-3's 7); the remaining gap to a Phi-3-style path is the qkv_fused
+fold ruled out under (b) above.
+
+**Qwen3.5 cross-check (same day).** The `_vec4h` variants also engage on the
+hybrid's K=2560 instances (fused GDN in_proj, c_attn, gate_up); the fused-qk
+kernel does not (the hybrid attention chain keeps the reference composition).
+Same-day pair: **65.67** vs WebLLM 0.2.84's **34.04** tok/s (**+92.9%**);
+`?vec4h=0` half: 64.38 (raw runs 65.73/65.29/65.67 vs 64.63/64.32/64.38) —
+**vec4h is +2.0% on the hybrid**, no regression. Note on 53.07 → 64.38
+(the 2026-07-29 perf-round number vs today's flags-off half): that jump is
+NOT this round's work — the prefill round's cross-turn prefix reuse
+(landed between the two measurements) removes the ~35-token re-prefill
+from every bench run's wall-clock window, which alone accounts for the
+bulk of the difference (the two figures reconcile to the same underlying
+decode rate if the old runs prefilled the short shallow-KV prompt at
+~110 tok/s — plausible for the readback-free per-token prefill, though
+not directly measured at that length). Accounting change plus ordinary
+session variance, documented here so nobody reads it as a kernel win
+(WebLLM's half moved only 32.36 → 33.2–34.0 across the same sessions).
 
 ## Qwen3.5-4B hybrid (2026-07-28, Apple M2 Max) — v1 scalar-GDN, same-weights A/B vs WebLLM
 
@@ -628,6 +737,10 @@ URL toggles for A/B bisection:
 - `?matmul=scalar|sg|tiled` — force matmul variant
 - `?vec4=0` / `?vec4qkv=0` — disable the vec4-load defaults (measured +7.1%
   together on M2 Max; default ON since 2026-07-25)
+- `?vec4h=0` — disable just the K%512 `_vec4h` half-unroll matmul siblings
+  (+5.7% on Qwen3, +2.0% on Qwen3.5; default ON since 2026-07-29)
+- `?fuseqk=0` — disable the fused qk_norm+RoPE+KV-append kernel on the
+  Qwen3 unfused path (+2.3% alone; default ON since 2026-07-29)
 
 Opt-in experiments (measured 2026-07-25 on M2 Max — see the A/B table above):
 

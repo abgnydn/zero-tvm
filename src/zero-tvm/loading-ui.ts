@@ -263,7 +263,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     log(`Allocating KV cache (${spec.layers} layers × ${spec.maxPages} pages)`)
     const kvPages = allocKVPages(device, spec)
     setProgress(96, 'Compiling shaders...')
-    log('Compiling 27 WGSL kernels (10 roles; 18 files + 9 generated)')
+    log('Compiling 55 WGSL kernels (10 roles; 37 files + 18 generated)')
     engine = buildDecodeEngine(device, weights, kvPages, { spec })
   }
 
@@ -287,7 +287,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   log(`Warmup forward: ${Math.round(performance.now() - warmupT0)} ms`)
 
   setProgress(100, 'Ready')
-  log('Ready. Zero TVM. 10 kernel roles across 27 WGSL kernels.')
+  log('Ready. Zero TVM. 10 kernel roles across 55 WGSL kernels.')
   setBadge('Ready', 'ready')
 
   return { ok: true, device, tokenizer, weights, engine }

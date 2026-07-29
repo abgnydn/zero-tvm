@@ -273,6 +273,12 @@ export function buildDecodeEngine(
       'the per-head Q/K RMSNorm must run between the QKV matmul and RoPE. Use unfused mode.'
     )
   }
+  // Fused qk_norm+RoPE+KV-append (?fuseqk, default on via parseVariantFlags):
+  // on the unfused qkNorm path the 3 post-matmul dispatches collapse into 1
+  // (10 → 8 per layer). Pure-attention specs only — the hybrid gated-attention
+  // chain keeps the reference composition (its rope input comes from
+  // gated_qkv_split and the win is 2 of 12 dispatches on 8 of 32 layers).
+  const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm
 
   // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and SCALES = K/32.
   // K = d for the QKV/gate_up projections, qDim for o_proj (== d when
@@ -301,7 +307,8 @@ export function buildDecodeEngine(
   console.log(
     `[engine] attention=${R.attentionLabel} argmax=${R.argmaxLabel} qkv=${R.qkvLabel} ` +
     `ffn=${R.ffnLabel} matmul=${R.matmulLabel} rowsPerWG=${R.matmulRowsPerWG} ` +
-    `mode=${fused ? (int8Mode ? 'fused+int8KV' : 'fused') : hybrid ? 'hybrid-unfused' : 'unfused'}`
+    `mode=${fused ? (int8Mode ? 'fused+int8KV' : 'fused') : hybrid ? 'hybrid-unfused' : 'unfused'}` +
+    (S.qkNorm && !hybrid ? ` fuseqk=${fuseQk ? 'on' : 'off'}` : '')
   )
 
   // Activation buffers. The per-layer QKV stage differs by mode:
@@ -414,6 +421,10 @@ export function buildDecodeEngine(
   // the decode path, so the uniform is fully constant.
   const QK_NORM_WGS = S.heads + S.kvHeads
   const qkNormU = S.qkNorm ? uniformBuf(device, [i32(1), u32(QK_NORM_WGS)]) : null
+  // Fused qk_norm+RoPE+append (?fuseqk): one 32-thread WG per (token, head)
+  // over Q, K AND V heads. seq_len is 1 on the decode path — fully constant.
+  const QK_FUSE_WGS = S.heads + 2 * S.kvHeads
+  const qkFuseU = fuseQk ? uniformBuf(device, [i32(1), u32(QK_FUSE_WGS)]) : null
   const qkvFusedU = (fused && !int8Mode) ? uniformBuf(device, [i32(0), i32(0), u32(S.qkvPairs)]) : null      // f16-KV mode
   const qkvFusedScratchU = int8Mode ? uniformBuf(device, [i32(0), u32(S.qkvPairs)]) : null                   // int8-KV mode
   const kvQuantU = int8Mode ? uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]) : null  // pos_off, pages_off, scales_off, kvHeads*2 WG
@@ -440,7 +451,7 @@ export function buildDecodeEngine(
   // GDN out_proj is a K = GDN_V_DIM matmul instance — resolve its own
   // pipeline so the vec4 K-divisibility gate applies to the right K
   // (== R.matmulOProj on Qwen3.5, where gdnVDim == qDim == 4096).
-  const matmulGdnOut = hybrid ? resolveMatmul(variants.matmul, P, variants.vec4, S.gdnVDim).pipeline : null
+  const matmulGdnOut = hybrid ? resolveMatmul(variants.matmul, P, variants.vec4, S.gdnVDim, variants.vec4Half).pipeline : null
 
   const SM_SCALE = 1.0 / Math.sqrt(S.headDim)
 
@@ -640,6 +651,7 @@ export function buildDecodeEngine(
   interface LayerBG {
     qkv?: GPUBindGroup          // unfused: qkv matmul | fused: qkv_fused / qkv_fused_scratch | hybrid attn: c_attn matmul
     qkNorm?: GPUBindGroup       // qkNorm specs (Qwen3/Qwen3.5) only — in-place Q/K RMSNorm on qkvOut
+    qkFused?: GPUBindGroup      // ?fuseqk (qkNorm specs): fused qk_norm+RoPE+append replaces qkNorm/rope/kvApp
     gatedSplit?: GPUBindGroup   // hybrid attn layers: c_attn → qkvOut + attnGateRaw unpack
     attnGate?: GPUBindGroup     // hybrid attn layers: attnOut *= sigmoid(gate), in place
     kvApp?: GPUBindGroup        // unfused only
@@ -673,6 +685,7 @@ export function buildDecodeEngine(
     let qkvBG: GPUBindGroup | undefined
     let attnBG: GPUBindGroup | undefined
     let qkNormBG: GPUBindGroup | undefined
+    let qkFusedBG: GPUBindGroup | undefined
     let gatedSplitBG: GPUBindGroup | undefined
     let attnGateBG: GPUBindGroup | undefined
     let kvAppBG: GPUBindGroup | undefined
@@ -735,10 +748,20 @@ export function buildDecodeEngine(
       qkvBG = bg(device, R.matmul, [
         B.qkvOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, qkvU!,
       ])
-      if (S.qkNorm) qkNormBG = qkNormBGFor()
-      kvAppBG = bg(device, P.kvAppend, [
-        B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!,
-      ])
+      if (fuseQk) {
+        // ?fuseqk: one fused kernel replaces qk_norm → rope → kv_append.
+        if (!lw.qNormGamma || !lw.kNormGamma) {
+          throw new Error(`buildDecodeEngine: spec ${S.id} sets qkNorm but layer ${L} has no q_norm/k_norm weights`)
+        }
+        qkFusedBG = bg(device, P.qkNormRopeAppend, [
+          B.qOut, kvL(), B.qkvOut!, lw.qNormGamma, lw.kNormGamma, B.posMap, qkFuseU!,
+        ])
+      } else {
+        if (S.qkNorm) qkNormBG = qkNormBGFor()
+        kvAppBG = bg(device, P.kvAppend, [
+          B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!,
+        ])
+      }
       attnBG = attnF16BG()
       oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
     } else if (int8Mode) {
@@ -773,6 +796,7 @@ export function buildDecodeEngine(
       layerBGs.push({
         qkv: qkvBG,
         qkNorm: qkNormBG,
+        qkFused: qkFusedBG,
         kvApp: kvAppBG,
         kvQuantize: kvQuantizeBG,
         attn: attnBG,
@@ -787,6 +811,7 @@ export function buildDecodeEngine(
     layerBGs.push({
       qkv: qkvBG,
       qkNorm: qkNormBG,
+      qkFused: qkFusedBG,
       gatedSplit: gatedSplitBG,
       attnGate: attnGateBG,
       kvApp: kvAppBG,
@@ -850,9 +875,9 @@ export function buildDecodeEngine(
     // Residual ping-pong is encoded into the cached bind groups: addNorm1 reads
     // residual / writes residual2; addNorm2 reads residual2 / writes residual.
     // Unfused: 9 dispatches/layer (10 for qkNorm specs — Qwen3 inserts the
-    // per-head Q/K RMSNorm between qkv matmul and rope). Fused f16: 7. Fused
-    // int8: 8 (adds a kv_quantize pass between qkv_fused_scratch and
-    // attention_int8).
+    // per-head Q/K RMSNorm between qkv matmul and rope; 8 with ?fuseqk, which
+    // fuses qkNorm+rope+kvAppend into one pass). Fused f16: 7. Fused int8: 8
+    // (adds a kv_quantize pass between qkv_fused_scratch and attention_int8).
     for (let L = 0; L < S.layers; L++) {
       const blk = layerBGs[L]
 
@@ -895,12 +920,18 @@ export function buildDecodeEngine(
       } else if (!fused) {
         // QKV matmul: B.hidden1 → B.qkvOut
         dispatch(enc, R.matmul, blk.qkv!, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
-        // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
-        if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
-        // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
-        dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
-        // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
-        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+        if (blk.qkFused) {
+          // ?fuseqk: fused qk_norm+RoPE+append — B.qkvOut → B.qOut + kvPages[L]
+          // in one dispatch (replaces the qkNorm/rope/kvAppend chain below).
+          dispatch(enc, P.qkNormRopeAppend, blk.qkFused, QK_FUSE_WGS, 1, 1, 'qkNormRopeAppend')
+        } else {
+          // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
+          if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
+          // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
+          dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
+          // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
+          dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+        }
         // Attention: Q + kvPages[L] → B.attnOut
         attentionF16()
         dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')

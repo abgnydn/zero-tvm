@@ -35,10 +35,10 @@ export function specFromSearch(search: string): ModelSpec {
 /** Page-facing copy for the active model (gate dialog, header, hints). */
 export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: string; rateLabel: string } {
   if (spec.id === QWEN35_4B.id) {
-    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~53 t/s' }  // fused-GDN-in_proj path, M2 Max (BENCH.md 2026-07-29)
+    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~66 t/s' }  // fused-GDN-in_proj + vec4h + reuse-era accounting, M2 Max (BENCH.md 2026-07-29)
   }
   return spec.id === QWEN3_4B.id
-    ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~25 t/s' }  // v1 unfused path, M2 Max (BENCH.md)
+    ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~76 t/s' }  // fuseqk+vec4h tuning round, M2 Max (BENCH.md 2026-07-29)
     : { name: 'Phi-3-mini', sizeLabel: '~2 GB', rateLabel: '60+ t/s' }
 }
 

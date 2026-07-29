@@ -28,7 +28,7 @@ models:
 
 **Phi-3-mini running in a browser on hand-written WGSL shaders. No TVM. No WebLLM runtime. No compiler.**
 
-The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles (27 WGSL implementations, counting subgroup / tiled / int8 variants) and about 2,000 lines of TypeScript**, using the same Phi-3-mini-q4f16_1 weights.
+The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles (55 WGSL implementations — 37 files + 18 generated int4 variants, counting subgroup / tiled / int8 variants) and about 2,000 lines of TypeScript**, using the same Phi-3-mini-q4f16_1 weights.
 
 The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
 
@@ -38,8 +38,8 @@ Measured on an Apple M2 Max (Chrome, WebLLM v0.2.80, identical Phi-3-mini-q4f16_
 
 | | WebLLM (TVM) | Zero-TVM |
 |---|---|---|
-| Unique WGSL kernels | **85** | **10 roles / 27 files** |
-| Total WGSL lines | **12,962** (generated) | **3,078** (hand-written) |
+| Unique WGSL kernels | **85** | **10 roles / 37 files** |
+| Total WGSL lines | **12,962** (generated) | **4,228** (hand-written) |
 | Dispatches per decode step | **342** | **228** |
 | Decode throughput | baseline | **28–31% faster** (same weights, same run) |
 | JS bundle (excl. weights) | **5.9 MB** / 2.1 MB gz | **157 kB** / 33 kB gz |

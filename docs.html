@@ -501,13 +501,13 @@
   <h1>Zero TVM Documentation</h1>
   <p class="lead">
     A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
-    10 hand-written WGSL kernel roles (27 files, 3,078 LOC), a BPE tokenizer, and raw WebGPU.
+    10 hand-written WGSL kernel roles (37 files, 4,228 LOC), a BPE tokenizer, and raw WebGPU.
     Decodes 28–31% faster than WebLLM's TVM-autotuned 85 kernels on identical weights, same run (M2 Max).
   </p>
 
   <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
     <span class="pill green">WebGPU</span>
-    <span class="pill purple">10 kernel roles · 27 WGSL files</span>
+    <span class="pill purple">10 kernel roles · 37 WGSL files</span>
     <span class="pill yellow">Q4F16_1</span>
     <span class="pill green">Phi-3-mini 3.8B</span>
     <span class="pill purple">Paged KV Cache</span>
@@ -594,7 +594,7 @@
     <tr><td><code>src/zero-tvm/chat.ts</code></td><td>Main decode engine + UI. Allocates buffers, builds bind groups, runs the decode loop.</td></tr>
     <tr><td><code>src/zero-tvm/weight-loader.ts</code></td><td>Fetches ndarray-cache.json, downloads shards, uploads to GPU buffers.</td></tr>
     <tr><td><code>src/zero-tvm/tokenizer.ts</code></td><td>BPE tokenizer: encode text → token IDs, decode IDs → text.</td></tr>
-    <tr><td><code>src/compiler/compiler.ts</code></td><td>Compiles all 27 WGSL files (10 kernel roles + tiled/subgroup variants) into <code>GPUComputePipeline</code> objects.</td></tr>
+    <tr><td><code>src/compiler/compiler.ts</code></td><td>Compiles all 37 WGSL files (10 kernel roles + tiled/subgroup variants) into <code>GPUComputePipeline</code> objects.</td></tr>
   </tbody>
 </table>
 
@@ -1025,19 +1025,19 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>QK-norm</td><td>none</td><td>per-head RMSNorm on Q and K between projection and RoPE</td></tr>
     <tr><td>Tokenizer</td><td>SentencePiece</td><td>byte-level BPE (Qwen2-style <code>tokenizer.json</code>)</td></tr>
     <tr><td>LM head</td><td>separate</td><td>tied — logits reuse the quantized embedding matrix (151,936 vocab)</td></tr>
-    <tr><td>Decode path</td><td>fused, 7 dispatches/layer</td><td>unfused v1, 10 dispatches/layer</td></tr>
+    <tr><td>Decode path</td><td>fused, 7 dispatches/layer</td><td>unfused QKV + fused qk_norm+RoPE+append, 8 dispatches/layer</td></tr>
   </tbody>
 </table>
 
 <p>
-  Measured 2026-07-28 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
-  <strong>25.43 tok/s</strong> decode vs WebLLM's prebuilt Qwen3-4B at <strong>14.15 tok/s</strong> — +80% on that
-  pair. Unlike the Phi-3 headline, these figures are static dated text, not synced from <code>bench/results.json</code>.
+  Measured 2026-07-29 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
+  <strong>75.74 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3-4B at <strong>43.75 tok/s</strong> — +73% on
+  that pair. Unlike the Phi-3 headline, these figures are static dated text, not synced from <code>bench/results.json</code>.
 </p>
 
 <div class="callout warning">
-  <div class="callout-title">Read the +80% cautiously — this is the untuned path</div>
-  <p>QK-norm must run between the QKV matmul and RoPE, which is incompatible with the fused QKV+RoPE+KV-append kernel — so Qwen runs the unfused reference composition, 10 dispatches/layer vs the Phi-3 chat path's 7. And both engines run Qwen3-4B far below their Phi-3 rates on this machine (62.9 → 25.4; 47.9 → 14.2), so the gap says as much about WebLLM's prebuilt Qwen3 lib on this GPU as about the port. One machine, one pair; full protocol and caveats in BENCH.md.</p>
+  <div class="callout-title">Read the +73% cautiously — one pair, one machine</div>
+  <p>QK-norm must run between the QKV matmul and RoPE, which is incompatible with the fused QKV+RoPE+KV-append kernel — the QKV matmul stays a separate dispatch. Since the 2026-07-29 tuning round everything after it is fused (<code>qk_norm_rope_append</code>: per-head norm + RoPE + paged KV write in one pass, 8 dispatches/layer; <code>?fuseqk=0</code> restores the 10-dispatch reference chain) and the K%512 <code>_vec4h</code> matmul variants give d=2560 / ffn=9728 wide loads (<code>?vec4h=0</code> opts out). Same-day A/Bs: fused-qk +2.3%, vec4h +5.7%, combined +5.8% over the flags-off half. The earlier 2026-07-28 pair (25.43 vs 14.15) did not reproduce on the same machine — both engines moved ~3× together (degraded session; control-run details in BENCH.md's tuning-round session note).</p>
 </div>
 
 <!-- QWEN35 -->
@@ -1066,10 +1066,12 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 
 <p>
   Measured 2026-07-29 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
-  <strong>53.07 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at <strong>32.36 tok/s</strong> —
-  +64% on that pair (the 2026-07-28 v1 floor was 47.99 vs 31.99, +50%; the gain since is the fused
+  <strong>65.67 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at <strong>34.04 tok/s</strong> —
+  +93% on that pair (the 2026-07-28 v1 floor was 47.99 vs 31.99, +50%; the gains since are the fused
   GDN input projection — the four per-layer in_proj matmuls packed into one 12352-row dispatch,
-  340 dispatches/token — plus a no-replay blocking decode). Static dated text, not synced from
+  340 dispatches/token — a no-replay blocking decode, the K%512 <code>_vec4h</code> matmuls (+2.0% A/B),
+  and prefix reuse removing prefill from the bench wall-clock window — see BENCH.md's cross-check note
+  before reading the jump as a kernel win). Static dated text, not synced from
   <code>bench/results.json</code>.
 </p>
 
@@ -1183,11 +1185,11 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Decode speed</td><td><!--bench:zt-->62.90<!--/bench:zt--> tok/s</td><td><!--bench:webllm-->47.9<!--/bench:webllm--> tok/s</td></tr>
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-31<!--/bench:gap-->% relative to WebLLM (negative = Zero-TVM ahead; ratio stable −28…−31% across sessions)</td></tr>
     <tr><td>Dispatches / token</td><td>228 (260 with <code>?int8kv=1</code>)</td><td>342</td></tr>
-    <tr><td>Distinct shaders</td><td>10 kernel roles · 27 .wgsl files · 3,078 LOC</td><td>85 TVM-generated shaders · 12,962 LOC</td></tr>
+    <tr><td>Distinct shaders</td><td>10 kernel roles · 37 .wgsl files · 4,228 LOC</td><td>85 TVM-generated shaders · 12,962 LOC</td></tr>
     <tr><td>Shipped JS bundle</td><td>157 kB / 33 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (<code>compiler-chat.html</code>)</td></tr>
     <tr><td>Bandwidth utilization</td><td>~30% of 222 tok/s ceiling</td><td>~23% of same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
-    <tr><td>Readable kernels?</td><td>✓ Yes — all 27 .wgsl files in repo</td><td>✗ No — emitted by the TVM compiler</td></tr>
+    <tr><td>Readable kernels?</td><td>✓ Yes — all 37 .wgsl files in repo</td><td>✗ No — emitted by the TVM compiler</td></tr>
   </tbody>
 </table>
 

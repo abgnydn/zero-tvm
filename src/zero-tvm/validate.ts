@@ -3,7 +3,7 @@
  *
  * Why this file exists:
  *   The per-shader test-harness (src/compiler/test-harness.ts) compares each
- *   of our 10 kernels (27 WGSL kernels) against TVM's ground truth — but only on a single
+ *   of our 10 kernels (55 WGSL kernels) against TVM's ground truth — but only on a single
  *   hard-coded prompt ("What is the capital of France?"). That tests shader
  *   correctness in isolation; it does not test the live chat path on diverse
  *   inputs.

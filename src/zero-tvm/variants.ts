@@ -58,8 +58,16 @@ export interface VariantFlags {
   int8KV: boolean
   /** vec4-load int4 matmuls — default ON (measured +4.5% on M2 Max); ?vec4=0 to disable. */
   vec4: boolean
+  /** K%512 half-unroll vec4 siblings (_vec4h) for the instances the K%1024
+   *  gate excludes (Qwen3 d=2560 / ffn=9728). Default follows `vec4`;
+   *  ?vec4h=0 disables just the half variants for A/B. */
+  vec4Half: boolean
   /** vec4-load qkv_fused sibling — default ON (measured +4.2% on M2 Max); ?vec4qkv=0 to disable. */
   vec4Qkv: boolean
+  /** Fused qk_norm+RoPE+KV-append on the unfused qkNorm decode path (Qwen3):
+   *  3 post-matmul dispatches become 1 (10 → 8 per layer). Default ON;
+   *  ?fuseqk=0 restores the reference 3-dispatch chain for A/B. */
+  fuseQkNorm: boolean
   /** ?splitk=N — split-K attention partitions per head; 0 = off (opt-in: ~+3% at short context). */
   splitK: number
   /** ?fuseprologue=1 — add_norm folded into the FFN prologue (opt-in; −13.7% on M2 Max — falsified there). */
@@ -78,7 +86,9 @@ export const SCALAR_VARIANTS: VariantFlags = {
   matmul: 'scalar',
   int8KV: false,
   vec4: false,
+  vec4Half: false,
   vec4Qkv: false,
+  fuseQkNorm: false,
   splitK: 0,
   fusePrologue: false,
 }
@@ -117,7 +127,13 @@ export function parseVariantFlags(
     // vec4 loads: measured +7% decode on M2 Max (BENCH.md 2026-07-25 A/B),
     // default ON where the sg32 builds exist; ?vec4=0 / ?vec4qkv=0 to A/B off.
     vec4: sgAll && q.get('vec4') !== '0',
+    // K%512 half-unroll siblings ride the vec4 default; ?vec4h=0 A/Bs just
+    // them (the K%1024 full-vec4 instances stay on).
+    vec4Half: sgAll && q.get('vec4') !== '0' && q.get('vec4h') !== '0',
     vec4Qkv: sgAll && q.get('vec4qkv') !== '0',
+    // Fused qk_norm+RoPE+append on the qkNorm decode path (plain 32-thread
+    // kernel — no subgroups needed). ?fuseqk=0 restores the reference chain.
+    fuseQkNorm: q.get('fuseqk') !== '0',
     // split-K attention: measured +3.1% at 128-token decode and +4.0% at
     // 1024-token decode on M2 Max (the win grows with KV depth, as the
     // occupancy hypothesis predicts) — default N=8 where the sg32 path
@@ -145,19 +161,33 @@ function parseSplitK(raw: string | null): number {
 // `k` is the reduction dim of the matmul INSTANCE this resolution serves:
 // the vec4 layout consumes 32 K-elements per thread per iteration, so it
 // requires K % 1024 == 0 (Phi-3: every K qualifies; Qwen3: K=2560/9728
-// fail, K=4096 passes) — instances that fail fall back to the non-vec4
-// pipeline of the same variant, keeping rowsPerWG identical.
+// fail, K=4096 passes). Instances that fail the 1024 gate but satisfy
+// K % 512 == 0 resolve to the `_vec4h` half-unroll siblings (vec2<u32>
+// weight loads — both Qwen3 shapes qualify) when `vec4Half` is on; anything
+// else falls back to the non-vec4 pipeline of the same variant, keeping
+// rowsPerWG identical.
 export function resolveMatmul(
   variant: MatmulVariant,
   P: Pipelines,
   vec4 = false,
   k?: number,
+  vec4Half = vec4,
 ): { pipeline: GPUComputePipeline; pipelineF32: GPUComputePipeline; rowsPerWG: number; label: string } {
   // ?vec4=1 experiment: vec4-load builds exist for the tiled and sg shapes.
   // tiled8 has no vec4 build (known-regressed tile size) and scalar can't
   // have one (64-thread WG breaks K divisibility) — those fall through
   // to their non-vec4 pipelines.
-  if (k !== undefined && k % 1024 !== 0) vec4 = false
+  let useHalf = false
+  if (k !== undefined && k % 1024 !== 0) {
+    useHalf = vec4Half && k % 512 === 0
+    vec4 = false
+  }
+  if (useHalf && variant === 'tiled' && P.int4MatmulTiledVec4h && P.int4MatmulF32TiledVec4h) {
+    return { pipeline: P.int4MatmulTiledVec4h, pipelineF32: P.int4MatmulF32TiledVec4h, rowsPerWG: 4, label: 'tiled_vec4h' }
+  }
+  if (useHalf && variant === 'sg' && P.int4MatmulSgVec4h && P.int4MatmulF32SgVec4h) {
+    return { pipeline: P.int4MatmulSgVec4h, pipelineF32: P.int4MatmulF32SgVec4h, rowsPerWG: 1, label: 'sg_vec4h' }
+  }
   if (vec4 && variant === 'tiled' && P.int4MatmulTiledVec4 && P.int4MatmulF32TiledVec4) {
     return { pipeline: P.int4MatmulTiledVec4, pipelineF32: P.int4MatmulF32TiledVec4, rowsPerWG: 4, label: 'tiled_vec4' }
   }
@@ -221,9 +251,9 @@ export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines, spec:
   // survives exactly on the instances whose K % 1024 == 0 (all of them for
   // Phi-3 — resolution unchanged there).
   const { pipeline: matmul, pipelineF32: matmulF32, rowsPerWG: matmulRowsPerWG, label: matmulLabel } =
-    resolveMatmul(flags.matmul, P, flags.vec4, spec.d)
-  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim)
-  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn)
+    resolveMatmul(flags.matmul, P, flags.vec4, spec.d, flags.vec4Half)
+  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim, flags.vec4Half)
+  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn, flags.vec4Half)
   const attention = (flags.sgAttn && P.attentionSg) ? P.attentionSg : P.attention
   // ?splitk=N experiment: partial pass follows the sgAttn toggle (subgroup
   // reduce when available), combine is feature-free.

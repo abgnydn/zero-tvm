@@ -28,7 +28,7 @@ novel layer; port everything with a peer-reviewed reference.**
 
 For `zero-tvm` specifically, the novel contribution is the
 **hand-written WGSL stack** — proving you can match TVM's autotuned
-kernels in 27 files of WGSL and 2k lines of TypeScript, by
+kernels in 37 files of WGSL and 2k lines of TypeScript, by
 out-fusing TVM's default pipeline. The Phi-3 architecture, MLC weight
 format, and BPE tokenizer are textbook and ported.
 
@@ -123,7 +123,7 @@ bugs to fix; they are findings.
 - Every JSON artifact records: git SHA (when available), full
   `navigator.userAgent`, `adapter.info`, WebGPU `limits`, UTC ISO8601
   timestamp, **shader-file SHA-256 / git-rev-parse hashes** for each
-  of the 10 kernel roles (27 WGSL files counting A/B/int8 variants).
+  of the 10 kernel roles (37 WGSL files counting A/B/int8 variants).
 - 5 warmup samples are discarded; 20 trials retained.
 - Report **median + p10/p90/p99 + std + IQR** for throughput
   measurements — never single-shot.
@@ -184,7 +184,7 @@ WebLLM's TVM-autotuned 85 kernels with 10 hand-written kernel roles
 by out-fusing the default emission pipeline. So:
 
 - **Hand-written and owned** (the contribution):
-  - All 10 WGSL kernel roles / 27 files: `qkv_fused.wgsl` (Q/K/V proj
+  - All 10 WGSL kernel roles / 37 files: `qkv_fused.wgsl` (Q/K/V proj
     + RoPE + paged-KV append in one dispatch), `attention.wgsl`
     (paged attention + page-table read), `fused_ffn.wgsl` (gate + up
     + SiLU), `add_norm.wgsl` (residual + RMSNorm), `matmul.wgsl`
@@ -271,7 +271,7 @@ don't re-test them.
 ## 9. Shader byte-hashing for reproducibility
 
 Every artifact records the SHA-256 (or `git rev-parse <gitSha>:<path>`
-short hash) of each of the 27 WGSL shader files the experiment
+short hash) of each of the 37 WGSL shader files the experiment
 depended on. This lets reviewers group rows by shader version when a
 kernel implementation changes (subgroup tile size, int4 dequant
 strategy, fused-vs-unfused FFN, A/B variant selection, …).

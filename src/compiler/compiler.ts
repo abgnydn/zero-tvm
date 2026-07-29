@@ -21,6 +21,7 @@ import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
 import kvAppendSrc from './shaders/kv_append.wgsl?raw'
 import qkNormSrc from './shaders/qk_norm.wgsl?raw'
+import qkNormRopeAppendSrc from './shaders/qk_norm_rope_append.wgsl?raw'
 import gatedQkvSplitSrc from './shaders/gated_qkv_split.wgsl?raw'
 import attnGateSrc from './shaders/attn_gate.wgsl?raw'
 import gdnConvSrc from './shaders/gdn_conv.wgsl?raw'
@@ -86,9 +87,16 @@ export interface Pipelines {
   int4MatmulTiledVec4: GPUComputePipeline | null    // vec4-load tiled variant (4 rows/WG)
   int4MatmulF32SgVec4: GPUComputePipeline | null    // vec4-load _sg LM-head variant
   int4MatmulF32TiledVec4: GPUComputePipeline | null // vec4-load tiled LM-head variant
+  // K%512 half-unroll siblings (_vec4h): vec2<u32> weight loads for the
+  // shapes the K%1024 gate excludes (Qwen3 d=2560 / ffn=9728); ?vec4h=0 opts out:
+  int4MatmulSgVec4h: GPUComputePipeline | null
+  int4MatmulTiledVec4h: GPUComputePipeline | null
+  int4MatmulF32SgVec4h: GPUComputePipeline | null
+  int4MatmulF32TiledVec4h: GPUComputePipeline | null
   rope: GPUComputePipeline
   kvAppend: GPUComputePipeline
   qkNorm: GPUComputePipeline           // Qwen3 per-head q/k RMSNorm (in place, pre-RoPE)
+  qkNormRopeAppend: GPUComputePipeline // fused qk_norm + rope + kv_append (qkNorm decode path)
   // Qwen3.5 hybrid kernels — compiled under every spec (the prelude's GDN
   // consts collapse to attention dims elsewhere); only hybrid specs dispatch.
   gatedQkvSplit: GPUComputePipeline    // c_attn [Q|gate]‖K‖V unpack → qkv + gate
@@ -198,9 +206,14 @@ export function compile(
     int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
     int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,
     int4MatmulF32TiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_f32_tiled_vec4') : null,
+    int4MatmulSgVec4h: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4Half: true }), 'int4_matmul_sg_vec4h') : null,
+    int4MatmulTiledVec4h: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4Half: true }), 'int4_matmul_tiled_vec4h') : null,
+    int4MatmulF32SgVec4h: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4Half: true }), 'int4_matmul_f32_sg_vec4h') : null,
+    int4MatmulF32TiledVec4h: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true }), 'int4_matmul_f32_tiled_vec4h') : null,
     rope: createPipeline(device, ropeSrc, 'rope_kernel'),
     kvAppend: createPipeline(device, kvAppendSrc, 'kv_append'),
     qkNorm: createPipeline(device, qkNormSrc, 'qk_norm'),
+    qkNormRopeAppend: createPipeline(device, qkNormRopeAppendSrc, 'qk_norm_rope_append'),
     gatedQkvSplit: createPipeline(device, gatedQkvSplitSrc, 'gated_qkv_split'),
     attnGate: createPipeline(device, attnGateSrc, 'attn_gate'),
     gdnConv: createPipeline(device, gdnConvSrc, 'gdn_conv'),

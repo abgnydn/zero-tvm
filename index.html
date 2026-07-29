@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zero-TVM — Phi-3 in your browser · 10 kernels across 27 WGSL files</title>
-  <meta name="description" content="Phi-3-mini decoding via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime, readable end-to-end.">
+  <title>Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files</title>
+  <meta name="description" content="Phi-3-mini decoding via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime, readable end-to-end.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zerotvm.com/">
-  <meta property="og:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 27 WGSL files">
-  <meta property="og:description" content="Phi-3-mini decoding via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
+  <meta property="og:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files">
+  <meta property="og:description" content="Phi-3-mini decoding via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 27 WGSL files">
-  <meta name="twitter:description" content="Phi-3-mini decoding via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
+  <meta name="twitter:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files">
+  <meta name="twitter:description" content="Phi-3-mini decoding via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <link rel="canonical" href="https://zerotvm.com/">
   <script type="application/ld+json">
@@ -28,7 +28,7 @@
         "url": "https://zerotvm.com",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Any (WebGPU browser, Chrome or Edge)",
-        "description": "Phi-3-mini decoding in the browser via 10 kernel roles across 27 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime.",
+        "description": "Phi-3-mini decoding in the browser via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime.",
         "author": { "@id": "https://zerotvm.com#author" },
         "isPartOf": {
           "@type": "CreativeWork",
@@ -716,14 +716,14 @@
 
   <h1>
     Run <span class="accent">Phi-3</span> in your browser<br>
-    with <span class="green">10 kernels / 27 WGSL files</span>
+    with <span class="green">10 kernels / 37 WGSL files</span>
   </h1>
 
   <p class="hero-sub">
     In <strong>February 2026</strong>, Hugging Face shipped Transformers.js v4 — a C++ WebGPU runtime built with
     Microsoft's ONNX Runtime team — as the production answer for browser LLM inference.
     In <strong>April 2026</strong>, this repo shows that for Phi-3 Mini specifically, the answer is
-    <span class="green">10 kernel roles across 27 WGSL files</span> and ~2,000 lines of TypeScript.
+    <span class="green">10 kernel roles across 37 WGSL files</span> and ~2,000 lines of TypeScript.
     No WebLLM, no TVM, no ONNX, no WASM runtime.
   </p>
 
@@ -770,7 +770,7 @@
     </div>
     <div class="terminal-body">
       <div><span class="t-dim">// No WebLLM. No TVM. No WASM runtime.</span></div>
-      <div><span class="t-dim">// 10 kernel roles · 27 WGSL files · raw WebGPU.</span></div>
+      <div><span class="t-dim">// 10 kernel roles · 37 WGSL files · raw WebGPU.</span></div>
       <br>
       <div><span class="t-green">[local]</span> <span class="t-white">ndarray-cache.json</span></div>
       <div><span class="t-green">[cache]</span> <span class="t-white">params_shard_0.bin</span> <span class="t-dim">49.3 MB</span></div>
@@ -851,7 +851,7 @@
 <section id="shaders" style="background: var(--surface);">
   <div class="section-inner">
     <div class="section-label">WGSL Shaders</div>
-    <h2 class="section-title">10 kernel roles. 27 WGSL files.</h2>
+    <h2 class="section-title">10 kernel roles. 37 WGSL files.</h2>
     <p class="section-sub">
       Every compute step is a readable WGSL file you can open and understand. No auto-generated code. No compiled blobs. The extra files are A/B variants — subgroup-reduced kernels, tiled matmuls, and an opt-in int8 KV cache path.
     </p>
@@ -984,13 +984,13 @@
         <tbody>
           <tr>
             <td>Unique WGSL kernels</td>
-            <td class="ours">10 roles / 27 files</td>
+            <td class="ours">10 roles / 37 files</td>
             <td>85 captured</td>
             <td>ORT-generated (not user-visible)</td>
           </tr>
           <tr>
             <td>Hand-written WGSL LOC</td>
-            <td class="ours">3,078 (incl. A/B variants)</td>
+            <td class="ours">4,228 (incl. A/B variants)</td>
             <td>12,962 (compiler-generated)</td>
             <td>0 (runtime-generated)</td>
           </tr>
@@ -1019,15 +1019,15 @@
             <td>not measured here</td>
           </tr>
           <tr>
-            <td>Decode speed (Qwen3-4B, M2 Max, 2026-07-28)</td>
-            <td class="ours">25.43 tok/s (untuned v1 path)</td>
-            <td>14.15 tok/s (prebuilt Qwen3 lib)</td>
+            <td>Decode speed (Qwen3-4B, M2 Max, 2026-07-29)</td>
+            <td class="ours">75.74 tok/s (fused qk_norm+RoPE+append + K%512 vec4)</td>
+            <td>43.75 tok/s (prebuilt Qwen3 lib, WebLLM 0.2.84)</td>
             <td>not measured here</td>
           </tr>
           <tr>
             <td>Decode speed (Qwen3.5-4B hybrid, M2 Max, 2026-07-29)</td>
-            <td class="ours">53.07 tok/s (fused GDN in_proj, scalar GDN kernels)</td>
-            <td>32.36 tok/s (prebuilt Qwen3.5 lib, WebLLM 0.2.84)</td>
+            <td class="ours">65.67 tok/s (fused GDN in_proj + vec4h, scalar GDN kernels)</td>
+            <td>34.04 tok/s (prebuilt Qwen3.5 lib, WebLLM 0.2.84)</td>
             <td>not measured here</td>
           </tr>
           <tr>
@@ -1038,7 +1038,7 @@
           </tr>
           <tr>
             <td>Readable source</td>
-            <td class="ours check">✓ 27 WGSL files</td>
+            <td class="ours check">✓ 37 WGSL files</td>
             <td class="cross">✗ Compiled blob</td>
             <td class="cross">✗ Generated ops</td>
           </tr>
@@ -1054,11 +1054,12 @@
 
     <p style="margin-top:1.25rem;font-size:0.9rem;color:var(--text-dim);max-width:720px;">
       Three models, all faster than WebLLM on identical weights, same session — each pair one machine, one
-      session, v1 paths. The Phi-3 row is the tuned-vs-tuned headline and syncs from <code>bench/results.json</code>;
-      the Qwen rows are static dated measurements of deliberately untuned v1 ports (Qwen3-4B: QK-norm rules out the
-      fused QKV kernel — 10 dispatches/layer vs Phi-3's 7; Qwen3.5-4B: a 24-layer gated-DeltaNet + 8-layer
-      attention hybrid on scalar GDN kernels — to our knowledge the first hand-written-kernel int4 hybrid of this
-      kind in a browser), so read the gaps cautiously — protocol and caveats in BENCH.md.
+      session. The Phi-3 row is the tuned-vs-tuned headline and syncs from <code>bench/results.json</code>;
+      the Qwen rows are static dated measurements (Qwen3-4B: QK-norm rules out the fused QKV kernel, but the
+      2026-07-29 tuning round fuses everything after the matmul — 8 dispatches/layer vs Phi-3's 7; Qwen3.5-4B:
+      a 24-layer gated-DeltaNet + 8-layer attention hybrid on scalar GDN kernels — to our knowledge the first
+      hand-written-kernel int4 hybrid of this kind in a browser), so read the gaps cautiously — protocol and
+      caveats in BENCH.md.
       <a href="zero-tvm.html?model=qwen35" style="color:var(--accent);text-decoration:none;">Chat with Qwen3.5-4B →</a>
     </p>
 
@@ -1174,7 +1175,7 @@
         <span class="shader-icon-lg">⭐</span>
         <div>
           <h4>Source on GitHub</h4>
-          <p>27 WGSL files and ~2,000 lines of TypeScript. Read it in one sitting.</p>
+          <p>37 WGSL files and ~2,000 lines of TypeScript. Read it in one sitting.</p>
           <span class="shader-tag">github.com/abgnydn/zero-tvm</span>
         </div>
       </a>
@@ -1246,7 +1247,7 @@
 <!-- ── FOOTER ── -->
 <footer>
   <p>
-    Built with WebGPU · 10 kernel roles · 27 WGSL files · Phi-3-mini-4k-instruct Q4F16<br>
+    Built with WebGPU · 10 kernel roles · 37 WGSL files · Phi-3-mini-4k-instruct Q4F16<br>
     Weights via <a href="https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC" style="color:var(--accent);text-decoration:none;">mlc-ai on HuggingFace</a> · No server. No framework. No TVM.
   </p>
   <div class="footer-links">
@@ -1267,12 +1268,12 @@
 
     <a class="share-option" target="_blank" rel="noopener" id="share-x">
       <span class="platform">X / Twitter</span>
-      <span class="msg">Zero-TVM: Phi-3-mini decoding at 60+ tok/s in a browser on 10 hand-written WGSL kernels (27 files, 3,078 LOC). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 28–31% faster than the autotuned compiler on M2 Max — fully readable in one sitting.</span>
+      <span class="msg">Zero-TVM: Phi-3-mini decoding at 60+ tok/s in a browser on 10 hand-written WGSL kernels (37 files, 4,228 LOC). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 28–31% faster than the autotuned compiler on M2 Max — fully readable in one sitting.</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-linkedin">
       <span class="platform">LinkedIn</span>
-      <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3-mini (3.8B params) entirely in the browser using 10 hand-written WebGPU kernel roles (27 WGSL files total). It replaces the 85 auto-generated shaders and WASM scheduler from Apache TVM / WebLLM with ~2,000 lines of TypeScript. Measured 28–31% faster than WebLLM across sessions on an M2 Max, on the same weights. The whole forward pass (32 layers, paged KV cache, int4 dequant, fused QKV+RoPE+KV-append, fused FFN, attention, argmax) is readable end-to-end.</span>
+      <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3-mini (3.8B params) entirely in the browser using 10 hand-written WebGPU kernel roles (37 WGSL files total). It replaces the 85 auto-generated shaders and WASM scheduler from Apache TVM / WebLLM with ~2,000 lines of TypeScript. Measured 28–31% faster than WebLLM across sessions on an M2 Max, on the same weights. The whole forward pass (32 layers, paged KV cache, int4 dequant, fused QKV+RoPE+KV-append, fused FFN, attention, argmax) is readable end-to-end.</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-hn">
@@ -1299,7 +1300,7 @@
   var url = window.location.origin + '/';
   var repo = 'https://github.com/abgnydn/zero-tvm';
 
-  var xText = "Zero-TVM: Phi-3-mini decoding at 60+ tok/s in a browser on 10 hand-written WGSL kernels (27 files). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 28-31% faster than the autotuned compiler, fully readable in one sitting.\n\n" + url;
+  var xText = "Zero-TVM: Phi-3-mini decoding at 60+ tok/s in a browser on 10 hand-written WGSL kernels (37 files). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. 28-31% faster than the autotuned compiler, fully readable in one sitting.\n\n" + url;
   document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(xText);
 
   document.getElementById('share-linkedin').href = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(url);
