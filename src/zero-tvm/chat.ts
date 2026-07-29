@@ -334,11 +334,16 @@ async function main(): Promise<void> {
       log(int8KV ? 'Allocating int8 KV cache (~800 MB)…' : 'Allocating KV cache…')
       const kv = int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
       log('Building decode engine…')
+      // Prefill A/B flags: ?reuse=0 disables cross-turn prefix reuse,
+      // ?chunk=0 disables chunked GDN prefill (hybrid specs). Both default on.
+      const q = new URLSearchParams(location.search)
       return buildDecodeEngine(device, weights, kv, {
         variants: flags,
         fused,
         int8KV,
         spec,
+        prefixReuse: q.get('reuse') !== '0',
+        chunkedPrefill: q.get('chunk') !== '0',
       })
     },
     // Pipeline warmup: one throwaway single-token generation behind the

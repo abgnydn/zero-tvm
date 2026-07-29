@@ -105,22 +105,31 @@ BENCH_QUERY="?model=qwen3" npm run bench          # same-session A/B vs WebLLM's
 Third model, first hybrid: 24 gated-DeltaNet layers + 8 gated-attention
 layers (GQA 16/4, head_dim 256, partial RoPE 64/256, sigmoid attention
 gate), 248k vocab, tied lm_head; `model-select.ts` maps `?model=qwen35` →
-`QWEN35_4B`. The GDN kernels are **scalar** (no subgroup variants yet) and
-there is no chunked prefill (prompts prefill token-by-token), so its
-BENCH.md number is a floor. Since 2026-07-29 the four GDN input projections
-are **fused into one 12352-row int4 matmul** (loader packs qkv‖z‖a‖b at
-upload; downstream kernels read regions via 256-aligned bind offsets — 340
-dispatches/token), and the blocking `generate()` is **incremental** (a
-`gdnStatePos` tracker reuses the non-idempotent recurrent state when it
-matches `startPos` instead of replaying the prompt). WebLLM A/B needs
-`@mlc-ai/web-llm` ≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84 prebuilt
-libs).
+`QWEN35_4B`. The GDN decode kernels are **scalar** (no subgroup variants
+yet). Since 2026-07-29 the four GDN input projections are **fused into one
+12352-row int4 matmul** (loader packs qkv‖z‖a‖b at upload; downstream
+kernels read regions via 256-aligned bind offsets — 340 dispatches/token),
+and the blocking `generate()` is **incremental** (a `gdnStatePos` tracker
+reuses the non-idempotent recurrent state when it matches `startPos`
+instead of replaying the prompt). Prompt PREFILL on the chat page is
+**chunked** (perf round A): tokens run in chunks of ≤64 — every projection
+one `int4_matmul_batched_dyn` dispatch (runtime M), rope/kv_append/conv/
+gates/norm batched, ONE `gdn_recur` dispatch per layer per chunk, causal
+`attention_prefill` for the 8 attention layers; `?chunk=0` opts out
+(engines without 32-lane subgroups fall back per-token automatically).
+All engines also do **cross-turn prefix reuse** (`?reuse=0` opts out): the
+engine tracks the exact absorbed (position, token) record and prefills only
+the delta on the next turn — hybrid reuse requires the new prompt to extend
+EVERY absorbed token (the ChatML non-thinking template re-renders past
+assistant turns WITH the empty `<think>` block so it does). WebLLM A/B
+needs `@mlc-ai/web-llm` ≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84
+prebuilt libs).
 
 ```bash
 node scripts/download-weights.mjs --model qwen35  # ~2.6 GB → .weights-local/
 npm run dev                                       # then zero-tvm.html?model=qwen35
                                                   #  or validate.html?model=qwen35
-npm run test:kernels:qwen35                       # 13/13 GDN kernel family vs CPU reference
+npm run test:kernels:qwen35                       # 19/19 GDN + chunked-prefill kernels vs CPU reference
 npm run test:e2e                                  # includes tests/e2e/qwen35.test.ts —
                                                   # skips loudly if the mirror isn't primed
 BENCH_QUERY="?model=qwen35" npm run bench         # same-session A/B vs WebLLM's

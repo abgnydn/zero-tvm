@@ -23,10 +23,14 @@ enable f16;
 @group(0) @binding(0) var<storage, read_write> out_buf : array<f16>;  // seq * GDN_V_DIM
 @group(0) @binding(1) var<storage, read> recur_out : array<f32>;      // seq * GDN_V_DIM
 @group(0) @binding(2) var<storage, read> gamma : array<f16>;          // GDN_HEAD_V
-@group(0) @binding(3) var<storage, read> z_gate : array<f16>;         // seq * GDN_V_DIM
+@group(0) @binding(3) var<storage, read> z_gate : array<f16>;         // seq * z_stride
 
 struct PODArgs {
   seq_len: i32,
+  z_stride: i32,      // f16 elements between consecutive tokens' z rows
+                      // (GDN_V_DIM when tightly packed — the decode region
+                      // view; gdnProjRows for chunked prefill's batched
+                      // fused-projection buffer)
   packGridDimX: u32
 }
 @group(0) @binding(4) var<uniform> podArgs : PODArgs;
@@ -50,6 +54,7 @@ fn gdn_norm_out(
   if (seq_idx >= podArgs.seq_len) { return; }
 
   let base : i32 = seq_idx * GDN_V_DIM + head * GDN_HEAD_V;
+  let z_base : i32 = seq_idx * podArgs.z_stride + head * GDN_HEAD_V;
 
   // Phase 1: this thread's dims + local sum of squares.
   var vals : array<f32, GDN_EPT>;
@@ -79,7 +84,7 @@ fn gdn_norm_out(
   // Phase 2: normalize · gamma · silu(z), write f16.
   for (var e : i32 = 0; e < GDN_EPT; e = e + 1) {
     let dim : i32 = tid * GDN_EPT + e;
-    let z : f32 = f32(z_gate[base + dim]);
+    let z : f32 = f32(z_gate[z_base + dim]);
     let gated : f32 = vals[e] * rms_inv * f32(gamma[dim]) * (z / (1.0 + exp(-z)));
     out_buf[base + dim] = f16(gated);
   }

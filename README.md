@@ -140,10 +140,16 @@ identical local weight bytes): Zero-TVM **53.07 tok/s** decode vs WebLLM
 2026-07-28 v1 floor was 47.99 vs 31.99, +50%; the gain since is the fused
 GDN input projection — the four per-layer in_proj matmuls packed into one
 12352-row dispatch — plus an incremental blocking decode with no prompt
-replay). Same honest framing as always: one machine, one pair, and the GDN
-kernels are still scalar (non-subgroup) with no chunked prefill — so the
-number remains a floor, not a tuned result. Protocol and caveats in
-[BENCH.md](BENCH.md).
+replay). Prefill is no longer token-by-token: the 2026-07-29 prefill round
+runs prompts in **chunks of ≤64** (batched projections, one `gdn_recur`
+dispatch per layer per chunk, causal batched attention) — 67.9 → **202
+prefill tok/s** on an 816-token prompt — and every model now does
+**cross-turn prefix reuse** (turn 3 of a ~950-token conversation:
+first-token latency 14.3 s → **0.19 s** on Qwen3.5; reused-prefix logits
+verified bit-identical to a fresh prefill). Same honest framing as always:
+one machine, one pair, and the GDN decode kernels are still scalar
+(non-subgroup) — the decode number remains a floor, not a tuned result.
+Protocol and caveats in [BENCH.md](BENCH.md).
 
 Weights: `node scripts/download-weights.mjs --model qwen35` primes the local
 dev mirror (~2.6 GB); without it the page streams from HuggingFace.
@@ -347,7 +353,7 @@ These are the caveats that survive the code as-shipped. Several earlier ones —
 ### Deliberate scoping
 
 - **Greedy decoding only.** Sampling is a single `argmax.wgsl` dispatch. No temperature, top-k, top-p, repetition penalty. A CPU-side sampler over the f32 logit buffer would be ~30 lines; left out to keep the minimal-stack claim honest.
-- **Sequential prefill.** Each prompt token is run through the full decode path. Fine for chat-length prompts; the `int4_matmul_batched_m4` generator variant is the shader for a batched-prefill attention path but is not yet wired into the decode loop.
+- **Sequential prefill on the pure-attention models.** Phi-3/Qwen3 prompt tokens still run the full decode path one at a time (cross-turn prefix reuse makes this cheap for multi-turn chat — only the delta prefills). Qwen3.5's hybrid path prefills in chunks of ≤64 since the 2026-07-29 prefill round (`int4_matmul_batched_dyn` batched projections + one `gdn_recur` dispatch per layer per chunk); porting the chunked composition to the attention-only specs is future work.
 - **One decode engine, two configurations.** `engine-core.ts` is the single `buildDecodeEngine`; `validate.html` runs it unfused/scalar with blocking per-token readback (deterministic positions, logits access), `zero-tvm.html` runs it fused with URL-flag shader variants and the pipelined readback ring. The per-layer QKV stage and the readback style are the only mode-dependent parts.
 - **Residual buffer ping-pong.** WebGPU forbids read+write to the same buffer in one dispatch, so the decode loops swap between `B.residual` and `B.residual2` across the `add_norm` dispatches. The two swaps per layer cancel out, which is why the per-layer bind groups can be pre-computed once and reused for every token.
 

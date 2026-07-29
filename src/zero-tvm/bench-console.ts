@@ -154,7 +154,148 @@ export function installBenchConsole(ctx: BenchConsoleCtx): void {
       }
     }
 
+  // ── Prefill throughput: `await benchPrefill(800, 3)` ──────────────────────
+  // Builds a chat prompt of ≈ nTokens (repeating a fixed paragraph), then for
+  // each run drops the engine's absorbed-token record (resetKVTracking → full
+  // prefill) and measures time-to-first-token. A/B chunked prefill with
+  // ?chunk=0 in the URL; the same numbers are comparable across builds.
+  ;(window as Window & typeof globalThis & { benchPrefill?: unknown }).benchPrefill =
+    async (nTokens: number = 800, nRuns: number = 3): Promise<unknown> => {
+      if (ctx.isBusy()) { console.warn('[benchPrefill] decode in flight — skipping'); return null }
+      ctx.setBusy(true)
+      try {
+        const para =
+          'Photosynthesis is the process by which green plants convert light energy into chemical energy, ' +
+          'storing it in the bonds of glucose molecules that fuel growth, respiration, and reproduction. '
+        // Grow the user message until the templated prompt reaches nTokens.
+        let reps = 4
+        let promptIds: number[] = []
+        const build = (r: number) =>
+          buildChatPromptFor(engine.spec, [
+            { role: 'system', content: 'You are a helpful assistant.' },
+            { role: 'user', content: para.repeat(r) + '\nSummarize the passage above in one sentence.' },
+          ], tokenizer)
+        promptIds = build(reps)
+        while (promptIds.length < nTokens) {
+          reps = Math.max(reps + 1, Math.ceil((reps * nTokens) / promptIds.length))
+          promptIds = build(reps)
+        }
+        console.log(`[benchPrefill] prompt: ${promptIds.length} tokens (target ${nTokens})`)
+        const runs: { ttftMs: number; tokPerS: number }[] = []
+        for (let r = 0; r <= nRuns; r++) {
+          engine.resetKVTracking()   // force a full prefill every run
+          const t0 = performance.now()
+          await engine.generatePipelined(promptIds, 1, () => {})
+          const ttftMs = performance.now() - t0
+          const tokPerS = promptIds.length / (ttftMs / 1000)
+          const label = r === 0 ? 'warmup' : `run${r}/${nRuns}`
+          console.log(`[benchPrefill] ${label}: ${ttftMs.toFixed(0)} ms to first token = ${tokPerS.toFixed(1)} prefill tok/s`)
+          if (r > 0) runs.push({ ttftMs, tokPerS })
+        }
+        const sorted = runs.map((x) => x.tokPerS).sort((a, b) => a - b)
+        const median = sorted[Math.floor(sorted.length / 2)]
+        console.log(`[benchPrefill] median: ${median.toFixed(1)} prefill tok/s (${engine.getLastPrefill()?.chunks ?? 0} chunks/run)`)
+        return { promptTokens: promptIds.length, runs, median, lastPrefill: engine.getLastPrefill() }
+      } finally {
+        ctx.setBusy(false)
+        ctx.onIdle()
+      }
+    }
+
+  // ── Multi-turn TTFT: `await benchTurns()` ─────────────────────────────────
+  // Simulates a 3-turn conversation (~800 absorbed tokens entering turn 3) and
+  // reports each turn's time-to-first-token plus the engine's reuse stats.
+  // A/B cross-turn prefix reuse with ?reuse=0 in the URL.
+  ;(window as Window & typeof globalThis & { benchTurns?: unknown }).benchTurns =
+    async (genTokens: number = 120): Promise<unknown> => {
+      if (ctx.isBusy()) { console.warn('[benchTurns] decode in flight — skipping'); return null }
+      ctx.setBusy(true)
+      try {
+        const filler =
+          'The city library reopened after a two-year renovation that added a glass atrium, ' +
+          'a children\'s wing, quiet study pods, and a rooftop reading garden overlooking the river. '
+        const turns = [
+          `Here is some background material: ${filler.repeat(9)}\nWhat changed in the renovation? Answer in detail.`,
+          `More context: ${filler.repeat(9)}\nHow do the study pods differ from the reading garden?`,
+          'Now, in one short sentence: what overlooks the river?',
+        ]
+        engine.resetKVTracking()   // fresh conversation
+        const history: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+          { role: 'system', content: 'You are a helpful, concise assistant.' },
+        ]
+        const results: unknown[] = []
+        for (let i = 0; i < turns.length; i++) {
+          history.push({ role: 'user', content: turns[i] })
+          const promptIds = buildChatPromptFor(engine.spec, history, tokenizer)
+          const generated: number[] = []
+          const t0 = performance.now()
+          let ttftMs = 0
+          await engine.generatePipelined(promptIds, genTokens, (id) => {
+            if (generated.length === 0) ttftMs = performance.now() - t0
+            generated.push(id)
+          })
+          history.push({ role: 'assistant', content: tokenizer.decode(generated) })
+          const info = engine.getLastPrefill()
+          console.log(
+            `[benchTurns] turn ${i + 1}: prompt ${promptIds.length} tok, ` +
+            `reused ${info?.reused ?? 0}, chunks ${info?.chunks ?? 0}, ` +
+            `TTFT ${ttftMs.toFixed(0)} ms, generated ${generated.length}`,
+          )
+          results.push({ turn: i + 1, promptTokens: promptIds.length, ttftMs, ...info })
+        }
+        return results
+      } finally {
+        ctx.setBusy(false)
+        ctx.onIdle()
+      }
+    }
+
+  // ── Prefix-reuse debug assertion: `await checkReuse()` ────────────────────
+  // Runs a short turn 1, then compares turn-2 logits computed via the reused
+  // prefix vs a fresh full prefill (engine.debugCompareReuse). Both passes
+  // replay per token, so when turn 1's prefill was also per-token the diff is
+  // exactly 0. With the hybrid CHUNKED prefill enabled, the absorbed prefix
+  // was built by the batched-matmul kernels, whose reduction order differs
+  // from the per-token GEMV — a small nonzero diff there measures
+  // chunked-vs-per-token numerics (same class as the sg/tiled variant
+  // differences), NOT a reuse-rule violation. For the bit-exact reuse
+  // assertion on hybrid specs, run with ?chunk=0.
+  ;(window as Window & typeof globalThis & { checkReuse?: unknown }).checkReuse =
+    async (): Promise<unknown> => {
+      if (ctx.isBusy()) { console.warn('[checkReuse] decode in flight — skipping'); return null }
+      ctx.setBusy(true)
+      try {
+        engine.resetKVTracking()
+        const history: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+          { role: 'system', content: 'You are a helpful, concise assistant.' },
+          { role: 'user', content: 'Name three primary colors.' },
+        ]
+        const t1 = buildChatPromptFor(engine.spec, history, tokenizer)
+        const generated: number[] = []
+        await engine.generatePipelined(t1, 48, (id) => generated.push(id))
+        history.push({ role: 'assistant', content: tokenizer.decode(generated) })
+        history.push({ role: 'user', content: 'Which of those is the warmest?' })
+        const t2 = buildChatPromptFor(engine.spec, history, tokenizer)
+        const res = await engine.debugCompareReuse(t2)
+        const chunked = (engine.getLastPrefill()?.chunks ?? 0) > 0
+        const verdict = res.maxAbsDiff === 0
+          ? ' (bit-exact ✓)'
+          : chunked
+            ? ' (nonzero: prefix built by CHUNKED prefill vs per-token replay — kernel-variant numerics; rerun with ?chunk=0 for the bit-exact assertion)'
+            : ' (MISMATCH — reuse rules broken!)'
+        console.log(
+          `[checkReuse] prompt ${res.promptLen} tok, reused prefix ${res.startPos} — ` +
+          `logits max|Δ| = ${res.maxAbsDiff} mean|Δ| = ${res.meanAbsDiff}` + verdict,
+        )
+        return { ...res, chunkedPrefix: chunked }
+      } finally {
+        ctx.setBusy(false)
+        ctx.onIdle()
+      }
+    }
+
   console.log('[bench] harness ready — call `await bench(128, 3)` or `await bench(0, 0, true)` for per-kernel profile')
+  console.log('[bench] prefill: `await benchPrefill(800, 3)` · multi-turn TTFT: `await benchTurns()` · reuse assertion: `await checkReuse()`')
   console.log('[bench] batched primitive: `await benchBatched(4, 500)` — ffnDown weight-reuse falsifiability test')
   console.log('[bench] PLD acceptance sim: `await specSim(160, 3, 3)` — measures spec-decode upside without GPU changes')
 }

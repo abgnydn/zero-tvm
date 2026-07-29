@@ -389,7 +389,17 @@ export function buildChatPrompt(
 ): number[] {
   let text = ''
   for (const msg of messages) {
-    text += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`
+    // Non-thinking mode: past assistant turns are re-rendered WITH the empty
+    // <think> block. The generation actually produced those tokens (the
+    // suffix below was part of the generation prompt the model continued
+    // from), so this is the faithful transcript — and it makes each turn's
+    // prompt an exact token-level extension of the previous turn's absorbed
+    // sequence, which is what the engine's cross-turn prefix reuse matches
+    // against (engine-core.ts computeReuseStart).
+    const content = opts?.thinking === false && msg.role === 'assistant'
+      ? `<think>\n\n</think>\n\n${msg.content}`
+      : msg.content
+    text += `<|im_start|>${msg.role}\n${content}<|im_end|>\n`
   }
   text += '<|im_start|>assistant\n'
   if (opts?.thinking === false) text += '<think>\n\n</think>\n\n'
