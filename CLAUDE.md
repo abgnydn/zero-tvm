@@ -3,7 +3,8 @@
 ## Goal
 
 Full browser-native Phi-3-mini inference on 10 hand-written kernel roles
-(27 WGSL files counting subgroup/tiled/int8 variants) + ~2k lines of
+(55 WGSL kernels — 37 files + 18 generated int4-matmul variants, counting
+subgroup/tiled/int8 variants) + ~2k lines of
 TypeScript — replacing the 85 TVM-autotuned shaders WebLLM ships. The
 pedagogical thesis: the entire LLM forward pass is readable end-to-end
 in a single sitting.
@@ -41,8 +42,9 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
   const block; `compile()`, `buildDecodeEngine()`, and `loadWeights()`
   all take an optional spec (default PHI3 — Phi-3 behavior unchanged).
   `npm run test:kernels:qwen` is a compile-only gate under QWEN3_4B dims.
-  `src/compiler/shaders/` holds the 27 WGSL files
-  (10 roles + tiled/subgroup/int8/f32 variants). The WebLLM/TVM
+  `src/compiler/shaders/` holds the 37 WGSL files
+  (10 roles + tiled/subgroup/int8/f32 variants; the int4_matmul generator
+  emits 18 more). The WebLLM/TVM
   reference path is `chat-v2.ts` (the `compiler-chat` page), which is
   the only file here that imports `@mlc-ai/web-llm`.
 - `src/shaders/` — 3 *unwired* "max-fusion" experiments
@@ -84,10 +86,13 @@ Deploy: `npx wrangler pages deploy dist --project-name=zerotvm --branch=main` (C
 
 Second architecture on the same engine (GQA 32/8, QK-norm, byte-level BPE,
 tied lm_head, ChatML non-thinking). Phi-3 stays the default everywhere;
-`model-select.ts` maps `?model=qwen3` → `QWEN3_4B`. The Qwen chat path is
-**v1-unfused** (QK-norm is incompatible with the fused QKV kernel → 10
-dispatches/layer; vec4 loads only where K % 1024 == 0; no int8-KV) — see
-BENCH.md's Qwen section for the measured WebLLM gap.
+`model-select.ts` maps `?model=qwen3` → `QWEN3_4B`. The Qwen chat path
+keeps the QKV matmul unfused (QK-norm is incompatible with the fused QKV
+kernel) but since the 2026-07-29 tuning round runs the fused
+`qk_norm_rope_append` kernel after it (**8 dispatches/layer**; `?fuseqk=0`
+restores the 10-dispatch reference chain) and the `_vec4h` K%512 matmul
+variants on d=2560 / ffn=9728 (`?vec4h=0` opts out). Still no int8-KV —
+see BENCH.md's Qwen sections for the measured WebLLM gap.
 
 ```bash
 node scripts/download-weights.mjs --model qwen3   # ~2.3 GB → .weights-local/

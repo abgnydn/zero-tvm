@@ -30,13 +30,14 @@ import { installBenchConsole } from './bench-console.js'
 const SPEC = specFromSearch(location.search)
 const BRAND = modelBranding(SPEC)
 // Dispatches per decode token: Phi-3 runs the fused path (32×7+4 = 228);
-// qkNorm specs (Qwen3) run unfused with qk_norm (36×10+4 = 364); hybrid
+// qkNorm specs (Qwen3) run unfused with the fused qk_norm+RoPE+append kernel
+// (default ?fuseqk on: 36×8+4 = 292; the reference chain is 10/layer); hybrid
 // (Qwen3.5) mixes GDN layers (10 with the fused input projection) and
 // gated-attention layers (12): 24×10+8×12+4 = 340.
 const GDN_LAYERS = SPEC.layerKinds.filter((k) => k === 'gdn').length
 const DISPATCHES_PER_TOKEN = GDN_LAYERS > 0
   ? GDN_LAYERS * 10 + (SPEC.layers - GDN_LAYERS) * 12 + 4
-  : SPEC.qkNorm ? SPEC.layers * 10 + 4 : SPEC.layers * 7 + 4
+  : SPEC.qkNorm ? SPEC.layers * 8 + 4 : SPEC.layers * 7 + 4
 
 // ============================================================
 // UI helpers
@@ -303,7 +304,7 @@ function showDownloadGate(): Promise<void> {
 async function main(): Promise<void> {
   setBadge('Initializing…', 'loading')
   log(`Zero-TVM ${BRAND.name} — No WebLLM, No TVM`)
-  log('10 hand-written WGSL kernel roles across 27 kernels (18 files + 9 generated)')
+  log('10 hand-written WGSL kernel roles across 55 kernels (37 files + 18 generated)')
   log('')
 
   const boot = await bootEngine({

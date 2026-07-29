@@ -96,16 +96,19 @@ function testVec4Gating() {
     int4MatmulTiled8: mk('tiled8'), int4MatmulF32Tiled8: mk('tiled8_f32'),
     int4MatmulSgVec4: mk('sg_vec4'), int4MatmulF32SgVec4: mk('sg_vec4_f32'),
     int4MatmulTiledVec4: mk('tiled_vec4'), int4MatmulF32TiledVec4: mk('tiled_vec4_f32'),
+    int4MatmulSgVec4h: mk('sg_vec4h'), int4MatmulF32SgVec4h: mk('sg_vec4h_f32'),
+    int4MatmulTiledVec4h: mk('tiled_vec4h'), int4MatmulF32TiledVec4h: mk('tiled_vec4h_f32'),
   }
   const cases = [
     // [variant, k, expected label] — Qwen3 instances: d=2560, qDim=4096, ffn=9728
-    ['tiled', Q.d, 'tiled'],          // K=2560 % 1024 ≠ 0 → vec4 falls back
-    ['tiled', Q.qDim, 'tiled_vec4'],  // K=4096 → vec4 survives (o_proj)
-    ['tiled', Q.ffn, 'tiled'],        // K=9728 → falls back (ffn_down)
-    ['sg', Q.d, 'sg'],
+    ['tiled', Q.d, 'tiled_vec4h'],    // K=2560 % 1024 ≠ 0, % 512 == 0 → half sibling
+    ['tiled', Q.qDim, 'tiled_vec4'],  // K=4096 → full vec4 survives (o_proj)
+    ['tiled', Q.ffn, 'tiled_vec4h'],  // K=9728 % 512 == 0 → half sibling (ffn_down)
+    ['sg', Q.d, 'sg_vec4h'],
     ['sg', Q.qDim, 'sg_vec4'],
     ['tiled', 3072, 'tiled_vec4'],    // Phi-3 d — unchanged resolution
     ['tiled', 8192, 'tiled_vec4'],    // Phi-3 ffn
+    ['tiled', 1056, 'tiled'],         // K % 512 ≠ 0 → no wide load at all
     ['tiled', undefined, 'tiled_vec4'], // no K given — legacy behaviour
   ]
   const bad = []
@@ -116,28 +119,40 @@ function testVec4Gating() {
     if (got.label !== want) bad.push(`${variant} K=${k}: got ${got.label}, want ${want}`)
     if (got.rowsPerWG !== gotNo4.rowsPerWG) bad.push(`${variant} K=${k}: rowsPerWG changed`)
   }
+  // ?vec4h=0: half siblings off, full-vec4 instances unaffected.
+  for (const [variant, k, want] of [
+    ['tiled', Q.d, 'tiled'],
+    ['tiled', Q.qDim, 'tiled_vec4'],
+    ['sg', Q.ffn, 'sg'],
+  ]) {
+    const got = resolveMatmul(variant, P, true, k, false)
+    if (got.label !== want) bad.push(`${variant} K=${k} vec4h=off: got ${got.label}, want ${want}`)
+  }
   return Promise.resolve({
     name: 'vec4_k_gating',
     pass: bad.length === 0,
-    detail: bad.length ? bad.join('; ') : `${cases.length} resolveMatmul cases (d/qDim/ffn × tiled/sg)`,
+    detail: bad.length ? bad.join('; ') : `${cases.length + 3} resolveMatmul cases (d/qDim/ffn × tiled/sg, ±vec4h)`,
   })
 }
 
-// ── int4_matmul — full gate_up shape: K=2560, N=9728 rows ────────────────────
-function makeInt4MatmulTest(src, entry, { rowsPerWG = 1 } = {}) {
+// ── int4_matmul — full gate_up shape by default: K=2560, N=9728 rows ─────────
+// K/M/outF32 overridable so the _vec4h siblings can run at the exact shapes
+// they exist for (K=2560 and the ffn_down K=9728; f32 for the LM-head form).
+function makeInt4MatmulTest(src, entry, { rowsPerWG = 1, K = Q.d, M = Q.ffn, outF32 = false } = {}) {
   return function int4MatmulTest(device) {
     const r = rng(1)
-    const K = Q.d, M = Q.ffn, KP = K / 8, SPR = K / 32
+    const KP = K / 8, SPR = K / 32
     const input = arr(K, () => toF16(r() * 2 - 1))
     const scales = arr(M * SPR, () => toF16(r() * 0.05 + 0.01))
     const weights = Uint32Array.from(arr(M * KP, () => (r() * 0xffffffff) >>> 0))
     const dot = makeDot(weights, scales, input, KP, SPR)
 
     // Spot-check rows across the range (full-N ref would be ~25M MACs × N).
-    const rows = [0, 1, 2, 3, 4863, 9724, 9725, 9726, 9727]
+    const rows = [0, 1, 2, 3, (M >> 1) - 1, M - 4, M - 3, M - 2, M - 1]
 
+    const outBytes = outF32 ? 4 : 2
     const pipe = pipelineFor(device, withPrelude(src, Q), entry)
-    const out = device.createBuffer({ size: M * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const out = device.createBuffer({ size: M * outBytes, usage: BU.STORAGE | BU.COPY_SRC })
     const buffers = [
       out,
       buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST),
@@ -145,15 +160,17 @@ function makeInt4MatmulTest(src, entry, { rowsPerWG = 1 } = {}) {
       buffer(device, weights, BU.STORAGE | BU.COPY_DST),
       buffer(device, new Uint32Array([KP, SPR, M, 0]), BU.UNIFORM | BU.COPY_DST),
     ]
-    return runCompute(device, pipe, buffers, [M / rowsPerWG], 0, M * 2).then((bytes) => {
-      const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
+    return runCompute(device, pipe, buffers, [M / rowsPerWG], 0, M * outBytes).then((bytes) => {
+      const got = outF32
+        ? Array.from(new Float32Array(bytes))
+        : Array.from(new Uint16Array(bytes), f16BitsToF32)
       const maxRel = Math.max(
         ...rows.map((row) => {
-          const ref = toF16(dot(row))
+          const ref = outF32 ? dot(row) : toF16(dot(row))
           return Math.abs(got[row] - ref) / (Math.abs(ref) + 1e-3)
         }),
       )
-      return { name: `${entry} K=2560 N=9728`, pass: maxRel < 0.02, detail: `max rel err ${maxRel.toExponential(2)}` }
+      return { name: `${entry} K=${K} N=${M}`, pass: maxRel < 0.02, detail: `max rel err ${maxRel.toExponential(2)}` }
     })
   }
 }
@@ -294,6 +311,86 @@ function testQkNorm(device) {
     for (let i = Q.qDim + Q.kvDim; i < QKV; i++) if (got[i] !== ref[i]) vBad++
     const pass = maxAbs < 5e-3 && vBad === 0
     return { name: 'qk_norm per-head', pass, detail: `max abs err ${maxAbs.toExponential(2)}, ${vBad} V elems touched` }
+  })
+}
+
+// ── qk_norm_rope_append — fused norm+RoPE+append vs the 3-kernel reference ───
+// CPU reference composes the exact qk_norm → rope → kv_append math: per-head
+// RMSNorm(q_gamma/k_gamma) on Q/K, RoPE on the NORMALIZED values, K/V into the
+// paged layout. Negative controls: the V page region must hold the RAW
+// projection values (a kernel that norms V fails), and nothing outside the one
+// written (K,V) slot may be touched.
+function testQkNormRopeAppend(device) {
+  const r = rng(15)
+  const QKV = Q.qkvDim, HD = Q.headDim, HALF = Q.halfHeadDim
+  const POS = 20, NUM_PAGES = 2, PAGE = Q.kvPageStride
+  const pageNo = (POS / Q.pageSize) | 0, slot = POS % Q.pageSize
+  const qkv = arr(QKV, () => toF16(r() * 2 - 1))
+  const qGamma = arr(HD, () => toF16(r() * 0.5 + 0.75))
+  const kGamma = arr(HD, () => toF16(r() * 0.5 + 0.75))
+
+  // Normalize one head, then rope the normalized vector (f32 math, f16 out).
+  const normRope = (base, gamma) => {
+    let ss = 0
+    for (let d = 0; d < HD; d++) ss += qkv[base + d] * qkv[base + d]
+    const rinv = 1 / Math.sqrt(ss / HD + Q.rmsEps)
+    const n = arr(HD, (_, d) => qkv[base + d] * rinv * gamma[d])
+    return arr(HD, (_, d) => {
+      const freq = ropeFreq(POS, d % HALF)
+      const pair = d < HALF ? -n[d + HALF] : n[d - HALF]
+      return toF16(Math.cos(freq) * n[d] + Math.sin(freq) * pair)
+    })
+  }
+  const refQ = []
+  for (let h = 0; h < Q.heads; h++) refQ.push(...normRope(h * HD, qGamma))
+  const refK = arr(Q.kvHeads, (_, h) => normRope(Q.qDim + h * HD, kGamma))
+
+  const WGS = Q.heads + 2 * Q.kvHeads
+  const pipe = pipelineFor(device, wgsl('qk_norm_rope_append.wgsl'), 'qk_norm_rope_append')
+  const qOut = device.createBuffer({ size: Q.qDim * 2, usage: BU.STORAGE | BU.COPY_SRC })
+  const pages = device.createBuffer({
+    size: NUM_PAGES * PAGE * 2,
+    usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC,
+  })
+  device.queue.writeBuffer(pages, 0, new Uint16Array(NUM_PAGES * PAGE))
+  const buffers = [
+    qOut,
+    pages,
+    buffer(device, f16Array(qkv), BU.STORAGE | BU.COPY_DST),
+    buffer(device, f16Array(qGamma), BU.STORAGE | BU.COPY_DST),
+    buffer(device, f16Array(kGamma), BU.STORAGE | BU.COPY_DST),
+    buffer(device, new Int32Array([POS]), BU.STORAGE | BU.COPY_DST),
+    podBuffer(device, [{ i32: 1 }, { u32: WGS }]),
+  ]
+  return runComputeReads(device, pipe, buffers, [WGS], [
+    { index: 0, bytes: Q.qDim * 2 },
+    { index: 1, bytes: NUM_PAGES * PAGE * 2 },
+  ]).then(([qBytes, pageBytes]) => {
+    const gotQ = Array.from(new Uint16Array(qBytes), f16BitsToF32)
+    const gotPageBits = new Uint16Array(pageBytes)
+    const gotPages = Array.from(gotPageBits, f16BitsToF32)
+    let maxAbs = 0
+    for (let i = 0; i < Q.qDim; i++) maxAbs = Math.max(maxAbs, Math.abs(gotQ[i] - refQ[i]))
+    let vBad = 0
+    const rawBits = f16Array(qkv)
+    for (let kh = 0; kh < Q.kvHeads; kh++) {
+      const kBase = pageNo * PAGE + kh * Q.headPageStride + slot * HD
+      for (let d = 0; d < HD; d++) {
+        maxAbs = Math.max(maxAbs, Math.abs(gotPages[kBase + d] - refK[kh][d]))
+        // Negative control: V must be the RAW projection value, bit-exact.
+        if (gotPageBits[kBase + Q.vPageOffset + d] !== rawBits[Q.qDim + Q.kvDim + kh * HD + d]) vBad++
+      }
+    }
+    // Negative control: only the one (K,V) slot may be written (2·KV_DIM f16s).
+    let nonZero = 0
+    for (const w of gotPageBits) if (w !== 0) nonZero++
+    const stray = Math.max(0, nonZero - 2 * Q.kvDim)
+    const pass = maxAbs < 5e-3 && vBad === 0 && stray === 0
+    return {
+      name: 'qk_norm_rope_append',
+      pass,
+      detail: `max abs err ${maxAbs.toExponential(2)}, ${vBad} V mismatches, ${stray} stray page writes`,
+    }
   })
 }
 
@@ -809,6 +906,7 @@ const TESTS = [
   { label: 'embedding', fn: testEmbedding },
   { label: 'rope', fn: testRope },
   { label: 'qk_norm', fn: testQkNorm },
+  { label: 'qk_norm_rope_append', fn: testQkNormRopeAppend },
   { label: 'qkv_fused', fn: makeQkvFusedTest('qkv_fused.wgsl', 'qkv_fused') },
   { label: 'attention', fn: makeAttentionTest('attention.wgsl', 'attention') },
   { label: 'attn_splitk2', fn: makeAttentionSplitkTest('attention_splitk.wgsl', 'attention_splitk', 2, 40) },
@@ -820,6 +918,28 @@ const TESTS = [
   { label: 'lm_head', fn: testLmHead },
   // Subgroup variants (need the feature + 32-lane subgroups, like run.mjs).
   { label: 'int4_matmul_sg', fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true }), 'int4_matmul_sg'), minSg: 32 },
+  // _vec4h half-unroll siblings at the exact Qwen3 shapes they exist for:
+  // K=2560 (d — qkv/gate_up/LM-head) and K=9728 (ffn_down), both % 512 == 0.
+  {
+    label: 'int4_matmul_sg_vec4h',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true, vec4Half: true }), 'int4_matmul_sg_vec4h'),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_tiled_vec4h',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4Half: true }), 'int4_matmul_tiled_vec4h', { rowsPerWG: 4 }),
+    minSg: 32,
+  },
+  {
+    label: 'tiled_vec4h_K9728',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4Half: true }), 'int4_matmul_tiled_vec4h', { rowsPerWG: 4, K: Q.ffn, M: Q.d }),
+    minSg: 32,
+  },
+  {
+    label: 'f32_tiled_vec4h',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true }), 'int4_matmul_f32_tiled_vec4h', { rowsPerWG: 4, M: 1024, outF32: true }),
+    minSg: 32,
+  },
   { label: 'qkv_fused_sg', fn: makeQkvFusedTest('qkv_fused_sg.wgsl', 'qkv_fused_sg'), minSg: 32 },
   { label: 'attention_sg', fn: makeAttentionTest('attention_sg.wgsl', 'attention_sg'), minSg: 32 },
   { label: 'attn_splitk_sg', fn: makeAttentionSplitkTest('attention_splitk_sg.wgsl', 'attention_splitk_sg', 4, 40), minSg: 32 },

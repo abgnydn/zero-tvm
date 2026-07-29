@@ -96,7 +96,7 @@
     <div class="pill"><span>85 → 10</span> TVM shaders → kernel roles</div>
     <div class="pill"><span>342 → 228</span> dispatches per token</div>
     <div class="pill"><span>728</span> GPU buffers mapped</div>
-    <div class="pill"><span>12,962 → 3,078</span> LOC WGSL</div>
+    <div class="pill"><span>12,962 → 4,228</span> LOC WGSL</div>
     <div class="pill"><span>60+</span> tok/s decode (M2 Max)</div>
   </div>
 
@@ -105,7 +105,7 @@
     <div class="content">
       <p>Large Language Models like Phi-3 generate text one word at a time. For each word, the model runs 342 GPU compute operations ("dispatches") across 32 neural network layers. Each layer does matrix multiplication, attention computation, and activation functions — all running on your GPU via WebGPU.</p>
       <p>Normally, a framework called TVM manages these operations. TVM's runtime (written in WASM) decides which GPU shader to run, writes the parameters, submits the work, and reads the result — 342 times per word.</p>
-      <p>I intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, then threw away the 85 TVM shaders and wrote 10 of my own (27 WGSL files, 3,078 LOC) that drive the GPU directly. Same weights, same math — 228 dispatches per token instead of 342, fully readable in one sitting, 28–31% faster than TVM's autotuned kernels on M2 Max (an earlier, buggier revision measured 22% slower on M2 Pro).</p>
+      <p>I intercepted TVM's GPU calls, captured every shader and buffer, decoded the architecture, then threw away the 85 TVM shaders and wrote 10 of my own (37 WGSL files, 4,228 LOC) that drive the GPU directly. Same weights, same math — 228 dispatches per token instead of 342, fully readable in one sitting, 28–31% faster than TVM's autotuned kernels on M2 Max (an earlier, buggier revision measured 22% slower on M2 Pro).</p>
     </div>
   </details>
 </section>
@@ -131,7 +131,7 @@
 <!-- Section 3: Shader Gallery -->
 <section id="shaders">
   <h2>85 Captured Shaders → 10 Kernel Roles</h2>
-  <p>I intercepted every <code>createShaderModule</code> call during model load, capturing 85 TVM-generated WGSL compute shaders totaling 12,962 lines. Then I rewrote the hot path: 10 hand-written kernel roles across 27 WGSL files, 3,078 LOC total.</p>
+  <p>I intercepted every <code>createShaderModule</code> call during model load, capturing 85 TVM-generated WGSL compute shaders totaling 12,962 lines. Then I rewrote the hot path: 10 hand-written kernel roles across 37 WGSL files, 4,228 LOC total.</p>
 
   <h3>TVM's Per-Layer Pattern (10 dispatches × 32 layers)</h3>
   <div class="shader-grid" id="layer-shaders"></div>
