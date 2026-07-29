@@ -171,6 +171,22 @@ export interface DecodeEngine {
   forwardLogits(promptIds: number[]): Promise<Float32Array>
   /** Reset KV-cache invalidation tracking (call when starting a fresh conversation). */
   resetKVTracking(): void
+  /**
+   * Debug assertion for cross-turn prefix reuse: compute the reusable prefix
+   * for `promptIds` against the engine's absorbed-token record, run the
+   * REUSED-prefix prefill and read the final-position logits, then run a
+   * FRESH full prefill of the same prompt and diff the two logit vectors.
+   * Both paths are deterministic dispatch-for-dispatch, so the expected diff
+   * is exactly 0. Blocking path; leaves the engine state at end-of-prompt.
+   */
+  debugCompareReuse(promptIds: number[]): Promise<{
+    startPos: number
+    promptLen: number
+    maxAbsDiff: number
+    meanAbsDiff: number
+  }>
+  /** Stats from the most recent generatePipelined prefill (reuse + chunking). */
+  getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null
   /** Hard KV ceiling in tokens: spec.maxPages × spec.pageSize. */
   maxContext: number
   /** The ModelSpec this engine was built for. */
@@ -199,6 +215,24 @@ export interface DecodeEngineOptions {
   int8KV?: boolean
   /** Model shape to build for. Default: PHI3. Must match the loaded weights. */
   spec?: ModelSpec
+  /**
+   * Cross-turn prefix reuse in generatePipelined (default true; ?reuse=0 on
+   * the chat page disables). The engine tracks the exact (position, token)
+   * record of every submitted forward pass; a new prompt that extends the
+   * absorbed prefix prefills only the delta. Trust rules: pure-attention
+   * specs reuse the longest common prefix (KV rewrite is idempotent); hybrid
+   * specs additionally require the GDN state boundary to sit exactly at the
+   * end of the absorbed record (the recurrence is not rewindable) and fall
+   * back to a full re-prefill otherwise.
+   */
+  prefixReuse?: boolean
+  /**
+   * Chunked GDN prefill (hybrid specs; default true; ?chunk=0 disables).
+   * Requires the subgroups pipelines (int4_matmul_batched_dyn). Prompt
+   * tokens before the last are processed in chunks of up to 64: batched
+   * projections + one gdn_recur dispatch per layer per chunk.
+   */
+  chunkedPrefill?: boolean
 }
 
 export function buildDecodeEngine(
@@ -395,9 +429,12 @@ export function buildDecodeEngine(
   const gdnOutU  = hybrid ? uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / GROUP), u32(S.d)]) : null
   const cAttnU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.cAttnDim)]) : null
   const gdnConvU = hybrid ? uniformBuf(device, [i32(0), u32(GDN_CONV_WGS)]) : null  // pos rewritten per token
-  const gdnGatesU = hybrid ? uniformBuf(device, [u32(1)]) : null
+  // gdn_gates / gdn_norm_out are seq-capable (chunked prefill): the decode
+  // uniforms pin seq_len=1 with tightly-packed strides (the region views the
+  // decode bind groups carry are single-token).
+  const gdnGatesU = hybrid ? uniformBuf(device, [i32(1), i32(2 * S.gdnVHeads), u32(1)]) : null
   const gdnRecurU = hybrid ? uniformBuf(device, [i32(1), u32(S.gdnVHeads)]) : null  // seq_len = 1 (decode/step prefill)
-  const gdnNormU  = hybrid ? uniformBuf(device, [i32(1), u32(S.gdnVHeads)]) : null
+  const gdnNormU  = hybrid ? uniformBuf(device, [i32(1), i32(S.gdnVDim), u32(S.gdnVHeads)]) : null
   const gatedSplitU = hybrid ? uniformBuf(device, [i32(1), u32(C_ATTN_WGS)]) : null
   const attnGateU = hybrid ? uniformBuf(device, [u32(ATTN_GATE_WGS)]) : null
   // GDN out_proj is a K = GDN_V_DIM matmul instance — resolve its own
@@ -509,6 +546,50 @@ export function buildDecodeEngine(
   // because no later call trusts state it can't match: pipelined generation
   // always re-prefills from 0, and the blocking path checks this counter.
   let gdnStatePos = 0
+
+  // ── Absorbed-token record (cross-turn prefix reuse) ───────────────────────
+  // absorbed[p] is the token id whose forward pass was the LAST submitted at
+  // position p — i.e. what KV slot p currently encodes and (for hybrid) what
+  // the GDN state absorbed at step p. Every submission path maintains it:
+  // blocking decodeToken and prefill submitSteps note tokens directly;
+  // generatePipelined patches the chained-argmax positions from its readbacks
+  // (the input of the step at position p is the readback of step p-1), so the
+  // record stays exact even for the ≤ PIPELINE_DEPTH-1 overrun steps
+  // submitted after a stop token. A readback failure (device loss) marks the
+  // record invalid, which disables reuse until resetKVTracking().
+  let absorbed: number[] = []
+  let absorbedValid = true
+  const prefixReuse = opts.prefixReuse ?? true
+  let lastPrefill: { promptLen: number; reused: number; chunks: number } | null = null
+
+  function noteAbsorbed(position: number, id: number): void {
+    if (position > absorbed.length) { absorbedValid = false; return }
+    absorbed.length = position
+    absorbed.push(id)
+  }
+
+  /**
+   * Longest reusable prefix of `promptIds` given the absorbed record.
+   * Pure attention: min(LCP, len-1) — KV slots are idempotent, stale slots
+   * past the LCP are overwritten by the delta prefill in order, and at least
+   * the final prompt token always runs (to produce the first argmax).
+   * Hybrid: the GDN recurrence is non-rewindable, so reuse requires the new
+   * prompt to extend EVERY absorbed token (LCP == absorbed.length — in normal
+   * chat the ≤1-token stop overrun is the <|im_end|> stop id, which IS the
+   * next prompt token) with the state boundary exactly there; else 0 (full
+   * re-prefill, which re-zeroes the GDN state at position 0).
+   */
+  function computeReuseStart(promptIds: number[]): number {
+    if (!prefixReuse || !absorbedValid || promptIds.length === 0) return 0
+    const max = Math.min(absorbed.length, promptIds.length)
+    let lcp = 0
+    while (lcp < max && absorbed[lcp] === promptIds[lcp]) lcp++
+    if (!hybrid) return Math.min(lcp, promptIds.length - 1)
+    if (gdnStatePos === absorbed.length && lcp === absorbed.length && lcp <= promptIds.length - 1) {
+      return lcp
+    }
+    return 0
+  }
 
   // Logit readback buffer — used by forwardLogits() for the validation harness only.
   // Allocated lazily on first call.
@@ -930,6 +1011,7 @@ export function buildDecodeEngine(
     enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     device.queue.submit([enc.finish()])
     gdnStatePos = position + 1
+    noteAbsorbed(position, tokenId)
 
     await readBuf.mapAsync(GPUMapMode.READ)
     const result = new DataView(readBuf.getMappedRange()).getInt32(0, true)
@@ -1066,10 +1148,55 @@ export function buildDecodeEngine(
     return readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
   }
 
+  /**
+   * Opt-in debug assertion for prefix reuse (?checkreuse=1 / window.checkReuse):
+   * runs the REUSED-prefix prefill of `promptIds` and reads the final-position
+   * logits, then a FRESH full prefill of the same prompt, and diffs the two
+   * f32 logit vectors. Every dispatch is deterministic and the reused prefix's
+   * KV/GDN state is bit-identical to what the fresh replay recomputes, so the
+   * expected maxAbsDiff is exactly 0. Blocking path (scalar-config dispatch
+   * chain); leaves KV + GDN state at end-of-prompt, absorbed record intact.
+   */
+  async function debugCompareReuse(promptIds: number[]): Promise<{
+    startPos: number
+    promptLen: number
+    maxAbsDiff: number
+    meanAbsDiff: number
+  }> {
+    if (promptIds.length < 2) throw new Error('debugCompareReuse: prompt too short')
+    const startPos = computeReuseStart(promptIds)
+    // Reused-prefix pass: prefill only the delta, then read logits.
+    for (let i = startPos; i < promptIds.length - 1; i++) {
+      await decodeToken(promptIds[i], i)
+    }
+    const reused = await readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
+    // Fresh pass: full prefill from 0 (re-zeroes GDN state at position 0).
+    for (let i = 0; i < promptIds.length - 1; i++) {
+      await decodeToken(promptIds[i], i)
+    }
+    const fresh = await readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
+    let maxAbs = 0
+    let sumAbs = 0
+    for (let i = 0; i < fresh.length; i++) {
+      const d = Math.abs(reused[i] - fresh[i])
+      if (d > maxAbs) maxAbs = d
+      sumAbs += d
+    }
+    return { startPos, promptLen: promptIds.length, maxAbsDiff: maxAbs, meanAbsDiff: sumAbs / fresh.length }
+  }
+
+  function getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null {
+    return lastPrefill
+  }
+
   function resetKVTracking(): void {
-    // The KV cache is just a buffer — there is no metadata to clear here.
-    // Callers track their own prefix length and pass startPos to generate().
-    // This method exists so callers can be explicit about conversation resets.
+    // Drop the absorbed-token record so the next generatePipelined performs a
+    // full prefill (the KV pages themselves need no clearing — stale slots
+    // are overwritten in order, and a from-0 prefill re-zeroes GDN state).
+    // Blocking-path callers additionally track their own prefix length and
+    // pass startPos to generate().
+    absorbed = []
+    absorbedValid = true
   }
 
   // ============================================================
@@ -1087,6 +1214,240 @@ export function buildDecodeEngine(
     }))
   }
   let readCursor = 0
+
+  // ============================================================
+  // Chunked GDN prefill (hybrid specs, subgroups path)
+  //
+  // Prompt tokens before the last are processed in chunks of up to CHUNK_CAP:
+  // every projection (fused GDN in_proj, out_proj, c_attn, o_proj, gate_up,
+  // down) becomes ONE int4_matmul_batched_dyn dispatch with M = chunk length
+  // (4× weight-traffic amortization from the m=4 register block), the GDN
+  // conv/gates/norm run batched over the chunk, and the recurrence — already
+  // seq-capable — runs as ONE gdn_recur dispatch per layer per chunk.
+  // Attention layers run fully batched too: rope/kv_append are seq-capable,
+  // and attention_prefill enforces causality with per-token kv_len. One
+  // submit per chunk; per-chunk uniforms are rewritten between submits
+  // (queue-ordered). ~394 dispatches per 64-token chunk vs 340/token before.
+  // ============================================================
+
+  const CHUNK_CAP = 64   // chunk capacity in tokens (buffer sizing)
+  const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
+
+  interface ChunkPrefill { record(promptIds: number[], start: number, seqLen: number): void }
+
+  function buildChunkPrefill(): ChunkPrefill {
+    const C = CHUNK_CAP
+    const dyn = P.int4MatmulBatchedDyn!
+    // Batched activation buffers ([C, dim] row-major).
+    const CB = {
+      inputIds: makeBuf(device, C * 4, 'c.inputIds'),
+      posMap:   makeBuf(device, C * 4, 'c.posMap'),
+      residual: makeBuf(device, C * S.d * 2, 'c.residual'),
+      residual2: makeBuf(device, C * S.d * 2, 'c.residual2'),
+      hidden1:  makeBuf(device, C * S.d * 2, 'c.hidden1'),
+      hidden2:  makeBuf(device, C * S.d * 2, 'c.hidden2'),
+      cAttnOut: makeBuf(device, C * S.cAttnDim * 2, 'c.cAttnOut'),
+      qkvOut:   makeBuf(device, C * S.qkvDim * 2, 'c.qkvOut'),
+      gateRaw:  makeBuf(device, C * S.qDim * 2, 'c.gateRaw'),
+      qOut:     makeBuf(device, C * S.qDim * 2, 'c.qOut'),
+      kOut:     makeBuf(device, C * S.kvDim * 2, 'c.kOut'),
+      vOut:     makeBuf(device, C * S.kvDim * 2, 'c.vOut'),
+      attnOut:  makeBuf(device, C * S.qDim * 2, 'c.attnOut'),
+      gateUp:   makeBuf(device, C * 2 * S.ffn * 2, 'c.gateUp'),
+      ffnOut:   makeBuf(device, C * S.ffn * 2, 'c.ffnOut'),
+      gdnProjOut: makeBuf(device, C * S.gdnProjRows * 2, 'c.gdnProjOut'),
+      gdnConvOut: makeBuf(device, C * S.gdnQkvDim * 2, 'c.gdnConvOut'),
+      gdnGates:   makeBuf(device, C * 2 * S.gdnVHeads * 4, 'c.gdnGates'),
+      gdnRecurOut: makeBuf(device, C * S.gdnVDim * 4, 'c.gdnRecurOut'),
+      gdnNormed:  makeBuf(device, C * S.gdnVDim * 2, 'c.gdnNormed'),
+    }
+
+    // Elementwise grids per token (packGridDimX values scale with seq_len).
+    const CATTN_WGS = S.cAttnDim / WG_SIZE_D
+    const FFN_WGS = S.ffn / WG_SIZE_D
+    const CONV_COMMIT_WGS = ((S.gdnConvK - 1) * S.gdnQkvDim) / WG_SIZE_D
+
+    // Per-chunk uniforms — contents rewritten before each chunk's submit.
+    // int4_matmul_batched_dyn PODArgs: {K_PACKED, SCALES_PER_ROW, N, M_ROWS};
+    // M_ROWS (offset 12) is the per-chunk field.
+    const cU = {
+      emb:   uniformBuf(device, [i32(0), u32(0)]),
+      norm:  uniformBuf(device, [u32(0)]),
+      gdnProj: uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnProjRows), u32(0)]),
+      gdnOut:  uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / GROUP), u32(S.d), u32(0)]),
+      cAttn:   uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.cAttnDim), u32(0)]),
+      oProj:   uniformBuf(device, [u32(S.qDim / PACK), u32(S.qDim / GROUP), u32(S.d), u32(0)]),
+      gateUp:  uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(2 * S.ffn), u32(0)]),
+      ffnDown: uniformBuf(device, [u32(S.ffn / PACK), u32(S.ffn / GROUP), u32(S.d), u32(0)]),
+      gatedSplit: uniformBuf(device, [i32(0), u32(0)]),
+      qkNorm: uniformBuf(device, [i32(0), u32(0)]),
+      rope:   uniformBuf(device, [i32(1), i32(0), i32(0), u32(0)]),
+      kvApp:  uniformBuf(device, [i32(0), i32(S.maxPages), i32(0), i32(0), u32(0)]),
+      attn:   uniformBuf(device, [i32(0), i32(0), (() => { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, SM_SCALE, true); return a })()]),
+      attnGate: uniformBuf(device, [u32(0)]),
+      conv:   uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(0)]),
+      convCommit: uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(CONV_COMMIT_WGS)]),
+      gates:  uniformBuf(device, [i32(0), i32(S.gdnProjRows), u32(0)]),
+      recur:  uniformBuf(device, [i32(0), u32(S.gdnVHeads)]),
+      normOut: uniformBuf(device, [i32(0), i32(S.gdnProjRows), u32(0)]),
+      silu:   uniformBuf(device, [i32(0), u32(0)]),
+    }
+
+    // Bind groups (buffers are fixed; only uniform contents change per chunk).
+    const cbgEmb = bg(device, P.embedding, [CB.residual, CB.inputIds, weights.embdScales, weights.embdWeights, cU.emb])
+    const cbgInitNorm = bg(device, P.rmsNorm, [CB.hidden1, CB.residual, weights.layers[0].normGamma1, cU.norm])
+
+    interface ChunkLayerBG {
+      // attention layers
+      cAttn?: GPUBindGroup
+      gatedSplit?: GPUBindGroup
+      qkNorm?: GPUBindGroup
+      rope?: GPUBindGroup
+      kvApp?: GPUBindGroup
+      attn?: GPUBindGroup
+      attnGate?: GPUBindGroup
+      // GDN layers
+      gdnProj?: GPUBindGroup
+      conv?: GPUBindGroup
+      convCommit?: GPUBindGroup
+      gates?: GPUBindGroup
+      recur?: GPUBindGroup
+      normOut?: GPUBindGroup
+      // shared
+      oProj: GPUBindGroup
+      addNorm1: GPUBindGroup
+      gateUp: GPUBindGroup
+      silu: GPUBindGroup
+      ffnDown: GPUBindGroup
+      addNorm2: GPUBindGroup
+    }
+    const cLayers: ChunkLayerBG[] = []
+    for (let L = 0; L < S.layers; L++) {
+      const lw = weights.layers[L]
+      const isGdn = S.layerKinds[L] === 'gdn'
+      const nextGamma = L < S.layers - 1 ? weights.layers[L + 1].normGamma1 : weights.finalNormGamma
+      const common = {
+        addNorm1: bg(device, P.addNorm, [CB.hidden2, CB.residual, lw.normGamma2, CB.hidden1, CB.residual2, cU.norm]),
+        gateUp: bg(device, dyn, [CB.gateUp, CB.hidden1, lw.ffnScales, lw.ffnWeights, cU.gateUp]),
+        silu: bg(device, P.siluMul, [CB.ffnOut, CB.gateUp, cU.silu]),
+        ffnDown: bg(device, dyn, [CB.hidden2, CB.ffnOut, lw.ffnDownScales, lw.ffnDownWeights, cU.ffnDown]),
+        addNorm2: bg(device, P.addNorm, [CB.hidden2, CB.residual2, nextGamma, CB.hidden1, CB.residual, cU.norm]),
+      }
+      if (isGdn) {
+        const gw = lw.gdn!
+        // Region views into the BATCHED packed projection [C, qkv|z|a|b]:
+        // token t's z / [a|b] rows sit at t·gdnProjRows + region offset — the
+        // kernels stride by gdnProjRows (z_stride / ab_stride uniforms).
+        const zRegion = {
+          buffer: CB.gdnProjOut, offset: S.gdnQkvDim * 2,
+          size: (C - 1) * S.gdnProjRows * 2 + S.gdnVDim * 2,
+        }
+        const abRegion = {
+          buffer: CB.gdnProjOut, offset: (S.gdnQkvDim + S.gdnVDim) * 2,
+          size: (C - 1) * S.gdnProjRows * 2 + 2 * S.gdnVHeads * 2,
+        }
+        cLayers.push({
+          gdnProj: bg(device, dyn, [CB.gdnProjOut, CB.hidden1, gw.projScales, gw.projWeights, cU.gdnProj]),
+          conv: bg(device, P.gdnConvSeq, [CB.gdnConvOut, CB.gdnProjOut, gdnConvState[L]!, gw.convWeight, cU.conv]),
+          convCommit: bg(device, P.gdnConvCommit, [gdnConvState[L]!, CB.gdnProjOut, cU.convCommit]),
+          gates: bg(device, P.gdnGates, [CB.gdnGates, abRegion, gw.aLog, gw.dtBias, cU.gates]),
+          recur: bg(device, P.gdnRecur, [CB.gdnRecurOut, CB.gdnConvOut, CB.gdnGates, gdnRecurState[L]!, cU.recur]),
+          normOut: bg(device, P.gdnNormOut, [CB.gdnNormed, CB.gdnRecurOut, gw.normGamma, zRegion, cU.normOut]),
+          oProj: bg(device, dyn, [CB.hidden2, CB.gdnNormed, gw.outScales, gw.outWeights, cU.gdnOut]),
+          ...common,
+        })
+      } else {
+        cLayers.push({
+          cAttn: bg(device, dyn, [CB.cAttnOut, CB.hidden1, lw.qkvScales!, lw.qkvWeights!, cU.cAttn]),
+          gatedSplit: bg(device, P.gatedQkvSplit, [CB.qkvOut, CB.gateRaw, CB.cAttnOut, cU.gatedSplit]),
+          qkNorm: bg(device, P.qkNorm, [CB.qkvOut, lw.qNormGamma!, lw.kNormGamma!, cU.qkNorm]),
+          rope: bg(device, P.rope, [CB.qOut, CB.kOut, CB.vOut, CB.qkvOut, CB.posMap, cU.rope]),
+          kvApp: bg(device, P.kvAppend, [CB.kOut, CB.vOut, kvPages[kvIndex[L]], CB.posMap, cU.kvApp]),
+          attn: bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
+          attnGate: bg(device, P.attnGate, [CB.attnOut, CB.gateRaw, cU.attnGate]),
+          oProj: bg(device, dyn, [CB.hidden2, CB.attnOut, lw.oProjScales!, lw.oProjWeights!, cU.oProj]),
+          ...common,
+        })
+      }
+    }
+
+    function record(promptIds: number[], start: number, seqLen: number): void {
+      const n = seqLen
+      // Per-chunk state + uniform writes — queue-ordered before the submit.
+      const ids = new Int32Array(n)
+      const posv = new Int32Array(n)
+      for (let t = 0; t < n; t++) { ids[t] = promptIds[start + t]; posv[t] = start + t }
+      device.queue.writeBuffer(CB.inputIds, 0, ids)
+      device.queue.writeBuffer(CB.posMap, 0, posv)
+      device.queue.writeBuffer(cU.emb, 0, new Int32Array([n, n * D_WGS]))
+      device.queue.writeBuffer(cU.norm, 0, new Uint32Array([n]))
+      const m = new Uint32Array([n])
+      for (const u of [cU.gdnProj, cU.gdnOut, cU.cAttn, cU.oProj, cU.gateUp, cU.ffnDown]) {
+        device.queue.writeBuffer(u, 12, m)
+      }
+      device.queue.writeBuffer(cU.gatedSplit, 0, new Int32Array([n, n * CATTN_WGS]))
+      device.queue.writeBuffer(cU.qkNorm, 0, new Int32Array([n, n * QK_NORM_WGS]))
+      device.queue.writeBuffer(cU.rope, 8, new Int32Array([n, n * QKV_WGS]))
+      device.queue.writeBuffer(cU.kvApp, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.kvApp, 16, new Uint32Array([n * KV_WGS]))
+      device.queue.writeBuffer(cU.attn, 0, new Int32Array([n, start + 1]))
+      device.queue.writeBuffer(cU.attnGate, 0, new Uint32Array([n * ATTN_GATE_WGS]))
+      device.queue.writeBuffer(cU.conv, 0, new Int32Array([start, n]))
+      device.queue.writeBuffer(cU.conv, 12, new Uint32Array([n * GDN_CONV_WGS]))
+      device.queue.writeBuffer(cU.convCommit, 0, new Int32Array([start, n]))
+      device.queue.writeBuffer(cU.gates, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.gates, 8, new Uint32Array([n]))
+      device.queue.writeBuffer(cU.recur, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.normOut, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.normOut, 8, new Uint32Array([n * S.gdnVHeads]))
+      device.queue.writeBuffer(cU.silu, 0, new Int32Array([n, n * FFN_WGS]))
+
+      const dynGrid = (rows: number) => Math.ceil(rows / 4)
+      const enc = device.createCommandEncoder()
+      if (start === 0) clearGdnState(enc)
+      dispatch(enc, P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
+      dispatch(enc, P.rmsNorm, cbgInitNorm, n, 1, 1, 'cRmsNormInit')
+      for (let L = 0; L < S.layers; L++) {
+        const blk = cLayers[L]
+        if (blk.gdnProj) {
+          dispatch(enc, dyn, blk.gdnProj, dynGrid(S.gdnProjRows), 1, 1, 'cGdnProj')
+          dispatch(enc, P.gdnConvSeq, blk.conv!, n * GDN_CONV_WGS, 1, 1, 'cGdnConv')
+          dispatch(enc, P.gdnConvCommit, blk.convCommit!, CONV_COMMIT_WGS, 1, 1, 'cGdnConvCommit')
+          dispatch(enc, P.gdnGates, blk.gates!, n, 1, 1, 'cGdnGates')
+          dispatch(enc, P.gdnRecur, blk.recur!, S.gdnVHeads, 1, 1, 'cGdnRecur')
+          dispatch(enc, P.gdnNormOut, blk.normOut!, n * S.gdnVHeads, 1, 1, 'cGdnNormOut')
+          dispatch(enc, dyn, blk.oProj, dynGrid(S.d), 1, 1, 'cGdnOutProj')
+        } else {
+          dispatch(enc, dyn, blk.cAttn!, dynGrid(S.cAttnDim), 1, 1, 'cCAttn')
+          dispatch(enc, P.gatedQkvSplit, blk.gatedSplit!, n * CATTN_WGS, 1, 1, 'cGatedSplit')
+          if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, n * QK_NORM_WGS, 1, 1, 'cQkNorm')
+          dispatch(enc, P.rope, blk.rope!, n * QKV_WGS, 1, 1, 'cRope')
+          dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
+          dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
+          dispatch(enc, P.attnGate, blk.attnGate!, n * ATTN_GATE_WGS, 1, 1, 'cAttnGate')
+          dispatch(enc, dyn, blk.oProj, dynGrid(S.d), 1, 1, 'cOProj')
+        }
+        dispatch(enc, P.addNorm, blk.addNorm1, n, 1, 1, 'cAddNorm1')
+        dispatch(enc, dyn, blk.gateUp, dynGrid(2 * S.ffn), 1, 1, 'cGateUp')
+        dispatch(enc, P.siluMul, blk.silu, n * FFN_WGS, 1, 1, 'cSiluMul')
+        dispatch(enc, dyn, blk.ffnDown, dynGrid(S.d), 1, 1, 'cFfnDown')
+        dispatch(enc, P.addNorm, blk.addNorm2, n, 1, 1, 'cAddNorm2')
+      }
+      device.queue.submit([enc.finish()])
+      gdnStatePos = start + n
+      for (let t = 0; t < n; t++) noteAbsorbed(start + t, promptIds[start + t])
+    }
+
+    return { record }
+  }
+
+  const chunkPrefill: ChunkPrefill | null =
+    hybrid && (opts.chunkedPrefill ?? true) && P.int4MatmulBatchedDyn
+      ? buildChunkPrefill()
+      : null
+  if (hybrid) {
+    console.log(`[engine] chunked prefill: ${chunkPrefill ? `on (cap ${CHUNK_CAP})` : 'off (per-token)'}`)
+  }
 
   /**
    * Submit one forward pass.
@@ -1121,6 +1482,7 @@ export function buildDecodeEngine(
       enc.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
       device.queue.submit([enc.finish()])
       gdnStatePos = position + 1
+      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
       return slot.mapAsync(GPUMapMode.READ).then(() => {
         const id = new DataView(slot.getMappedRange()).getInt32(0, true)
         slot.unmap()
@@ -1130,6 +1492,7 @@ export function buildDecodeEngine(
 
     device.queue.submit([enc.finish()])
     gdnStatePos = position + 1
+    if (writeInputId !== null) noteAbsorbed(position, writeInputId)
     return null
   }
 
@@ -1151,18 +1514,42 @@ export function buildDecodeEngine(
     }
 
     // --- Prefill ---
-    // Fire all but the last step without readback. The argmax of intermediate
+    // Cross-turn prefix reuse: skip prompt tokens the engine has provably
+    // already absorbed (KV slots + GDN state) — see computeReuseStart.
+    const startPos = computeReuseStart(promptIds)
+    const last = promptIds.length - 1
+    let prefillPos = startPos
+    let chunks = 0
+    // Chunked prefill (hybrid + subgroups): all but the last prompt token run
+    // in chunks — batched projections, one gdn_recur dispatch per layer per
+    // chunk. Short tails fall through to the per-token path below.
+    if (chunkPrefill) {
+      while (last - prefillPos >= CHUNK_MIN) {
+        const s = Math.min(CHUNK_CAP, last - prefillPos)
+        chunkPrefill.record(promptIds, prefillPos, s)
+        prefillPos += s
+        chunks++
+      }
+    }
+    // Per-token tail: fire without readback. The argmax of intermediate
     // prefill steps is not useful (we overwrite inputIds on the next step), so
-    // skipping readback removes N-1 CPU syncs.
-    for (let i = 0; i < promptIds.length - 1; i++) {
-      submitStep(promptIds[i], i, false)
+    // skipping readback removes the CPU syncs.
+    for (; prefillPos < last; prefillPos++) {
+      submitStep(promptIds[prefillPos], prefillPos, false)
+    }
+    lastPrefill = { promptLen: promptIds.length, reused: startPos, chunks }
+    if (startPos > 0 || chunks > 0) {
+      console.log(
+        `[engine] prefill: ${promptIds.length} tokens, reused prefix ${startPos}` +
+        (chunks ? `, ${chunks} chunk${chunks > 1 ? 's' : ''} of ≤${CHUNK_CAP}` : ''),
+      )
     }
     // Last prefill step: readback to get the first generated token.
-    const firstTokenPromise = submitStep(
-      promptIds[promptIds.length - 1],
-      promptIds.length - 1,
-      true,
-    )!
+    const firstTokenPromise = submitStep(promptIds[last], last, true)!
+    // Readback bookkeeping for the absorbed record: the input of the step at
+    // position p is the readback of the step at position p-1.
+    const rbByPos = new Map<number, Promise<number>>()
+    rbByPos.set(last, firstTokenPromise)
     const firstToken = await firstTokenPromise
     if (STOP.has(firstToken) || firstToken < 0 || firstToken >= S.vocab) return tokens
     tokens.push(firstToken)
@@ -1185,11 +1572,16 @@ export function buildDecodeEngine(
     // reusing state (falling back to a full replay on mismatch).
     const inFlight: Promise<number>[] = []
     let pos = promptIds.length
+    const submitChained = (): void => {
+      const p = submitStep(null, pos, true)!
+      rbByPos.set(pos, p)
+      inFlight.push(p)
+      pos++
+    }
 
     try {
       for (let k = 0; k < PIPELINE_DEPTH && tokens.length + k < maxTokens && pos < MAX_CONTEXT; k++) {
-        inFlight.push(submitStep(null, pos, true)!)
-        pos++
+        submitChained()
       }
 
       while (inFlight.length > 0) {
@@ -1203,8 +1595,7 @@ export function buildDecodeEngine(
         if (shouldStop?.()) break
         // Keep the pipeline full, but don't overshoot maxTokens or the KV window.
         if (tokens.length + inFlight.length < maxTokens && pos < MAX_CONTEXT) {
-          inFlight.push(submitStep(null, pos, true)!)
-          pos++
+          submitChained()
         }
       }
     } finally {
@@ -1212,6 +1603,19 @@ export function buildDecodeEngine(
       // mapAsync on a still-pending slot buffer would be a validation error).
       while (inFlight.length > 0) {
         await inFlight.shift()!.catch(() => {})
+      }
+      // Patch the absorbed record for the chained-argmax steps: every decode
+      // step at position p (last+1 .. pos-1) consumed the readback of the
+      // step at p-1 — including the ≤ PIPELINE_DEPTH-1 overrun steps past the
+      // emitted text (in normal chat the first overrun input is the stop id,
+      // which the next turn's prompt also contains). All these promises are
+      // settled by the drain above.
+      try {
+        for (let p = promptIds.length; p < pos; p++) {
+          noteAbsorbed(p, await rbByPos.get(p - 1)!)
+        }
+      } catch {
+        absorbedValid = false
       }
     }
 
@@ -1447,6 +1851,8 @@ export function buildDecodeEngine(
     generatePipelined,
     forwardLogits,
     resetKVTracking,
+    debugCompareReuse,
+    getLastPrefill,
     maxContext: MAX_CONTEXT,
     spec: S,
     profileStep,

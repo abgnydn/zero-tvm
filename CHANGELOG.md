@@ -13,6 +13,34 @@ one machine benchmarked.
 
 ### Added
 
+- **Prefill round A (2026-07-29)** — chunked GDN prefill + cross-turn
+  prefix reuse, measured on the same M2 Max (BENCH.md "Prefill round A"):
+  - *Chunked GDN prefill (Qwen3.5, `?chunk=0` opts out)* — prompt tokens run
+    in chunks of ≤64: every projection is ONE `int4_matmul_batched_dyn`
+    dispatch (new generator variant: the m=4 register block looping over
+    runtime-M row blocks), the conv/gates/norm run batched
+    (`gdn_conv_seq` + `gdn_conv_commit`, seq+stride uniforms on
+    `gdn_gates`/`gdn_norm_out`), the recurrence is ONE `gdn_recur` dispatch
+    per layer per chunk, and the 8 attention layers batch through the new
+    causal `attention_prefill` (bit-exact vs the decode kernel) with a
+    batched FFN (`silu_mul`). 816-token prompt: **67.9 → 202.1 prefill
+    tok/s** (TTFT 12.0 → 4.0 s). Chunk-vs-per-token equality is pinned
+    BIT-EXACTLY (f32 recurrent state included) in the kernel suite, now
+    **19/19** (6 new tests).
+  - *Cross-turn prefix reuse (all models, `?reuse=0` opts out)* — the engine
+    records the exact (position, token) of every submitted forward pass
+    (including the pipelined stop-token overrun, reconstructed from the
+    readback chain) and prefills only the delta on the next turn. Hybrid
+    reuse is all-or-nothing (the GDN recurrence can't rewind); the ChatML
+    non-thinking template now re-renders past assistant turns WITH the
+    empty `<think>` block so each turn extends the absorbed sequence
+    exactly. Turn-3 first-token latency (~950–1105-token conversations):
+    Phi-3 15,405 → **269 ms**, Qwen3-4B 14,554 → **438 ms**, Qwen3.5
+    14,340 → **194 ms**. Reused-prefix logits verified **bit-identical**
+    to a fresh prefill on all three models (`checkReuse()`, opt-in).
+  - New devtools harnesses `benchPrefill` / `benchTurns` / `checkReuse`
+    (bench-console), engine API `debugCompareReuse` / `getLastPrefill`,
+    and 2 new multi-turn e2e tests (13/13).
 - **Qwen3.5 hybrid perf round (2026-07-29)** — two engine changes, measured
   **53.07** vs WebLLM 0.2.84's **32.36** tok/s on the same-session M2 Max
   pair (**+64.0%**, up from the v1 floor's 47.99 vs 31.99 / +50.0%):

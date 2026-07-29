@@ -197,8 +197,8 @@ wall-clock accounting as everywhere in this file). **+10.6% over the
 2026-07-28 Zero-TVM floor (47.99 → 53.07); +64.0% over WebLLM on this
 pair** (was +50.0%). The chat-path gain is entirely change 1 — change 2
 moves the validation/blocking path only. Still on the table for the GDN
-half: subgroup/vec4 variants for the GDN kernels, chunked prefill, and a
-fused conv+gates step.
+half: subgroup/vec4 variants for the GDN kernels and a fused conv+gates
+step (chunked prefill landed in the 2026-07-29 prefill round below).
 
 Each cell is the median of 5 × 128-token runs, versus the same-day
 pre-vec4-default baseline of **60.96 tok/s** (old defaults). Run-to-run
@@ -249,6 +249,91 @@ Outcomes:
    saved dispatch bubbles. Same treatment as the tiling and spec-decode
    negatives: flag + shaders kept compiled for A/B on other GPUs
    (`?fuseprologue=1`), documented as a negative result, not shipped.
+
+## Prefill round A (2026-07-29, Apple M2 Max) — chunked GDN prefill + cross-turn prefix reuse
+
+Decode was never the whole story: every prompt token used to run the FULL
+per-token dispatch chain (Qwen3.5: 340 dispatches/token), and every chat
+turn re-prefilled the WHOLE conversation. Two changes, measured with the
+new devtools harnesses (`benchPrefill(800, 3)` / `benchTurns()` /
+`checkReuse()` on the chat page; A/B via `?chunk=0` / `?reuse=0` in the
+same build — the flags-off halves ARE the pre-change behavior). Decode
+path untouched (`recordForward` unchanged; same 340 dispatches/token).
+`bench/results.json` untouched.
+
+1. **Chunked GDN prefill (Qwen3.5, `?chunk=0` opts out).** Prompt tokens
+   before the last run in chunks of ≤64: every projection (fused GDN
+   in_proj, out_proj, c_attn, o_proj, gate_up, down) becomes ONE
+   `int4_matmul_batched_dyn` dispatch — the m=4 register block looping over
+   runtime-M row blocks, unpacking each weight word once per 4 batch rows
+   (4× weight-traffic amortization, tile L2-resident across blocks);
+   `gdn_conv_seq`+`gdn_conv_commit` batch the causal conv (ring read/rotate
+   split so the chunk is race-free), `gdn_gates`/`gdn_norm_out` grew
+   seq+stride uniforms, and the recurrence — already seq-capable — runs as
+   ONE `gdn_recur` dispatch per layer per chunk. The 8 attention layers
+   batch too: rope/kv_append were already seq-capable and the new
+   `attention_prefill` walks per-token causal kv_len (bit-exact vs the
+   decode kernel, pinned in tests). FFN runs batched gate_up → `silu_mul` →
+   batched down. ~394 dispatches per 64-token chunk ≈ **6.2/token vs 340**.
+   Chunked-vs-per-token equality is pinned bit-exactly (f32 recurrent state
+   included) by `gdn_chunk_chain` in `tests/kernels/compile-qwen35.mjs`
+   (suite now 19/19). Requires sg32; falls back per-token otherwise.
+
+   | Qwen3.5 prefill, 816-token prompt (median of 3) | prefill tok/s | TTFT |
+   |---|---:|---:|
+   | before (`?chunk=0&reuse=0`)                     |  67.9 | 12.0 s |
+   | after (chunked, defaults)                       | **202.1** | **4.0 s** |
+
+   Raw runs — before: 69.4 / 67.9 / 67.7; after: 213.8 / 197.4 / 202.1
+   (13 chunks/run). **2.98× prefill throughput.**
+
+2. **Cross-turn prefix reuse (all three models, `?reuse=0` opts out).** The
+   engine records the exact (position, token) of every submitted forward
+   pass — including the pipelined path's ≤1-step overrun past a stop token,
+   reconstructed from the readback chain — and a new turn prefills only the
+   delta past the longest reusable prefix. Trust rules: pure-attention
+   specs reuse `min(LCP, len-1)` (KV rewrite is idempotent; stale slots are
+   overwritten in order). Hybrid GDN is all-or-nothing: the recurrence
+   can't rewind, so reuse requires the new prompt to extend EVERY absorbed
+   token with the state boundary exactly there, else full re-prefill (which
+   re-zeroes GDN state at position 0). Template mechanics measured:
+   - *ChatML (Qwen3/Qwen3.5, non-thinking)*: past assistant turns are now
+     re-rendered WITH the empty `<think>\n\n</think>\n\n` block (it was
+     genuinely part of the generation prompt the model continued), making
+     each turn an exact token-level extension of the absorbed sequence —
+     the ≤1-token overrun is the `<|im_end|>` stop id, which the next
+     prompt also contains. Turn 3 below reuses 922 of 950 tokens.
+   - *Phi-3 (SPM)*: the previous prompt reuses in full; the generated text
+     re-encodes with a boundary merge at `<|assistant|>\n` ↔ first response
+     token, so reuse conservatively restarts there when the merge differs
+     (LCP handles it — no correctness impact). Turn 3 reused 1086 of 1105.
+
+   3-turn conversation (`benchTurns()`: ~120 generated tokens/turn,
+   turn-3 prompt ≈ 950–1105 tokens absorbed), TTFT of turn 3:
+
+   | Model | turn-3 TTFT before | after | reused | speedup |
+   |---|---:|---:|---:|---:|
+   | Phi-3    | 15,405 ms | **269 ms** | 1086/1105 | 57× |
+   | Qwen3-4B | 14,554 ms | **438 ms** |  922/950  | 33× |
+   | Qwen3.5  | 14,340 ms | **194 ms** |  922/950  | 74× |
+
+   (Qwen3.5 turn-2, where the reusable prefix is ~58%: 12,083 → 1,790 ms —
+   reuse + chunking compose.)
+
+**Correctness gates.** `checkReuse()` (opt-in debug assertion,
+`engine.debugCompareReuse`) prefills a turn-2 prompt via the reused prefix,
+reads the final-position logits, then does a fresh full prefill of the same
+prompt and diffs: **max|Δ| = 0 (bit-exact) on all three models** (Qwen3.5
+asserted with `?chunk=0`; with chunking on, the absorbed prefix was built
+by the batched-matmul kernels whose reduction order differs from the
+per-token GEMV, and the diff measures that variant numerics instead —
+max|Δ| 0.019 / mean 0.0023 on the 248k-logit vector, the same class as the
+sg-vs-scalar differences). Suites: kernels 28/28 + 21/21 + **19/19** (6 new
+chunked-prefill tests, incl. bit-exact chunk-vs-stepwise with f32 state),
+unit 287, e2e **13/13** (2 new multi-turn tests asserting turn-2 coherence
+AND that reuse actually engaged, per model family). Decode sanity after
+the round: 51.2 tok/s on a quick 2×64-token check (headline protocol
+unchanged — decode dispatches untouched).
 
 ## Prior measurements (M2 Pro, 19-core — historical)
 

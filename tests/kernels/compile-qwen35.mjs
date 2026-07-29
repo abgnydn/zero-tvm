@@ -38,6 +38,7 @@ import {
   runComputeReads,
   pipelineFor,
   BU,
+  MM,
 } from './gpu.mjs'
 import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
 import { withPrelude, QWEN35_4B } from '../../src/compiler/shader-prelude.ts'
@@ -47,6 +48,7 @@ import {
   INT4_MATMUL_VARIANTS,
 } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import {
+  int4Matvec,
   refConvStep,
   expectedConvRing,
   refGates,
@@ -178,7 +180,8 @@ async function testGdnGates(device) {
     buffer(device, f16Array([...aRaw, ...bRaw]), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Float32Array(aLog), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Float32Array(dtBias), BU.STORAGE | BU.COPY_DST),
-    podBuffer(device, [{ u32: 1 }]),
+    // PODArgs {seq_len, ab_stride, packGridDimX} — single token, tight stride.
+    podBuffer(device, [{ i32: 1 }, { i32: 2 * H }, { u32: 1 }]),
   ]
   const bytes = await runCompute(device, pipe, buffers, [1], 0, 2 * H * 4)
   const got = new Float32Array(bytes)
@@ -312,7 +315,8 @@ async function testGdnNormOut(device) {
     buffer(device, x, BU.STORAGE | BU.COPY_DST),
     buffer(device, f16Array(gamma), BU.STORAGE | BU.COPY_DST),
     buffer(device, f16Array(z), BU.STORAGE | BU.COPY_DST),
-    podBuffer(device, [{ i32: SEQ }, { u32: GRID }]),
+    // PODArgs {seq_len, z_stride, packGridDimX} — z tightly packed here.
+    podBuffer(device, [{ i32: SEQ }, { i32: Q.gdnVDim }, { u32: GRID }]),
   ]
   const bytes = await runCompute(device, pipe, buffers, [GRID], 0, SEQ * Q.gdnVDim * 2)
   const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
@@ -401,9 +405,9 @@ async function testGdnBlockChain(device) {
   const pods = {
     proj: buffer(device, new Uint32Array([KP, SPR, Q.gdnProjRows, 0]), BU.UNIFORM | BU.COPY_DST),
     out: buffer(device, new Uint32Array([w.out.KP, w.out.SPR, d, 0]), BU.UNIFORM | BU.COPY_DST),
-    gates: podBuffer(device, [{ u32: 1 }]),
+    gates: podBuffer(device, [{ i32: 1 }, { i32: 2 * Q.gdnVHeads }, { u32: 1 }]),
     recur: podBuffer(device, [{ i32: 1 }, { u32: Q.gdnVHeads }]),
-    norm: podBuffer(device, [{ i32: 1 }, { u32: Q.gdnVHeads }]),
+    norm: podBuffer(device, [{ i32: 1 }, { i32: Q.gdnVDim }, { u32: Q.gdnVHeads }]),
   }
 
   // Region views into projOut — same 256-aligned offsets the engine binds.
@@ -685,6 +689,410 @@ async function testGatedAttnBlockChain(device) {
   }
 }
 
+// Set in main() after the device probe — the chunked-prefill kernels
+// (int4_matmul_batched_dyn) hard-assume 32-lane subgroups like every _sg
+// variant; on adapters without that the chunked tests SKIP (the engine
+// falls back to per-token prefill there too).
+let HAS_SG32 = false
+const skip = (name) => ({ name, pass: true, detail: 'SKIPPED — no 32-lane subgroup support (engine falls back to per-token prefill)' })
+
+// Region-view-aware dispatch helper (bind-group entries may be
+// { buffer, offset, size } views — same as the engine binds).
+function dispatchViews(device, pipe, bufs, grid) {
+  const bg = device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: bufs.map((b, i) => ({ binding: i, resource: b.buffer ? b : { buffer: b } })),
+  })
+  const enc = device.createCommandEncoder()
+  const pass = enc.beginComputePass()
+  pass.setPipeline(pipe)
+  pass.setBindGroup(0, bg)
+  pass.dispatchWorkgroups(grid[0], grid[1] ?? 1, grid[2] ?? 1)
+  pass.end()
+  device.queue.submit([enc.finish()])
+}
+
+async function readBack(device, buf, bytes) {
+  const out = device.createBuffer({ size: bytes, usage: BU.COPY_DST | BU.MAP_READ })
+  const enc = device.createCommandEncoder()
+  enc.copyBufferToBuffer(buf, 0, out, 0, bytes)
+  device.queue.submit([enc.finish()])
+  await out.mapAsync(MM.READ)
+  return out.getMappedRange().slice(0)
+}
+
+// ── gdn_conv_seq + commit — chunked conv (2 chunks, engine stride) must be
+// BIT-EXACT vs the per-token gdn_conv kernel, output AND ring state ──────────
+async function testGdnConvSeq(device) {
+  const r = rng(31)
+  const C = Q.gdnQkvDim, K = Q.gdnConvK, RING = K - 1
+  const STRIDE = Q.gdnProjRows      // batched fused-projection layout
+  const STEPS = 7                   // chunks of 4 + 3 (exercises base_pos > 0)
+  const xs = arr(STEPS, () => arr(C, () => toF16(r() * 2 - 1)))
+  const convW = arr(C * K, () => toF16(r() - 0.5))
+  const wBuf = buffer(device, f16Array(convW), BU.STORAGE | BU.COPY_DST)
+  const GRID1 = C / 256
+
+  // Per-token reference stream (the pinned gdn_conv kernel).
+  const stepPipe = pipelineFor(device, wgsl('gdn_conv.wgsl'), 'gdn_conv')
+  const refOut = new Uint16Array(STEPS * C)
+  const stateA = device.createBuffer({ size: RING * C * 2, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC })
+  device.queue.writeBuffer(stateA, 0, new Uint16Array(RING * C))
+  {
+    const out = device.createBuffer({ size: C * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const xBuf = device.createBuffer({ size: C * 2, usage: BU.STORAGE | BU.COPY_DST })
+    for (let t = 0; t < STEPS; t++) {
+      device.queue.writeBuffer(xBuf, 0, f16Array(xs[t]))
+      const pod = podBuffer(device, [{ i32: t }, { u32: GRID1 }])
+      const bytes = await runCompute(device, stepPipe, [out, xBuf, stateA, wBuf, pod], [GRID1], 0, C * 2)
+      refOut.set(new Uint16Array(bytes), t * C)
+    }
+  }
+  const ringRef = new Uint16Array(await readBack(device, stateA, RING * C * 2))
+
+  // Chunked: same stream through gdn_conv_seq + gdn_conv_commit.
+  const seqPipe = pipelineFor(device, wgsl('gdn_conv_seq.wgsl'), 'gdn_conv_seq')
+  const commitPipe = pipelineFor(device, wgsl('gdn_conv_commit.wgsl'), 'gdn_conv_commit')
+  const stateB = device.createBuffer({ size: RING * C * 2, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC })
+  device.queue.writeBuffer(stateB, 0, new Uint16Array(RING * C))
+  const gotOut = new Uint16Array(STEPS * C)
+  const CHUNKS = [[0, 4], [4, 3]]
+  for (const [start, n] of CHUNKS) {
+    // Batched raw buffer at the engine stride; non-qkv rows are random noise
+    // to prove the kernel never reads past channel GDN_QKV_DIM.
+    const raw = new Uint16Array(n * STRIDE)
+    for (let i = 0; i < raw.length; i++) raw[i] = (r() * 0xffff) | 0
+    for (let t = 0; t < n; t++)
+      for (let c = 0; c < C; c++) raw[t * STRIDE + c] = f32ToF16Bits(xs[start + t][c])
+    const rawBuf = buffer(device, raw, BU.STORAGE | BU.COPY_DST)
+    const outBuf = device.createBuffer({ size: n * C * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const pod = podBuffer(device, [{ i32: start }, { i32: n }, { i32: STRIDE }, { u32: n * GRID1 }])
+    const bytes = await runCompute(device, seqPipe, [outBuf, rawBuf, stateB, wBuf, pod], [n * GRID1], 0, n * C * 2)
+    gotOut.set(new Uint16Array(bytes), start * C)
+    const podCommit = podBuffer(device, [{ i32: start }, { i32: n }, { i32: STRIDE }, { u32: RING * GRID1 }])
+    dispatchViews(device, commitPipe, [stateB, rawBuf, podCommit], [RING * GRID1])
+  }
+  const ringGot = new Uint16Array(await readBack(device, stateB, RING * C * 2))
+
+  let outBad = 0
+  for (let i = 0; i < refOut.length; i++) if (gotOut[i] !== refOut[i]) outBad++
+  let ringBad = 0
+  for (let i = 0; i < ringRef.length; i++) if (ringGot[i] !== ringRef[i]) ringBad++
+  return {
+    name: 'gdn_conv_seq 2 chunks',
+    pass: outBad === 0 && ringBad === 0,
+    detail: `${outBad} output / ${ringBad} ring mismatches vs per-token gdn_conv (must be bit-exact)`,
+  }
+}
+
+// ── gdn_gates seq — strided batched gates BIT-EXACT vs per-token dispatches ──
+async function testGdnGatesSeq(device) {
+  const r = rng(34)
+  const H = Q.gdnVHeads, SEQ = 3, STRIDE = Q.gdnProjRows
+  const abs = arr(SEQ, () => arr(2 * H, () => toF16(r() * 4 - 2)))
+  const aLog = arr(H, () => Math.fround(Math.log(r() * 3.5 + 0.5)))
+  const dtBias = arr(H, () => Math.fround(r() - 1))
+  const aLogBuf = buffer(device, new Float32Array(aLog), BU.STORAGE | BU.COPY_DST)
+  const dtBuf = buffer(device, new Float32Array(dtBias), BU.STORAGE | BU.COPY_DST)
+  const pipe = pipelineFor(device, wgsl('gdn_gates.wgsl'), 'gdn_gates')
+
+  // Per-token reference.
+  const ref = new Float32Array(SEQ * 2 * H)
+  for (let t = 0; t < SEQ; t++) {
+    const out = device.createBuffer({ size: 2 * H * 4, usage: BU.STORAGE | BU.COPY_SRC })
+    const pod = podBuffer(device, [{ i32: 1 }, { i32: 2 * H }, { u32: 1 }])
+    const bytes = await runCompute(
+      device, pipe,
+      [out, buffer(device, f16Array(abs[t]), BU.STORAGE | BU.COPY_DST), aLogBuf, dtBuf, pod],
+      [1], 0, 2 * H * 4,
+    )
+    ref.set(new Float32Array(bytes), t * 2 * H)
+  }
+
+  // Batched strided (noise between tokens, as in the packed projection).
+  const raw = new Uint16Array(SEQ * STRIDE)
+  for (let i = 0; i < raw.length; i++) raw[i] = (r() * 0xffff) | 0
+  for (let t = 0; t < SEQ; t++)
+    for (let i = 0; i < 2 * H; i++) raw[t * STRIDE + i] = f32ToF16Bits(abs[t][i])
+  const out = device.createBuffer({ size: SEQ * 2 * H * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const pod = podBuffer(device, [{ i32: SEQ }, { i32: STRIDE }, { u32: SEQ }])
+  const bytes = await runCompute(
+    device, pipe,
+    [out, buffer(device, raw, BU.STORAGE | BU.COPY_DST), aLogBuf, dtBuf, pod],
+    [SEQ], 0, SEQ * 2 * H * 4,
+  )
+  const got = new Float32Array(bytes)
+  let bad = 0
+  for (let i = 0; i < ref.length; i++) if (got[i] !== ref[i]) bad++
+  return { name: 'gdn_gates seq=3 strided', pass: bad === 0, detail: `${bad} mismatches vs per-token (must be bit-exact)` }
+}
+
+// ── int4_matmul_batched_dyn — runtime-M GEMM vs CPU reference + M-invariance ─
+async function testMatmulBatchedDyn(device) {
+  if (!HAS_SG32) return skip('int4_matmul_batched_dyn')
+  const r = rng(35)
+  const K = Q.d, N = 64, M = 6, CAP = 8   // M=6 exercises the partial last block
+  const w = randInt4(r, N, K)
+  const input = arr(CAP * K, () => toF16(r() * 2 - 1))
+  const pipe = pipelineFor(
+    device,
+    withPrelude(int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true }), Q),
+    'int4_matmul_batched_dyn',
+  )
+  const inBuf = buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST)
+  const wBuf = buffer(device, w.weights, BU.STORAGE | BU.COPY_DST)
+  const sBuf = buffer(device, f16Array(Array.from(w.scales)), BU.STORAGE | BU.COPY_DST)
+  const run = async (m) => {
+    const out = device.createBuffer({ size: CAP * N * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+    device.queue.writeBuffer(out, 0, new Uint16Array(CAP * N))
+    const pod = buffer(device, new Uint32Array([w.KP, w.SPR, N, m]), BU.UNIFORM | BU.COPY_DST)
+    const bytes = await runCompute(device, pipe, [out, inBuf, sBuf, wBuf, pod], [N / 4], 0, CAP * N * 2)
+    return new Uint16Array(bytes)
+  }
+  const got6 = await run(M)
+  const got8 = await run(8)
+  // CPU reference per batch row.
+  let maxRel = 0
+  for (let b = 0; b < M; b++) {
+    const ref = int4Matvec(w.weights, w.scales, input.slice(b * K, (b + 1) * K), K, N)
+    const row = Array.from(got6.subarray(b * N, (b + 1) * N), f16BitsToF32)
+    maxRel = Math.max(maxRel, maxRelDiff(row, ref, 1e-2))
+  }
+  // Rows past M must stay untouched (zeroed).
+  let tailBad = 0
+  for (let i = M * N; i < CAP * N; i++) if (got6[i] !== 0) tailBad++
+  // M-invariance: the same row is computed identically regardless of M.
+  let mBad = 0
+  for (let i = 0; i < M * N; i++) if (got6[i] !== got8[i]) mBad++
+  const pass = maxRel < 1e-2 && tailBad === 0 && mBad === 0
+  return {
+    name: 'int4_matmul_batched_dyn',
+    pass,
+    detail: `max rel err ${maxRel.toExponential(2)} vs CPU, ${tailBad} rows-past-M writes, ${mBad} M-variance mismatches`,
+  }
+}
+
+// ── full chunked GDN chain — ONE chunk of 6 vs 6 single-token chunks (must be
+// BIT-EXACT, f32 state included) and vs the sequential CPU reference ─────────
+async function testGdnChunkChain(device) {
+  if (!HAS_SG32) return skip('gdn_chunk_chain')
+  const r = rng(36)
+  const d = Q.d, S = 6, CAP = 8, STRIDE = Q.gdnProjRows
+  const w = {
+    qkv: randInt4(r, Q.gdnQkvDim, d),
+    z: randInt4(r, Q.gdnVDim, d),
+    a: randInt4(r, Q.gdnVHeads, d, 0.001, 0.004),
+    b: randInt4(r, Q.gdnVHeads, d),
+    out: randInt4(r, d, Q.gdnVDim),
+  }
+  const convW = arr(Q.gdnQkvDim * Q.gdnConvK, () => toF16(r() - 0.5))
+  const gamma = arr(Q.gdnHeadV, () => toF16(r() * 0.5 + 0.75))
+  const aLog = arr(Q.gdnVHeads, () => Math.fround(Math.log(r() * 3.5 + 0.5)))
+  const dtBias = arr(Q.gdnVHeads, () => Math.fround(r() - 1))
+  const xs = arr(S, () => arr(d, () => toF16(r() * 2 - 1)))
+
+  const refState = { history: [], recur: new Float64Array(Q.gdnVHeads * Q.gdnStatePerHead) }
+  const refOuts = refGdnBlock(xs, {
+    qkvW: w.qkv.weights, qkvS: w.qkv.scales,
+    zW: w.z.weights, zS: w.z.scales,
+    aW: w.a.weights, aS: w.a.scales,
+    bW: w.b.weights, bS: w.b.scales,
+    outW: w.out.weights, outS: w.out.scales,
+    convW, gamma, aLog, dtBias,
+  }, Q, refState)
+
+  // Packed projection (loader layout).
+  const KP = d / 8, SPR = d / 32
+  const projW = new Uint32Array(Q.gdnProjRows * KP)
+  const projS = new Float32Array(Q.gdnProjRows * SPR)
+  {
+    let row = 0
+    for (const rec of [w.qkv, w.z, w.a, w.b]) {
+      projW.set(rec.weights, row * KP)
+      projS.set(rec.scales, row * SPR)
+      row += rec.weights.length / KP
+    }
+  }
+  const dyn = pipelineFor(device, withPrelude(int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true }), Q), 'int4_matmul_batched_dyn')
+  const conv = pipelineFor(device, wgsl('gdn_conv_seq.wgsl'), 'gdn_conv_seq')
+  const commit = pipelineFor(device, wgsl('gdn_conv_commit.wgsl'), 'gdn_conv_commit')
+  const gatesP = pipelineFor(device, wgsl('gdn_gates.wgsl'), 'gdn_gates')
+  const recur = pipelineFor(device, wgsl('gdn_recur.wgsl'), 'gdn_recur')
+  const norm = pipelineFor(device, wgsl('gdn_norm_out.wgsl'), 'gdn_norm_out')
+
+  const projWBuf = buffer(device, projW, BU.STORAGE | BU.COPY_DST)
+  const projSBuf = buffer(device, f16Array(Array.from(projS)), BU.STORAGE | BU.COPY_DST)
+  const outWBuf = buffer(device, w.out.weights, BU.STORAGE | BU.COPY_DST)
+  const outSBuf = buffer(device, f16Array(Array.from(w.out.scales)), BU.STORAGE | BU.COPY_DST)
+  const convWBuf = buffer(device, f16Array(convW), BU.STORAGE | BU.COPY_DST)
+  const gammaBuf = buffer(device, f16Array(gamma), BU.STORAGE | BU.COPY_DST)
+  const aLogBuf = buffer(device, new Float32Array(aLog), BU.STORAGE | BU.COPY_DST)
+  const dtBiasBuf = buffer(device, new Float32Array(dtBias), BU.STORAGE | BU.COPY_DST)
+
+  const CONV_GRID1 = Q.gdnQkvDim / 256
+  const RING = Q.gdnConvK - 1
+
+  async function runChain(chunks) {
+    const mk = (bytes) => device.createBuffer({ size: bytes, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+    const hidden = mk(CAP * d * 2)
+    const projOut = mk(CAP * STRIDE * 2)
+    const convState = mk(RING * Q.gdnQkvDim * 2)
+    device.queue.writeBuffer(convState, 0, new Uint16Array(RING * Q.gdnQkvDim))
+    const convOut = mk(CAP * Q.gdnQkvDim * 2)
+    const gatesBuf = mk(CAP * 2 * Q.gdnVHeads * 4)
+    const recurState = mk(Q.gdnVHeads * Q.gdnStatePerHead * 4)
+    device.queue.writeBuffer(recurState, 0, new Float32Array(Q.gdnVHeads * Q.gdnStatePerHead))
+    const recurOut = mk(CAP * Q.gdnVDim * 4)
+    const normOut = mk(CAP * Q.gdnVDim * 2)
+    const blockOut = mk(CAP * d * 2)
+    const zRegion = { buffer: projOut, offset: Q.gdnQkvDim * 2, size: (CAP - 1) * STRIDE * 2 + Q.gdnVDim * 2 }
+    const abRegion = { buffer: projOut, offset: (Q.gdnQkvDim + Q.gdnVDim) * 2, size: (CAP - 1) * STRIDE * 2 + 2 * Q.gdnVHeads * 2 }
+
+    const outs = new Uint16Array(S * d)
+    let start = 0
+    for (const n of chunks) {
+      const hid = new Uint16Array(n * d)
+      for (let t = 0; t < n; t++)
+        for (let i = 0; i < d; i++) hid[t * d + i] = f32ToF16Bits(xs[start + t][i])
+      device.queue.writeBuffer(hidden, 0, hid)
+      const pods = {
+        proj: buffer(device, new Uint32Array([KP, SPR, Q.gdnProjRows, n]), BU.UNIFORM | BU.COPY_DST),
+        conv: podBuffer(device, [{ i32: start }, { i32: n }, { i32: STRIDE }, { u32: n * CONV_GRID1 }]),
+        commit: podBuffer(device, [{ i32: start }, { i32: n }, { i32: STRIDE }, { u32: RING * CONV_GRID1 }]),
+        gates: podBuffer(device, [{ i32: n }, { i32: STRIDE }, { u32: n }]),
+        recur: podBuffer(device, [{ i32: n }, { u32: Q.gdnVHeads }]),
+        norm: podBuffer(device, [{ i32: n }, { i32: STRIDE }, { u32: n * Q.gdnVHeads }]),
+        out: buffer(device, new Uint32Array([w.out.KP, w.out.SPR, d, n]), BU.UNIFORM | BU.COPY_DST),
+      }
+      dispatchViews(device, dyn, [projOut, hidden, projSBuf, projWBuf, pods.proj], [Q.gdnProjRows / 4])
+      dispatchViews(device, conv, [convOut, projOut, convState, convWBuf, pods.conv], [n * CONV_GRID1])
+      dispatchViews(device, commit, [convState, projOut, pods.commit], [RING * CONV_GRID1])
+      dispatchViews(device, gatesP, [gatesBuf, abRegion, aLogBuf, dtBiasBuf, pods.gates], [n])
+      dispatchViews(device, recur, [recurOut, convOut, gatesBuf, recurState, pods.recur], [Q.gdnVHeads])
+      dispatchViews(device, norm, [normOut, recurOut, gammaBuf, zRegion, pods.norm], [n * Q.gdnVHeads])
+      dispatchViews(device, dyn, [blockOut, normOut, outSBuf, outWBuf, pods.out], [d / 4])
+      const bytes = await readBack(device, blockOut, n * d * 2)
+      outs.set(new Uint16Array(bytes), start * d)
+      start += n
+    }
+    const state = new Float32Array(await readBack(device, recurState, Q.gdnVHeads * Q.gdnStatePerHead * 4))
+    return { outs, state }
+  }
+
+  const chunked = await runChain([S])
+  const stepwise = await runChain([1, 1, 1, 1, 1, 1])
+  let outBits = 0
+  for (let i = 0; i < chunked.outs.length; i++) if (chunked.outs[i] !== stepwise.outs[i]) outBits++
+  let stateBits = 0
+  for (let i = 0; i < chunked.state.length; i++) if (chunked.state[i] !== stepwise.state[i]) stateBits++
+  // vs CPU: mixed tolerance — |Δ| < max(2e-2, 2e-2·|ref|). Six recurrence
+  // steps amplify f16 input rounding on near-zero outputs, so a pure
+  // relative metric over-penalizes; the BIT-EXACT chunk-vs-stepwise check
+  // above (same kernels, f32 state included) is the load-bearing equality,
+  // and the per-token semantics vs CPU are pinned by gdn_block.
+  let cpuWorst = 0
+  for (let t = 0; t < S; t++) {
+    for (let i = 0; i < d; i++) {
+      const got = f16BitsToF32(chunked.outs[t * d + i])
+      const ref = refOuts[t][i]
+      const tol = Math.max(2e-2, 2e-2 * Math.abs(ref))
+      cpuWorst = Math.max(cpuWorst, Math.abs(got - ref) / tol)
+    }
+  }
+  const refStateF32 = Float32Array.from(refState.recur)
+  const stateErr = maxRelDiff(chunked.state, refStateF32, 1e-2)
+  // State tolerance 5e-3 (vs gdn_recur_seq's 1e-3): here the recurrence
+  // inputs passed through the f16 projection + conv stages, adding their
+  // rounding to the drift a direct-input recurrence doesn't see.
+  const pass = outBits === 0 && stateBits === 0 && cpuWorst < 1 && stateErr < 5e-3
+  return {
+    name: 'gdn_chunk_chain 6 tok',
+    pass,
+    detail: `chunk-vs-stepwise: ${outBits} out / ${stateBits} f32-state bit diffs; vs CPU: out ${cpuWorst.toFixed(3)}×tol, state rel ${stateErr.toExponential(2)}`,
+  }
+}
+
+// ── attention_prefill — chunk of 5 query tokens BIT-EXACT vs per-token decode ─
+async function testAttentionPrefill(device) {
+  const r = rng(37)
+  const BASE = 3, SEQ = 5, T = BASE + SEQ   // 8 tokens fit one 16-slot page
+  const NUM_PAGES = 1
+  // Random K/V for positions 0..T-1, written straight into the page layout.
+  const pageData = new Uint16Array(NUM_PAGES * Q.kvPageStride)
+  for (let h = 0; h < Q.kvHeads; h++) {
+    for (let t = 0; t < T; t++) {
+      for (let dd = 0; dd < Q.headDim; dd++) {
+        pageData[h * Q.headPageStride + t * Q.headDim + dd] = f32ToF16Bits(toF16(r() - 0.5))
+        pageData[Q.vPageOffset + h * Q.headPageStride + t * Q.headDim + dd] = f32ToF16Bits(toF16(r() - 0.5))
+      }
+    }
+  }
+  const pages = buffer(device, pageData, BU.STORAGE | BU.COPY_DST)
+  const qAll = arr(SEQ * Q.qDim, () => toF16(r() * 2 - 1))
+  const pageVals = buffer(device, new Int32Array([0]), BU.STORAGE | BU.COPY_DST)
+  const indptr = buffer(device, new Int32Array([0, NUM_PAGES]), BU.STORAGE | BU.COPY_DST)
+
+  // Per-token reference via the decode attention kernel.
+  const decodeAttn = pipelineFor(device, wgsl('attention.wgsl'), 'attention')
+  const ref = new Uint16Array(SEQ * Q.qDim)
+  {
+    const qBuf = device.createBuffer({ size: Q.qDim * 2, usage: BU.STORAGE | BU.COPY_DST })
+    const out = device.createBuffer({ size: Q.qDim * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+    for (let t = 0; t < SEQ; t++) {
+      device.queue.writeBuffer(qBuf, 0, f16Array(qAll.slice(t * Q.qDim, (t + 1) * Q.qDim)))
+      device.queue.writeBuffer(out, 0, new Uint16Array(Q.qDim))
+      const lenBuf = buffer(device, new Int32Array([BASE + 1 + t]), BU.STORAGE | BU.COPY_DST)
+      const pod = podBuffer(device, [
+        { i32: 1 }, { i32: NUM_PAGES }, { i32: NUM_PAGES },
+        { i32: 0 }, { i32: 0 }, { i32: 0 }, { i32: 0 },
+        { f32: 1 / Math.sqrt(Q.headDim) }, { u32: 1 },
+      ])
+      const bytes = await runCompute(
+        device, decodeAttn,
+        [qBuf, indptr, pageVals, pages, lenBuf, out, pod],
+        [1, Q.heads], 5, Q.qDim * 2,
+      )
+      ref.set(new Uint16Array(bytes), t * Q.qDim)
+    }
+  }
+
+  // Chunked: one dispatch, per-token causal kv_len.
+  const prefillAttn = pipelineFor(device, wgsl('attention_prefill.wgsl'), 'attention_prefill')
+  const qBatch = buffer(device, f16Array(qAll), BU.STORAGE | BU.COPY_DST)
+  const outBatch = device.createBuffer({ size: SEQ * Q.qDim * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+  device.queue.writeBuffer(outBatch, 0, new Uint16Array(SEQ * Q.qDim))
+  const pod = podBuffer(device, [{ i32: SEQ }, { i32: BASE + 1 }, { f32: 1 / Math.sqrt(Q.headDim) }])
+  const bytes = await runCompute(device, prefillAttn, [qBatch, pageVals, pages, outBatch, pod], [SEQ, Q.heads], 3, SEQ * Q.qDim * 2)
+  const got = new Uint16Array(bytes)
+  let bad = 0
+  for (let i = 0; i < ref.length; i++) if (got[i] !== ref[i]) bad++
+  return { name: 'attention_prefill seq=5', pass: bad === 0, detail: `${bad} mismatches vs per-token decode attention (must be bit-exact)` }
+}
+
+// ── silu_mul — chunked FFN epilogue vs CPU ───────────────────────────────────
+async function testSiluMul(device) {
+  const r = rng(38)
+  const SEQ = 3, F = Q.ffn
+  const gu = arr(SEQ * 2 * F, () => toF16(r() * 6 - 3))
+  const ref = new Array(SEQ * F)
+  for (let t = 0; t < SEQ; t++)
+    for (let i = 0; i < F; i++) {
+      const g = gu[t * 2 * F + i]
+      ref[t * F + i] = toF16(gu[t * 2 * F + F + i] * (g / (1 + Math.exp(-g))))
+    }
+  const pipe = pipelineFor(device, wgsl('silu_mul.wgsl'), 'silu_mul')
+  const out = device.createBuffer({ size: SEQ * F * 2, usage: BU.STORAGE | BU.COPY_SRC })
+  const GRID = (SEQ * F) / 256
+  const bytes = await runCompute(
+    device, pipe,
+    [out, buffer(device, f16Array(gu), BU.STORAGE | BU.COPY_DST), podBuffer(device, [{ i32: SEQ }, { u32: GRID }])],
+    [GRID], 0, SEQ * F * 2,
+  )
+  const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
+  const maxAbs = maxAbsDiff(got, ref)
+  return { name: 'silu_mul', pass: maxAbs < 5e-3, detail: `max abs err ${maxAbs.toExponential(2)}` }
+}
+
 // ── test roster ──────────────────────────────────────────────────────────────
 const recurFixture = buildRecurFixture()
 const TESTS = [
@@ -700,6 +1108,13 @@ const TESTS = [
   { label: 'gated_qkv_split', fn: testGatedQkvSplit },
   { label: 'attn_gate', fn: testAttnGate },
   { label: 'gated_attn_block', fn: testGatedAttnBlockChain },
+  // Chunked-prefill kernel family (perf round A):
+  { label: 'gdn_conv_seq', fn: testGdnConvSeq },
+  { label: 'gdn_gates_seq', fn: testGdnGatesSeq },
+  { label: 'matmul_batched_dyn', fn: testMatmulBatchedDyn },
+  { label: 'gdn_chunk_chain', fn: testGdnChunkChain },
+  { label: 'attention_prefill', fn: testAttentionPrefill },
+  { label: 'silu_mul', fn: testSiluMul },
 ]
 
 // ── compile-all gate — every shader must build under QWEN35_4B ───────────────
@@ -777,6 +1192,7 @@ async function main() {
       console.error(`WARN: subgroup-size probe failed (${String(e).split('\n')[0]}); treating as no subgroups`)
     }
   }
+  HAS_SG32 = subgroups && sgSize === 32
   const sgLabel = subgroups ? (sgSize ? `yes (size ${sgSize})` : 'yes (size unknown)') : 'no'
   console.log(
     `adapter: ${info.description || info.vendor || 'unknown'} | shader-f16: ${f16} | subgroups: ${sgLabel} | spec: ${Q.id}`,
