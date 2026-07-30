@@ -6,7 +6,7 @@ colorTo: purple
 sdk: static
 pinned: true
 license: mit
-short_description: Phi-3-mini in 10 hand-written WGSL kernels (no TVM)
+short_description: Phi-3, Qwen3, Qwen3.5 in hand-written WGSL — beats WebLLM
 tags:
   - llm
   - phi-3
@@ -34,17 +34,25 @@ The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant m
 
 ## Headline result
 
-Measured on an Apple M2 Max (Chrome, WebLLM v0.2.80, identical Phi-3-mini-q4f16_1 weights, same-run head-to-head):
+Measured on an Apple M2 Max (Chrome 150, WebLLM v0.2.80, identical Phi-3-mini-q4f16_1 weights, same-session head-to-head, 2026-07-30). Two numbers, always both: **total** is wall-clock throughput with prefill included (both engines doing identical work), **decode** excludes prefill.
 
 | | WebLLM (TVM) | Zero-TVM |
 |---|---|---|
 | Unique WGSL kernels | **85** | **10 roles / 37 files** |
 | Total WGSL lines | **12,962** (generated) | **4,228** (hand-written) |
 | Dispatches per decode step | **342** | **228** |
-| Decode throughput | baseline | **28–31% faster** (same weights, same run) |
+| Total throughput (prefill + decode) | **59.95 tok/s** | **69.55 tok/s** — **+16.0%** |
+| Decode only | **63.23 tok/s** (self-reported) | **83.10 tok/s** — **+31.4%** |
+| Time to first token (~35-tok prompt) | **~150 ms** (implied) | **291 ms** — *WebLLM wins this one* |
 | JS bundle (excl. weights) | **5.9 MB** / 2.1 MB gz | **157 kB** / 33 kB gz |
 
-**The hand-written kernels don't just keep up with the autotuning compiler — on this hardware they beat it.** For decoder-only LLMs of this shape, most of the compiler's complexity budget isn't buying much — the expensive parts are matmul, attention, and int4 dequant. Everything else is plumbing. ~10 kernels of plumbing, instead of 85. Exact medians, full methodology, and the optimization experiments that were measured and *dropped* live in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md). (An earlier measurement on an M2 Pro with an older, buggier engine read 22% *behind* — that history is preserved there too, not retconned.)
+**The hand-written kernels don't just keep up with the autotuning compiler — on this hardware they beat it on throughput.** For decoder-only LLMs of this shape, most of the compiler's complexity budget isn't buying much — the expensive parts are matmul, attention, and int4 dequant. Everything else is plumbing. ~10 kernels of plumbing, instead of 85.
+
+**The gap grows with how recent the architecture is** — +16% / +31% (total / decode) on 2024's Phi-3, +32% / +58% on 2025's Qwen3-4B, +100% / +114% on 2026's Qwen3.5-4B. Consistent with compiler stacks having had less time to tune newer architectures; an observation across three points on one machine, not a proven law.
+
+**Honest negative, published not buried:** WebLLM reaches the first token faster than we do on short prompts (~150 ms implied vs our 291 ms on Phi-3; 453 ms on Qwen3-4B). We win sustained throughput and lose the first-token sprint on short inputs — our chunked prefill is strong on long ones (202 tok/s at 816 tokens) and prefix reuse makes follow-up turns free.
+
+Exact medians, full methodology, and the optimization experiments that were measured and *dropped* live in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md). (An earlier measurement on an M2 Pro with an older, buggier engine read 22% *behind* — that history is preserved there too, not retconned. So are two 2026-07-29 Qwen pairs that a bench-harness defect made non-comparable; they are marked withdrawn with the reason, not deleted.)
 
 ## Run it
 
@@ -58,9 +66,11 @@ Subsequent loads are instant. **Both `zero-tvm.html` and `compiler-chat.html` sh
 
 ## Models
 
-- **Phi-3-mini-4k-instruct (3.8B, q4f16_1)** — the default. Every headline number above is Phi-3; no URL flag needed.
-- **Qwen3-4B (q4f16_1)** — append `?model=qwen3` to `zero-tvm.html` or `validate.html`; weights stream from [`mlc-ai/Qwen3-4B-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC) (~2.3 GB). A port on the spec-parameterized engine: GQA 32/8, per-head QK-norm, byte-level BPE, tied lm_head. Measured 2026-07-29 (Apple M2 Max, same session, identical weight bytes): Zero-TVM **75.7 tok/s** vs WebLLM 0.2.84's prebuilt Qwen3-4B at **43.8 tok/s** (+73%), after the tuning round fused the post-matmul chain (`qk_norm_rope_append`, 8 dispatches/layer) and widened loads to K%512 matmuls. An earlier 2026-07-28 pair (25.43 vs 14.15) did not reproduce — both engines measured ~3× low in that session; a control re-run confirmed it as machine state, not a kernel change. One machine, one pair; protocol and the session note in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md).
-- **Qwen3.5-4B (q4f16_1)** — append `?model=qwen35` to `zero-tvm.html` or `validate.html`; weights stream from [`mlc-ai/Qwen3.5-4B-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Qwen3.5-4B-q4f16_1-MLC) (~2.6 GB). The first *hybrid* on the engine: 24 gated-DeltaNet (linear-attention) layers + 8 gated-attention layers (GQA 16/4, head_dim 256, partial RoPE, sigmoid attention gate) — to our knowledge the first hand-written-kernel int4 gated-DeltaNet hybrid in a browser. Measured 2026-07-29 (Apple M2 Max, same session, identical weight bytes): Zero-TVM **65.7 tok/s** vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at **34.0 tok/s** (+93%). The GDN decode kernels are still scalar (non-subgroup), so the decode number is a floor; prefill runs in chunks of ≤64 (202 tok/s on an 816-token prompt) and every model reuses its cross-turn prefix (turn-3 first token 14.3 s → 0.19 s, logits verified bit-identical to a fresh prefill). One machine, one pair; caveats in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md).
+All three pairs re-measured 2026-07-30 under the corrected protocol — same session, identical local weight bytes, both engines paying a full prefill on every run, total and decode reported side by side.
+
+- **Phi-3-mini-4k-instruct (3.8B, q4f16_1)** — the default; every headline number above is Phi-3, no URL flag needed. Zero-TVM **69.55 tok/s total** (TTFT 291 ms, decode 83.10) vs WebLLM 0.2.80's **59.95 tok/s total** (self-reported decode 63.23) — **+16.0% total, +31.4% decode**.
+- **Qwen3-4B (q4f16_1)** — append `?model=qwen3` to `zero-tvm.html` or `validate.html`; weights stream from [`mlc-ai/Qwen3-4B-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC) (~2.3 GB). A port on the spec-parameterized engine: GQA 32/8, per-head QK-norm, byte-level BPE, tied lm_head, with the tuning round's fused post-matmul chain (`qk_norm_rope_append`, 8 dispatches/layer) and K%512 wide loads. Zero-TVM **59.85 tok/s total** (TTFT 453 ms, decode 75.49) vs WebLLM 0.2.84's prebuilt Qwen3-4B at **45.46 tok/s total** (self-reported decode 47.77) — **+31.7% total, +58.0% decode**. This is the model where WebLLM most clearly beats us on first-token latency (~150 ms implied vs our 453 ms). The previously published "75.7 vs 43.8, +73%" pair is **withdrawn** — a bench-harness defect had stopped our half paying prefill; and the 2026-07-28 pair (25.43 vs 14.15) was a degraded session that did not reproduce. Both are kept as dated history with the reason in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md).
+- **Qwen3.5-4B (q4f16_1)** — append `?model=qwen35` to `zero-tvm.html` or `validate.html`; weights stream from [`mlc-ai/Qwen3.5-4B-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Qwen3.5-4B-q4f16_1-MLC) (~2.6 GB). The first *hybrid* on the engine: 24 gated-DeltaNet (linear-attention) layers + 8 gated-attention layers (GQA 16/4, head_dim 256, partial RoPE, sigmoid attention gate) — to our knowledge the first hand-written-kernel int4 gated-DeltaNet hybrid in a browser. Zero-TVM **65.28 tok/s total** (TTFT 171 ms, decode 73.30) vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at **32.56 tok/s total** (self-reported decode 34.32) — **+100.5% total, +113.6% decode**, and the one model where first-token latency is a wash rather than a loss. The GDN decode kernels are still scalar (non-subgroup), so the decode number is a floor; prefill runs in chunks of ≤64 (202 tok/s on an 816-token prompt) and every model reuses its cross-turn prefix (turn-3 first token 14.3 s → 0.19 s, logits verified bit-identical to a fresh prefill). The previously published "65.7 vs 34.0, +93%" cross-check is **withdrawn** (same harness defect); the earlier 53.07/32.36 (+64%) and 47.99/31.99 (+50%) pairs were like-for-like but are superseded. One machine, one pair each; caveats in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md).
 
 ## Pages in this Space
 

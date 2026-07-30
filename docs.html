@@ -502,7 +502,8 @@
   <p class="lead">
     A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
     10 hand-written WGSL kernel roles (37 files, 4,228 LOC), a BPE tokenizer, and raw WebGPU.
-    Decodes 28–31% faster than WebLLM's TVM-autotuned 85 kernels on identical weights, same run (M2 Max).
+    Measured +16.0% on total wall-clock throughput and +31.4% on decode against WebLLM's TVM-autotuned 85
+    kernels, identical weights, same session (M2 Max, 2026-07-30).
   </p>
 
   <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
@@ -553,7 +554,7 @@
     <div class="step-line"><div class="step-dot">3</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Chat</h5>
-      <p>Phi-3-mini decodes at 60+ tok/s on M2 Max — 28–31% faster than WebLLM on identical weights, same run. Your conversation never leaves the browser. No API calls during inference.</p>
+      <p>Phi-3-mini runs at 69.6 tok/s total (83.1 tok/s decode) on M2 Max — +16.0% / +31.4% vs WebLLM on identical weights, same session. Your conversation never leaves the browser. No API calls during inference.</p>
     </div>
   </div>
   <div class="step-row">
@@ -1030,14 +1031,17 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 </table>
 
 <p>
-  Measured 2026-07-29 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
-  <strong>75.74 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3-4B at <strong>43.75 tok/s</strong> — +73% on
-  that pair. Unlike the Phi-3 headline, these figures are static dated text, not synced from <code>bench/results.json</code>.
+  Measured 2026-07-30 on an Apple M2 Max under the corrected protocol (same session, identical local weight
+  bytes, both engines paying a full prefill on every run): Zero-TVM <strong>59.85 tok/s total</strong>
+  (TTFT 453 ms, decode 75.49) vs WebLLM 0.2.84's prebuilt Qwen3-4B at <strong>45.46 tok/s total</strong>
+  (self-reported decode 47.77) — <strong>+31.7% total, +58.0% decode</strong>. Unlike the Phi-3 headline,
+  these figures are static dated text, not synced from <code>bench/results.json</code>; the machine-readable
+  record is <code>bench/results/qwen3-4b.json</code>.
 </p>
 
 <div class="callout warning">
-  <div class="callout-title">Read the +73% cautiously — one pair, one machine</div>
-  <p>QK-norm must run between the QKV matmul and RoPE, which is incompatible with the fused QKV+RoPE+KV-append kernel — the QKV matmul stays a separate dispatch. Since the 2026-07-29 tuning round everything after it is fused (<code>qk_norm_rope_append</code>: per-head norm + RoPE + paged KV write in one pass, 8 dispatches/layer; <code>?fuseqk=0</code> restores the 10-dispatch reference chain) and the K%512 <code>_vec4h</code> matmul variants give d=2560 / ffn=9728 wide loads (<code>?vec4h=0</code> opts out). Same-day A/Bs: fused-qk +2.3%, vec4h +5.7%, combined +5.8% over the flags-off half. The earlier 2026-07-28 pair (25.43 vs 14.15) did not reproduce on the same machine — both engines moved ~3× together (degraded session; control-run details in BENCH.md's tuning-round session note).</p>
+  <div class="callout-title">Read it cautiously — one pair, one machine, and the previous number was withdrawn</div>
+  <p>The <strong>"75.74 vs 43.75, +73%" pair published on 2026-07-29 is withdrawn.</strong> It was measured after cross-turn prefix reuse shipped (PR #24) but before the bench harness was fixed to reset it, so the Zero-TVM half prefilled a single token per run while the WebLLM half prefilled the whole prompt — not like-for-like. Full writeup at the top of BENCH.md. The engine work itself is unchanged and its Zero-TVM-vs-Zero-TVM A/Bs still stand: QK-norm must run between the QKV matmul and RoPE, which is incompatible with the fused QKV+RoPE+KV-append kernel — the QKV matmul stays a separate dispatch — but since the 2026-07-29 tuning round everything after it is fused (<code>qk_norm_rope_append</code>: per-head norm + RoPE + paged KV write in one pass, 8 dispatches/layer; <code>?fuseqk=0</code> restores the 10-dispatch reference chain) and the K%512 <code>_vec4h</code> matmul variants give d=2560 / ffn=9728 wide loads (<code>?vec4h=0</code> opts out). Same-day A/Bs: fused-qk +2.3%, vec4h +5.7%, combined +5.8% over the flags-off half. The earlier 2026-07-28 pair (25.43 vs 14.15) did not reproduce on the same machine — both engines moved ~3× together (degraded session; control-run details in BENCH.md's tuning-round session note). Qwen3-4B is also the model where WebLLM most clearly beats us on time-to-first-token: its 263–271 tok/s prefill implies ~150 ms against our 453 ms.</p>
 </div>
 
 <!-- QWEN35 -->
@@ -1065,19 +1069,18 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 </table>
 
 <p>
-  Measured 2026-07-29 on an Apple M2 Max (same session, identical local weight bytes): Zero-TVM
-  <strong>65.67 tok/s</strong> decode vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at <strong>34.04 tok/s</strong> —
-  +93% on that pair (the 2026-07-28 v1 floor was 47.99 vs 31.99, +50%; the gains since are the fused
-  GDN input projection — the four per-layer in_proj matmuls packed into one 12352-row dispatch,
-  340 dispatches/token — a no-replay blocking decode, the K%512 <code>_vec4h</code> matmuls (+2.0% A/B),
-  and prefix reuse removing prefill from the bench wall-clock window — see BENCH.md's cross-check note
-  before reading the jump as a kernel win). Static dated text, not synced from
-  <code>bench/results.json</code>.
+  Measured 2026-07-30 on an Apple M2 Max under the corrected protocol (same session, identical local weight
+  bytes, both engines paying a full prefill on every run): Zero-TVM <strong>65.28 tok/s total</strong>
+  (TTFT 171 ms, decode 73.30) vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at <strong>32.56 tok/s total</strong>
+  (self-reported decode 34.32) — <strong>+100.5% total, +113.6% decode</strong>. This is the one model where
+  first-token latency is roughly a wash rather than a loss (our 171 ms against an implied ~0.2 s from
+  WebLLM's 175–177 tok/s prefill). Static dated text, not synced from <code>bench/results.json</code>;
+  the machine-readable record is <code>bench/results/qwen35-4b.json</code>.
 </p>
 
 <div class="callout warning">
-  <div class="callout-title">Read the +64% cautiously — the GDN kernels are still scalar, so this remains a floor</div>
-  <p>The 24 DeltaNet layers run scalar (non-subgroup) kernels and there is no chunked prefill (prompts still prefill token-by-token). The input projections are now fused 4→1 per GDN layer; the rest of the Phi-3 fusion story has not been applied to the GDN half. One machine, one pair; full protocol and caveats in BENCH.md.</p>
+  <div class="callout-title">Read it cautiously — the GDN kernels are still scalar, so decode remains a floor, and the previous number was withdrawn</div>
+  <p>The <strong>"65.67 vs 34.04, +93%" cross-check published on 2026-07-29 is withdrawn</strong> — same defect as the Qwen3 pair: measured after cross-turn prefix reuse shipped and before the bench harness reset it, so only the WebLLM half was paying prefill. The two earlier pairs (53.07 vs 32.36, +64%, from the hybrid perf round; 47.99 vs 31.99, +50%, the v1 floor) predate prefix reuse and were like-for-like — superseded, not defective. Full writeup at the top of BENCH.md. Engine caveats unchanged: the 24 DeltaNet layers run scalar (non-subgroup) kernels, so the decode number is a floor; the input projections are fused 4→1 per GDN layer and prompts prefill in chunks of ≤64 since the 2026-07-29 prefill round, but the rest of the Phi-3 fusion story has not been applied to the GDN half. One machine, one pair; full protocol and caveats in BENCH.md.</p>
 </div>
 
 <!-- PORTING -->
@@ -1177,33 +1180,66 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <!-- VS WEBLLM -->
 <h2 id="vs-webllm">vs WebLLM</h2>
 
-<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same run, same browser (Chrome 150 with WebGPU), Apple M2 Max — <code>npm run bench</code>, 128 decode tokens × 5 runs, median (latest run recorded in <code>bench/results.json</code>):</p>
+<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same session, same browser (Chrome 150 with WebGPU), Apple M2 Max — <code>npm run bench</code>, 128-token target × 5 runs, median, 2026-07-30 corrected protocol (latest run recorded in <code>bench/results.json</code>). Every run pays a full prefill on both sides, and both metrics are reported: <em>total</em> is wall-clock throughput including prefill, <em>decode</em> excludes it.</p>
 
 <table>
   <thead><tr><th></th><th>Zero-TVM</th><th>WebLLM</th></tr></thead>
   <tbody>
-    <tr><td>Decode speed</td><td><!--bench:zt-->62.90<!--/bench:zt--> tok/s</td><td><!--bench:webllm-->47.9<!--/bench:webllm--> tok/s</td></tr>
-    <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-31<!--/bench:gap-->% relative to WebLLM (negative = Zero-TVM ahead; ratio stable −28…−31% across sessions)</td></tr>
+    <tr><td>Total throughput (prefill + decode)</td><td><!--bench:zt-->69.55<!--/bench:zt--> tok/s</td><td><!--bench:webllm-->60.0<!--/bench:webllm--> tok/s</td></tr>
+    <tr><td>Decode only</td><td>83.10 tok/s</td><td>63.23 tok/s (self-reported)</td></tr>
+    <tr><td>Time to first token (~35-token prompt)</td><td>291 ms</td><td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM ahead</td></tr>
+    <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
     <tr><td>Dispatches / token</td><td>228 (260 with <code>?int8kv=1</code>)</td><td>342</td></tr>
     <tr><td>Distinct shaders</td><td>10 kernel roles · 37 .wgsl files · 4,228 LOC</td><td>85 TVM-generated shaders · 12,962 LOC</td></tr>
     <tr><td>Shipped JS bundle</td><td>157 kB / 33 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (<code>compiler-chat.html</code>)</td></tr>
-    <tr><td>Bandwidth utilization</td><td>~30% of 222 tok/s ceiling</td><td>~23% of same ceiling</td></tr>
+    <tr><td>Bandwidth utilization (total / decode)</td><td>~31% / ~37% of the 222 tok/s ceiling</td><td>~27% / ~28% of the same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
     <tr><td>Readable kernels?</td><td>✓ Yes — all 37 .wgsl files in repo</td><td>✗ No — emitted by the TVM compiler</td></tr>
   </tbody>
 </table>
 
-<h3>How the result flipped (22% behind &rarr; 28–31% ahead)</h3>
-<p>An earlier head-to-head (M2 Pro, 2026-06) read 42.14 vs ~51.5 tok/s — Zero-TVM 22% <em>behind</em>. Both the hardware and the engine changed since, so the two Zero-TVM numbers are not a pure optimization delta; the same-day, same-machine WebLLM number is the valid comparator for the current Zero-TVM median (both in the table above). What changed in the engine:</p>
+<h3>The corrected protocol (2026-07-30) — and what it invalidated</h3>
+
+<div class="callout warning">
+  <div class="callout-title">Our half of the A/B had stopped paying prefill</div>
+  <p><code>bench()</code> in <code>src/zero-tvm/bench-console.ts</code> looped its runs against the same prompt and never called <code>engine.resetKVTracking()</code> — while <code>benchPrefill()</code>, <code>specSim()</code> and <code>validate.ts</code> all did. That was harmless until cross-turn prefix reuse shipped on 2026-07-29 (PR #24). After it, runs 2..N of every bench found the whole prompt already absorbed and prefilled exactly <strong>one</strong> token, while the WebLLM half — a fresh chat completion per run — kept paying a full prefill inside its wall clock. The two halves were measuring different work.</p>
+  <p><strong>Withdrawn as a result:</strong> the Qwen3-4B "75.74 / 43.75, +73.1%" and Qwen3.5-4B "65.67 / 34.04, +92.9%" pairs, both 2026-07-29. Everything earlier predates prefix reuse and was like-for-like. <strong>Fixed:</strong> <code>bench()</code> resets before every run, both halves split TTFT from decode, and WebLLM's own per-run decode/prefill rates are captured instead of logged once and discarded. Prior published numbers stay in BENCH.md as dated history with the defect explained in place — nothing was silently overwritten.</p>
+</div>
+
+<h3>The advantage grows with architecture recency</h3>
+
+<p>Monotonic on both metrics across the three models, all measured 2026-07-30 on the same machine:</p>
+
+<table>
+  <thead><tr><th>Model</th><th>Architecture released</th><th>Δ total</th><th>Δ decode</th></tr></thead>
+  <tbody>
+    <tr><td>Phi-3-mini</td><td>2024</td><td>+16.0%</td><td>+31.4%</td></tr>
+    <tr><td>Qwen3-4B</td><td>2025</td><td>+31.7%</td><td>+58.0%</td></tr>
+    <tr><td>Qwen3.5-4B</td><td>2026</td><td>+100.5%</td><td>+113.6%</td></tr>
+  </tbody>
+</table>
+
+<p>The reading that fits: compiler stacks have had less time to tune newer architectures, so there is more headroom for a hand-written kernel set to take. That is an <strong>observation across three points</strong>, not a proven law — one machine, one browser, one day, no mechanism isolated, and no control for how differently each model stresses the two engines. Worth testing on a fourth model.</p>
+
+<h3>Where we lose: time to first token on short prompts</h3>
+
+<div class="callout warning">
+  <div class="callout-title">WebLLM reaches the first token sooner than we do</div>
+  <p>WebLLM's self-reported prefill runs at 251 tok/s on Phi-3 and 263–271 tok/s on Qwen3-4B. Against the ~35-token bench prompt that implies a TTFT of roughly <strong>150 ms</strong> on Phi-3, where we measure <strong>291 ms</strong>; on Qwen3-4B our <strong>453 ms</strong> is worse still. Only Qwen3.5-4B is a wash (our 171 ms vs an implied ~0.2 s). Stated plainly: <strong>we win sustained decode decisively and lose the first-token sprint on short inputs.</strong></p>
+  <p>It is specifically a <em>short</em>-prompt weakness. Chunked prefill measures 202 tok/s on an 816-token prompt (2026-07-29), and cross-turn prefix reuse removes prefill entirely on follow-up turns. What is not competitive is the fixed cost of a short, cold prefill on the attention-only specs, which still run prompt tokens one at a time. It is the top open item on BENCH.md's levers list.</p>
+</div>
+
+<h3>How the result flipped (22% behind &rarr; +16% total / +31% decode ahead)</h3>
+<p>An earlier head-to-head (M2 Pro, 2026-06) read 42.14 vs ~51.5 tok/s — Zero-TVM 22% <em>behind</em>. Both the hardware and the engine changed since, so the two Zero-TVM numbers are not a pure optimization delta; the same-session, same-machine WebLLM number is the valid comparator for the current Zero-TVM median (both in the table above). What changed in the engine:</p>
 <ul>
   <li><strong>Correctness fixes</strong>. f32 accumulation in the fused FFN, a workgroup-barrier fix in attention, and a decode off-by-one fix — the old number understates even the old hardware.</li>
   <li><strong>vec4 loads, now default</strong>. Re-declaring weight + activation buffers as <code>array&lt;vec4&lt;u32&gt;&gt;</code> in the int4 matmuls and <code>qkv_fused</code> measured +7.1% on M2 Max; opt out with <code>?vec4=0</code> / <code>?vec4qkv=0</code>.</li>
   <li><strong>Tiled + subgroup kernels</strong>. The 4-row tiled subgroup FFN and the <code>_sg</code> matmul/attention/argmax variants are the default path on Apple sg32 hardware.</li>
 </ul>
-<p>Still default since 2026-07-27 (`?splitk=0` to disable): split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured config <code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code> reaches 68.36 tok/s. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (228 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
+<p>Still default since 2026-07-27 (`?splitk=0` to disable): split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured opt-in config of that era (<code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code>, 68.36 tok/s on 2026-07-25) is now simply the default path. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (228 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
 
 <h3>The memory-bandwidth ceiling</h3>
-<p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Max's 400 GB/s memory bus that's ~4.5 ms/token, or ~222 tok/s theoretical max. Zero-TVM's measured decode median sits at roughly 30% of that ceiling; WebLLM's at roughly 23% (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
+<p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Max's 400 GB/s memory bus that's ~4.5 ms/token, or ~222 tok/s theoretical max. Zero-TVM's measured decode-only median sits at roughly 37% of that ceiling (31% on total, which pays prefill too); WebLLM's at roughly 28% decode-only / 27% total (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
 
 </main>
 </div>

@@ -14,7 +14,7 @@
  * #progress-detail, #progress-log.
  */
 
-import { loadWeights, LoadedWeights } from './weight-loader.js'
+import { loadWeights, formatEta, LoadedWeights } from './weight-loader.js'
 import { Tokenizer } from './tokenizer.js'
 import { loadTokenizerFor, buildChatPromptFor } from './model-select.js'
 import { allocKVPages, buildDecodeEngine, type DecodeEngine } from './engine-core.js'
@@ -234,17 +234,19 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   setBadge('Downloading...', 'loading')
   let weights: LoadedWeights
   try {
-    weights = await loadWeights(device, (m) => {
-      log(m)
-      // Coarse progress: our weight-loader emits "Loading layer N/32" messages.
-      const match = /Loading layer (\d+)/.exec(m)
-      if (match) {
-        const layer = parseInt(match[1], 10)
-        const pct = (layer / spec.layers) * 100
-        setProgress(10 + pct * 0.8, `Loading layer ${layer} / ${spec.layers}`, `${Math.round(pct)}%`)
-        setBadge(`${Math.round(pct)}%`, 'loading')
-      }
-    }, undefined, spec)
+    weights = await loadWeights(device, (m) => log(m), (s) => {
+      // Real byte-level progress from the loader's own stats.
+      const frac = s.totalBytes > 0 ? Math.min(1, s.bytesLoaded / s.totalBytes) : 0
+      const pct = Math.round(frac * 100)
+      setProgress(
+        10 + frac * 80,
+        `Downloading weights — shard ${s.shardsLoaded} / ${s.totalShards}`,
+        `${formatBytes(s.bytesLoaded)} / ${formatBytes(s.totalBytes)} · ` +
+          `${s.mbPerSec.toFixed(0)} MB/s` +
+          (s.etaSec > 0 ? ` · ~${formatEta(s.etaSec)} left` : ''),
+      )
+      setBadge(`${pct}%`, 'loading')
+    }, spec)
   } catch (e) {
     setBadge('Download failed', 'error')
     setProgress(10, `Weight load error: ${e}`)

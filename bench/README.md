@@ -17,8 +17,11 @@ Drives the actual browser engine — so it needs WebGPU (a dev Mac) and ~2 GB of
 Phi-3 weights (first run downloads them; cached after). It **cannot** run in a
 GPU-less CI sandbox. It:
 
-1. boots `zero-tvm.html` and calls `window.bench()` → Zero-TVM decode median,
-2. boots `webllm-bench.html` → WebLLM decode median,
+1. boots `zero-tvm.html` and calls `window.bench()` → Zero-TVM total median,
+   plus median TTFT and median decode-only rate (every run resets the
+   engine's absorbed-token record, so every run pays a full prefill),
+2. boots `webllm-bench.html` → WebLLM total median, plus its self-reported
+   decode/prefill rates captured per run,
 3. writes `bench/results.json` (the single source of truth — commit it after
    each bench run so the repo records the numbers the docs were synced from),
 4. runs `sync-docs.mjs --write` to update the docs.
@@ -58,17 +61,29 @@ to apply. Updates:
 
 Prose mentions in README / docs.html / demo.html / index.html are **reported,
 not rewritten** — auto-editing prose is how benchmark numbers get mangled.
-Prose should cite the stable ratio range ("28–31% faster across sessions"),
-not exact medians; exact medians belong only in marker-wrapped table/stat-tile
-positions. Anything the script prints in its prose checklist is either
-intentional history (the old M2 Pro numbers, falsified experiments) or needs
+Prose should cite a dated, same-session pair with **both** metrics ("+16.0%
+total / +31.4% decode, Phi-3, 2026-07-30"), not exact medians and not a
+cross-session band. The old "28–31% faster across sessions" phrasing was
+retired on 2026-07-30: it was a total-wall-clock ratio labelled "decode", and
+the corrected round measured −16.0% total on the same pair. Exact medians
+belong only in marker-wrapped table/stat-tile positions. Anything the script
+prints in its prose checklist is either intentional history (the old M2 Pro
+numbers, the withdrawn 2026-07-29 pairs, falsified experiments) or needs
 rewording.
 
 `results.json` schema:
 
 ```json
-{ "ztDecode": 66.33, "webllmDecode": 51.98, "hardware": "Apple M2 Max", "date": "2026-07-25" }
+{ "ztDecode": 69.55, "webllmDecode": 59.95, "hardware": "Apple M2 Max", "date": "2026-07-30" }
 ```
+
+**Naming caveat:** `ztDecode` / `webllmDecode` hold **total wall-clock**
+medians (prefill + decode), not decode-only rates. The names predate the
+2026-07-30 metric split and are the wire format `run.mjs` writes and
+`sync-docs.mjs` reads. For the unambiguous per-model records — total, TTFT,
+decode, and WebLLM's self-reported prefill/decode — see
+[`bench/results/`](results/), which also holds the two Qwen pairs that A/B
+mode never writes here.
 
 ## Run it on a cloud GPU (no Mac)
 

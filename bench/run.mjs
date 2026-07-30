@@ -35,7 +35,7 @@ const N_RUNS = Number(process.env.BENCH_RUNS ?? 5)
 // zero-tvm.html with the query AND webllm-bench.html with the same model
 // param — and prints both medians + the gap, but still does NOT touch
 // results.json (that file is the Phi-3 headline artifact; Qwen numbers live
-// in BENCH.md's Qwen section).
+// in bench/results/*.json and BENCH.md's Qwen sections).
 const QUERY = process.env.BENCH_QUERY ?? ''
 const AB_MODEL = QUERY ? new URLSearchParams(QUERY.replace(/^\?/, '')).get('model') : null
 const HARDWARE = process.env.BENCH_HW ?? 'unknown GPU'

@@ -34,12 +34,15 @@ export function specFromSearch(search: string): ModelSpec {
 
 /** Page-facing copy for the active model (gate dialog, header, hints). */
 export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: string; rateLabel: string } {
+  // rateLabel is the TOTAL wall-clock median (prefill + decode) from the
+  // 2026-07-30 corrected protocol — the conservative number a user actually
+  // experiences. Decode-only rates run higher (83 / 75 / 73 t/s); see BENCH.md.
   if (spec.id === QWEN35_4B.id) {
-    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~66 t/s' }  // fused-GDN-in_proj + vec4h + reuse-era accounting, M2 Max (BENCH.md 2026-07-29)
+    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~65 t/s' }  // 65.28 total, M2 Max (BENCH.md 2026-07-30)
   }
   return spec.id === QWEN3_4B.id
-    ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~76 t/s' }  // fuseqk+vec4h tuning round, M2 Max (BENCH.md 2026-07-29)
-    : { name: 'Phi-3-mini', sizeLabel: '~2 GB', rateLabel: '60+ t/s' }
+    ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~60 t/s' }  // 59.85 total, M2 Max (BENCH.md 2026-07-30)
+    : { name: 'Phi-3-mini', sizeLabel: '~2 GB', rateLabel: '~70 t/s' }  // 69.55 total, M2 Max (BENCH.md 2026-07-30)
 }
 
 /**

@@ -135,8 +135,16 @@ interface AiMsgHandle {
   showThinking(): void
   /** Re-render the full text (Markdown) into body on next animation frame. */
   render(text: string): void
-  /** Remove cursor, add copy + stats + regenerate actions, stop streaming. */
-  finish(opts: { fullText: string; tokens: number; tokPerS: number; onRegenerate?: () => void }): void
+  /** Remove cursor, add copy + stats + regenerate actions, stop streaming.
+   *  `notice` renders a persistent banner under the reply — used when the
+   *  reply was cut short, so it never just stops mid-word in silence. */
+  finish(opts: {
+    fullText: string
+    tokens: number
+    tokPerS: number
+    onRegenerate?: () => void
+    notice?: { text: string; onContinue?: () => void }
+  }): void
 }
 
 function addAiMsg(): AiMsgHandle {
@@ -186,10 +194,13 @@ function addAiMsg(): AiMsgHandle {
         requestAnimationFrame(doRender)
       }
     },
-    finish({ fullText, tokens, tokPerS, onRegenerate }) {
+    finish({ fullText, tokens, tokPerS, onRegenerate, notice }) {
       // Ensure final markdown render without cursor.
       const frag = renderMarkdown(fullText)
       body.replaceChildren(frag)
+      // A resumed reply re-runs finish() on the same message — drop the
+      // banner that made it resumable before rebuilding.
+      wrap.querySelector('.truncation')?.remove()
       const actions = wrap.querySelector('.actions') as HTMLElement | null
       if (!actions) return
       actions.replaceChildren()
@@ -213,6 +224,25 @@ function addAiMsg(): AiMsgHandle {
       stats.className = 'msg-stats'
       stats.textContent = `${tokens} tok · ${tokPerS.toFixed(1)} tok/s`
       actions.appendChild(stats)
+
+      // .actions is hover-revealed; the cut-short banner must not be, so it
+      // gets its own always-visible row between the body and the actions.
+      if (notice) {
+        const el = document.createElement('div')
+        el.className = 'truncation'
+        const label = document.createElement('span')
+        label.textContent = notice.text
+        el.appendChild(label)
+        if (notice.onContinue) {
+          const btn = document.createElement('button')
+          btn.type = 'button'
+          btn.className = 'truncation-btn'
+          btn.textContent = 'Continue'
+          btn.addEventListener('click', notice.onContinue)
+          el.appendChild(btn)
+        }
+        wrap.insertBefore(el, actions)
+      }
     },
   }
 }
@@ -332,7 +362,13 @@ async function main(): Promise<void> {
         log(`?kv8=1 ignored for ${spec.id} — int8 KV requires the fused QKV path (Phi-3 only for now)`)
       }
       // KV cache: int8 halves memory at the cost of one extra dispatch per layer.
-      log(int8KV ? 'Allocating int8 KV cache (~800 MB)…' : 'Allocating KV cache…')
+      const kvMiB = Math.round(
+        (spec.maxContext * spec.kvBytesPerToken) / (1024 * 1024) / (int8KV ? 2 : 1),
+      )
+      log(
+        `Allocating ${int8KV ? 'int8 ' : ''}KV cache — ${spec.maxPages} pages × ` +
+        `${spec.pageSize} = ${spec.maxContext} tokens · ~${kvMiB} MiB`,
+      )
       const kv = int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
       log('Building decode engine…')
       // Prefill A/B flags: ?reuse=0 disables cross-turn prefix reuse,
@@ -380,7 +416,12 @@ async function main(): Promise<void> {
   }
 
   const SYSTEM_PROMPT = 'You are a helpful, concise assistant. Use Markdown (numbered lists, **bold**, and fenced ```code``` blocks with a language tag) when it clarifies the answer.'
-  const history: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+  /** A history entry. Assistant turns also keep the exact token ids the model
+   *  produced — re-encoding the rendered text is not guaranteed to reproduce
+   *  them (BPE re-segments at the cut), and the resume path needs the ids to
+   *  hand the model back its own unterminated turn. */
+  type Turn = { role: 'system' | 'user' | 'assistant'; content: string; ids?: number[] }
+  const history: Turn[] = [
     { role: 'system', content: SYSTEM_PROMPT },
   ]
   let generating = false
@@ -403,8 +444,8 @@ async function main(): Promise<void> {
 
   function updateCtxHint(nTokens?: number) {
     if (!ctxHint) return
-    // True ceiling is the KV page table (MAX_PAGES × PAGE_SIZE = 4112), not
-    // the model's nominal 4096 — derived from the same constant the engine uses.
+    // True ceiling is the KV page table (spec.maxPages × spec.pageSize), which
+    // is what the engine enforces — not the model's nominal maxSeq.
     if (!nTokens) {
       ctxHint.textContent = `Zero TVM · 10 WGSL kernels · ${DISPATCHES_PER_TOKEN} dispatches/token`
     } else if (nTokens >= engine.maxContext) {
@@ -464,23 +505,50 @@ async function main(): Promise<void> {
     form.requestSubmit()
   })
 
-  async function runGeneration(ai: AiMsgHandle, promptIds: number[]): Promise<string> {
-    log(`Prompt: ${promptIds.length} tokens`)
+  interface GenResult {
+    text: string
+    /** Every token id in the message, including any carried over from a
+     *  reply this run resumed. */
+    ids: number[]
+  }
+
+  /**
+   * Decode one reply into `ai`.
+   *
+   * `priorIds` non-empty means this is a RESUME: the new tokens extend the
+   * same message (and the same history entry) rather than starting a fresh
+   * one, and the whole id list is decoded together so a multi-byte character
+   * split across the join renders correctly.
+   */
+  async function runGeneration(
+    ai: AiMsgHandle,
+    promptIds: number[],
+    priorIds: number[],
+    onContinue: () => void,
+  ): Promise<GenResult> {
+    // The per-reply cap is the KV room the prompt leaves behind, not a magic
+    // constant: the engine refuses to step past maxContext anyway, so this is
+    // the true ceiling and the only budget that can cut a reply short.
+    const budget = engine.maxContext - promptIds.length
+    log(`Prompt: ${promptIds.length} tokens · reply budget ${budget} tokens`)
     updateCtxHint(promptIds.length)
-    ai.showThinking()
+    const resuming = priorIds.length > 0
+    if (!resuming) ai.showThinking()
     const t0 = performance.now()
     let count = 0
     let firstToken = true
-    const allIds: number[] = []
-    let fullResponse = ''
+    const allIds: number[] = priorIds.slice()
+    let fullResponse = resuming ? tokenizer.decode(allIds) : ''
 
     try {
       // Cooperative cancellation: the engine polls the flag between pipeline
       // submissions and drains its in-flight readbacks before returning.
-      await engine.generatePipelined(promptIds, 500, (id) => {
+      await engine.generatePipelined(promptIds, budget, (id) => {
         if (firstToken) {
-          // Swap thinking indicator for the real body on first token.
-          ai.body.replaceChildren(ai.cursor)
+          // Swap thinking indicator for the real body on first token. When
+          // resuming, the body already holds the text so far — the next
+          // render() re-attaches the cursor to it.
+          if (!resuming) ai.body.replaceChildren(ai.cursor)
           firstToken = false
         }
         count++
@@ -496,25 +564,41 @@ async function main(): Promise<void> {
     }
     const totalSec = (performance.now() - t0) / 1000
     const tokPerS = count / Math.max(totalSec, 0.001)
+    const used = promptIds.length + count
+    // Why the reply ended. The engine emits exactly `budget` tokens only when
+    // it ran out of KV window; a Stop lands somewhere below that. Anything
+    // else means the model chose to stop, which needs no notice.
+    const contextFull = count >= budget
+    const stopped = stopRequested && !contextFull
     ai.finish({
       fullText: fullResponse,
-      tokens: count,
+      // The badge sits under the whole message, so it counts the whole
+      // message; tok/s is a rate, so it measures just this run.
+      tokens: allIds.length,
       tokPerS,
       onRegenerate: () => { void regenerate() },
+      notice: contextFull
+        ? { text: `Cut off — the ${engine.maxContext}-token context window is full. Start a new chat to keep going.` }
+        : stopped
+          ? { text: 'Stopped — this reply is incomplete.', onContinue }
+          : undefined,
     })
     // Reflect the true KV position count (prompt + generated) in the context hint.
-    updateCtxHint(promptIds.length + count)
-    if (promptIds.length + count >= engine.maxContext) {
+    updateCtxHint(used)
+    if (used >= engine.maxContext) {
       setBadge('Context full', 'error')
       log(`Context window full (${engine.maxContext} tokens) — start a new chat to continue.`)
     }
-    return fullResponse
+    return { text: fullResponse, ids: allIds }
   }
 
   /** Shared bracketing around a single decode turn: busy flags, prefill
    * tokenization, run, commit response to history, re-enable UI. */
   async function runTurn(): Promise<void> {
     setBusy(true); stopRequested = false
+    // Resuming an earlier reply stops being meaningful once a new turn is
+    // under way — retire the button but keep the "this was cut short" text.
+    $('messages')?.querySelectorAll('.truncation-btn').forEach((b) => b.remove())
     const ai = addAiMsg()
     const promptIds = buildChatPromptFor(SPEC, history, tokenizer)
     // Every turn re-prefills the whole history, so once it no longer fits the
@@ -530,8 +614,47 @@ async function main(): Promise<void> {
       updateSendEnabled()
       return
     }
-    const fullResponse = await runGeneration(ai, promptIds)
-    history.push({ role: 'assistant', content: fullResponse })
+    // Commit the (empty) assistant turn before decoding so the resume path has
+    // a stable identity to bind its Continue button to.
+    const entry: Turn = { role: 'assistant', content: '' }
+    history.push(entry)
+    const r = await runGeneration(ai, promptIds, [], () => { void continueTurn(entry, ai) })
+    entry.content = r.text
+    entry.ids = r.ids
+    setBusy(false); stopRequested = false
+    updateSendEnabled()
+    inp?.focus()
+  }
+
+  /**
+   * Resume a reply that was cut short — instead of opening a new turn and
+   * asking the model to "continue".
+   *
+   * The prompt is the conversation WITHOUT the partial reply (so the chat
+   * template's generation prompt is the last thing in it) followed by that
+   * reply's own token ids — the ids the model actually emitted, not a
+   * re-encoding of the rendered text. The assistant turn is therefore still
+   * open — no <|im_end|> / <|end|> — and the model simply keeps writing the
+   * sentence it was in. Nothing is injected into the conversation.
+   *
+   * Prefix reuse: pure-attention specs (Phi-3, Qwen3) reuse the whole thing,
+   * since the resumed prompt is a prefix of what the engine absorbed. Hybrid
+   * (Qwen3.5) re-prefills — its GDN state is non-rewindable and sits a step
+   * or two PAST the last emitted token (the pipeline's in-flight overrun), so
+   * computeReuseStart's all-or-nothing rule declines. Correct either way;
+   * only the hybrid pays for it.
+   */
+  async function continueTurn(entry: Turn, ai: AiMsgHandle): Promise<void> {
+    if (generating || !entry.ids) return
+    // The conversation moved on (new message / regenerate / reset) — the
+    // stale button is no longer about the last thing the model said.
+    if (history[history.length - 1] !== entry) return
+    setBusy(true); stopRequested = false
+    const promptIds = buildChatPromptFor(SPEC, history.slice(0, -1), tokenizer)
+      .concat(entry.ids)
+    const r = await runGeneration(ai, promptIds, entry.ids, () => { void continueTurn(entry, ai) })
+    entry.content = r.text
+    entry.ids = r.ids
     setBusy(false); stopRequested = false
     updateSendEnabled()
     inp?.focus()

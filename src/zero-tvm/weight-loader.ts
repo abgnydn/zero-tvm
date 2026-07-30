@@ -399,7 +399,7 @@ function opfsStatusLabel(opfs: OPFSDir, persisted: boolean): string {
   return persisted ? 'OPFS persistent' : 'OPFS best-effort'
 }
 
-function formatEta(sec: number): string {
+export function formatEta(sec: number): string {
   if (!isFinite(sec) || sec <= 0) return '—'
   if (sec < 60) return `${Math.round(sec)}s`
   const m = Math.floor(sec / 60)

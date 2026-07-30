@@ -113,7 +113,7 @@ async function main() {
   log('[webllm-bench] engine ready, running benches')
   log('')
 
-  const runs: { tokens: number; seconds: number; tokPerS: number }[] = []
+  const runs: { tokens: number; seconds: number; tokPerS: number; selfDecode: number }[] = []
   for (let r = 0; r <= NUM_RUNS; r++) {
     const label = r === 0 ? 'warmup' : `run${r}/${NUM_RUNS}`
     const t0 = performance.now()
@@ -131,13 +131,18 @@ async function main() {
     const completionTokens = usage?.completion_tokens ?? 0
     const totalTokens = usage?.total_tokens ?? 0
     const tokPerS = completionTokens / seconds
-    log(`[bench] ${label}: ${completionTokens} gen tok / ${seconds.toFixed(2)}s = ${tokPerS.toFixed(2)} tok/s (total ${totalTokens})`)
-    // Log extra info from WebLLM's own stats if present on first non-warmup run
+    // WebLLM reports its own prefill/decode split; capture it EVERY run so the
+    // comparison against our half (which now also splits TTFT from decode) is
+    // auditable rather than wall-clock-vs-decode apples to oranges.
     const extra = (usage as unknown as { extra?: Record<string, number> } | undefined)?.extra
-    if (extra && r === 1) {
-      log(`[bench]   webllm extra: ${JSON.stringify(extra)}`)
-    }
-    if (r > 0) runs.push({ tokens: completionTokens, seconds, tokPerS })
+    const selfDecode = extra?.decode_tokens_per_s ?? 0
+    const selfPrefill = extra?.prefill_tokens_per_s ?? 0
+    log(
+      `[bench] ${label}: ${completionTokens} gen tok / ${seconds.toFixed(2)}s = ${tokPerS.toFixed(2)} tok/s total` +
+      (selfDecode ? ` · webllm self-reported decode ${selfDecode.toFixed(2)} tok/s · prefill ${selfPrefill.toFixed(2)} tok/s` : '') +
+      ` (total ${totalTokens})`
+    )
+    if (r > 0) runs.push({ tokens: completionTokens, seconds, tokPerS, selfDecode })
   }
 
   const sorted = runs.map(r => r.tokPerS).sort((a, b) => a - b)
@@ -147,7 +152,10 @@ async function main() {
   const max = sorted[sorted.length - 1]
   log('')
   log(`[summary] WebLLM on ${MODEL_ID}`)
-  log(`  median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s`)
+  const selfDecodes = runs.map(r => r.selfDecode).filter(x => x > 0).sort((a, b) => a - b)
+  const medianSelfDecode = selfDecodes.length ? selfDecodes[Math.floor(selfDecodes.length / 2)] : 0
+  log(`  median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s (wall-clock incl. prefill)`)
+  if (medianSelfDecode) log(`  webllm self-reported decode median=${medianSelfDecode.toFixed(2)} tok/s`)
   log('')
   if (QWEN || QWEN35) {
     // No stored comparison constant for the Qwen models — run the Zero-TVM
@@ -156,8 +164,8 @@ async function main() {
     // aren't comparable.
     setStats(`WebLLM ${median.toFixed(1)} tok/s (${QWEN35 ? 'Qwen3.5-4B' : 'Qwen3-4B'})`)
   } else {
-    const ztvm = 62.90 // bench:zt — Zero-TVM decode median (tok/s), updated by `npm run bench`
-    log(`[comparison] Zero-TVM (this repo) median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (Apple M2 Max, 2026-07-25 — see bench/results.json)`)
+    const ztvm = 69.55 // bench:zt — Zero-TVM TOTAL wall-clock median (tok/s), updated by `npm run bench`
+    log(`[comparison] Zero-TVM (this repo) total median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (Apple M2 Max, 2026-07-30 — see bench/results.json)`)
     const delta = ((median - ztvm) / ztvm) * 100
     log(`  → Zero-TVM is ${delta < 0 ? '+' : '-'}${Math.abs(delta).toFixed(1)}% ${delta < 0 ? 'faster' : 'slower'} than WebLLM on this machine`)
     setStats(`WebLLM ${median.toFixed(1)} tok/s · Zero-TVM ${ztvm} tok/s`)
@@ -165,7 +173,7 @@ async function main() {
 
   ;(window as Window & typeof globalThis & { webllmResult?: unknown }).webllmResult = {
     model: MODEL_ID,
-    runs, median, mean, min, max,
+    runs, median, mean, min, max, medianSelfDecode,
   }
 }
 
