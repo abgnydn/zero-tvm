@@ -1,0 +1,25 @@
+{
+  "model": "Qwen3-4B-q4f16_1",
+  "archReleased": 2025,
+  "date": "2026-07-30",
+  "hardware": "Apple M2 Max",
+  "browser": "Chrome 150",
+  "protocol": "same-session interleaved pair, identical local q4f16_1 weight bytes, greedy; Zero-TVM 128-token target x 5 runs + warmup (BENCH_QUERY=\"?model=qwen3\"), WebLLM 3 x 120-token completions + warmup on its prebuilt Qwen3-4B lib; medians",
+  "zeroTvm": {
+    "totalTokPerS": 59.85,
+    "ttftMs": 453,
+    "decodeTokPerS": 75.49,
+    "totalRuns": [60.23, 59.85, 60.07, 59.75, 59.43]
+  },
+  "webllm": {
+    "version": "0.2.84",
+    "totalTokPerS": 45.46,
+    "selfReportedDecodeTokPerS": 47.77,
+    "selfReportedPrefillTokPerS": [263, 271],
+    "totalRuns": [45.46, 45.87, 44.67]
+  },
+  "deltaTotalPct": 31.7,
+  "deltaDecodePct": 58.0,
+  "supersedes": "2026-07-29 pair 75.74 / 43.75 (\"+73.1%\") — WITHDRAWN: measured after cross-turn prefix reuse (PR #24) and before bench() reset it, so the Zero-TVM half prefilled one token per run while the WebLLM half prefilled the whole prompt. Not like-for-like. Also supersedes the 2026-07-28 v1 pair 25.43 / 14.15 (degraded session, both engines ~3x low).",
+  "notes": "bench/results.json is untouched by cross-engine A/B mode; this file is the durable record. WebLLM has the better first token here: its 263-271 tok/s prefill implies ~150 ms against our measured 453 ms."
+}

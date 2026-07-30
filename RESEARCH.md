@@ -282,7 +282,7 @@ Eleven unique kernels (`int4_matmul` and `int4_matmul_f32` are two variants of t
 
 Transformers.js v4 is the right choice for most production work. Zero-TVM is not trying to replace it. The point of the contrast is that when a stack can assume a single model/precision, most of the compiler and runtime surface is optional.
 
-Speed (2026-07-25 head-to-head): Zero-TVM decode measures 66.33 tok/s on an Apple M2 Max; WebLLM on the same machine, same run, same weights measures 51.98 tok/s (via `webllm-bench.html` / `npm run bench`, recorded in `BENCH.md`). Zero-TVM is ~28% faster than the autotuned compiler on that machine — one machine, one model, one browser, decode-only. An earlier M2 Pro measurement with a since-fixed engine read ~22% behind; the history is preserved in `BENCH.md`.
+Speed (2026-07-30 same-session head-to-head): Zero-TVM measures 69.55 tok/s total wall-clock (prefill + decode) and 83.10 tok/s decode-only on an Apple M2 Max; WebLLM on the same machine, same session, same weights measures 59.95 tok/s total and 63.23 tok/s decode (via `webllm-bench.html` / `npm run bench`, recorded in `BENCH.md`). Zero-TVM is +16.0% on total and +31.4% on decode — one machine, one model, one browser, short-context, one pair. WebLLM has the better time-to-first-token on short prompts (~150 ms implied vs our 291 ms); that negative is published in `BENCH.md`, not buried. An earlier M2 Pro measurement with a since-fixed engine read ~22% behind, and a 2026-07-30 harness fix withdrew two 2026-07-29 Qwen pairs that were not like-for-like; both histories are preserved in `BENCH.md`.
 
 ## What This Repo Is NOT
 

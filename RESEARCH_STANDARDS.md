@@ -106,7 +106,8 @@ Nvidia Vulkan vs Intel iGPU) yields statistically equivalent logits
   2026-06 "22% behind WebLLM" headline was an honest negative encoded
   as a pass-bar miss with documented root cause; it stood until the
   2026-07-25 M2 Max re-measurement (correctness fixes + vec4-load
-  defaults) flipped it to ~28% ahead — the negative's full arc is
+  defaults) flipped it ahead, and the 2026-07-30 corrected protocol
+  restated it as +16% total / +31% decode — the negative's full arc is
   preserved in BENCH.md, not retconned out.
 
 Honest negatives become the project's evidence base. They are not
@@ -165,8 +166,11 @@ sophistication / decreasing strength:
      same OPFS cache.
    - **WebLLM (`mlc-ai/web-llm`) as the head-to-head reference** —
      same hardware, same weights, same prompt. The head-to-head
-     headline (~28% ahead as of the 2026-07-25 M2 Max run; 22%
-     behind before it) is the falsifiable claim.
+     headline (+16.0% total / +31.4% decode as of the 2026-07-30
+     M2 Max run; ~28% ahead on 2026-07-25; 22% behind before that)
+     is the falsifiable claim. Both metrics are always quoted: total
+     wall-clock and decode-only. So is the counter-result — WebLLM
+     wins time-to-first-token on short prompts.
 4. **Experiment**: human-readable output equivalence on a fixed
    prompt corpus, scored against WebLLM's output for "did this
    answer the question equally well."
@@ -301,7 +305,8 @@ Standing entry (**closed 2026-07-25**): the 22% throughput gap
 behind WebLLM on M2 Pro, identical-weights identical-prompt. Closed
 by correctness fixes (fused_ffn f32 accumulation, attention barrier,
 decode off-by-one) plus promoting the measured vec4-load kernels to
-default; the M2 Max head-to-head now reads ~28% *ahead* (BENCH.md).
+default; the M2 Max head-to-head now reads +16.0% total / +31.4%
+decode *ahead* (2026-07-30, BENCH.md).
 Hardware changed too (M2 Pro → M2 Max), so per-hypothesis attribution
 is not fully resolved; the surviving open sub-question — split-K
 attention at long context — is queued in BENCH.md.
@@ -323,8 +328,19 @@ that surfaces the data**, with the full arc preserved. Examples:
   head-to-head artifact to read "22% behind WebLLM" instead. The
   earlier overclaim is preserved in `CHANGELOG.md`. (The arc
   continued: the 2026-07-25 M2 Max re-measurement flipped the
-  headline to ~28% ahead, recorded the same way — measurement first,
+  headline ahead, recorded the same way — measurement first,
   claim second.)
+- **"+73% on Qwen3-4B" / "+93% on Qwen3.5-4B" (2026-07-29) — withdrawn
+  2026-07-30.** The bench harness never reset the engine's absorbed-token
+  record between runs, so once cross-turn prefix reuse shipped, our half
+  of the A/B prefilled one token per run while WebLLM's half prefilled the
+  whole prompt. The comparison was not like-for-like. Both pairs are
+  marked withdrawn *in place* in BENCH.md with the reason, the harness was
+  fixed to reset per run and to split TTFT from decode, and all three
+  models were re-measured. Every pair now carries two numbers — total
+  wall-clock and decode-only — because reporting one alone is
+  cherry-picking. A finding that shrank the headline (+73% → +31.7% on
+  Qwen3-4B) is still a finding.
 - "228 dispatches/token" was the result after fusing QKV+RoPE+KV-append
   into one dispatch; the earlier 3-dispatch-per-layer count is
   archived rather than retconned out.

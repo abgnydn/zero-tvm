@@ -25,7 +25,8 @@ const RESULTS = resolve(ROOT, 'bench/results.json')
 
 if (!existsSync(RESULTS)) {
   console.error(`No ${RESULTS}. Run \`npm run bench\` on a GPU machine first, or write it by hand:`)
-  console.error('  { "ztDecode": 66.33, "webllmDecode": 51.98, "hardware": "Apple M2 Max", "date": "2026-07-25" }')
+  console.error('  { "ztDecode": 69.55, "webllmDecode": 59.95, "hardware": "Apple M2 Max", "date": "2026-07-30" }')
+  console.error('  (ztDecode/webllmDecode are TOTAL wall-clock medians — names predate the 2026-07-30 metric split)')
   process.exit(1)
 }
 
@@ -79,8 +80,9 @@ function reportProse() {
       .split('\n')
       .forEach((line, i) => {
         if (line.includes('<!--bench:')) return // marker-managed, not prose
-        // The % pattern skips range phrasing like "28–31% faster" — that's the
-        // evergreen wording prose is supposed to use.
+        // The % pattern skips en-dash range phrasing like "28–31% faster".
+        // (That particular band was retired on 2026-07-30 — prose should now
+        // cite a dated same-session pair with BOTH metrics; see bench/README.)
         if (/\b\d+(\.\d+)?\s*tok\/s/i.test(line) || /(?<![\d.–-])\b\d+\s*%\s*(faster|slower|behind)/i.test(line))
           hits.push(`  ${rel}:${i + 1}  ${line.trim().slice(0, 96)}`)
       })

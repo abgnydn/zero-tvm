@@ -4,8 +4,9 @@ title: "Zero-TVM: Phi-3-mini in the browser on hand-written WGSL kernels"
 abstract: >-
   A browser-native Phi-3-mini inference engine built on 10 hand-written WGSL
   kernel roles (37 files) and ~2,000 lines of TypeScript, replacing WebLLM /
-  MLC-LLM's TVM-compiled 85-kernel stack while measuring ~28% faster decode
-  on identical quantized weights (Apple M2 Max, 2026-07-25 head-to-head).
+  MLC-LLM's TVM-compiled 85-kernel stack while measuring 16% higher total
+  throughput and 31% higher decode throughput on identical quantized weights
+  (Apple M2 Max, 2026-07-30 same-session head-to-head).
 type: software
 authors:
   - family-names: Gunaydin

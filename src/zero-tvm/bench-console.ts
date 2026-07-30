@@ -57,24 +57,47 @@ export function installBenchConsole(ctx: BenchConsoleCtx): void {
           return prof
         }
 
-        const runs: { tokens: number; seconds: number; tokPerS: number }[] = []
+        const runs: { tokens: number; seconds: number; tokPerS: number; ttftMs: number; decodeTokPerS: number }[] = []
         for (let r = 0; r <= nRuns; r++) {
           const label = r === 0 ? 'warmup' : `run${r}/${nRuns}`
+          // Every run must do a FULL prefill. Without this, cross-turn prefix
+          // reuse makes runs 2..N prefill a single token, so our half of the
+          // A/B measures decode-only while the WebLLM half (a fresh chat
+          // completion per run) still pays prefill inside its wall clock.
+          engine.resetKVTracking()
           const t0 = performance.now()
           let count = 0
-          await engine.generatePipelined(promptIds, nTokens, () => { count++ })
-          const seconds = (performance.now() - t0) / 1000
+          let tFirst = 0
+          await engine.generatePipelined(promptIds, nTokens, () => {
+            if (count === 0) tFirst = performance.now()
+            count++
+          })
+          const tEnd = performance.now()
+          const seconds = (tEnd - t0) / 1000
           const tokPerS = count / seconds
-          console.log(`[bench] ${label}: ${count} tok / ${seconds.toFixed(2)}s = ${tokPerS.toFixed(2)} tok/s`)
-          if (r > 0) runs.push({ tokens: count, seconds, tokPerS })
+          // TTFT covers prefill + the first decode step; decode rate excludes it,
+          // so the two halves can be compared like for like.
+          const ttftMs = tFirst ? tFirst - t0 : seconds * 1000
+          const decodeTokPerS = count > 1 && tFirst ? (count - 1) / ((tEnd - tFirst) / 1000) : tokPerS
+          console.log(
+            `[bench] ${label}: ${count} tok / ${seconds.toFixed(2)}s = ${tokPerS.toFixed(2)} tok/s total` +
+            ` · ttft ${ttftMs.toFixed(0)}ms · decode ${decodeTokPerS.toFixed(2)} tok/s`
+          )
+          if (r > 0) runs.push({ tokens: count, seconds, tokPerS, ttftMs, decodeTokPerS })
         }
+        const medianOf = (xs: number[]) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]
         const sorted = runs.map(r => r.tokPerS).sort((a, b) => a - b)
         const median = sorted[Math.floor(sorted.length / 2)]
         const mean = sorted.reduce((a, b) => a + b, 0) / sorted.length
         const min = sorted[0]
         const max = sorted[sorted.length - 1]
-        const summary = { runs, median, mean, min, max }
-        console.log(`[bench] summary: median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s`)
+        const medianDecode = medianOf(runs.map(r => r.decodeTokPerS))
+        const medianTtftMs = medianOf(runs.map(r => r.ttftMs))
+        const summary = { runs, median, mean, min, max, medianDecode, medianTtftMs }
+        console.log(
+          `[bench] summary: median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s` +
+          ` · decode=${medianDecode.toFixed(2)} tok/s · ttft=${medianTtftMs.toFixed(0)}ms`
+        )
         return summary
       } finally {
         ctx.setBusy(false)
