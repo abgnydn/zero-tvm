@@ -6,7 +6,7 @@ colorTo: purple
 sdk: static
 pinned: true
 license: mit
-short_description: Phi-3-mini in 10 hand-written WGSL kernels (no TVM)
+short_description: Phi-3, Qwen3, Qwen3.5 in hand-written WGSL — beats WebLLM
 tags:
   - llm
   - phi-3

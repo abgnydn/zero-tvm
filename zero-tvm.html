@@ -468,6 +468,35 @@
       padding-right: 0.2rem;
     }
     .msg.user .actions { justify-content: flex-end; }
+
+    /* Reply cut short (context window full, or the user hit Stop). Unlike
+       .actions this is always visible — a truncated answer must never look
+       like a finished one. */
+    .msg.ai .truncation {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      margin-top: 0.7rem;
+      padding: 0.45rem 0.7rem;
+      border: 1px solid var(--border-2);
+      border-left: 2px solid var(--accent-2);
+      border-radius: 8px;
+      background: var(--panel-2);
+      font-size: 0.72rem;
+      line-height: 1.45;
+      color: var(--text-dim);
+    }
+    .truncation-btn {
+      padding: 3px 11px;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: #000;
+      background: var(--accent);
+    }
+    .truncation-btn:hover { background: var(--accent-2); }
+    .truncation-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .action-btn {
       display: inline-flex;
       align-items: center;

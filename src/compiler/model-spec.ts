@@ -90,7 +90,17 @@ export interface ModelSpecBase {
   ffn: number        // FFN intermediate dim (gate→up row stride)
   vocab: number
   pageSize: number   // KV-cache slots per page
-  maxPages: number   // KV-cache page budget
+  /**
+   * KV-cache page budget — the hard context ceiling is maxPages × pageSize.
+   *
+   * Sized per model against a ~1 GiB KV VRAM budget, NOT copied between
+   * specs: `kvBytesPerToken` (below) varies ~12× across our three models, so
+   * one page count buys wildly different context. The rule is
+   * `maxPages = min(1 GiB / (kvBytesPerToken × pageSize), maxSeq / pageSize)`
+   * — except Phi-3, which is already at its trained 4k window and would LOSE
+   * a third of it for no user benefit if squeezed into 1 GiB (see PHI3).
+   */
+  maxPages: number
   maxSeq: number     // model's trained context length
   ropeTheta: number
   rmsEps: number
@@ -137,6 +147,13 @@ export interface ModelSpec extends ModelSpecBase {
   kvPageStride: number   // kvHeads * pageSize * headDim * 2 (f16 per page, K+V)
   vPageOffset: number    // kvHeads * pageSize * headDim (V region start in a page)
   maxContext: number     // maxPages * pageSize (hard KV ceiling in tokens)
+  /** f16 KV bytes ONE context position costs, summed over every attention
+   *  layer: 2 (K+V) × kvHeads × headDim × 2 B × attnLayers. This is what sets
+   *  the VRAM price of maxPages, and it differs by ~12× across our specs
+   *  (Qwen3.5 keeps KV on 8 of 32 layers, Phi-3 on all 32 with MHA), so a
+   *  shared page budget is never the right answer. `maxContext ×
+   *  kvBytesPerToken` is the total KV allocation (halved by ?kv8=1). */
+  kvBytesPerToken: number
   // int8-KV layout products
   kvI8RowWords: number     // headDim / 4 (u32 words per (head,slot,side) row)
   kvI8SlotWords: number    // 2 * kvI8RowWords (K+V)
@@ -232,6 +249,8 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
     kvPageStride: 2 * base.kvHeads * base.pageSize * base.headDim,
     vPageOffset: base.kvHeads * base.pageSize * base.headDim,
     maxContext: base.maxPages * base.pageSize,
+    kvBytesPerToken: 2 * base.kvHeads * base.headDim * 2
+      * layerKinds.filter((k) => k === 'attn').length,
     kvI8RowWords,
     kvI8SlotWords: 2 * kvI8RowWords,
     kvI8HeadWords: base.pageSize * 2 * kvI8RowWords,
@@ -256,6 +275,10 @@ export const PHI3: ModelSpec = makeModelSpec({
   ffn: 8192,
   vocab: 32064,
   pageSize: 16,
+  // 4112 tokens. MHA over 32 layers is our most expensive KV by far —
+  // 384 KiB/token, so this costs 1542 MiB (771 MiB with ?kv8=1). Left alone:
+  // the model is only trained to 4096, and a 1 GiB budget would cut the
+  // window to 2720. The KV bill here is the price of MHA, not of the ceiling.
   maxPages: 257,
   maxSeq: 4096,
   ropeTheta: 10000,
@@ -307,7 +330,11 @@ export const QWEN3_4B: ModelSpec = makeModelSpec({
   ffn: 9728,       // gate_up fused rows = 19456
   vocab: 151936,
   pageSize: 16,
-  maxPages: 257,   // same page budget as Phi-3 for now (model supports 40960)
+  // 7168 tokens. GQA 8:1 over 36 layers = 144 KiB/token → 1008 MiB, just
+  // inside the 1 GiB budget. (The model itself would go to 40960; that would
+  // cost 5.6 GiB of KV, which is not a sane default alongside 2.3 GB of
+  // weights.)
+  maxPages: 448,
   maxSeq: 40960,
   ropeTheta: 1e6,
   rmsEps: 1e-6,
@@ -375,7 +402,13 @@ export const QWEN35_4B: ModelSpec = makeModelSpec({
   ffn: 9216,       // gate_up fused rows = 18432
   vocab: 248320,
   pageSize: 16,
-  maxPages: 257,   // same page budget as the other specs (model supports 262144)
+  // 32768 tokens — 8× Phi-3's window for 2/3 of its VRAM. The hybrid only
+  // keeps KV on its 8 attention layers (the 24 GDN layers carry a fixed-size
+  // recurrent state that does not grow with context), so a position costs
+  // 32 KiB and 32768 of them land on exactly 1024 MiB — 128 MiB per layer
+  // buffer, which is also the WebGPU floor for maxStorageBufferBindingSize.
+  // (maxSeq is 262144; that would be 8 GiB of KV.)
+  maxPages: 2048,
   maxSeq: 262144,
   ropeTheta: 1e7,
   rmsEps: 1e-6,
