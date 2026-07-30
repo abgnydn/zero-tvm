@@ -856,7 +856,10 @@
   </dialog>
 
   <!-- ─────────── Loading overlay ─────────── -->
-  <div class="loading-overlay" id="loading-overlay">
+  <!-- Ships with .active: boot begins the moment the page loads, so the
+       progress/error card must be visible from the first frame. chat.ts's
+       hideLoadingOverlay() removes the class once the engine is ready. -->
+  <div class="loading-overlay active" id="loading-overlay">
     <div class="loading-card">
       <div class="loading-title" id="loading-title">Preparing Zero-TVM</div>
       <div class="loading-status" id="progress-status">Starting…</div>
