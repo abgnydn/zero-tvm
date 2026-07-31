@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>transformers.js Bench — HuggingFace's ONNX Runtime Web baseline vs Zero-TVM</title>
+  <meta name="description" content="Fourth benchmark baseline: transformers.js (ONNX Runtime Web, WebGPU EP) on ONNX q4f16 vs Zero-TVM on MLC q4f16_1. NOT a same-bytes comparison — the block layouts differ, so this measures runtime AND quantization. Also runs the TTFT-vs-prompt-length sweep behind huggingface/transformers.js#1599.">
+  <meta name="theme-color" content="#0a0a0c">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <a href="/" class="back-link">← zerotvm.com</a>
+      <h1>transformers.js (ONNX Runtime Web / WebGPU) Baseline</h1>
+      <span id="badge" class="badge loading">Loading...</span>
+      <span id="stats" class="stats"></span>
+    </header>
+    <p style="max-width:70ch;line-height:1.5">
+      <strong>Not a same-bytes comparison.</strong> transformers.js reads ONNX
+      <code>q4f16</code> (MatMulNBits 4-bit blocks, fp16 activations);
+      Zero-TVM and the WebLLM baseline read MLC <code>q4f16_1</code>. Same bit
+      width and the same activation dtype, but a different block layout and
+      different rounding — the files are not byte-identical. Every number on
+      this page is therefore a <strong>runtime + quantization</strong> result,
+      not the clean runtime-only A/B that
+      <a href="/webllm-bench.html">webllm-bench</a> is. The confound is
+      smaller than the <a href="/wllama-bench.html">wllama</a> page's
+      GGUF Q4_K_M, but it is not zero.
+    </p>
+    <p style="max-width:70ch;line-height:1.5">
+      <code>?ttft=1</code> runs the TTFT-vs-prompt-length sweep instead of the
+      standard throughput protocol — the measurement behind
+      <a href="https://github.com/huggingface/transformers.js/issues/1599">huggingface/transformers.js#1599</a>.
+      <code>?device=wasm</code> is the CPU control run.
+    </p>
+    <pre id="log" class="log"></pre>
+  </div>
+  <footer>@huggingface/transformers (ONNX Runtime Web, WebGPU EP) measured against Zero-TVM — different quantization, read the caveat above.</footer>
+  <script type="module" src="/src/tjs-bench/main.ts"></script>
+</body>
+</html>

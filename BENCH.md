@@ -12,7 +12,269 @@ retconned out.
 Sections dated before 2026-07-30 label their figures "decode". Read those as
 **total wall-clock** — except the Zero-TVM halves of the two withdrawn
 2026-07-29 pairs, which really were decode-only, which is exactly the defect.
-The corrected-protocol section immediately below has the details.
+The corrected-protocol section below has the details.
+
+Two baselines now. **WebLLM/MLC** is the same-bytes A/B: identical q4f16_1
+weight files, so it isolates the runtime. **llama.cpp via wllama** is *not*
+same-bytes — it reads GGUF — so it measures runtime and quantization together.
+The two are reported separately and must not be merged into one table.
+
+## Third baseline: llama.cpp via wllama (WebGPU) (2026-07-30, Apple M2 Max)
+
+**This is not a same-bytes comparison.** wllama reads GGUF — `Q4_K_M` for the
+two Qwen models, `Q4` for Phi-3 — while Zero-TVM and WebLLM read MLC
+`q4f16_1`, so every number in this section compares a **runtime *and* a
+quantization** together, unlike the WebLLM pairs below where both engines load
+byte-identical weight files.
+
+Keep that distinction attached to these figures wherever they are quoted. A
+different quantization changes the bytes moved per token, the dequant kernel,
+and the arithmetic — Q4_K_M's super-block structure is not q4f16_1's, and this
+bench is memory-bound, so weight-format differences land directly on tok/s.
+Nothing here separates "llama.cpp's kernels are slower" from "Q4_K_M is more
+expensive to move and unpack than q4f16_1". Both are folded into one number.
+
+### Why a third baseline
+
+Every Zero-TVM number published before today was measured against WebLLM
+alone. That is one baseline, and it is a compiler stack — which makes it the
+*easier* opponent for the thesis this repo is testing. llama.cpp's WebGPU
+backend (landed in wllama v3.1, upstream PR #215; here `@wllama/wllama@3.5.1`,
+libllama **b9640-dd4623a**) is the hand-written-C++ opponent, and published
+work says it is the stronger one: **arXiv 2605.20706 (LlamaWeb) reports
+llama.cpp-WebGPU decoding 45–69% faster than WebLLM across 16 devices.** If
+that held on this machine, WebLLM would be the wrong baseline to be publishing
+against and several of the numbers above would need re-framing. So it was
+worth measuring rather than assuming.
+
+### Result — it does not reproduce, and the gap runs the other way
+
+| Model | engine | total tok/s | TTFT | decode tok/s | gen tok |
+|---|---|---:|---:|---:|---:|
+| **Phi-3-mini** | Zero-TVM q4f16_1 (paired w/ WebLLM) | **69.70** | 290 ms | **83.20** | 120 |
+| | Zero-TVM q4f16_1 (paired w/ wllama) | 68.15 | 303 ms | 81.61 | 120 |
+| | WebLLM 0.2.80, q4f16_1 | 56.98 | ~113 ms † | 60.07 ‡ | 119 |
+| | **wllama, GGUF Q4** | **24.62** | 321 ms | **26.16** | 119 |
+| **Qwen3-4B** | Zero-TVM q4f16_1 (paired w/ WebLLM) | **60.30** | 446 ms | **75.94** | 127 |
+| | Zero-TVM q4f16_1 (paired w/ wllama) | 53.25 ⚠ | 506 ms | 67.10 ⚠ | 127 |
+| | WebLLM 0.2.84, q4f16_1 | 46.95 | ~138 ms † | 49.44 ‡ | 119 |
+| | **wllama, GGUF Q4_K_M** | **19.22** | 626 ms | **21.59** | 101 |
+| **Qwen3.5-4B** | Zero-TVM q4f16_1 (paired w/ WebLLM) | **65.17** | 171 ms | **73.19** | 94 |
+| | Zero-TVM q4f16_1 (paired w/ wllama) | 63.59 | 170 ms | 71.07 | 94 |
+| | WebLLM 0.2.84, q4f16_1 | 34.54 | ~204 ms † | 36.54 ‡ | 119 |
+| | **wllama, GGUF Q4_K_M** | **16.48** | 853 ms | **19.18** | 95 |
+
+† Derived from WebLLM's self-reported prefill rate against the prompt length,
+not measured — its page reports no TTFT. ‡ WebLLM's own
+`decode_tokens_per_s`. ⚠ Thermally disturbed Zero-TVM run; see "Our own half
+was the noisy one" below.
+
+Same-session deltas, Zero-TVM against wllama (each pair measured back-to-back
+in one browser session, so these are the only deltas that mean anything):
+
+| Model | Δ total | Δ decode |
+|---|---:|---:|
+| Phi-3-mini | **+176.8%** | **+212.0%** |
+| Qwen3-4B (disturbed ZT half) | **+177.0%** | **+210.8%** |
+| Qwen3-4B (clean ZT half, cross-session) | +213.7% | +251.7% |
+| Qwen3.5-4B | **+285.8%** | **+270.5%** |
+
+And the number that actually falsifies the LlamaWeb result on this device —
+**WebLLM beats wllama**, measured the same day on the same machine, in the
+opposite direction and by roughly 3–3.6× the reported magnitude:
+
+| Model | WebLLM total | wllama total | WebLLM is |
+|---|---:|---:|---:|
+| Phi-3-mini | 56.98 | 24.62 | **2.31× faster** |
+| Qwen3-4B | 46.95 | 19.22 | **2.44× faster** |
+| Qwen3.5-4B | 34.54 | 16.48 | **2.10× faster** |
+
+The two engines' medians were taken from separate sessions on the same day, so
+that last table is weaker evidence than the same-session pairs above. It is
+still a 2× effect, well outside the ~10 tok/s session-to-session drift this
+file already documents.
+
+### Raw runs (tok/s, total wall-clock)
+
+- **Phi-3** — ZT/webllm `69.61 69.81 69.54 69.76 69.70` · ZT/wllama
+  `69.84 68.99 63.49 67.25 68.15` · WebLLM `56.98 56.98 57.68` · wllama
+  `24.46 24.63 24.62`
+- **Qwen3-4B** — ZT/webllm `60.17 60.14 60.30 60.71 60.61` · ZT/wllama
+  `48.84 48.31 54.03 53.50 53.25` · WebLLM `46.95 47.56 45.95` · wllama
+  `19.22 19.23 18.85`
+- **Qwen3.5-4B** — ZT/webllm `65.62 65.50 65.17 64.90 56.31` · ZT/wllama
+  `66.25 66.33 63.59 59.61 57.66` · WebLLM `34.79 34.45 34.54` · wllama
+  `16.36 16.48 16.68`
+
+### Prefill is the smoking gun
+
+llama.cpp's WebGPU backend self-reports **79 / 62 / 42 prefill tok/s** (Phi-3 /
+Qwen3 / Qwen3.5) on a 24–31-token prompt, against WebLLM's **249 / 264 / 176**
+on the same prompts. That is a 3–4× prefill deficit, materially worse than its
+~2.3× decode deficit, and 42 tok/s of prefill on a 4B model is not a plausible
+steady-state figure for any competent batched matmul. The most likely reading
+is an immature batched-matmul path on Dawn/Metal rather than a decode-loop
+deficit — which is exactly the kind of thing that would differ on a newer
+libllama build or a non-Apple GPU. It is also the reason not to treat this as
+a verdict on llama.cpp's WebGPU backend in general.
+
+### Our own half was the noisy one — publish that too
+
+Zero-TVM ran twice per model (once against each baseline), which makes its own
+drift visible, and it is not flattering:
+
+- **Qwen3-4B spread 11.7% between the two invocations** — 60.30 clean against
+  53.25 in the wllama session, whose per-run ramp `48.84 → 48.31 → 54.03 →
+  53.50 → 53.25` is a thermally disturbed session, not a measurement. Treat
+  60.30 as Qwen3's value and 53.25 as a degraded outlier.
+- **Qwen3.5 drifted downward inside a single invocation** in both sessions
+  (`65.62 … 56.31` and `66.25 … 57.66`). The median is doing real work there.
+- **wllama was the more stable engine throughout** (≤2% spread on every run
+  set), because at ~20 tok/s it never loads the GPU hard enough to throttle.
+  Our engine's numbers are the ones that need a median and a warm machine.
+
+So the honest form of the headline is a range with a reason, not a point:
+Zero-TVM is roughly **2.8–3.9× wllama's wall-clock throughput on this machine
+at this quantization pairing**, and the top of that range is partly our own
+best-case session.
+
+### Why we distrust our own result
+
+This is a very large win in our own favour against a well-regarded engine,
+which is exactly the situation this file's falsified-experiment entries exist
+to guard against. Recorded reasons to hold it loosely:
+
+1. **One device, one browser, one day** — Apple M2 Max, Chrome 150.0.7871.187.
+   LlamaWeb's claim spans 16 devices; a single Apple GPU cannot refute it, only
+   fail to reproduce it here.
+2. **One libllama build** — b9640-dd4623a, as vendored by
+   `@wllama/wllama@3.5.1`. The WebGPU backend is young and moving fast; a
+   newer build could close much of the prefill gap.
+3. **The quantization confound is unresolved** — see the top of this section.
+   Some unknown share of the gap is Q4_K_M-vs-q4f16_1, not runtime.
+4. **No mechanism was isolated.** The prefill diagnostic points at batched
+   matmul, but nothing here profiles llama.cpp's kernels to prove it.
+
+Conclusion recorded as such: **the WebLLM same-bytes baseline is not retired
+in favour of this one.** It remains the primary comparison because it is the
+one where the weights are identical. This section is a second data point with
+a confound, published because omitting a baseline we actually measured would
+be the worse dishonesty.
+
+### A bug that produced a fake number first (found and fixed pre-publication)
+
+The first sweep reported **Qwen3.5 at 0.00 tok/s ("+Infinity%")** and Qwen3 at
+0 tokens on 2 of 4 runs, while llama.cpp simultaneously self-reported 19–22
+tok/s. The cause: the Qwen3/Qwen3.5 **GGUF chat templates enable thinking by
+default**, so llama.cpp streamed every token as `delta.reasoning_content` and
+the page — counting only `delta.content` — divided 0 tokens by 5.8 s. A
+plausible-looking zero that silently poisoned the median.
+
+It was also a genuine like-for-like defect independent of the counting bug:
+the Zero-TVM half runs Qwen's **non**-thinking template (`model-select.ts`
+passes `{thinking: false}`), so the two halves were not decoding the same
+task. Fixed in `src/wllama-bench/main.ts` with
+`chat_template_kwargs: { enable_thinking: false }` (verified inert on Phi-3 —
+24.85 vs 24.49, noise), plus a `reasoningChunks` counter, a loud zero-token
+guard, and a `contentAccountingOk` flag surfaced through `bench/run.mjs`.
+Every number in this section is post-fix.
+
+Two more protocol traps worth recording, both of which would have inflated
+wllama's number in *its* favour or deflated it unfairly:
+
+- **`cache_prompt` defaults to ON in llama.cpp.** Left alone, runs 2..N skip
+  prefill entirely — the same class of defect as the withdrawn 2026-07-29
+  pairs, pointed the other way. Set to `false`, and the stable 319–443 ms TTFT
+  across runs confirms a full prefill every time.
+- **Cross-origin isolation.** Vite's dev server sets no COOP/COEP, so
+  `SharedArrayBuffer` is absent and wllama silently drops to single-thread
+  WASM. Production already sets `same-origin` + `credentialless` site-wide in
+  `public/_headers`; that is replicated in dev but **scoped to
+  `/wllama-bench*` only**, so the Zero-TVM and WebLLM pages keep serving
+  byte-identical headers and their recorded numbers stay comparable. Result:
+  `crossOriginIsolated: true`, 6 threads.
+
+### WebGPU was proven active, not assumed
+
+`wllama.isSupportWebGPU()` is worthless as proof — it is literally
+`!!navigator.gpu` (`node_modules/@wllama/wllama/src/utils.ts:267`). Instead the
+page captures llama.cpp's own native stdout through `WllamaConfig.logger` and
+greps it. All six wllama halves reported `backend=webgpu`,
+`adapter_info: vendor: apple | architecture: metal-3`,
+`crossOriginIsolated: true`, 6 threads, `contentAccountingOk: true`, 0
+reasoning chunks. Layers offloaded: Phi-3 **33/33** (2228.82 MiB WebGPU model
+buffer), Qwen3 **37/37** (2375.91 MiB), Qwen3.5 **33/33** (2603.51 MiB).
+`adapter_info` is only emitted by `ggml-webgpu.cpp` after both a `GPUAdapter`
+and a `GPUDevice` were acquired.
+
+Falsification control (`?ngl=0`, wired in for exactly this), same session,
+Phi-3:
+
+| | total | decode | TTFT | detected backend | layers |
+|---|---:|---:|---:|---|---|
+| default (`n_gpu_layers=99999`) | **24.62** | 26.16 | 321 ms | `webgpu` | 33/33 |
+| `?ngl=0` | **8.29** | 9.71 | 2199 ms | `wasm-cpu` | 0/33 |
+
+3.0× wall-clock / 2.7× decode. The GPU is doing the work; the log line is not
+cosmetic. `window.wllamaResult.backend` / `.webgpuProven` / `.adapterInfo` /
+`.layersOnGpu` carry this to the harness, and `bench/run.mjs` prints
+`*** WEBGPU NOT PROVEN ***` if it ever flips.
+
+### Sanity checks
+
+- **Output is coherent on all three models**, not garbage — e.g. Qwen3.5:
+  *"Photosynthesis is the process by which green plants, algae, and some
+  bacteria convert light energy into chemical energy…"*
+- **Token counts vs the 120 target:** Phi-3 119, Qwen3 101, Qwen3.5 95 — all
+  `finish_reason: stop`, none truncated.
+- **No wall-clock/self-report disagreement remains.** wllama's own
+  `predicted_per_second` sits 3–17% above the page's decode figure (26.61 vs
+  26.16; 22.23 vs 21.59; 19.59 vs 19.18), as expected: llama.cpp times decode
+  only, the page's window includes per-token JS callback overhead.
+- **Independent replication** in a fresh session with a separate driver script
+  agreed within 2.5%: 24.00 / 19.13 / 16.43.
+- **Weights verified byte-exact** against HuggingFace `content-length` with
+  `GGUF` magic present — `phi3-q4.gguf` 2,393,231,072 B; `qwen3-4b-q4km.gguf`
+  2,497,280,256 B; `qwen35-4b-q4km.gguf` 2,740,937,888 B.
+
+### What a true same-bytes race would require — not done
+
+To turn this into the same kind of A/B the WebLLM baseline is, **Zero-TVM
+would have to read GGUF directly**: a GGUF container parser (header, KV
+metadata, tensor directory), a `Q4_K_M` dequant kernel matching llama.cpp's
+super-block layout (256-element blocks, 6-bit sub-scales/mins, per-block f16
+scale — structurally unlike q4f16_1's flat group-wise scheme), and a name
+mapping from GGUF tensor names to this engine's parameter scheme. That is a
+separate project and **it has not been done.** Until it is, no number in this
+section is a clean runtime comparison, and this section must not be quoted as
+one.
+
+The cheaper half-step, also not done: run WebLLM and Zero-TVM against a
+q4f16_1 build while running wllama against a GGUF quantization chosen to match
+bits-per-weight as closely as possible, and report the bpw of each. That would
+bound the confound without removing it.
+
+### Reproducing
+
+```bash
+export PUPPETEER_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+BENCH_BASELINE=wllama npm run bench                              # Phi-3 pair
+BENCH_BASELINE=wllama BENCH_QUERY="?model=qwen3"  npm run bench  # Qwen3-4B pair
+BENCH_BASELINE=wllama BENCH_QUERY="?model=qwen35" npm run bench  # Qwen3.5-4B pair
+```
+
+GGUF files are served from `.weights-local/gguf/` by the `/local-gguf/*` dev
+middleware in `vite.config.ts` — fully offline, no HuggingFace fetch. The page
+runs directly at `/wllama-bench.html?model=phi3|qwen3|qwen35`, with `&ngl=0`
+for the CPU falsification control.
+
+`BENCH_BASELINE=wllama` **deliberately does not write `bench/results.json`**
+and skips `sync-docs.mjs`. That file's schema field is `webllmDecode`, which
+`sync-docs.mjs` propagates into the published headline numbers; a GGUF figure
+landing there unlabelled is precisely the confusion this section exists to
+prevent. The pairs are printed to stdout and recorded in
+`bench/results/*-wllama.json` instead.
 
 ## Corrected protocol (2026-07-30, Apple M2 Max) — all three pairs re-measured
 
@@ -943,8 +1205,13 @@ Simulator: `src/zero-tvm/spec-sim.ts`. Window helper: `await specSim(160, N, K)`
 ## How to reproduce
 
 ```bash
-npm run bench   # both engines, identical local weights, 128 tok × 5 runs;
-                # writes bench/results.json and syncs the marked numbers
+npm run bench   # Zero-TVM vs WebLLM, identical local q4f16_1 weights,
+                # 128 tok × 5 runs; writes bench/results.json and syncs
+                # the marked numbers
+
+BENCH_BASELINE=wllama npm run bench   # Zero-TVM vs llama.cpp/wllama (GGUF).
+                # NOT same-bytes — see "Third baseline" above. Prints the pair,
+                # never writes results.json, never runs sync-docs.
 ```
 
 ```js

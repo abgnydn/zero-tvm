@@ -1,0 +1,48 @@
+{
+ "model": "Qwen3.5-4B",
+ "engine": "zero-tvm",
+ "date": "2026-07-31",
+ "hardware": "Apple M2 Max",
+ "quant": "MLC q4f16_1",
+ "result": {
+  "mode": "ttft-sweep",
+  "engine": "zero-tvm",
+  "runsPerPoint": 2,
+  "genTokensPerPoint": 64,
+  "points": [
+   {
+    "targetTokens": 64,
+    "promptTokens": 60,
+    "ttftMsRuns": [
+     605.2999999821186,
+     628
+    ],
+    "ttftMs": 628,
+    "decodeTokPerS": 31.960227272437354,
+    "chunks": 1
+   },
+   {
+    "targetTokens": 1024,
+    "promptTokens": 1025,
+    "ttftMsRuns": [
+     9507.700000017881,
+     10144.40000000596
+    ],
+    "ttftMs": 10144.40000000596,
+    "decodeTokPerS": 31.396391906801124,
+    "chunks": 16
+   },
+   {
+    "targetTokens": 2048,
+    "promptTokens": 2044,
+    "ttftMsRuns": [
+     21915.40000000596,
+     25132.5
+    ],
+    "ttftMs": 25132.5,
+    "decodeTokPerS": 23.25152242111091,
+    "chunks": 32
+   }
+  ]
+ }
+}

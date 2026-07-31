@@ -5,7 +5,7 @@
 [![CI](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml/badge.svg)](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Live](https://img.shields.io/badge/live-zerotvm.com-6ea8ff)](https://zerotvm.com)
-[![Bench](https://img.shields.io/badge/bench-vs%20WebLLM-orange)](./BENCH.md)
+[![Bench](https://img.shields.io/badge/bench-vs%20WebLLM%20%2B%20llama.cpp-orange)](./BENCH.md)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20838918.svg)](https://doi.org/10.5281/zenodo.20838918)
 
 **[zerotvm.com](https://zerotvm.com)**
@@ -25,6 +25,8 @@
 | JS bundle (chat page, excl. weights) | **5.9 MB** / 2.1 MB gz | **157 kB** / 33 kB gz |
 
 Same model, same quantized weights. [WebLLM / MLC-LLM](https://webllm.mlc.ai/) — the standard way to run a browser LLM — ships an Apache-TVM pipeline that emits 85 autotuned WGSL kernels driven from a WASM scheduler. This repo replaces that whole stack with **10 kernel roles (55 WGSL kernels — 37 hand-written files plus 18 int4-matmul variants emitted by a small readable generator, counting subgroup/tiled/int8 variants) and ~2,000 lines of TypeScript** (engine + tokenizer + weight loader) — and, as of the 2026-07-30 head-to-head, runs faster than it on the one machine measured. The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
+
+**Two baselines, measured separately.** The table above is the **compiler-stack** baseline — WebLLM/TVM on *byte-identical* q4f16_1 weights, so it isolates the runtime. Since 2026-07-30 there is also a **hand-written-C++ / GGUF** baseline: llama.cpp's WebGPU backend via [wllama](https://github.com/ngxson/wllama) 3.5.1 (libllama b9640). **That one is not a same-bytes comparison** — wllama reads GGUF (Q4_K_M / Q4) while Zero-TVM and WebLLM read MLC q4f16_1, so it compares a runtime *and* a quantization together, and the two baselines must not be merged into one table. On this M2 Max, Zero-TVM measured +177% / +178% / +286% on total wall-clock against it (Phi-3 68.15 vs 24.62, Qwen3-4B 53.25 vs 19.22, Qwen3.5-4B 63.59 vs 16.48 tok/s) — and WebLLM itself came out 2.1–2.4× faster than wllama, the *opposite* direction from the 45–69% wllama-over-WebLLM decode win reported in arXiv 2605.20706 across 16 devices. A win that large in our own favour against a well-regarded engine is a reason for suspicion, not a headline: one device, one libllama build, an unresolved quantization confound, and llama.cpp's implausibly low 42–79 tok/s prefill all bound how far it travels. The WebLLM same-bytes pair stays the primary comparison. Full writeup, raw runs, WebGPU proof and falsification control: [BENCH.md § Third baseline](BENCH.md).
 
 **Two numbers, always both.** *Total* is wall-clock throughput with prefill included — both engines doing identical work, the conservative figure. *Decode* excludes prefill and is the kernel-level figure. Quoting one without the other is cherry-picking, so this repo quotes both everywhere. (Until 2026-07-30 it quoted one blended number labelled "decode"; the bench harness had also stopped making our half pay prefill after cross-turn prefix reuse shipped, which invalidated two published Qwen comparisons. The defect, the fix, and the withdrawn pairs are written up at the top of [BENCH.md](BENCH.md).)
 
@@ -60,6 +62,8 @@ Measured result on an Apple M2 Max, Chrome 150, identical Phi-3-mini-q4f16_1 wei
 The reading that fits is that compiler stacks have had less time to tune newer architectures, so there is more room for a hand-written kernel set to take. That is an observation across three points on one machine on one day, not a proven law — no mechanism was isolated and nothing controls for how differently each model stresses the two engines. Treat it as a hypothesis worth testing on a fourth model.
 
 **Where we lose: time to first token on short prompts.** WebLLM's prefill runs 251–271 tok/s on Phi-3/Qwen3, implying a TTFT around 150 ms on Phi-3 where we measure 291 ms — and 453 ms on Qwen3-4B. We win sustained decode decisively and lose the first-token sprint on short inputs. It is specifically a *short*-prompt weakness: chunked prefill measures 202 tok/s on an 816-token prompt, and cross-turn prefix reuse removes prefill entirely on follow-up turns. It is the top open item on BENCH.md's levers list.
+
+**And where we look worse than we'd like: run-to-run stability.** Zero-TVM ran twice per model during the 2026-07-30 wllama round, and its two Qwen3-4B medians disagreed by 11.7% (60.30 vs a thermally disturbed 53.25); Qwen3.5 drifted downward inside single invocations in both sessions. wllama held ≤2% spread throughout — because at ~20 tok/s it never loads the GPU hard enough to throttle. Our numbers need a median and a warm machine; theirs don't. Recorded in [BENCH.md](BENCH.md), not smoothed over.
 
 The scope of these numbers matters: one machine, one browser, short-context bench, one same-session pair per model. But within that scope the question the repo was built to test now has a sharper answer — the ten hand-written kernels aren't merely "close enough" to the 85 autotuned ones; on this hardware they win on throughput. The repo also makes the stack *auditable*: if you want to instrument a layer, add a new fusion, test a different attention pattern, or teach someone how browser LLM inference works at the metal, there is no compiler in the way — just WGSL and a few hundred lines of TypeScript orchestrating it.
 
@@ -208,6 +212,11 @@ validate.html           → src/zero-tvm/validate.ts Multi-prompt smoke test dri
 webllm-bench.html       → src/webllm-bench/main.ts (3) Honesty check: WebLLM driven
                                                        against the same local weights
                                                        for a fair head-to-head
+wllama-bench.html       → src/wllama-bench/main.ts (4) Second honesty check:
+                                                       llama.cpp's WebGPU backend via
+                                                       wllama. GGUF, NOT the same
+                                                       weight bytes — runtime AND
+                                                       quantization differ (BENCH.md)
 
 demo.html               → src/demo.ts              Dispatch timeline visualization
 dump.html               → src/dump-tvm.ts          Captures all 85 TVM-emitted WGSL
