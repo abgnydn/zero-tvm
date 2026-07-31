@@ -340,8 +340,12 @@ export default defineConfig({
         demo:          resolve(__dirname, 'demo.html'),
         validate:      resolve(__dirname, 'validate.html'),
         'webllm-bench':resolve(__dirname, 'webllm-bench.html'),
-        'wllama-bench':resolve(__dirname, 'wllama-bench.html'),
-        'tjs-bench':   resolve(__dirname, 'tjs-bench.html'),
+        // wllama-bench and tjs-bench are DEV-ONLY benchmark harnesses. They are
+        // deliberately not built or deployed: they pull in llama.cpp's 7.7 MB
+        // wasm and ONNX Runtime's >10 MB wasm respectively, which bloat the
+        // deploy and exceed HuggingFace's 10 MiB non-LFS file limit. bench/run.mjs
+        // drives them through the vite DEV server, which serves any root HTML
+        // regardless of build inputs, so benchmarking is unaffected.
         architecture:  resolve(__dirname, 'architecture.html'),
         docs:          resolve(__dirname, 'docs.html'),
         dump:          resolve(__dirname, 'dump.html'),
