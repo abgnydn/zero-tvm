@@ -6,27 +6,26 @@ colorTo: purple
 sdk: static
 pinned: true
 license: mit
-short_description: Phi-3, Qwen3, Qwen3.5 in hand-written WGSL — beats WebLLM
+thumbnail: https://huggingface.co/spaces/abgunaydin/zero-tvm/resolve/main/og.png
+short_description: Phi-3, Qwen3 and Qwen3.5 in the browser on hand-written WGSL
 tags:
-  - llm
-  - phi-3
-  - phi3
-  - microsoft-phi
   - webgpu
-  - wgsl
-  - kernel-fusion
-  - in-browser
-  - mlc
-  - webllm
+  - llm
   - inference
+  - on-device
+  - wgsl
 models:
+  - Qwen/Qwen3.5-4B
+  - Qwen/Qwen3-4B
   - microsoft/Phi-3-mini-4k-instruct
+  - mlc-ai/Qwen3.5-4B-q4f16_1-MLC
+  - mlc-ai/Qwen3-4B-q4f16_1-MLC
   - mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC
 ---
 
 # Zero-TVM
 
-**Phi-3-mini running in a browser on hand-written WGSL shaders. No TVM. No WebLLM runtime. No compiler.**
+**Three models running in your browser on ~4,200 lines of hand-written WGSL. No TVM. No ONNX. No WASM runtime.**
 
 The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles (55 WGSL implementations — 37 files + 18 generated int4 variants, counting subgroup / tiled / int8 variants) and about 2,000 lines of TypeScript**, using the same Phi-3-mini-q4f16_1 weights.
 
