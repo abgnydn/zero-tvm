@@ -85,9 +85,32 @@ fitted trend — every op that grows is inside a `Scan` body. Extrapolated, a 10
 is ~394k body-op invocations before the first token.
 
 Those are CPU timings and I'm not offering them as a WebGPU measurement. But the *count* is a
-property of graph execution rather than of the backend, and on a GPU backend each invocation
-is a kernel dispatch rather than a cheap function call — which is why I'd expect this to hurt
-WebGPU considerably more than it hurts the CPU run above.
+property of graph execution rather than of the backend.
+
+**And the WebGPU backend can't run the `Scan` at all.** onnxruntime-web has no WebGPU kernel
+for it, so it falls back to CPU. ORT reports this itself with `logSeverityLevel: 0`:
+
+```
+[GetCapability] webgpu kernel not found in registries for Op type: Scan
+[transformer_memcpy] Add MemcpyFromHost after y for JsExecutionProvider
+Node placements
+  Node(s) placed on [JsExecutionProvider]. Number of nodes: 9
+    Exp, Mul, Mul, ReduceSum, Sub, Add, Mul, MatMul, MemcpyFromHost
+  Node(s) placed on [CPUExecutionProvider]. Number of nodes: 1
+    Scan ()
+```
+
+The loop control sits on CPU while the body ops are assigned to WebGPU, with a host copy
+inserted at the boundary. `Scan`, `If` and `Loop` are likewise absent from the shipped JSEP op
+registry (178 entries), which matches. Since this is a property of the op registry rather than
+of any particular model, it reproduces with a ~1 KB model of the same shape — no 2.5 GB
+download needed; the `MatMul` in that toy sits on WebGPU, so the split is genuine partitioning
+rather than a wholesale CPU fallback.
+
+That is the part I'd flag as most relevant: a per-position recurrence, 24 layers deep, whose
+loop is driven from the CPU side while its body dispatches to the GPU. I have not attributed
+wall-clock on WebGPU, so I'm not claiming a share of the 16 s — but it's a concrete mechanism
+that would not show up by looking at the attention kernels.
 
 **One thing that may have sent the earlier investigation sideways:** Qwen3.5's hybrid is
 3:1 **gated-DeltaNet (linear attention)** + full attention, not sliding-window attention.

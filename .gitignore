@@ -5,3 +5,5 @@ dist/
 *.log
 .DS_Store
 .weights-local/
+docs/webgpu-placement/ort-dist/
+docs/webgpu-placement/toy_scan.onnx
