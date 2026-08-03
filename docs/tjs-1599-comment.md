@@ -34,7 +34,8 @@ cause is an ONNX `Scan` on the prefill path rather than anything in the attentio
 
 The ONNX weights live in sibling `.onnx_data` files, so the *graph* is only 1.4 MB and its
 structure is cheap to check. Here's a Colab that re-derives everything below in about 15
-seconds — no GPU, no auth, and it downloads only that 1.4 MB:
+seconds — no GPU, no auth, and it downloads only that 1.4 MB (an optional appendix repeats
+the runtime check against the real weights):
 
 **[Open in Colab](https://colab.research.google.com/github/abgnydn/zero-tvm/blob/tjs-1599-repro/docs/tjs-1599-repro.ipynb)**
 
@@ -65,6 +66,28 @@ takes `state_in, q_in, k_in, v_in, beta_in, g_in` and is 16 nodes
 So a 1024-token prompt runs on the order of 1024 × 24 × 16 ≈ 390k sequential node
 executions before the first token can be produced, and that count grows linearly with
 prompt length with nothing batched across positions.
+
+**Does the runtime actually execute it that way?** A fair objection is that the shipped graph
+says nothing about execution — an optimizer might fold the `Scan` away. It doesn't. Running
+prefill under ONNX Runtime's profiler with `ORT_ENABLE_ALL` (CPU EP; the notebook's appendix
+reproduces this):
+
+| prompt tokens | `Scan` nodes | delta-rule body-op invocations |
+|---:|---:|---:|
+| 16 | 24 | 6,785 |
+| 32 | 24 | 12,929 |
+| 64 | 24 | 25,217 |
+| 128 | 24 | 49,793 |
+
+That is exactly `384 × prompt_tokens + 641`, where 384 = 24 `Scan` layers × 16 body nodes.
+The residual is *identical* at every length, so this is a counting identity rather than a
+fitted trend — every op that grows is inside a `Scan` body. Extrapolated, a 1024-token prompt
+is ~394k body-op invocations before the first token.
+
+Those are CPU timings and I'm not offering them as a WebGPU measurement. But the *count* is a
+property of graph execution rather than of the backend, and on a GPU backend each invocation
+is a kernel dispatch rather than a cheap function call — which is why I'd expect this to hurt
+WebGPU considerably more than it hurts the CPU run above.
 
 **One thing that may have sent the earlier investigation sideways:** Qwen3.5's hybrid is
 3:1 **gated-DeltaNet (linear attention)** + full attention, not sliding-window attention.
