@@ -107,10 +107,30 @@ of any particular model, it reproduces with a ~1 KB model of the same shape — 
 download needed; the `MatMul` in that toy sits on WebGPU, so the split is genuine partitioning
 rather than a wholesale CPU fallback.
 
-That is the part I'd flag as most relevant: a per-position recurrence, 24 layers deep, whose
-loop is driven from the CPU side while its body dispatches to the GPU. I have not attributed
-wall-clock on WebGPU, so I'm not claiming a share of the 16 s — but it's a concrete mechanism
-that would not show up by looking at the attention kernels.
+**How much of the time is that?** The `Scan` body is pure elementwise/reduce arithmetic with
+no weights, so it can be lifted out of the export into a standalone ~2.5 KB model (again from
+just the 1.4 MB graph) and timed on WebGPU on its own, at real dimensions — state
+`[1,32,128,128]`, one layer. Cost per position comes out flat across a 252× range of sequence
+length, which is what a loop that batches nothing looks like:
+
+| | run 1 | run 2 |
+|---|---:|---:|
+| ms per position, one layer | 2.83 | 2.54 |
+| one layer, 252 positions | 714 ms | 640 ms |
+| **× 24 GDN layers** | **17.1 s** | **15.4 s** |
+
+That's ~61–68 ms per prompt token from the recurrence alone, against ~16 s TTFT reported here
+at a comparable prompt length. I'd treat the gap between the two runs as the honest error bar
+— absolute numbers move with machine load — but the conclusion is not sensitive to it: this
+isn't one contributor among several, it's most of the prefill.
+
+(Apple M2 Max, Chrome, onnxruntime-web 1.22.0-dev. The isolated `Scan` is measured on its own
+rather than in situ, so treat it as the cost of the mechanism rather than a full-model
+benchmark.)
+
+So: a per-position recurrence, 24 layers deep, whose loop is driven from the CPU side while
+its body dispatches to the GPU — a mechanism that wouldn't show up by looking at the attention
+kernels at all.
 
 **One thing that may have sent the earlier investigation sideways:** Qwen3.5's hybrid is
 3:1 **gated-DeltaNet (linear attention)** + full attention, not sliding-window attention.

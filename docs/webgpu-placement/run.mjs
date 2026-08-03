@@ -7,7 +7,8 @@
  *
  *   python3 build-toy.py                       # writes toy_scan.onnx
  *   cp -r node_modules/onnxruntime-web/dist ./ort-dist
- *   node run.mjs
+ *   node run.mjs                 # placement
+ *   node run.mjs scan-bench.html  # cost of the real Scan on WebGPU
  */
 import http from 'node:http'
 import { readFile } from 'node:fs/promises'
@@ -38,7 +39,8 @@ const logs = []
 page.on('console', (m) => logs.push(m.text()))
 page.on('pageerror', (e) => logs.push('PAGEERROR: ' + e.message))
 
-await page.goto('http://127.0.0.1:8731/index.html', { waitUntil: 'domcontentloaded' })
+const PAGE = process.argv[2] || 'index.html'
+await page.goto(`http://127.0.0.1:8731/${PAGE}`, { waitUntil: 'domcontentloaded' })
 try { await page.waitForFunction('window.__done === true', { timeout: 120_000 }) }
 catch { logs.push('TIMEOUT') }
 await new Promise((r) => setTimeout(r, 2000))

@@ -7,3 +7,4 @@ dist/
 .weights-local/
 docs/webgpu-placement/ort-dist/
 docs/webgpu-placement/toy_scan.onnx
+docs/webgpu-placement/real_scan.onnx

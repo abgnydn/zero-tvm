@@ -43,9 +43,39 @@ node run.mjs
 the `MatMul` is a op WebGPU definitely supports, so it shows the partitioning
 is real and not a wholesale CPU fallback.
 
+## How much of the prefill time is this?
+
+`build-real-scan.py` lifts the export's **own** delta-rule `Scan` out into a
+standalone ~2.5 KB model (the body is pure elementwise/reduce arithmetic with no
+weights, so only the 1.4 MB graph is needed), and `scan-bench.html` times it on
+WebGPU at real dimensions — state `[1,32,128,128]`, one layer.
+
+```bash
+python3 build-real-scan.py         # 1.4 MB download -> real_scan.onnx (2.5 KB)
+node run.mjs scan-bench.html
+```
+
+On an M2 Max, Chrome, cost per position is flat across a 252x range of sequence
+length — the signature of a loop that batches nothing:
+
+| | run 1 | run 2 |
+|---|---:|---:|
+| ms per position (one layer) | 2.83 | 2.54 |
+| one layer, 252 positions | 714 ms | 640 ms |
+| **x24 GDN layers** | **17.1 s** | **15.4 s** |
+
+Per prompt token that is ~61–68 ms of `Scan` alone. The issue reports ~16 s TTFT
+at a comparable prompt length, and an end-to-end sweep on this same machine gave
+72–74 ms per prompt token. So the recurrence is not one contributor among many —
+it accounts for most of the prefill.
+
+Treat the spread between runs as the real error bar; absolute numbers move with
+machine load, which is why the range is quoted rather than a single figure.
+
 ## Scope
 
-Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops are
-placed on WebGPU; a memcpy is inserted between them. Observed on this toy model
-in Chrome with onnxruntime-web 1.22.0-dev. Not measured here: the placement of
-the real model's fp16 bodies, or any wall-clock attribution.
+Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
+WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
+~15–17 s for 24 layers at a 252-token prompt. Chrome, onnxruntime-web
+1.22.0-dev, Apple M2 Max. Not measured: the full model end-to-end in one
+session, or any other backend.
