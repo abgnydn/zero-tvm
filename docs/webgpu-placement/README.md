@@ -85,3 +85,28 @@ WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
 ~13-17 s for 24 layers at a 252-token prompt. Chrome, Apple M2 Max,
 onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: the full model
 end-to-end in one session, or any backend other than WebGPU.
+
+## Full model vs isolated Scan (same session)
+
+`full-model-bench.html` loads the real 2.5 GB decoder in the browser and times
+prefill, alongside the isolated `Scan`, in one session — so the ratio is not
+affected by machine load the way two separate absolute numbers would be.
+Serve `.weights-local/onnx/Qwen3.5-4B-ONNX/onnx` at `/weights/` (stream it; the
+data file is 2.1 GB) and open with `?s=252`.
+
+One clean run (session created in 4.6 s, three repeats within 0.5%):
+
+| | |
+|---|---:|
+| isolated `Scan` x24, 252 positions | 13.10 s |
+| **full decoder prefill, 252 tokens** | **13.11 s** (13.05 / 13.11 / 13.12) |
+
+i.e. the recurrence accounted for essentially the whole prefill. **Treat this as
+one data point, not a settled number.** Repeat runs afterwards were unusable: a
+leaked browser process was pegging a core, the isolated `Scan` slowed 4.4x
+(546 ms -> 1229 ms at the same size), session creation went 4.6 s -> 37.6 s, and
+the ratio moved to ~73%. Confirm on a quiet machine before quoting a percentage.
+
+Worth noting *why* it degrades so hard under CPU load: the loop control runs on
+the CPU, so CPU contention hits this workload directly. A GPU-bound stage would
+not lose 4.4x to a single busy core.
