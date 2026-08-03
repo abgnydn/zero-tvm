@@ -22,7 +22,10 @@
 # If you want a numbers claim in here later, re-measure interleaved on an idle
 # machine and add it as a separate follow-up comment.
 #
-# Before posting, replace COLAB_LINK_HERE with the real notebook URL.
+# The Colab link below is live and was checked anonymously (14 cells render,
+# no sign-in needed to read). It points at the `tjs-1599-repro` branch — if you
+# ever delete or rename that branch, the link dies. Merge the notebook to main
+# before posting if you want it to outlive the branch.
 
 ---
 
@@ -33,7 +36,7 @@ The ONNX weights live in sibling `.onnx_data` files, so the *graph* is only 1.4 
 structure is cheap to check. Here's a Colab that re-derives everything below in about 15
 seconds — no GPU, no auth, and it downloads only that 1.4 MB:
 
-**COLAB_LINK_HERE**
+**[Open in Colab](https://colab.research.google.com/github/abgnydn/zero-tvm/blob/tjs-1599-repro/docs/tjs-1599-repro.ipynb)**
 
 ```python
 import onnx, collections
