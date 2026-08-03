@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files</title>
-  <meta name="description" content="Phi-3-mini decoding via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime, readable end-to-end.">
+  <title>Zero-TVM — Phi-3 &amp; Qwen3 in your browser · 10 kernels across 37 WGSL files</title>
+  <meta name="description" content="Phi-3-mini, Qwen3-4B and Qwen3.5-4B decoding in the browser via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime, readable end-to-end.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zerotvm.com/">
   <meta property="og:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files">
-  <meta property="og:description" content="Phi-3-mini decoding via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
+  <meta property="og:description" content="Three models — Phi-3-mini, Qwen3-4B, Qwen3.5-4B — decoding on 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files">
-  <meta name="twitter:description" content="Phi-3-mini decoding via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
+  <meta name="twitter:description" content="Three models — Phi-3-mini, Qwen3-4B, Qwen3.5-4B — decoding on 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript. Hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack — readable end-to-end.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <link rel="canonical" href="https://zerotvm.com/">
   <script type="application/ld+json">
@@ -28,7 +28,7 @@
         "url": "https://zerotvm.com",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Any (WebGPU browser, Chrome or Edge)",
-        "description": "Phi-3-mini decoding in the browser via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime.",
+        "description": "Phi-3-mini, Qwen3-4B and Qwen3.5-4B decoding in the browser via 10 kernel roles across 37 WGSL files and ~2,000 lines of TypeScript — hand-written WGSL replacing WebLLM's compiler-emitted 85-kernel stack. No TVM, no WebLLM runtime.",
         "author": { "@id": "https://zerotvm.com#author" },
         "isPartOf": {
           "@type": "CreativeWork",
@@ -715,14 +715,15 @@
   <div class="hero-badge">⚡ WebGPU · No Framework · No TVM</div>
 
   <h1>
-    Run <span class="accent">Phi-3</span> in your browser<br>
-    with <span class="green">10 kernels / 37 WGSL files</span>
+    Run <span class="accent">Phi-3 &amp; Qwen3</span><br>
+    in your browser on <span class="green">10&nbsp;kernels</span>
   </h1>
 
   <p class="hero-sub">
     In <strong>February 2026</strong>, Hugging Face shipped Transformers.js v4 — a C++ WebGPU runtime built with
     Microsoft's ONNX Runtime team — as the production answer for browser LLM inference.
-    In <strong>April 2026</strong>, this repo shows that for Phi-3 Mini specifically, the answer is
+    This repo shows that for decoder-only models of this shape — Phi-3-mini, Qwen3-4B, and the
+    Qwen3.5-4B hybrid with gated DeltaNet — the answer is
     <span class="green">10 kernel roles across 37 WGSL files</span> and ~2,000 lines of TypeScript.
     No WebLLM, no TVM, no ONNX, no WASM runtime.
   </p>
@@ -741,12 +742,12 @@
       <div class="lbl">tok/s total on M2 Max (83.1 decode)</div>
     </div>
     <div class="hero-stat">
-      <div class="val p">10 / 27</div>
+      <div class="val p">10 / 37</div>
       <div class="lbl">kernel roles / WGSL files</div>
     </div>
     <div class="hero-stat">
-      <div class="val">3.8B</div>
-      <div class="lbl">parameter model</div>
+      <div class="val">3</div>
+      <div class="lbl">models · 3.8B–4B</div>
     </div>
     <div class="hero-stat">
       <div class="val g">0</div>
