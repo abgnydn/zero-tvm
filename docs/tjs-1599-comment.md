@@ -88,45 +88,47 @@ Those are CPU timings and I'm not offering them as a WebGPU measurement. But the
 property of graph execution rather than of the backend.
 
 **And the WebGPU backend can't run the `Scan` at all.** onnxruntime-web has no WebGPU kernel
-for it, so it falls back to CPU. ORT reports this itself with `logSeverityLevel: 0`:
+for it, so it falls back to CPU. ORT reports this itself with `logSeverityLevel: 0` — this is
+on `onnxruntime-web@1.26.0-dev.20260416`, the build `@huggingface/transformers@4.2.0` pins:
 
 ```
 [GetCapability] webgpu kernel not found in registries for Op type: Scan
-[transformer_memcpy] Add MemcpyFromHost after y for JsExecutionProvider
 Node placements
-  Node(s) placed on [JsExecutionProvider]. Number of nodes: 9
-    Exp, Mul, Mul, ReduceSum, Sub, Add, Mul, MatMul, MemcpyFromHost
-  Node(s) placed on [CPUExecutionProvider]. Number of nodes: 1
-    Scan ()
+  Node(s) placed on [WebGpuExecutionProvider]. Number of nodes: 16
+  Node(s) placed on [CPUExecutionProvider].    Number of nodes: 1
 ```
 
-The loop control sits on CPU while the body ops are assigned to WebGPU, with a host copy
-inserted at the boundary. `Scan`, `If` and `Loop` are likewise absent from the shipped JSEP op
-registry (178 entries), which matches. Since this is a property of the op registry rather than
-of any particular model, it reproduces with a ~1 KB model of the same shape — no 2.5 GB
-download needed; the `MatMul` in that toy sits on WebGPU, so the split is genuine partitioning
-rather than a wholesale CPU fallback.
+Those 16 are the delta-rule body; the 1 is the `Scan` itself. So the loop control sits on CPU
+while its body is dispatched to the GPU, and a `MemcpyFromHost` gets inserted at the boundary.
+`Scan`, `If` and `Loop` are also absent from the shipped op registry. I get the identical split
+on the older `1.22.0-dev` (where the provider was still named `JsExecutionProvider`), so this
+isn't a regression in one build.
+
+Because it's a property of the op registry rather than of any particular model, none of this
+needs the 2.5 GB weights — a small model with the same shape reproduces it.
 
 **How much of the time is that?** The `Scan` body is pure elementwise/reduce arithmetic with
 no weights, so it can be lifted out of the export into a standalone ~2.5 KB model (again from
 just the 1.4 MB graph) and timed on WebGPU on its own, at real dimensions — state
-`[1,32,128,128]`, one layer. Cost per position comes out flat across a 252× range of sequence
-length, which is what a loop that batches nothing looks like:
+`[1,32,128,128]`, one layer. Apple M2 Max, Chrome, three runs across both runtime builds:
 
-| | run 1 | run 2 |
-|---|---:|---:|
-| ms per position, one layer | 2.83 | 2.54 |
-| one layer, 252 positions | 714 ms | 640 ms |
-| **× 24 GDN layers** | **17.1 s** | **15.4 s** |
+| | 1.22 run 1 | 1.22 run 2 | **1.26** |
+|---|---:|---:|---:|
+| ms per position, one layer | 2.83 | 2.54 | **2.19** |
+| one layer, 252 positions | 714 ms | 640 ms | **552 ms** |
+| **× 24 GDN layers** | **17.1 s** | **15.4 s** | **13.2 s** |
 
-That's ~61–68 ms per prompt token from the recurrence alone, against ~16 s TTFT reported here
-at a comparable prompt length. I'd treat the gap between the two runs as the honest error bar
-— absolute numbers move with machine load — but the conclusion is not sensitive to it: this
-isn't one contributor among several, it's most of the prefill.
+The number that matters isn't the absolute: it's that cost per position **does not amortize as
+the prompt grows**. From 8 positions to 252 — a 30× range — each position still costs about the
+same. That's the signature of a loop that batches nothing, and it's what makes the total scale
+linearly with prompt length.
 
-(Apple M2 Max, Chrome, onnxruntime-web 1.22.0-dev. The isolated `Scan` is measured on its own
-rather than in situ, so treat it as the cost of the mechanism rather than a full-model
-benchmark.)
+I want to be careful about what I'm comparing to. 13–17 s is the recurrence *alone*, measured
+in isolation on my hardware; the ~16 s TTFT in this issue was measured on someone else's, at a
+prompt length I don't know. So I'm not claiming a precise percentage. What I'd say is that the
+recurrence lands in the same order as the entire reported TTFT, which makes it look like the
+dominant term rather than one contributor among several — and the spread across my own runs is
+the honest error bar on that.
 
 So: a per-position recurrence, 24 layers deep, whose loop is driven from the CPU side while
 its body dispatches to the GPU — a mechanism that wouldn't show up by looking at the attention
@@ -137,10 +139,15 @@ kernels at all.
 `config.json` says so explicitly under `text_config`: `full_attention_interval: 4` and a
 `layer_types` array of exactly 24 `"linear_attention"` and 8 `"full_attention"` entries
 (the notebook cross-checks that against the op counts). That would explain why
-[microsoft/onnxruntime#27780](https://github.com/microsoft/onnxruntime/pull/27780) didn't
-move this number — it targets the attention path, and 24 of the 32 layers here aren't
-attention at all. For the same reason, changes to ORT's `LinearAttention` kernel can't
-affect this model either: that op never appears in the graph.
+[microsoft/onnxruntime#27780](https://github.com/microsoft/onnxruntime/pull/27780) didn't move
+this number — it tunes FlashAttention (`flash_attention.wgsl.template`) for
+MultiHeadAttention/GroupQueryAttention, so it should speed up the 8 attention layers here, but
+the other 24 aren't attention at all. For the same reason, changes to ORT's `LinearAttention`
+kernel can't affect this model either: that op never appears in the graph.
+
+None of this is specific to the quantized build — `decoder_model_merged.onnx`,
+`_fp16` and `_q4f16` all give the same 24 / 8 / 0, so it comes from the export rather than
+from quantization.
 
 **The question:** is the sequential `Scan` intentional for this export, or is there a
 chunked form that could be emitted instead? The gated delta rule is chunkable — the

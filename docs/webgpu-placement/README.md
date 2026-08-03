@@ -13,18 +13,19 @@ directory answers the follow-up: **what does the WebGPU backend do with it?**
 
 ```
 [GetCapability] webgpu kernel not found in registries for Op type: Scan
-[transformer_memcpy] Add MemcpyFromHost after y for JsExecutionProvider
 Node placements
-  Node(s) placed on [JsExecutionProvider]. Number of nodes: 9
-    Exp, Mul, Mul, ReduceSum, Sub, Add, Mul, MatMul, MemcpyFromHost
-  Node(s) placed on [CPUExecutionProvider]. Number of nodes: 1
-    Scan ()
+  Node(s) placed on [WebGpuExecutionProvider]. Number of nodes: 16
+  Node(s) placed on [CPUExecutionProvider].    Number of nodes: 1
 ```
+
+(on `onnxruntime-web@1.26.0-dev.20260416`, the build `@huggingface/transformers@4.2.0`
+pins — the 16 are the delta-rule body, the 1 is the `Scan`. The identical split appears
+on `1.22.0-dev`, where the provider was still called `JsExecutionProvider`.)
 
 So the loop control runs on CPU while the body ops are assigned to WebGPU,
 with a host copy inserted at the boundary. Independently, `Scan`, `If` and
-`Loop` appear zero times in onnxruntime-web's shipped JSEP op registry
-(178 entries), which is consistent with the log above.
+`Loop` appear zero times in onnxruntime-web's shipped op registry
+(178 entries in both 1.22 and 1.26), which is consistent with the log above.
 
 This is a property of the runtime's op registry rather than of any one model,
 so it does not depend on the 2.5 GB Qwen3.5 weights — a ~1 KB model with the
@@ -55,27 +56,32 @@ python3 build-real-scan.py         # 1.4 MB download -> real_scan.onnx (2.5 KB)
 node run.mjs scan-bench.html
 ```
 
-On an M2 Max, Chrome, cost per position is flat across a 252x range of sequence
-length — the signature of a loop that batches nothing:
+On an M2 Max, Chrome — note the per-position cost barely moves as the sequence
+grows:
 
-| | run 1 | run 2 |
-|---|---:|---:|
-| ms per position (one layer) | 2.83 | 2.54 |
-| one layer, 252 positions | 714 ms | 640 ms |
-| **x24 GDN layers** | **17.1 s** | **15.4 s** |
+| | 1.22 run 1 | 1.22 run 2 | 1.26 |
+|---|---:|---:|---:|
+| ms per position (one layer) | 2.83 | 2.54 | 2.19 |
+| one layer, 252 positions | 714 ms | 640 ms | 552 ms |
+| **x24 GDN layers** | **17.1 s** | **15.4 s** | **13.2 s** |
 
-Per prompt token that is ~61–68 ms of `Scan` alone. The issue reports ~16 s TTFT
-at a comparable prompt length, and an end-to-end sweep on this same machine gave
-72–74 ms per prompt token. So the recurrence is not one contributor among many —
-it accounts for most of the prefill.
+Cost per position does not amortize: from 8 to 252 positions — a 30x range — each
+position still costs about the same. That is the signature of a loop that batches
+nothing, and it makes the total scale linearly with prompt length.
 
-Treat the spread between runs as the real error bar; absolute numbers move with
-machine load, which is why the range is quoted rather than a single figure.
+13-17 s is the recurrence *alone*, in isolation, on this machine. The ~16 s TTFT in
+the issue was measured on different hardware at an unknown prompt length, so this is
+not a percentage — it is "the same order as the entire reported TTFT", i.e. the
+dominant term rather than one contributor among several. Treat the spread across runs
+as the error bar.
+
+**Test against the ORT-web build transformers.js pins**, not whatever is hoisted in
+node_modules: 4.2.0 -> `onnxruntime-web@1.26.0-dev.20260416`, 3.8.1 -> `1.22.0-dev`.
 
 ## Scope
 
 Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
 WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
-~15–17 s for 24 layers at a 252-token prompt. Chrome, onnxruntime-web
-1.22.0-dev, Apple M2 Max. Not measured: the full model end-to-end in one
-session, or any other backend.
+~13-17 s for 24 layers at a 252-token prompt. Chrome, Apple M2 Max,
+onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: the full model
+end-to-end in one session, or any backend other than WebGPU.
