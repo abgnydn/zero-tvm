@@ -34,8 +34,9 @@ cause is an ONNX `Scan` on the prefill path rather than anything in the attentio
 
 The ONNX weights live in sibling `.onnx_data` files, so the *graph* is only 1.4 MB and its
 structure is cheap to check. Here's a Colab that re-derives everything below in about 15
-seconds — no GPU, no auth, and it downloads only that 1.4 MB (an optional appendix repeats
-the runtime check against the real weights):
+seconds — no GPU, no auth, and it downloads only that 1.4 MB. Two optional appendices go
+further against the real weights: one counts what the runtime actually executes, the other
+reports which execution provider each op is assigned to and what share of prefill it costs:
 
 **[Open in Colab](https://colab.research.google.com/github/abgnydn/zero-tvm/blob/tjs-1599-repro/docs/tjs-1599-repro.ipynb)**
 
