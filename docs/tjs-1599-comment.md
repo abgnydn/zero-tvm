@@ -99,29 +99,34 @@ aren't attention at all: Qwen3.5's hybrid is 3:1 gated-DeltaNet + full attention
 sliding-window. Same reason ORT's `LinearAttention` kernel wouldn't move it — that op doesn't
 appear in this graph.
 
-What makes me think this is fixable rather than inherent: `modeling_qwen3_5.py` already has
-both fallbacks, and picks between them by sequence length —
+My first thought was that the export could just trace `torch_chunk_gated_delta_rule`, which
+sits right next to the recurrent one in `modeling_qwen3_5.py` and is what eager PyTorch
+actually uses for prefill (`if use_precomputed_states and seq_len == 1` picks the recurrent
+one, else the chunked one, `chunk_size=64`). That turns out not to work, so for whatever it's
+worth here's the negative result: exporting either fallback directly, with the sequence axis
+marked dynamic, gives a graph that is only valid at the length you traced it at.
 
-```python
-if use_precomputed_states and seq_len == 1:
-    self.recurrent_gated_delta_rule(...)   # per position
-else:
-    self.chunk_gated_delta_rule(...)       # torch_chunk_gated_delta_rule, chunk_size=64
-```
+| exported at S=128 | S=128 | S=192 | S=252 |
+|---|---|---|---|
+| `torch_chunk_gated_delta_rule` (dynamo) | 1.4e-06 | **1.0** | **1.0** |
+| `torch_chunk_gated_delta_rule` (legacy) | 3.8e-06 | **1.0** | **1.0** |
+| `torch_recurrent_gated_delta_rule` (legacy) | 4.1e-06 | **1.0** | **1.0** |
 
-so eager PyTorch runs prefill through the chunked path (`for i in range(0, seq_len //
-chunk_size)`, 4 iterations at 252 tokens), while the exported prefill branch is the
-per-position one (252). I assume the FLA/Triton kernel simply can't be traced, so export has
-to fall back to pure PyTorch — but there are two PyTorch fallbacks and this looks like the
-decode one ending up on the prefill branch. Possibly because chunk-64 needs the sequence
-padded to a multiple of the chunk size and a ragged tail handled, which is awkward with a
-dynamic `sequence_length`, whereas a `Scan` is trivially correct for any length. Both give the
-same numbers, so correctness checks wouldn't flag it, and decode never touches this branch at
-all — the exported decode path has zero `Scan` nodes, which would be why tok/s benchmarks look
-fine.
+(max relative error vs PyTorch). Neither emits control flow — both unroll the Python loop — so
+at another length they still run and still return the right shape, they're just wrong. The
+recurrent one also fails outright under `dynamo=True`. So a `Scan` looks like the reasonable
+way to get something correct at any prompt length, and I can see why it's there.
 
-So the question: is tracing `torch_chunk_gated_delta_rule` for the `else` branch feasible, or
-is there a dynamic-shape reason it has to be the recurrent form?
+Which makes the question narrower than "why not chunk it": could the `Scan` iterate over
+**chunks instead of positions**? Same recurrence, but the body takes a block of 64 and the
+state is carried block to block — roughly 4 iterations instead of 252 at this prompt length,
+and the per-block work becomes matmuls rather than per-position elementwise ops (the chunked
+export has 13 `MatMul` nodes; the recurrent one has none). `torch_chunk_gated_delta_rule`
+already pads to a multiple of `chunk_size`, so the ragged tail is handled.
+
+Worth noting the reason this can sit unnoticed: decode never touches this branch. At
+`seq_len == 1` the `If` takes the other side, and the exported decode path has zero `Scan`
+nodes — so tok/s benchmarks look fine and only TTFT shows it.
 
 Colab that re-derives all of the above, 1.4 MB download and no GPU needed:
 https://colab.research.google.com/github/abgnydn/zero-tvm/blob/tjs-1599-repro/docs/tjs-1599-repro.ipynb
