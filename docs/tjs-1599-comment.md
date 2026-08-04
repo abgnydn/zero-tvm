@@ -25,6 +25,13 @@
 # method was discarded after it returned >100%, which is impossible; it overcounts
 # by ~25%. Both the method and the negative result are in docs/webgpu-placement/.
 #
+# THREAD STATE (checked 2026-08-04): issue is OPEN, 5 comments, last activity
+# 2026-04-12. @xenova replied twice suggesting ORT #27780; @youqibing pushed back
+# ("I'm not entirely sure whether these two issues are related") and that doubt was
+# never resolved; @kokroo added "+1 Experiencing the same issue" on 2026-04-05.
+# So this is a stalled thread with an unanswered question, not a closed one — and
+# the comment below answers exactly the question that was left hanging.
+#
 # The Colab link below is live and was checked anonymously (14 cells render,
 # no sign-in needed to read). It points at the `tjs-1599-repro` branch — if you
 # ever delete or rename that branch, the link dies. Merge the notebook to main
@@ -142,12 +149,15 @@ kernels at all.
 3:1 **gated-DeltaNet (linear attention)** + full attention, not sliding-window attention.
 `config.json` says so explicitly under `text_config`: `full_attention_interval: 4` and a
 `layer_types` array of exactly 24 `"linear_attention"` and 8 `"full_attention"` entries
-(the notebook cross-checks that against the op counts). That would explain why
-[microsoft/onnxruntime#27780](https://github.com/microsoft/onnxruntime/pull/27780) didn't move
-this number — it tunes FlashAttention (`flash_attention.wgsl.template`) for
-MultiHeadAttention/GroupQueryAttention, so it should speed up the 8 attention layers here, but
-the other 24 aren't attention at all. For the same reason, changes to ORT's `LinearAttention`
-kernel can't affect this model either: that op never appears in the graph.
+(the notebook cross-checks that against the op counts). That bears on
+[microsoft/onnxruntime#27780](https://github.com/microsoft/onnxruntime/pull/27780), raised
+early in this thread: it tunes FlashAttention (`flash_attention.wgsl.template`) for
+MultiHeadAttention/GroupQueryAttention, so it should help the 8 attention layers here — but the
+other 24 aren't attention at all, and by the measurement above they are where the prefill time
+actually goes. That may be the answer to @youqibing's question about whether the two are
+related: I'd expect #27780 to be real but to touch a quarter of the layers. For the same
+reason, changes to ORT's `LinearAttention` kernel can't affect this model either — that op
+never appears in the graph.
 
 None of this is specific to the quantized build — `decoder_model_merged.onnx`,
 `_fp16` and `_q4f16` all give the same 24 / 8 / 0, so it comes from the export rather than
