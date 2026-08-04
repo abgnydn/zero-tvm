@@ -1,6 +1,12 @@
 # DRAFT — comment for huggingface/transformers.js#1599
 # NOT POSTED. Review, edit, post manually when you're happy with it.
 #
+# 2026-08-04 REWRITE: cut roughly in half and de-formalised. The previous version
+# had a bold header on every paragraph, three tables, and a caveat attached to
+# every claim — it read like a defence brief. Same findings, fewer scaffolds:
+# one code block, numbers inline, and @youqibing addressed directly since the
+# unanswered question in the thread is his.
+#
 # REVISION (2026-08-03): restructured so that every claim in the comment is
 # reproducible by the reader, and the parts that weren't have been removed.
 #
@@ -39,16 +45,12 @@
 
 ---
 
-I went looking in the exported graph for where the prefill time goes, and I think the
-cause is an ONNX `Scan` on the prefill path rather than anything in the attention kernels.
+I had a dig through the exported graph and I think the TTFT here is a graph problem rather
+than a kernel one.
 
-The ONNX weights live in sibling `.onnx_data` files, so the *graph* is only 1.4 MB and its
-structure is cheap to check. Here's a Colab that re-derives everything below in about 15
-seconds — no GPU, no auth, and it downloads only that 1.4 MB. Two optional appendices go
-further against the real weights: one counts what the runtime actually executes, the other
-reports which execution provider each op is assigned to and what share of prefill it costs:
-
-**[Open in Colab](https://colab.research.google.com/github/abgnydn/zero-tvm/blob/tjs-1599-repro/docs/tjs-1599-repro.ipynb)**
+The 24 gated-DeltaNet layers are exported as ONNX `Scan` — a sequential loop over the
+sequence axis. The weights sit in the `.onnx_data` siblings so the graph itself is only
+1.4 MB, and you can check it in a few lines:
 
 ```python
 import onnx, collections
@@ -61,46 +63,18 @@ def walk(g):
             if a.g and a.g.node: walk(a.g)
 walk(m.graph)
 print(ops['Scan'], ops['GroupQueryAttention'], ops['LinearAttention'])
-# -> 24 8 0
+# 24 8 0
 ```
 
-- **24 `Scan`** — one per linear-attention layer
-- 8 `GroupQueryAttention` — the full-attention layers
-- **0 `LinearAttention`** — ORT's fused contrib op isn't used by this graph
+All 24 are in the `else_branch` of a per-layer `If` on `/model/layers.N/gdn/is_decode` — so
+the prefill side — and each body is the gated delta rule (16 nodes) with
+`scan_input_axes: [2,2,2,2,2]`, one position per iteration. Counts are the same in
+`decoder_model_merged.onnx` and `_fp16`, so it's coming from the export rather than from
+quantization.
 
-All 24 `Scan`s sit in the **`else_branch`** of a per-layer `If` switching on
-`/model/layers.N/gdn/is_decode` — that is, specifically the **prefill** path. Each body
-takes `state_in, q_in, k_in, v_in, beta_in, g_in` and is 16 nodes
-(`Unsqueeze`×6, `Mul`×5, `ReduceSum`×2, `Exp`, `Sub`, `Add`) — the gated delta rule — with
-`scan_input_axes: [2,2,2,2,2]`, so it walks the sequence one position at a time.
-
-So a 1024-token prompt runs on the order of 1024 × 24 × 16 ≈ 390k sequential node
-executions before the first token can be produced, and that count grows linearly with
-prompt length with nothing batched across positions.
-
-**Does the runtime actually execute it that way?** A fair objection is that the shipped graph
-says nothing about execution — an optimizer might fold the `Scan` away. It doesn't. Running
-prefill under ONNX Runtime's profiler with `ORT_ENABLE_ALL` (CPU EP; the notebook's appendix
-reproduces this):
-
-| prompt tokens | `Scan` nodes | delta-rule body-op invocations |
-|---:|---:|---:|
-| 16 | 24 | 6,785 |
-| 32 | 24 | 12,929 |
-| 64 | 24 | 25,217 |
-| 128 | 24 | 49,793 |
-
-That is exactly `384 × prompt_tokens + 641`, where 384 = 24 `Scan` layers × 16 body nodes.
-The residual is *identical* at every length, so this is a counting identity rather than a
-fitted trend — every op that grows is inside a `Scan` body. Extrapolated, a 1024-token prompt
-is ~394k body-op invocations before the first token.
-
-Those are CPU timings and I'm not offering them as a WebGPU measurement. But the *count* is a
-property of graph execution rather than of the backend.
-
-**And the WebGPU backend can't run the `Scan` at all.** onnxruntime-web has no WebGPU kernel
-for it, so it falls back to CPU. ORT reports this itself with `logSeverityLevel: 0` — this is
-on `onnxruntime-web@1.26.0-dev.20260416`, the build `@huggingface/transformers@4.2.0` pins:
+Two things make that expensive. First, onnxruntime-web has no WebGPU kernel for `Scan`, so it
+falls back to CPU while the body ops go to the GPU. With `logSeverityLevel: 0` on
+`1.26.0-dev` (what 4.2.0 pins):
 
 ```
 [GetCapability] webgpu kernel not found in registries for Op type: Scan
@@ -109,67 +83,30 @@ Node placements
   Node(s) placed on [CPUExecutionProvider].    Number of nodes: 1
 ```
 
-Those 16 are the delta-rule body; the 1 is the `Scan` itself. So the loop control sits on CPU
-while its body is dispatched to the GPU, and a `MemcpyFromHost` gets inserted at the boundary.
-`Scan`, `If` and `Loop` are also absent from the shipped op registry. I get the identical split
-on the older `1.22.0-dev` (where the provider was still named `JsExecutionProvider`), so this
-isn't a regression in one build.
+which is a CPU-driven loop dispatching GPU kernels once per position, 24 layers deep. `If`
+and `Loop` aren't in the registry either.
 
-Because it's a property of the op registry rather than of any particular model, none of this
-needs the 2.5 GB weights — a small model with the same shape reproduces it.
+Second, it's most of the prefill. I took a copy of the decoder with every `Scan` swapped for
+shape-preserving `Identity` — everything else in the GDN layers left alone — and timed both in
+one session on a 252-token prompt (M2 Max, Chrome): full 13.99 s vs ablated 1.24 s, and
+13.71 s vs 0.95 s on a second run. So ~92%. Everything that isn't the recurrence, including
+all the quantized matmuls and the 8 attention layers, comes to about a second.
 
-**How much of the time is that?** Rather than time the `Scan` in isolation and extrapolate
-(which is biased — it overcounts by ~25%), I ablated it in place: same model, same weights,
-every `Scan` replaced by shape-preserving `Identity` nodes. Everything else stays, *including
-the other 78 nodes of each GDN layer* — projections, conv, gates, norms — so the only thing
-removed is the recurrence itself. Full and ablated are timed in one session, and the full model
-is re-measured afterwards as a drift control:
+@youqibing — on whether #27780 is related, I think you were right to wonder. It tunes
+FlashAttention for MHA/GQA, so it should help the 8 attention layers here, but the other 24
+aren't attention at all: Qwen3.5's hybrid is 3:1 gated-DeltaNet + full attention
+(`text_config.layer_types` is exactly 24 `linear_attention` / 8 `full_attention`), not
+sliding-window. Same reason ORT's `LinearAttention` kernel wouldn't move it — that op doesn't
+appear in this graph.
 
-| | full (with `Scan`) | ablated (no `Scan`) | control drift | **`Scan` share** |
-|---|---:|---:|---:|---:|
-| run 1 | 13.99 s | 1.24 s | 4% | **91.3%** |
-| run 2 | 13.71 s | 0.95 s | 2% | **93.1%** |
+Main question then is about the export: is the sequential `Scan` intentional here, or could a
+chunked form be emitted instead? The gated delta rule chunks fine — you evaluate a block of
+positions in parallel and carry the state across blocks, which is what makes prefill tractable
+elsewhere. If the export only has the serial form that would fit a large TTFT regression
+sitting next to a much smaller decode one.
 
-252-token prompt, Apple M2 Max, Chrome, onnxruntime-web 1.26.0-dev. Everything that is *not*
-the recurrence — every quantized matmul, all 8 attention layers, the norms, and a 125 MB logits
-tensor — comes to about **one second**.
+Colab that re-derives all of the above, 1.4 MB download and no GPU needed:
+https://colab.research.google.com/github/abgnydn/zero-tvm/blob/tjs-1599-repro/docs/tjs-1599-repro.ipynb
 
-That is a ratio inside one model on one machine, so I'd expect the exact figure to move with
-hardware; the TTFT reported in this issue was measured on someone else's. But the shape of it
-is hard to move: the non-recurrence part of a 252-token prefill is ~1 s, and cost per position
-in the recurrence **does not amortize as the prompt grows** — from 8 positions to 252, a 30×
-range, each position still costs about the same. That is what a loop that batches nothing looks
-like, and it is why the total scales linearly with prompt length.
-
-So: a per-position recurrence, 24 layers deep, whose loop is driven from the CPU side while
-its body dispatches to the GPU — a mechanism that wouldn't show up by looking at the attention
-kernels at all.
-
-**One thing that may have sent the earlier investigation sideways:** Qwen3.5's hybrid is
-3:1 **gated-DeltaNet (linear attention)** + full attention, not sliding-window attention.
-`config.json` says so explicitly under `text_config`: `full_attention_interval: 4` and a
-`layer_types` array of exactly 24 `"linear_attention"` and 8 `"full_attention"` entries
-(the notebook cross-checks that against the op counts). That bears on
-[microsoft/onnxruntime#27780](https://github.com/microsoft/onnxruntime/pull/27780), raised
-early in this thread: it tunes FlashAttention (`flash_attention.wgsl.template`) for
-MultiHeadAttention/GroupQueryAttention, so it should help the 8 attention layers here — but the
-other 24 aren't attention at all, and by the measurement above they are where the prefill time
-actually goes. That may be the answer to @youqibing's question about whether the two are
-related: I'd expect #27780 to be real but to touch a quarter of the layers. For the same
-reason, changes to ORT's `LinearAttention` kernel can't affect this model either — that op
-never appears in the graph.
-
-None of this is specific to the quantized build — `decoder_model_merged.onnx`,
-`_fp16` and `_q4f16` all give the same 24 / 8 / 0, so it comes from the export rather than
-from quantization.
-
-**The question:** is the sequential `Scan` intentional for this export, or is there a
-chunked form that could be emitted instead? The gated delta rule is chunkable — the
-reference implementations evaluate a block of positions in parallel (intra-chunk terms
-computed together, state carried across chunks), which is what makes prefill practical
-elsewhere. If the export currently only emits the sequential form, this would be a
-**prefill** problem originating in the export rather than in the runtime's shaders — which
-would fit a large TTFT regression sitting next to a much smaller decode one.
-
-I've implemented the chunked form of this recurrence in WGSL for this model, so I'm happy
-to share the chunking scheme, or to test any export variant that would be useful.
+I've implemented the chunked form of this recurrence in WGSL for the same model, so happy to
+share the chunking scheme or to test any export variant that would help.
