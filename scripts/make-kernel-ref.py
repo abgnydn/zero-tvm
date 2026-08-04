@@ -82,7 +82,92 @@ def qwen36moe(seed: int):
     }
 
 
-PRODUCERS = {"qwen36moe": qwen36moe}
+def qwen36moe_block(seed: int):
+    """Whole SparseMoeBlock of layer 0 — reference computed by MLX's OWN block.
+
+    Staged deliberately: the routed-expert path is the part with no precedent in
+    this engine, so the bundle also carries the top-k indices/scores the
+    reference chose. A GPU test can validate the expert FFN + combine against
+    them before the router (which is 8-bit quantised, unlike everything else)
+    is implemented.
+    """
+    import mlx.core as mx, mlx.nn as nn
+    from mlx_lm.models.qwen3_5 import TextModelArgs, SparseMoeBlock
+
+    W = os.path.join(ROOT, ".weights-local/Qwen3.6-35B-A3B-MLX-4bit")
+    if not os.path.exists(W):
+        sys.exit(f"missing checkpoint: {W}")
+    cfg = json.load(open(os.path.join(W, "config.json")))
+    t = cfg.get("text_config", cfg)
+    args = TextModelArgs(**{k: v for k, v in t.items() if k in TextModelArgs.__dataclass_fields__})
+
+    blk = SparseMoeBlock(args)
+    qz = cfg["quantization"]
+    nn.quantize(blk, group_size=qz["group_size"], bits=qz["bits"])
+    PRE = "language_model.model.layers.0.mlp."
+    g8 = qz.get(PRE + "gate")          # the router ships at 8 bits, not 4
+    if g8:
+        blk.gate = nn.QuantizedLinear(args.hidden_size, args.num_experts, bias=False,
+                                      group_size=g8["group_size"], bits=g8["bits"])
+        blk.shared_expert_gate = nn.QuantizedLinear(args.hidden_size, 1, bias=False,
+                                                    group_size=g8["group_size"], bits=g8["bits"])
+    w = mx.load(os.path.join(W, "model-00001-of-00004.safetensors"))
+    blk.load_weights([(k[len(PRE):], v) for k, v in w.items() if k.startswith(PRE)])
+    mx.eval(blk.parameters())
+
+    # Realistic scale: the MLP sees post_attention_layernorm(h), i.e. RMS ≈ 1.
+    rng = np.random.default_rng(seed)
+    x = mx.array(rng.standard_normal((1, args.hidden_size)).astype(np.float32)).astype(mx.bfloat16)
+    y = blk(x)
+    # Split the reference so a partial GPU implementation can be validated
+    # against exactly the part it implements, instead of a loosened tolerance.
+    g = mx.softmax(blk.gate(x).astype(mx.float32), axis=-1, precise=True)
+    k = args.num_experts_per_tok
+    inds = mx.argpartition(g, kth=-k, axis=-1)[..., -k:]
+    sc = mx.take_along_axis(g, inds, axis=-1)
+    if args.norm_topk_prob:
+        sc = sc / sc.sum(axis=-1, keepdims=True)
+    y_routed = (blk.switch_mlp(x, inds) * sc[..., None]).sum(axis=-2)
+    y_shared = mx.sigmoid(blk.shared_expert_gate(x)) * blk.shared_expert(x)
+    mx.eval(y, inds, sc, y_routed, y_shared)
+
+    arrays = {
+        "x_f16": np.array(x.astype(mx.float32)).astype(np.float16).ravel(),
+        "y_ref_f32": np.array(y.astype(mx.float32)).astype(np.float32).ravel(),
+        "y_routed_f32": np.array(y_routed.astype(mx.float32)).astype(np.float32).ravel(),
+        "y_shared_f32": np.array(y_shared.astype(mx.float32)).astype(np.float32).ravel(),
+        "topk_idx_u32": np.array(inds).astype(np.uint32).ravel(),
+        "topk_score_f32": np.array(sc).astype(np.float32).ravel(),
+    }
+    # Expert + shared weights, exactly as stored (nibbles untouched); bias2 = 7s+b.
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        for who, key in (("exp", f"switch_mlp.{proj}"), ("shd", f"shared_expert.{proj}")):
+            Wq = np.array(w[PRE + key + ".weight"].astype(mx.uint32))
+            S = np.array(w[PRE + key + ".scales"].astype(mx.float32))
+            B = np.array(w[PRE + key + ".biases"].astype(mx.float32))
+            arrays[f"{who}_{proj}_w_u32"] = Wq.ravel()
+            arrays[f"{who}_{proj}_s_f16"] = S.astype(np.float16).ravel()
+            arrays[f"{who}_{proj}_b2_f16"] = (7.0 * S + B).astype(np.float16).ravel()
+
+    shp = lambda k_: list(np.array(w[PRE + k_ + ".weight"]).shape)
+    return {
+        "arrays": arrays,
+        "meta": {"kernel": "moe_block",
+                 "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
+                 "tensor": "layers.0.mlp (SparseMoeBlock)",
+                 "reference": "mlx_lm qwen3_next.Qwen3NextSparseMoeBlock",
+                 "hidden": int(args.hidden_size), "num_experts": int(args.num_experts),
+                 "top_k": int(k), "moe_intermediate": int(args.moe_intermediate_size),
+                 "shared_intermediate": int(args.shared_expert_intermediate_size),
+                 "norm_topk_prob": bool(args.norm_topk_prob),
+                 "group": qz["group_size"],
+                 "exp_shapes": {p: shp(f"switch_mlp.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
+                 "shd_shapes": {p: shp(f"shared_expert.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
+                 "note": "routed y = sum_k score_k * down(silu(gate)*up); shared added with sigmoid gate"},
+    }
+
+
+PRODUCERS = {"qwen36moe": qwen36moe, "qwen36moe_block": qwen36moe_block}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -96,5 +181,8 @@ if __name__ == "__main__":
         arr.tofile(os.path.join(out, f"{name}.bin"))
     json.dump(b["meta"], open(os.path.join(out, "meta.json"), "w"), indent=1)
     print(f"wrote {out}")
-    print(f"  {b['meta']['tensor']}  N={b['meta']['N']} K={b['meta']['K']}")
-    print(f"  cross-check vs {b['meta']['reference']}: {b['meta']['cross_check_rel_err']:.2e}")
+    m = b["meta"]
+    print(f"  {m['tensor']}  (kernel: {m['kernel']}, reference: {m['reference']})")
+    if "cross_check_rel_err" in m:
+        print(f"  cross-check vs {m['reference']}: {m['cross_check_rel_err']:.2e}")
+    print(f"  arrays: {', '.join(sorted(b['arrays']))[:200]}")
