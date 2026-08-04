@@ -117,12 +117,23 @@ at another length they still run and still return the right shape, they're just 
 recurrent one also fails outright under `dynamo=True`. So a `Scan` looks like the reasonable
 way to get something correct at any prompt length, and I can see why it's there.
 
-Which makes the question narrower than "why not chunk it": could the `Scan` iterate over
-**chunks instead of positions**? Same recurrence, but the body takes a block of 64 and the
-state is carried block to block — roughly 4 iterations instead of 252 at this prompt length,
-and the per-block work becomes matmuls rather than per-position elementwise ops (the chunked
-export has 13 `MatMul` nodes; the recurrent one has none). `torch_chunk_gated_delta_rule`
-already pads to a multiple of `chunk_size`, so the ragged tail is handled.
+What does work is keeping the `Scan` and changing what one iteration does. Trace
+`torch_chunk_gated_delta_rule` at a **fixed** length of one `chunk_size` — 64 is a constant, so
+there's nothing shape-dependent to unroll — and use that as the `Scan` body, with the
+recurrent state as the scan state and the chunk axis as the scan axis. The number of chunks
+stays dynamic because that's the `Scan`'s job.
+
+I built that to check it holds up. It's HF's own chunked function, untouched, just traced at
+64 and wrapped:
+
+- matches PyTorch at S = 64 / 128 / 192 / 256 — max relative error ~5e-06, different chunk
+  counts each time, so it is genuinely dynamic
+- one GDN layer at 256 tokens on WebGPU: **617 ms → 54 ms** (a second run: 683 → 54), so
+  **11-13x**
+- across 24 layers that's roughly **15 s → 1.3 s** of prefill
+
+The chunk timings are also far steadier (54/57/54/55/54 ms vs 529-733 ms for per-position),
+which is what you'd expect once the work is GPU-bound instead of paced by a CPU loop.
 
 Worth noting the reason this can sit unnoticed: decode never touches this branch. At
 `seq_len == 1` the `If` takes the other side, and the exported decode path has zero `Scan`

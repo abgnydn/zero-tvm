@@ -46,3 +46,37 @@ python verify_numerics.py   # runs each at 128/192/252 vs PyTorch
 
 transformers 5.12.1, torch 2.12.1. Small dims (4 heads, 32 dim) — the structure is
 what matters, not the size.
+
+## What does work: a chunk-level `Scan`
+
+Keep the `Scan`, change what one iteration does. Trace `torch_chunk_gated_delta_rule`
+at a **fixed** length of one `chunk_size` (64 is a constant, so nothing shape-dependent
+unrolls) and use that as the `Scan` body — recurrent state as the scan state, chunk axis
+as the scan axis. Chunk *count* stays dynamic; that is what the `Scan` is for.
+
+`build_chunk_scan.py` does exactly that, using HF's own function untouched.
+`verify_chunk_scan.py` checks it against PyTorch:
+
+| sequence | chunks | max rel. error |
+|---:|---:|---|
+| 64 | 1 | 5.5e-06 |
+| 128 | 2 | 5.4e-06 |
+| 192 | 3 | 3.6e-06 |
+| 256 | 4 | 1.0e-05 |
+
+Different chunk counts each time, so it is genuinely dynamic. (At S=512 the reference
+itself overflows to `inf`/`nan` with uniformly random gates — a property of the synthetic
+inputs, not of the graph.)
+
+### On WebGPU, real Qwen3.5 GDN dims (32 heads, 128/128), 256-token prompt
+
+`../webgpu-placement/chunk-vs-pos.html`, run via `node run.mjs chunk-vs-pos.html`:
+
+| | iterations | one layer |
+|---|---:|---:|
+| per-position `Scan` (ships today) | 256 | 617 ms / 683 ms |
+| **chunk-64 `Scan`** | **4** | **54 ms / 54 ms** |
+
+**11-13x**, and across 24 layers roughly **15 s → 1.3 s** of prefill. The chunked timings
+barely move between repeats (54/57/54/55/54) while the per-position ones swing 529-733 ms,
+which is what you'd expect once the work is GPU-bound rather than paced by a CPU loop.
