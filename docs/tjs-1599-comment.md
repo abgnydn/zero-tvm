@@ -99,11 +99,29 @@ aren't attention at all: Qwen3.5's hybrid is 3:1 gated-DeltaNet + full attention
 sliding-window. Same reason ORT's `LinearAttention` kernel wouldn't move it — that op doesn't
 appear in this graph.
 
-Main question then is about the export: is the sequential `Scan` intentional here, or could a
-chunked form be emitted instead? The gated delta rule chunks fine — you evaluate a block of
-positions in parallel and carry the state across blocks, which is what makes prefill tractable
-elsewhere. If the export only has the serial form that would fit a large TTFT regression
-sitting next to a much smaller decode one.
+What makes me think this is fixable rather than inherent: `modeling_qwen3_5.py` already has
+both fallbacks, and picks between them by sequence length —
+
+```python
+if use_precomputed_states and seq_len == 1:
+    self.recurrent_gated_delta_rule(...)   # per position
+else:
+    self.chunk_gated_delta_rule(...)       # torch_chunk_gated_delta_rule, chunk_size=64
+```
+
+so eager PyTorch runs prefill through the chunked path (`for i in range(0, seq_len //
+chunk_size)`, 4 iterations at 252 tokens), while the exported prefill branch is the
+per-position one (252). I assume the FLA/Triton kernel simply can't be traced, so export has
+to fall back to pure PyTorch — but there are two PyTorch fallbacks and this looks like the
+decode one ending up on the prefill branch. Possibly because chunk-64 needs the sequence
+padded to a multiple of the chunk size and a ragged tail handled, which is awkward with a
+dynamic `sequence_length`, whereas a `Scan` is trivially correct for any length. Both give the
+same numbers, so correctness checks wouldn't flag it, and decode never touches this branch at
+all — the exported decode path has zero `Scan` nodes, which would be why tok/s benchmarks look
+fine.
+
+So the question: is tracing `torch_chunk_gated_delta_rule` for the `else` branch feasible, or
+is there a dynamic-shape reason it has to be the recurrent form?
 
 Colab that re-derives all of the above, 1.4 MB download and no GPU needed:
 https://colab.research.google.com/github/abgnydn/zero-tvm/blob/tjs-1599-repro/docs/tjs-1599-repro.ipynb
