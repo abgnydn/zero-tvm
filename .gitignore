@@ -10,3 +10,4 @@ docs/webgpu-placement/toy_scan.onnx
 docs/webgpu-placement/real_scan.onnx
 docs/webgpu-placement/decoder_ablated_q4f16.onnx
 docs/webgpu-placement/real_chunked_scan.onnx
+.weights-local/kernel-refs/

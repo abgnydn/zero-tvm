@@ -68,11 +68,31 @@ export interface Int4MatmulOpts {
    * Requires subgroups + rowsPerWG=4.
    */
   mDyn?: boolean
+  /**
+   * Affine (MLX-style) quantization instead of the symmetric MLC scheme:
+   * `w = scale·q + bias` over groups of 64, rather than `w = (nibble−7)·scale`
+   * over groups of 32. Adds a per-group bias tensor at `@binding(5)`.
+   *
+   * The nibbles are read unchanged — only the metadata differs — via
+   *
+   *   w = s·(q−7) + (7s+b)
+   *   Σ xᵢwᵢ = s·Σ xᵢ(qᵢ−7) + (7s+b)·Σ xᵢ
+   *
+   * so the existing `(q−7)` dot is reused and the caller supplies
+   * `bias2 = 7·scale + bias` precomputed. `Σ xᵢ` is accumulated per thread over
+   * exactly the 8 values that thread already loaded, and multiplied by that
+   * thread's own group bias — summing across threads then lands each group's
+   * bias term exactly once. (Adding a whole-group Σx per thread would
+   * double-count it 8×, since 8 consecutive threads share one group-64 scale.)
+   *
+   * `SCALES_PER_ROW` means K/64 for this variant, not K/32.
+   */
+  affine?: boolean
 }
 
 /** Entry-point name for a variant (same names the old .wgsl files used). */
 export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false } = opts
   if (mDyn) return 'int4_matmul_batched_dyn'
   if (m === 4) return 'int4_matmul_batched_m4'
   let name = 'int4_matmul'
@@ -82,6 +102,7 @@ export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
   else if (subgroups) name += '_sg'
   if (vec4) name += '_vec4'
   else if (vec4Half) name += '_vec4h'
+  if (affine) name += '_affine'
   return name
 }
 
@@ -99,7 +120,9 @@ function dequantDot(p: string, x: (i: number) => string, indent: string): string
 
 /** Render the WGSL for one variant. */
 export function int4MatmulWGSL(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false } = opts
+  if (affine && (m !== 1 || vec4 || vec4Half || mDyn))
+    throw new Error('affine is implemented for the scalar path only (m=1, no vec4/vec4Half/mDyn)')
   if (rowsPerWG !== 1 && !subgroups) throw new Error('rowsPerWG > 1 requires subgroups')
   if (m === 4 && (!subgroups || rowsPerWG !== 4)) throw new Error('m=4 requires subgroups + rowsPerWG=4')
   if (vec4 && !subgroups) throw new Error('vec4 requires subgroups (32-thread WG keeps K=3072 divisible)')
@@ -128,10 +151,10 @@ ${subgroups ? 'enable subgroups;\n' : ''}
 @group(0) @binding(1) var<storage, read> input_buf : array<${vec4 || vec4Half ? 'vec4<u32>' : 'f16'}>;
 @group(0) @binding(2) var<storage, read> scales : array<f16>;
 @group(0) @binding(3) var<storage, read> weights : array<${vec4 ? 'vec4<u32>' : vec4Half ? 'vec2<u32>' : 'u32'}>;
-
+${affine ? '@group(0) @binding(5) var<storage, read> biases : array<f16>;   // bias2 = 7·scale + bias\n' : ''}
 struct PODArgs {
   K_PACKED: u32,        // K / 8  (u32 words per weight row)
-  SCALES_PER_ROW: u32,  // K / 32 (int4 group scales per weight row)
+  SCALES_PER_ROW: u32,  // K / ${affine ? '64' : '32'} (int4 group scales per weight row)
   packGridDimX: u32     // N (number of output ${m > 1 ? 'columns' : 'elements'})
 }
 @group(0) @binding(4) var<uniform> podArgs : PODArgs;
@@ -271,11 +294,11 @@ ${rowBlocks}
             .join('\n')
     const rowBlocks = rows
       .map(
-        (r) => `    { // row r${r}: one (packed, scale) load, scale factored out of the 8 terms
+        (r) => `    { // row r${r}: one (packed, scale${affine ? ', bias' : ''}) load, scale factored out of the 8 terms
       let p = weights[r${r} * K_PACKED + w_offset];
       let s = f32(scales[r${r} * SCALES_PER_ROW + sc_idx]);
-      acc${r} = acc${r} + s * (
-          ${dequantDot('p', (i) => `i${i}`, '        ')});
+${affine ? `      let b2 = f32(biases[r${r} * SCALES_PER_ROW + sc_idx]);\n` : ''}      acc${r} = acc${r} + s * (
+          ${dequantDot('p', (i) => `i${i}`, '        ')})${affine ? ' + b2 * xs' : ''};
     }`,
       )
       .join('\n')
@@ -287,10 +310,10 @@ ${rowDecl}
   for (var chunk : u32 = 0u; chunk < K_PACKED / ${wgSize}u; chunk = chunk + 1u) {
     let w_offset : u32 = tid + chunk * ${wgSize}u;
     let base : u32 = w_offset * 8u;
-    let sc_idx : u32 = w_offset >> 2u;
+    let sc_idx : u32 = w_offset >> ${affine ? '3' : '2'}u;
 
 ${loads}
-
+${affine ? '\n    // Σx over exactly this thread\'s 8 values — paired with this thread\'s own\n    // group bias, so the group term is counted once across the 8 threads.\n    let xs : f32 = i0 + i1 + i2 + i3 + i4 + i5 + i6 + i7;\n' : ''}
 ${rowBlocks}
   }
 `

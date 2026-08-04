@@ -31,7 +31,8 @@
     "gen:tokenizer-fixtures-qwen": "node scripts/gen-tokenizer-fixtures-qwen.mjs",
     "bench": "node bench/run.mjs",
     "bench:sync": "node bench/sync-docs.mjs",
-    "check": "npm run typecheck && npm run test"
+    "check": "npm run typecheck && npm run test",
+    "test:kernels:real": "node tests/kernels/real-weights.mjs"
   },
   "devDependencies": {
     "@huggingface/transformers": "^4.2.0",
