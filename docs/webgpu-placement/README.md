@@ -82,9 +82,57 @@ node_modules: 4.2.0 -> `onnxruntime-web@1.26.0-dev.20260416`, 3.8.1 -> `1.22.0-d
 
 Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
 WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
-~13-17 s for 24 layers at a 252-token prompt. Chrome, Apple M2 Max,
-onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: the full model
-end-to-end in one session, or any backend other than WebGPU.
+~13-17 s for 24 layers at a 252-token prompt, which is the same order as the
+full prefill measured in the same session. Chrome, Apple M2 Max,
+onnxruntime-web 1.22.0-dev and 1.26.0-dev. NOT established: a precise share —
+the isolated x24 method is an upper bound and returns >100% in the fast regime.
+Also not measured: any backend other than WebGPU.
+
+## Full model vs isolated Scan (same session)
+
+`full-model-bench.html` loads the real 2.5 GB decoder in the browser and times
+prefill, alongside the isolated `Scan`, in one session — so the ratio is not
+affected by machine load the way two separate absolute numbers would be.
+Serve `.weights-local/onnx/Qwen3.5-4B-ONNX/onnx` at `/weights/` (stream it; the
+data file is 2.1 GB) and open with `?s=252`.
+
+Five controlled runs (2026-08-04, machine load ~3.3). Each run times the isolated
+`Scan` **before and after** the full-model prefill; if those two controls disagree
+the run is discarded, so a drifting machine eliminates itself rather than
+producing a plausible-looking number.
+
+| run | control drift | isolated x24 | full prefill | ratio |
+|---|---|---:|---:|---:|
+| 1 | 8% ok | 27.8 s | 31.06 s | 90% |
+| 2 | 29% — discarded | | | |
+| 3 | 110% — discarded | | | |
+| 4 | 14% ok | 16.0 s | 13.90 s | 115% |
+| 5 | **1% ok** | 16.5 s | 13.59 s | 122% |
+
+**Read this as a refutation of the method, not as a 122% share.** A `Scan` that lives
+inside the model cannot cost more than the whole model, so `isolated x 24` is an
+**upper bound with a systematic upward bias**, not an estimate. Across valid runs it
+lands at 90-122%, which is too loose to quote a percentage from.
+
+What survives: at a 252-token prompt the recurrence alone costs on the order of the
+entire prefill (16.5 s against 13.6 s measured in the same session). That supports
+"the recurrence dominates prefill" and does not support any specific number.
+
+Note the two regimes: runs 1-3 caught the machine at ~2x slower (isolated 1.1-1.3 s,
+full 31 s), runs 4-5 in the fast regime (isolated ~0.69 s, full ~13.6 s) matching the
+first clean run ever taken (546 ms / 13.11 s). Absolute times move by 2x with load;
+that is why the same-session ratio is the only thing worth reporting — and even that
+is bounded, not pinned.
+
+## Scope
+
+Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
+WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
+~13-17 s for 24 layers at a 252-token prompt, which is the same order as the
+full prefill measured in the same session. Chrome, Apple M2 Max,
+onnxruntime-web 1.22.0-dev and 1.26.0-dev. NOT established: a precise share —
+the isolated x24 method is an upper bound and returns >100% in the fast regime.
+Also not measured: any backend other than WebGPU.
 
 ## Full model vs isolated Scan (same session)
 
