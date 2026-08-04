@@ -550,7 +550,7 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   { outF32: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_f32_tiled
   { outF32: true, subgroups: true, rowsPerWG: 8 }, // int4_matmul_f32_tiled8
   { subgroups: true, rowsPerWG: 4, m: 4 },       // int4_matmul_batched_m4
-  { subgroups: true, rowsPerWG: 4, mDyn: true }, // int4_matmul_batched_dyn (chunked prefill, runtime M)
+  { subgroups: true, rowsPerWG: 4, mDyn: true }, // int4_matmul_batched_dyn (chunked prefill, runtime M),
   { subgroups: true, vec4: true },                            // int4_matmul_sg_vec4
   { subgroups: true, rowsPerWG: 4, vec4: true },              // int4_matmul_tiled_vec4
   { outF32: true, subgroups: true, vec4: true },              // int4_matmul_f32_sg_vec4
@@ -560,7 +560,12 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   { subgroups: true, vec4Half: true },                            // int4_matmul_sg_vec4h
   { subgroups: true, rowsPerWG: 4, vec4Half: true },              // int4_matmul_tiled_vec4h
   { outF32: true, subgroups: true, vec4Half: true },              // int4_matmul_f32_sg_vec4h
-  { outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true } // int4_matmul_f32_tiled_vec4h
+  { outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true }, // int4_matmul_f32_tiled_vec4h
+  // MLX affine (w = scale·q + bias, group 64) — second per-group tensor at @binding(5).
+  { affine: true }, // int4_matmul_affine
+  { outF32: true, affine: true }, // int4_matmul_f32_affine
+  { subgroups: true, affine: true }, // int4_matmul_sg_affine
+  { subgroups: true, rowsPerWG: 4, affine: true } // int4_matmul_tiled_affine
 ]
 
 /** Human-auditable dump of every shipped variant. */

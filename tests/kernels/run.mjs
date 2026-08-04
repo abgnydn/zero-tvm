@@ -744,6 +744,31 @@ const TESTS = [
     label: 'int4_matmul_affine',
     fn: makeInt4MatmulTest(int4MatmulWGSL({ affine: true }), 'int4_matmul_affine', { affine: true }),
   },
+  {
+    label: 'int4_matmul_sg_affine',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true, affine: true }), 'int4_matmul_sg_affine', {
+      affine: true,
+    }),
+    minSg: 32,
+  },
+  {
+    // rowsPerWG=4: xsum is computed once per weight word and reused across the
+    // 4 rows, so this also covers the shared-xsum path.
+    label: 'int4_matmul_tiled_affine',
+    fn: makeInt4MatmulTest(
+      int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, affine: true }),
+      'int4_matmul_tiled_affine',
+      { affine: true, rowsPerWG: 4 },
+    ),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_f32_affine',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ outF32: true, affine: true }), 'int4_matmul_f32_affine', {
+      affine: true,
+      outF32: true,
+    }),
+  },
   { label: 'rms_norm', fn: testRmsNorm },
   { label: 'argmax', fn: makeArgmaxTest('argmax.wgsl', 'argmax_kernel') },
   { label: 'embedding', fn: testEmbedding },
