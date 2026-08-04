@@ -18,7 +18,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { resolve, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { getDevice, pipelineFor, buffer, runCompute, BU, MM } from './gpu.mjs'
+import { getDevice, pipelineFor, buffer, runCompute, runComputeReads, BU, MM } from './gpu.mjs'
 import { f16Array, f16BitsToF32 } from './half.mjs'
 import { int4MatmulWGSL, int4MatmulEntry } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import { withPrelude } from '../../src/compiler/shader-prelude.ts'
@@ -76,18 +76,23 @@ enable f16;
 @group(0) @binding(0) var<storage, read_write> acc : array<f32>;
 @group(0) @binding(1) var<storage, read> src : array<f16>;
 @group(0) @binding(2) var<uniform> args : Args;
-struct Args { n : u32, score : f32 }
+@group(0) @binding(3) var<storage, read> gate : array<f32>;
+struct Args { n : u32, score : f32, useGate : u32 }
 @compute @workgroup_size(256)
 fn moe_combine(@builtin(global_invocation_id) g : vec3<u32>) {
   if (g.x >= args.n) { return; }
-  acc[g.x] = acc[g.x] + args.score * f32(src[g.x]);
+  // Routed slots carry a router score; the shared expert instead carries
+  // sigmoid(shared_expert_gate·x), so it is the same accumulate with a
+  // different weight — not a separate code path.
+  let wgt : f32 = select(args.score, 1.0 / (1.0 + exp(-gate[0])), args.useGate == 1u);
+  acc[g.x] = acc[g.x] + wgt * f32(src[g.x]);
 }`
 
 async function moeBlock(device, dir, meta) {
   const D = meta.hidden, F = meta.moe_intermediate, K = meta.top_k
   const rd = (n, T) => read(dir, n, T)
   const x = rd('x_f16', Uint16Array)
-  const yRef = rd('y_routed_f32', Float32Array)
+  const yRef = rd('y_ref_f32', Float32Array)
   const idx = rd('topk_idx_u32', Uint32Array)
   const score = rd('topk_score_f32', Float32Array)
 
@@ -99,6 +104,32 @@ async function moeBlock(device, dir, meta) {
     W[`${proj}_b`] = st(`exp_${proj}_b2_f16`, Uint16Array)
   }
   const xBuf = buffer(device, x, BU.STORAGE | BU.COPY_DST)
+
+  // ---- router (8-bit affine, its own kernel) -> top-K on the GPU ----
+  const rt = pipelineFor(device, withPrelude(readFileSync(join(SHADERS, 'moe_router.wgsl'), 'utf8')), 'moe_router')
+  const rIdx = device.createBuffer({ size: K * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const rScore = device.createBuffer({ size: K * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const [idxBytes, scBytes] = await runComputeReads(device, rt, [
+    rIdx, rScore, xBuf,
+    st('router_w_u32', Uint32Array), st('router_s_f16', Uint16Array), st('router_b_f16', Uint16Array),
+    buffer(device, new Uint32Array([D, meta.num_experts, K, meta.norm_topk_prob ? 1 : 0]),
+           BU.UNIFORM | BU.COPY_DST),
+  ], [1], [{ index: 0, bytes: K * 4 }, { index: 1, bytes: K * 4 }])
+  const gpuIdx = new Uint32Array(idxBytes)
+  const gpuScore = new Float32Array(scBytes)
+
+  // Order-invariant comparison: the kernel emits descending, mlx ascending, and
+  // the block output does not depend on the order either way.
+  const byIdx = (a, b) => a[0] - b[0]
+  const refPairs = Array.from(idx, (v, i) => [v, score[i]]).sort(byIdx)
+  const gotPairs = Array.from(gpuIdx, (v, i) => [v, gpuScore[i]]).sort(byIdx)
+  const sameSet = refPairs.every((r, i) => r[0] === gotPairs[i][0])
+  const scoreErr = sameSet
+    ? Math.max(...refPairs.map((r, i) => Math.abs(r[1] - gotPairs[i][1]) / r[1]))
+    : Infinity
+  if (!sameSet) {
+    return { pass: false, detail: `router picked ${[...gpuIdx].sort((a, b) => a - b)} but reference picked ${[...idx].sort((a, b) => a - b)}` }
+  }
   const gu = device.createBuffer({ size: 2 * F * 2, usage: BU.STORAGE | BU.COPY_SRC })   // [gate|up] f16
   const h = device.createBuffer({ size: F * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
   const dOut = device.createBuffer({ size: D * 2, usage: BU.STORAGE | BU.COPY_SRC })
@@ -130,9 +161,10 @@ async function moeBlock(device, dir, meta) {
       ],
     })
 
+  const gateLogitPlaceholder = device.createBuffer({ size: 4, usage: BU.STORAGE })
   const enc = device.createCommandEncoder()
   for (let t = 0; t < K; t++) {
-    const e = idx[t]
+    const e = gpuIdx[t]
     const pass = enc.beginComputePass()
     pass.setPipeline(mm)
     pass.setBindGroup(0, bgMM(gu, 0, F * 2, xBuf, 'gate_proj', e, podGate))
@@ -154,11 +186,74 @@ async function moeBlock(device, dir, meta) {
       layout: comb.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: acc } }, { binding: 1, resource: { buffer: dOut } },
                 { binding: 2, resource: { buffer: buffer(device, new Uint32Array(
-                    [D, new Uint32Array(new Float32Array([score[t]]).buffer)[0]]), BU.UNIFORM | BU.COPY_DST) } }],
+                    [D, new Uint32Array(new Float32Array([gpuScore[t]]).buffer)[0], 0]), BU.UNIFORM | BU.COPY_DST) } },
+                { binding: 3, resource: { buffer: gateLogitPlaceholder } }],
     }))
     pass.dispatchWorkgroups(Math.ceil(D / 256))
     pass.end()
   }
+  // ---- shared expert: same chain, no expert offset, gated by sigmoid ----
+  const SW = {}
+  for (const proj of ['gate_proj', 'up_proj', 'down_proj']) {
+    SW[`${proj}_w`] = st(`shd_${proj}_w_u32`, Uint32Array)
+    SW[`${proj}_s`] = st(`shd_${proj}_s_f16`, Uint16Array)
+    SW[`${proj}_b`] = st(`shd_${proj}_b2_f16`, Uint16Array)
+  }
+  const mv = pipelineFor(device, withPrelude(readFileSync(join(SHADERS, 'int8_affine_matvec.wgsl'), 'utf8')),
+                         'int8_affine_matvec')
+  const gateLogit = device.createBuffer({ size: 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const bgShared = (out, outOff, outSize, inp, proj, podBuf) =>
+    device.createBindGroup({
+      layout: mm.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: out, offset: outOff, size: outSize } },
+        { binding: 1, resource: { buffer: inp } },
+        { binding: 2, resource: { buffer: SW[`${proj}_s`] } },
+        { binding: 3, resource: { buffer: SW[`${proj}_w`] } },
+        { binding: 4, resource: { buffer: podBuf } },
+        { binding: 5, resource: { buffer: SW[`${proj}_b`] } },
+      ],
+    })
+  {
+    const pass = enc.beginComputePass()
+    pass.setPipeline(mv)
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: mv.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: gateLogit } }, { binding: 1, resource: { buffer: xBuf } },
+        { binding: 2, resource: { buffer: st('shdgate_w_u32', Uint32Array) } },
+        { binding: 3, resource: { buffer: st('shdgate_s_f16', Uint16Array) } },
+        { binding: 4, resource: { buffer: st('shdgate_b_f16', Uint16Array) } },
+        { binding: 5, resource: { buffer: buffer(device, new Uint32Array([D, 1]), BU.UNIFORM | BU.COPY_DST) } },
+      ],
+    }))
+    pass.dispatchWorkgroups(1)
+    pass.setPipeline(mm)
+    pass.setBindGroup(0, bgShared(gu, 0, F * 2, xBuf, 'gate_proj', podGate))
+    pass.dispatchWorkgroups(F)
+    pass.setBindGroup(0, bgShared(gu, F * 2, F * 2, xBuf, 'up_proj', podGate))
+    pass.dispatchWorkgroups(F)
+    pass.setPipeline(silu)
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: silu.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: h } }, { binding: 1, resource: { buffer: gu } },
+                { binding: 2, resource: { buffer: podSilu } }],
+    }))
+    pass.dispatchWorkgroups(Math.ceil(F / 256))
+    pass.setPipeline(mm)
+    pass.setBindGroup(0, bgShared(dOut, 0, D * 2, h, 'down_proj', podDown))
+    pass.dispatchWorkgroups(D)
+    pass.setPipeline(comb)
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: comb.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: acc } }, { binding: 1, resource: { buffer: dOut } },
+                { binding: 2, resource: { buffer: buffer(device, new Uint32Array([D, 0, 1]), BU.UNIFORM | BU.COPY_DST) } },
+                { binding: 3, resource: { buffer: gateLogit } }],
+    }))
+    pass.dispatchWorkgroups(Math.ceil(D / 256))
+    pass.end()
+  }
+
   const outBuf = device.createBuffer({ size: D * 4, usage: BU.COPY_DST | BU.MAP_READ })
   enc.copyBufferToBuffer(acc, 0, outBuf, 0, D * 4)
   device.queue.submit([enc.finish()])
@@ -166,16 +261,21 @@ async function moeBlock(device, dir, meta) {
   const got = new Float32Array(outBuf.getMappedRange().slice(0))
 
   // Tolerance is set by the REFERENCE's precision, not ours. MLX runs the whole
-  // block in bfloat16 (~4e-3 relative), and gate→silu→down→weighted-sum compounds
-  // it. Re-running this exact algorithm on CPU in f32 lands at max 1.24e-2 /
-  // median 2.27e-3 against the same reference — the GPU f16 path adds ~0 on top
-  // (1.27e-2). So 3e-2 is headroom over bf16 noise, not cover for a bug: a real
-  // indexing or routing error shows up as a few huge outliers, whereas this error
-  // is spread across every one of the 2048 outputs.
+  // block in bfloat16 (~4e-3 relative) and gate→silu→down→weighted-sum compounds
+  // it. Evidence it is not covering for a bug: re-running this exact algorithm on
+  // CPU in f32 — no GPU, no f16 intermediates — lands at max 1.24e-2 / median
+  // 2.27e-3 on the routed part alone, i.e. the GPU path adds ~nothing (1.26e-2),
+  // and the error is spread across all 2048 outputs rather than concentrated in
+  // a few, which is what an indexing or routing mistake looks like. Measured
+  // 4.32e-3 for the full block (the shared expert dominates the magnitude, so
+  // routed noise shrinks relative to it); 1.2e-2 leaves ~3x headroom.
   const scale = Math.max(...Array.from(yRef, Math.abs))
   let maxRel = 0
   for (let i = 0; i < D; i++) maxRel = Math.max(maxRel, Math.abs(got[i] - yRef[i]) / scale)
-  return { pass: maxRel < 0.03, detail: `routed max rel err ${maxRel.toExponential(2)} (vs ${meta.reference})` }
+  return {
+    pass: maxRel < 0.012 && scoreErr < 0.01,
+    detail: `router top-${K} exact, scores ${scoreErr.toExponential(2)} | FULL block ${maxRel.toExponential(2)}`,
+  }
 }
 
 const KERNELS = { affine_matmul: affineMatmul, moe_block: moeBlock }

@@ -149,6 +149,12 @@ def qwen36moe_block(seed: int):
             arrays[f"{who}_{proj}_s_f16"] = S.astype(np.float16).ravel()
             arrays[f"{who}_{proj}_b2_f16"] = (7.0 * S + B).astype(np.float16).ravel()
 
+    # Router + shared gate ship at 8 bits, group 64 — a different kernel path.
+    for who, key in (("router", "gate"), ("shdgate", "shared_expert_gate")):
+        arrays[f"{who}_w_u32"] = np.array(w[PRE + key + ".weight"].astype(mx.uint32)).ravel()
+        arrays[f"{who}_s_f16"] = np.array(w[PRE + key + ".scales"].astype(mx.float32)).astype(np.float16).ravel()
+        arrays[f"{who}_b_f16"] = np.array(w[PRE + key + ".biases"].astype(mx.float32)).astype(np.float16).ravel()
+
     shp = lambda k_: list(np.array(w[PRE + k_ + ".weight"]).shape)
     return {
         "arrays": arrays,
@@ -163,6 +169,7 @@ def qwen36moe_block(seed: int):
                  "group": qz["group_size"],
                  "exp_shapes": {p: shp(f"switch_mlp.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
                  "shd_shapes": {p: shp(f"shared_expert.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
+                 "router_bits": int(g8["bits"]) if g8 else int(qz["bits"]),
                  "note": "routed y = sum_k score_k * down(silu(gate)*up); shared added with sigmoid gate"},
     }
 
