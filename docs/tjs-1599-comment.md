@@ -19,8 +19,11 @@
 #  - Kept: the sliding-window correction, the ORT #27780 explanation, and the
 #    chunkability question — these are the parts that redirect the investigation.
 #
-# If you want a numbers claim in here later, re-measure interleaved on an idle
-# machine and add it as a separate follow-up comment.
+# UPDATE 2026-08-04: there IS a numbers claim now, and it is properly measured —
+# in-place ablation of the Scan (not extrapolation), same session, with a control
+# re-run, reproduced twice: 91.3% and 93.1% of prefill. The earlier isolated-Scan
+# method was discarded after it returned >100%, which is impossible; it overcounts
+# by ~25%. Both the method and the negative result are in docs/webgpu-placement/.
 #
 # The Colab link below is live and was checked anonymously (14 cells render,
 # no sign-in needed to read). It points at the `tjs-1599-repro` branch — if you
@@ -108,28 +111,28 @@ isn't a regression in one build.
 Because it's a property of the op registry rather than of any particular model, none of this
 needs the 2.5 GB weights — a small model with the same shape reproduces it.
 
-**How much of the time is that?** The `Scan` body is pure elementwise/reduce arithmetic with
-no weights, so it can be lifted out of the export into a standalone ~2.5 KB model (again from
-just the 1.4 MB graph) and timed on WebGPU on its own, at real dimensions — state
-`[1,32,128,128]`, one layer. Apple M2 Max, Chrome, three runs across both runtime builds:
+**How much of the time is that?** Rather than time the `Scan` in isolation and extrapolate
+(which is biased — it overcounts by ~25%), I ablated it in place: same model, same weights,
+every `Scan` replaced by shape-preserving `Identity` nodes. Everything else stays, *including
+the other 78 nodes of each GDN layer* — projections, conv, gates, norms — so the only thing
+removed is the recurrence itself. Full and ablated are timed in one session, and the full model
+is re-measured afterwards as a drift control:
 
-| | 1.22 run 1 | 1.22 run 2 | **1.26** |
-|---|---:|---:|---:|
-| ms per position, one layer | 2.83 | 2.54 | **2.19** |
-| one layer, 252 positions | 714 ms | 640 ms | **552 ms** |
-| **× 24 GDN layers** | **17.1 s** | **15.4 s** | **13.2 s** |
+| | full (with `Scan`) | ablated (no `Scan`) | control drift | **`Scan` share** |
+|---|---:|---:|---:|---:|
+| run 1 | 13.99 s | 1.24 s | 4% | **91.3%** |
+| run 2 | 13.71 s | 0.95 s | 2% | **93.1%** |
 
-The number that matters isn't the absolute: it's that cost per position **does not amortize as
-the prompt grows**. From 8 positions to 252 — a 30× range — each position still costs about the
-same. That's the signature of a loop that batches nothing, and it's what makes the total scale
-linearly with prompt length.
+252-token prompt, Apple M2 Max, Chrome, onnxruntime-web 1.26.0-dev. Everything that is *not*
+the recurrence — every quantized matmul, all 8 attention layers, the norms, and a 125 MB logits
+tensor — comes to about **one second**.
 
-I want to be careful about what I'm comparing to. 13–17 s is the recurrence *alone*, measured
-in isolation on my hardware; the ~16 s TTFT in this issue was measured on someone else's, at a
-prompt length I don't know. So I'm not claiming a precise percentage. What I'd say is that the
-recurrence lands in the same order as the entire reported TTFT, which makes it look like the
-dominant term rather than one contributor among several — and the spread across my own runs is
-the honest error bar on that.
+That is a ratio inside one model on one machine, so I'd expect the exact figure to move with
+hardware; the TTFT reported in this issue was measured on someone else's. But the shape of it
+is hard to move: the non-recurrence part of a 252-token prefill is ~1 s, and cost per position
+in the recurrence **does not amortize as the prompt grows** — from 8 positions to 252, a 30×
+range, each position still costs about the same. That is what a loop that batches nothing looks
+like, and it is why the total scales linearly with prompt length.
 
 So: a per-position recurrence, 24 layers deep, whose loop is driven from the CPU side while
 its body dispatches to the GPU — a mechanism that wouldn't show up by looking at the attention

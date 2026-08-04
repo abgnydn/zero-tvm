@@ -82,11 +82,71 @@ node_modules: 4.2.0 -> `onnxruntime-web@1.26.0-dev.20260416`, 3.8.1 -> `1.22.0-d
 
 Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
 WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
-~13-17 s for 24 layers at a 252-token prompt, which is the same order as the
-full prefill measured in the same session. Chrome, Apple M2 Max,
-onnxruntime-web 1.22.0-dev and 1.26.0-dev. NOT established: a precise share —
-the isolated x24 method is an upper bound and returns >100% in the fast regime.
-Also not measured: any backend other than WebGPU.
+the recurrence accounts for **91-93% of prefill** at a 252-token prompt, measured
+by in-place ablation with a control re-run, reproduced twice. Chrome, Apple M2 Max,
+onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: any backend other than
+WebGPU, or any hardware other than this one.
+
+## Full model vs isolated Scan (same session)
+
+`full-model-bench.html` loads the real 2.5 GB decoder in the browser and times
+prefill, alongside the isolated `Scan`, in one session — so the ratio is not
+affected by machine load the way two separate absolute numbers would be.
+Serve `.weights-local/onnx/Qwen3.5-4B-ONNX/onnx` at `/weights/` (stream it; the
+data file is 2.1 GB) and open with `?s=252`.
+
+### The right way: ablate the `Scan` in place
+
+Extrapolating from an isolated `Scan` is biased — it charges per-run host/device
+transfers 24 times over, and returns >100% in the fast regime (see below), which is
+impossible. The fix is to not extrapolate at all.
+
+`build-ablated.py` rewrites the real decoder with every `Scan` replaced by
+shape-preserving `Identity` nodes (`state_fin <- state_f`, `y <- vf`). Numerically
+meaningless, structurally valid, ~free to execute, and it shares the same 2.1 GB
+`.onnx_data` so it costs no extra disk. Everything else in the model is untouched —
+including the other 78 nodes of each GDN layer (projections, conv, gates, norms), so
+what is removed is the recurrence and nothing else.
+
+```bash
+python3 build-ablated.py     # 1.4 MB graph in, 24 Scans out
+node run.mjs ablation.html   # full vs ablated, same session, with a control re-run
+```
+
+| | full (with `Scan`) | ablated (no `Scan`) | control drift | **`Scan` share** |
+|---|---:|---:|---:|---:|
+| run 1 | 13.99 s | 1.24 s | 4% | **91.3%** |
+| run 2 | 13.71 s | 0.95 s | 2% | **93.1%** |
+
+252-token prompt, Apple M2 Max, Chrome, onnxruntime-web 1.26.0-dev. The full model is
+re-measured after the ablated one as a control; a run whose two full-model timings
+disagree is discarded. Everything that is *not* the recurrence — every quantized
+matmul, all 8 attention layers, the norms, and a 125 MB logits tensor — accounts for
+the remaining ~1 second.
+
+### What the isolated method got wrong
+
+Kept here because it is a useful negative result. Timing one layer's `Scan` standalone
+and multiplying by 24 gives, across three runs whose before/after controls agreed:
+
+| run | control drift | isolated x24 | full prefill | ratio |
+|---|---|---:|---:|---:|
+| 1 | 8% | 27.8 s | 31.06 s | 90% |
+| 4 | 14% | 16.0 s | 13.90 s | 115% |
+| 5 | 1% | 16.5 s | 13.59 s | 122% |
+
+A `Scan` inside the model cannot cost more than the model, so this is an upper bound
+with systematic upward bias — about 25% high against the ablation figure. The 90% in
+run 1 was luck, not measurement.
+
+## Scope
+
+Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
+WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
+the recurrence accounts for **91-93% of prefill** at a 252-token prompt, measured
+by in-place ablation with a control re-run, reproduced twice. Chrome, Apple M2 Max,
+onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: any backend other than
+WebGPU, or any hardware other than this one.
 
 ## Full model vs isolated Scan (same session)
 
@@ -128,11 +188,10 @@ is bounded, not pinned.
 
 Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
 WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
-~13-17 s for 24 layers at a 252-token prompt, which is the same order as the
-full prefill measured in the same session. Chrome, Apple M2 Max,
-onnxruntime-web 1.22.0-dev and 1.26.0-dev. NOT established: a precise share —
-the isolated x24 method is an upper bound and returns >100% in the fast regime.
-Also not measured: any backend other than WebGPU.
+the recurrence accounts for **91-93% of prefill** at a 252-token prompt, measured
+by in-place ablation with a control re-run, reproduced twice. Chrome, Apple M2 Max,
+onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: any backend other than
+WebGPU, or any hardware other than this one.
 
 ## Full model vs isolated Scan (same session)
 

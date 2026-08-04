@@ -8,3 +8,4 @@ dist/
 docs/webgpu-placement/ort-dist/
 docs/webgpu-placement/toy_scan.onnx
 docs/webgpu-placement/real_scan.onnx
+docs/webgpu-placement/decoder_ablated_q4f16.onnx
