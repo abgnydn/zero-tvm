@@ -88,11 +88,26 @@ export interface Int4MatmulOpts {
    * `SCALES_PER_ROW` means K/64 for this variant, not K/32.
    */
   affine?: boolean
+  /**
+   * MoE indirection: `workgroup_id.z` is a SLOT (0..top_k-1), and the expert row
+   * for that slot is read from an `ids` buffer at `@binding(6)`, so one dispatch
+   * covers every selected expert instead of one dispatch each. Measured: 960
+   * per-expert dispatches cost 7.6 ms/token against 1.0 ms when the expert is a
+   * grid dimension, at 7.9 µs of launch overhead apiece.
+   *
+   * Note this changes what `z` means. Every other variant flattens the grid as
+   * `(z * gridDim.x + x)`; here `z` is the slot and the row comes from `x` alone.
+   *
+   * Slot striding for the activation and output buffers comes from PODArgs, so
+   * one kernel serves gate/up (input shared across slots, output strided) and
+   * down (both strided). Requires `affine`.
+   */
+  moe?: boolean
 }
 
 /** Entry-point name for a variant (same names the old .wgsl files used). */
 export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false } = opts
   if (mDyn) return 'int4_matmul_batched_dyn'
   if (m === 4) return 'int4_matmul_batched_m4'
   let name = 'int4_matmul'
@@ -103,6 +118,7 @@ export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
   if (vec4) name += '_vec4'
   else if (vec4Half) name += '_vec4h'
   if (affine) name += '_affine'
+  if (moe) name += '_moe'
   return name
 }
 
@@ -120,7 +136,8 @@ function dequantDot(p: string, x: (i: number) => string, indent: string): string
 
 /** Render the WGSL for one variant. */
 export function int4MatmulWGSL(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false } = opts
+  if (moe && !affine) throw new Error('moe requires affine (the MoE weights are MLX affine-quantised)')
   if (affine && (m !== 1 || vec4 || vec4Half || mDyn))
     throw new Error('affine is implemented for the scalar path only (m=1, no vec4/vec4Half/mDyn)')
   if (rowsPerWG !== 1 && !subgroups) throw new Error('rowsPerWG > 1 requires subgroups')
@@ -151,11 +168,13 @@ ${subgroups ? 'enable subgroups;\n' : ''}
 @group(0) @binding(1) var<storage, read> input_buf : array<${vec4 || vec4Half ? 'vec4<u32>' : 'f16'}>;
 @group(0) @binding(2) var<storage, read> scales : array<f16>;
 @group(0) @binding(3) var<storage, read> weights : array<${vec4 ? 'vec4<u32>' : vec4Half ? 'vec2<u32>' : 'u32'}>;
-${affine ? '@group(0) @binding(5) var<storage, read> biases : array<f16>;   // bias2 = 7·scale + bias\n' : ''}
+${affine ? '@group(0) @binding(5) var<storage, read> biases : array<f16>;   // bias2 = 7·scale + bias\n' : ''}${moe ? '@group(0) @binding(6) var<storage, read> ids : array<u32>;       // expert row per slot\n' : ''}
 struct PODArgs {
   K_PACKED: u32,        // K / 8  (u32 words per weight row)
   SCALES_PER_ROW: u32,  // K / ${affine ? '64' : '32'} (int4 group scales per weight row)
-  packGridDimX: u32     // N (number of output ${m > 1 ? 'columns' : 'elements'})
+  packGridDimX: u32${moe ? ',' : ''}     // N (number of output ${m > 1 ? 'columns' : 'elements'})${moe ? `
+  IN_SLOT_STRIDE: u32,  // activation elements per slot (0 = all slots share one input)
+  OUT_SLOT_STRIDE: u32  // output elements per slot` : ''}
 }
 @group(0) @binding(4) var<uniform> podArgs : PODArgs;
 `
@@ -167,13 +186,20 @@ fn ${entry}(
   @builtin(num_workgroups) gridDim : vec3<u32>,
   @builtin(local_invocation_id) threadIdx : vec3<u32>
 ) {
-  let row_base : u32 = (blockIdx.z * gridDim.x + blockIdx.x) * ${rowsPerWG}u;
+${moe ? `  // z is the SLOT here, not part of the row flattening the other variants use.
+  let slot : u32 = blockIdx.z;
+  let row_base : u32 = blockIdx.x * ${rowsPerWG}u;` : `  let row_base : u32 = (blockIdx.z * gridDim.x + blockIdx.x) * ${rowsPerWG}u;`}
   if (row_base >= podArgs.packGridDimX) { return; }
 
   let K_PACKED : u32 = podArgs.K_PACKED;
   let SCALES_PER_ROW : u32 = podArgs.SCALES_PER_ROW;
   let tid : u32 = threadIdx.x;
-`
+${moe ? `  let expert : u32 = ids[slot];
+  let wBase : u32 = expert * podArgs.packGridDimX * K_PACKED;
+  let sBase : u32 = expert * podArgs.packGridDimX * SCALES_PER_ROW;
+  let inBase : u32 = slot * podArgs.IN_SLOT_STRIDE;
+  let outBase : u32 = slot * podArgs.OUT_SLOT_STRIDE;
+` : ''}`
 
   // Per-thread K-chunk loop. Each thread strides by the workgroup width.
   const rowDecl = rows.map((r) => `  let r${r} = row_base${r ? ` + ${r}u` : ''};`).join('\n')
@@ -295,9 +321,9 @@ ${rowBlocks}
     const rowBlocks = rows
       .map(
         (r) => `    { // row r${r}: one (packed, scale${affine ? ', bias' : ''}) load, scale factored out of the 8 terms
-      let p = weights[r${r} * K_PACKED + w_offset];
-      let s = f32(scales[r${r} * SCALES_PER_ROW + sc_idx]);
-${affine ? `      let b2 = f32(biases[r${r} * SCALES_PER_ROW + sc_idx]);\n` : ''}      acc${r} = acc${r} + s * (
+      let p = weights[${moe ? 'wBase + ' : ''}r${r} * K_PACKED + w_offset];
+      let s = f32(scales[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);
+${affine ? `      let b2 = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);\n` : ''}      acc${r} = acc${r} + s * (
           ${dequantDot('p', (i) => `i${i}`, '        ')})${affine ? ' + b2 * xs' : ''};
     }`,
       )
@@ -309,7 +335,7 @@ ${rowDecl}
 
   for (var chunk : u32 = 0u; chunk < K_PACKED / ${wgSize}u; chunk = chunk + 1u) {
     let w_offset : u32 = tid + chunk * ${wgSize}u;
-    let base : u32 = w_offset * 8u;
+    let base : u32 = ${moe ? 'inBase + ' : ''}w_offset * 8u;
     let sc_idx : u32 = w_offset >> ${affine ? '3' : '2'}u;
 
 ${loads}
@@ -379,7 +405,7 @@ ${rowBlocks}
             .join('\n')
     const writes =
       m === 1
-        ? rows.map((r) => `    output_buf[r${r}] = ${cast(`sum${r}`)};`).join('\n')
+        ? rows.map((r) => `    output_buf[${moe ? 'outBase + ' : ''}r${r}] = ${cast(`sum${r}`)};`).join('\n')
         : `    let N = podArgs.packGridDimX;\n` +
           batches
             .map((b) =>
@@ -414,7 +440,7 @@ ${writes}
   workgroupBarrier();
 
   if (tid == 0u) {
-    output_buf[r0] = ${cast('red_buf[0]')};
+    output_buf[${moe ? 'outBase + ' : ''}r0] = ${cast('red_buf[0]')};
   }
 }
 `
