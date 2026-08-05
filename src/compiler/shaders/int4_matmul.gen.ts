@@ -75,15 +75,22 @@ export interface Int4MatmulOpts {
    *
    * The nibbles are read unchanged — only the metadata differs — via
    *
-   *   w = s·(q−7) + (7s+b)
-   *   Σ xᵢwᵢ = s·Σ xᵢ(qᵢ−7) + (7s+b)·Σ xᵢ
+   *   Σ xᵢwᵢ = s·Σ xᵢqᵢ + b·Σ xᵢ
    *
-   * so the existing `(q−7)` dot is reused and the caller supplies
-   * `bias2 = 7·scale + bias` precomputed. `Σ xᵢ` is accumulated per thread over
-   * exactly the 8 values that thread already loaded, and multiplied by that
-   * thread's own group bias — summing across threads then lands each group's
-   * bias term exactly once. (Adding a whole-group Σx per thread would
-   * double-count it 8×, since 8 consecutive threads share one group-64 scale.)
+   * `Σ xᵢ` is accumulated per thread over exactly the 8 values that thread
+   * already loaded, and multiplied by that thread's own group bias — summing
+   * across threads then lands each group's bias term exactly once. (Adding a
+   * whole-group Σx per thread would double-count it 8×, since 8 consecutive
+   * threads share one group-64 scale.)
+   *
+   * The symmetric path's `−7` per nibble is NOT applied here. It exists only
+   * because MLC stores `w = (nibble−7)·scale`; folding it in as
+   * `s·Σx(q−7) + (7s+b)·Σx` is algebraically identical and was how this variant
+   * first shipped. Dropping it is NOT a speed win — an A/B of the two shaders in
+   * one session, 9 paired runs on the Qwen3.6 gate projection, measured 27.00 µs
+   * both ways (0.0%); the subtract folds into the multiply-add. It is kept out
+   * because the caller then hands MLX's bias straight through instead of
+   * materialising a derived `7·scale + bias` tensor at load time.
    *
    * `SCALES_PER_ROW` means K/64 for this variant, not K/32.
    */
@@ -122,12 +129,15 @@ export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
   return name
 }
 
-// Σ xᵢ·(nibble(p, i) - 7), scale factored out by the caller.
-function dequantDot(p: string, x: (i: number) => string, indent: string): string {
+// Σ xᵢ·(nibble(p, i) - 7), scale factored out by the caller. With
+// `offset = false` the -7 is dropped: affine (MLX) weights are `s·q + b`, so
+// the nibble is used raw and the bias rides along in its own term.
+function dequantDot(p: string, x: (i: number) => string, indent: string, offset = true): string {
   const terms: string[] = []
   for (let i = 0; i < 8; i++) {
     const shift = String(i * 4).padStart(2)
-    terms.push(`${x(i)} * (f32((${p} >> ${shift}u) & 15u) - 7.0)`)
+    const q = `f32((${p} >> ${shift}u) & 15u)`
+    terms.push(offset ? `${x(i)} * (${q} - 7.0)` : `${x(i)} * ${q}`)
   }
   const pairs: string[] = []
   for (let i = 0; i < 8; i += 2) pairs.push(`${terms[i]} + ${terms[i + 1]}`)
@@ -168,7 +178,7 @@ ${subgroups ? 'enable subgroups;\n' : ''}
 @group(0) @binding(1) var<storage, read> input_buf : array<${vec4 || vec4Half ? 'vec4<u32>' : 'f16'}>;
 @group(0) @binding(2) var<storage, read> scales : array<f16>;
 @group(0) @binding(3) var<storage, read> weights : array<${vec4 ? 'vec4<u32>' : vec4Half ? 'vec2<u32>' : 'u32'}>;
-${affine ? '@group(0) @binding(5) var<storage, read> biases : array<f16>;   // bias2 = 7·scale + bias\n' : ''}${moe ? '@group(0) @binding(6) var<storage, read> ids : array<u32>;       // expert row per slot\n' : ''}
+${affine ? '@group(0) @binding(5) var<storage, read> biases : array<f16>;   // MLX bias, verbatim\n' : ''}${moe ? '@group(0) @binding(6) var<storage, read> ids : array<u32>;       // expert row per slot\n' : ''}
 struct PODArgs {
   K_PACKED: u32,        // K / 8  (u32 words per weight row)
   SCALES_PER_ROW: u32,  // K / ${affine ? '64' : '32'} (int4 group scales per weight row)
@@ -323,8 +333,8 @@ ${rowBlocks}
         (r) => `    { // row r${r}: one (packed, scale${affine ? ', bias' : ''}) load, scale factored out of the 8 terms
       let p = weights[${moe ? 'wBase + ' : ''}r${r} * K_PACKED + w_offset];
       let s = f32(scales[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);
-${affine ? `      let b2 = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);\n` : ''}      acc${r} = acc${r} + s * (
-          ${dequantDot('p', (i) => `i${i}`, '        ')})${affine ? ' + b2 * xs' : ''};
+${affine ? `      let b = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);\n` : ''}      acc${r} = acc${r} + s * (
+          ${dequantDot('p', (i) => `i${i}`, '        ', !affine)})${affine ? ' + b * xs' : ''};
     }`,
       )
       .join('\n')

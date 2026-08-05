@@ -48,7 +48,7 @@ async function affineMatmul(device, dir, meta) {
   const { N, K, K_PACKED: KP, GROUPS_PER_ROW: SPR } = meta
   const weights = read(dir, 'weights_u32', Uint32Array)
   const scales = read(dir, 'scales_f16', Uint16Array)
-  const bias2 = read(dir, 'bias2_f16', Uint16Array)
+  const bias = read(dir, 'bias_f16', Uint16Array)
   const x = read(dir, 'x_f16', Uint16Array)
   const ref = read(dir, 'y_ref_f32', Float32Array)
 
@@ -63,7 +63,7 @@ async function affineMatmul(device, dir, meta) {
     buffer(device, scales, BU.STORAGE | BU.COPY_DST),
     buffer(device, weights, BU.STORAGE | BU.COPY_DST),
     buffer(device, new Uint32Array([KP, SPR, N, 0]), BU.UNIFORM | BU.COPY_DST),
-    buffer(device, bias2, BU.STORAGE | BU.COPY_DST), // @binding(5)
+    buffer(device, bias, BU.STORAGE | BU.COPY_DST), // @binding(5)
   ]
   const bytes = await runCompute(device, pipelineFor(device, src, entry), buffers, [N], 0, outBytes)
   const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
@@ -98,7 +98,7 @@ async function moeBlock(device, dir, meta) {
   for (const proj of ['gate_proj', 'up_proj', 'down_proj']) {
     W[`${proj}_w`] = st(`exp_${proj}_w_u32`, Uint32Array)
     W[`${proj}_s`] = st(`exp_${proj}_s_f16`, Uint16Array)
-    W[`${proj}_b`] = st(`exp_${proj}_b2_f16`, Uint16Array)
+    W[`${proj}_b`] = st(`exp_${proj}_b_f16`, Uint16Array)
   }
   const xBuf = buffer(device, x, BU.STORAGE | BU.COPY_DST)
 

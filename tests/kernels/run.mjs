@@ -96,7 +96,8 @@ function makeInt4MatmulTest(src, entry, { K = 512, rowsPerWG = 1, outF32 = false
         let dot = 0, xs = 0
         for (let n = 0; n < 8; n++) {
           const nib = (packed >>> (4 * n)) & 15
-          dot += input[w * 8 + n] * (nib - 7)
+          // affine reads the nibble raw (w = s·q + b); symmetric offsets it.
+          dot += input[w * 8 + n] * (affine ? nib : nib - 7)
           xs += input[w * 8 + n]
         }
         acc += scale * dot
@@ -740,7 +741,7 @@ const TESTS = [
   { label: 'int4_matmul', fn: makeInt4MatmulTest(int4MatmulWGSL(), 'int4_matmul') },
   {
     // MLX-style affine quant (w = scale·q + bias, group 64) — the format the
-    // Qwen3.6-35B-A3B MoE weights ship in. Caller passes bias2 = 7·scale + bias.
+    // Qwen3.6-35B-A3B MoE weights ship in. Caller passes MLX's bias verbatim.
     label: 'int4_matmul_affine',
     fn: makeInt4MatmulTest(int4MatmulWGSL({ affine: true }), 'int4_matmul_affine', { affine: true }),
   },

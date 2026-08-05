@@ -47,17 +47,16 @@ def qwen36moe(seed: int):
     assert S.shape == (N, NG), f"scales {S.shape} != {(N, NG)}"
 
     f16 = lambda a: a.astype(np.float16)
-    # The kernel consumes bias2 = 7*scale + bias, because it reuses the existing
-    # (nibble-7) dot:  w = s*(q-7) + (7s+b).
-    scales_f16, bias2_f16 = f16(S), f16(7.0 * S + B)
+    # The affine kernel consumes MLX's bias verbatim: y = s*sum(x*q) + b*sum(x).
+    scales_f16, bias_f16 = f16(S), f16(B)
     x_f16 = f16(np.random.default_rng(seed).standard_normal(K) * 0.05)
 
     nib = np.zeros((N, K), dtype=np.float32)
     for i in range(8):
         nib[:, i::8] = (Wq >> (4 * i)) & 0xF
     xg = x_f16.astype(np.float32).reshape(NG, G)
-    dot = ((nib.reshape(N, NG, G) - 7.0) * xg[None]).sum(axis=2)
-    y = (scales_f16.astype(np.float32) * dot).sum(1) + (bias2_f16.astype(np.float32) * xg.sum(1)[None]).sum(1)
+    dot = (nib.reshape(N, NG, G) * xg[None]).sum(axis=2)
+    y = (scales_f16.astype(np.float32) * dot).sum(1) + (bias_f16.astype(np.float32) * xg.sum(1)[None]).sum(1)
 
     # Independent cross-check against the vendor's own dequantiser. If this
     # disagrees, our understanding of the format is wrong and the bundle is void.
@@ -70,14 +69,14 @@ def qwen36moe(seed: int):
 
     return {
         "arrays": {"weights_u32": Wq.astype(np.uint32), "scales_f16": scales_f16,
-                   "bias2_f16": bias2_f16, "x_f16": x_f16, "y_ref_f32": y.astype(np.float32)},
+                   "bias_f16": bias_f16, "x_f16": x_f16, "y_ref_f32": y.astype(np.float32)},
         "meta": {"kernel": "affine_matmul",
                  "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
                  "tensor": f"{key} [expert {expert}]",
                  "reference": "mlx.core.dequantize",
                  "N": int(N), "K": int(K), "K_PACKED": int(KP), "GROUP": G,
                  "GROUPS_PER_ROW": int(NG),
-                 "note": "y = sum_g( s_g*dot_g + bias2_g*xsum_g ), bias2 = 7*s + b",
+                 "note": "y = sum_g( s_g*dot_g + b_g*xsum_g ), nibbles read raw",
                  "cross_check_rel_err": rel},
     }
 
@@ -145,7 +144,7 @@ def qwen36moe_block(seed: int):
     # becomes a plain weighted sum. Costs one expert's worth of memory (0.4%)
     # and removes an entire second matmul path. This is the layout the engine's
     # loader should build, so the harness validates the kernels as they'll run.
-    # Nibbles are untouched; bias2 = 7s+b (see the note in qwen36moe).
+    # Nibbles and biases are stored verbatim (see the note in qwen36moe).
     def stack(key_e, key_s):
         """[E, ...] ++ shared -> [E+1, ...], for weight/scales/biases alike."""
         out = []
@@ -163,7 +162,7 @@ def qwen36moe_block(seed: int):
         Wq, S, B = stack(f"switch_mlp.{proj}", f"shared_expert.{proj}")
         arrays[f"exp_{proj}_w_u32"] = Wq.ravel()
         arrays[f"exp_{proj}_s_f16"] = S.astype(np.float16).ravel()
-        arrays[f"exp_{proj}_b2_f16"] = (7.0 * S + B).astype(np.float16).ravel()
+        arrays[f"exp_{proj}_b_f16"] = B.astype(np.float16).ravel()
 
     # Router ships at 8 bits, group 64 — a different kernel path. Row E is the
     # shared-expert gate, so one dispatch produces every logit the block needs.
