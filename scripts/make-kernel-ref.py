@@ -115,8 +115,12 @@ def qwen36moe_block(seed: int):
     mx.eval(blk.parameters())
 
     # Realistic scale: the MLP sees post_attention_layernorm(h), i.e. RMS ≈ 1.
+    # f32, not the checkpoint's bfloat16 — a bf16 reference is ~1.7e-2 off f32
+    # truth on a projection this size, several times our own error, so it would
+    # set the tolerance instead of the kernel setting it (see qwen36gdn).
+    blk.set_dtype(mx.float32)
     rng = np.random.default_rng(seed)
-    x = mx.array(rng.standard_normal((1, args.hidden_size)).astype(np.float32)).astype(mx.bfloat16)
+    x = mx.array(rng.standard_normal((1, args.hidden_size)).astype(np.float32))
     y = blk(x)
     # Split the reference so a partial GPU implementation can be validated
     # against exactly the part it implements, instead of a loosened tolerance.
@@ -193,7 +197,237 @@ def qwen36moe_block(seed: int):
     }
 
 
-PRODUCERS = {"qwen36moe": qwen36moe, "qwen36moe_block": qwen36moe_block}
+def _qwen36_args():
+    """TextModelArgs + the checkpoint's own quantization config."""
+    import json as _json
+    W = os.path.join(ROOT, ".weights-local/Qwen3.6-35B-A3B-MLX-4bit")
+    if not os.path.exists(W):
+        sys.exit(f"missing checkpoint: {W}")
+    cfg = _json.load(open(os.path.join(W, "config.json")))
+    t = cfg.get("text_config", cfg)
+    from mlx_lm.models.qwen3_5 import TextModelArgs
+    args = TextModelArgs(**{k: v for k, v in t.items() if k in TextModelArgs.__dataclass_fields__})
+    return W, cfg, args
+
+
+def _affine(w, key, out, prefix):
+    """Emit one MLX affine int4 tensor (weight/scales/biases) verbatim."""
+    import mlx.core as mx
+    import numpy as _np
+    out[f"{prefix}_w_u32"] = _np.array(w[key + ".weight"].astype(mx.uint32)).ravel()
+    out[f"{prefix}_s_f16"] = _np.array(w[key + ".scales"].astype(mx.float32)).astype(_np.float16).ravel()
+    out[f"{prefix}_b_f16"] = _np.array(w[key + ".biases"].astype(mx.float32)).astype(_np.float16).ravel()
+
+
+def _f16(a):
+    import mlx.core as mx
+    import numpy as _np
+    return _np.array(a.astype(mx.float32)).astype(_np.float16).ravel()
+
+
+def _f32(a):
+    import mlx.core as mx
+    import numpy as _np
+    return _np.array(a.astype(mx.float32)).astype(_np.float32).ravel()
+
+
+def qwen36gdn(seed: int):
+    """Layer 0's gated-DeltaNet sub-block: input_layernorm -> linear_attn -> r.
+
+    The engine already runs GDN for Qwen3.5 and its kernels are checked against a
+    JS reference in compile-qwen35.mjs. What is NOT checked there is this model:
+    Qwen3.6 quantises every weight MLX-affine (group 64) rather than MLC-symmetric
+    (group 32), and a shared reference can share a misreading with the kernel. So
+    this compares against mlx_lm's OWN module, on the checkpoint's own weights.
+
+    A DECODE step with a SEEDED cache, not a first token: three tokens are
+    prefilled first so the depthwise conv sees four real taps and the recurrent
+    state is non-zero. A first-token bundle would leave three of the four conv
+    taps at zero and let a tap-ordering bug pass.
+    """
+    import mlx.core as mx, mlx.nn as nn
+    from mlx_lm.models.qwen3_5 import GatedDeltaNet
+    from mlx_lm.models.cache import ArraysCache
+
+    W, cfg, args = _qwen36_args()
+    qz = cfg["quantization"]
+    gdn = GatedDeltaNet(args)
+    norm1 = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+    nn.quantize(gdn, group_size=qz["group_size"], bits=qz["bits"])
+    _f32_params = True
+
+    PRE = "language_model.model.layers.0."
+    w = mx.load(os.path.join(W, "model-00001-of-00004.safetensors"))
+    gdn.load_weights([(k[len(PRE + "linear_attn."):], v) for k, v in w.items()
+                      if k.startswith(PRE + "linear_attn.")])
+    norm1.load_weights([("weight", w[PRE + "input_layernorm.weight"])])
+    gdn.set_dtype(mx.float32)
+    norm1.set_dtype(mx.float32)
+    mx.eval(gdn.parameters(), norm1.parameters())
+
+    # f32, not the checkpoint's bfloat16. bf16 carries 8 mantissa bits, so a
+    # bf16 reference is itself ~1.7e-2 wrong against f32 truth on this
+    # projection — measured — which is SEVEN TIMES our own f16-activation error
+    # of 2.4e-3. A test whose noise floor sits above the error it is looking for
+    # cannot fail for the right reason. The quantized weights are untouched; only
+    # the activations and accumulation move to f32.
+    rng = np.random.default_rng(seed)
+    D, PREFILL = args.hidden_size, 3
+    hs = mx.array(rng.standard_normal((1, PREFILL + 1, D)).astype(np.float32))
+
+    cache = ArraysCache(2)
+    gdn(norm1(hs[:, :PREFILL]), cache=cache)          # seed conv + recurrent state
+    mx.eval(cache[0], cache[1])
+    conv_state, recur_state = cache[0], cache[1]
+    state_shape = list(recur_state.shape)
+
+    x = hs[:, PREFILL:]                                # the token the GPU will step
+    xn = norm1(x)
+
+    # Re-run GatedDeltaNet.__call__ stage by stage so a GPU mismatch localises to
+    # one kernel instead of "the block is wrong". The module's own output is
+    # computed too and asserted against this transcription — if they disagree the
+    # bundle is void, exactly like the mx.dequantize cross-check in qwen36moe.
+    from mlx_lm.models.gated_delta import gated_delta_update
+    qkv = gdn.in_proj_qkv(xn)
+    z_p = gdn.in_proj_z(xn)
+    a_p = gdn.in_proj_a(xn)
+    b_p = gdn.in_proj_b(xn)
+    conv_in = mx.concatenate([conv_state, qkv], axis=1)
+    conv_out = nn.silu(gdn.conv1d(conv_in))
+    kd, vd = gdn.key_dim, gdn.value_dim
+    q_, k_, v_ = [t.reshape(1, 1, h, d) for t, h, d in zip(
+        mx.split(conv_out, [kd, 2 * kd], -1),
+        [gdn.num_k_heads, gdn.num_k_heads, gdn.num_v_heads],
+        [gdn.head_k_dim, gdn.head_k_dim, gdn.head_v_dim])]
+    inv = gdn.head_k_dim ** -0.5
+    qn = (inv ** 2) * mx.fast.rms_norm(q_, None, 1e-6)
+    kn = inv * mx.fast.rms_norm(k_, None, 1e-6)
+    rec, state_out = gated_delta_update(qn, kn, v_, a_p, b_p, gdn.A_log, gdn.dt_bias,
+                                        recur_state, None, use_kernel=True)
+    gn = gdn.norm(rec, z_p.reshape(1, 1, gdn.num_v_heads, gdn.head_v_dim))
+    y_mine = gdn.out_proj(gn.reshape(1, 1, -1))
+
+    r = gdn(xn, cache=cache)
+    mx.eval(xn, r, cache[1], qkv, z_p, a_p, b_p, conv_out, rec, gn, y_mine, state_out)
+    rel = float(mx.abs(y_mine - r).max() / (mx.abs(r).max() + 1e-9))
+    if rel > 1e-5:
+        sys.exit(f"stage-by-stage transcription disagrees with the module (rel {rel:.2e}) "
+                 "— refusing to write")
+
+    arrays = {
+        "x_f16": _f16(x), "xnorm_ref_f32": _f32(xn), "y_ref_f32": _f32(r),
+        "proj_ref_f32": np.concatenate([_f32(qkv), _f32(z_p), _f32(a_p), _f32(b_p)]),
+        "conv_ref_f32": _f32(conv_out),
+        "recur_ref_f32": _f32(rec),
+        "gnorm_ref_f32": _f32(gn),
+        "conv_state_f16": _f16(conv_state),
+        # TRANSPOSED. mlx allocates the recurrent state as (B, Hv, Dv, Dk) —
+        # gated_delta.gated_delta_update — i.e. S[h][dv][dk]; gdn_recur.wgsl
+        # indexes S[h][dk][dv] (dk stride GDN_HEAD_V) so each thread owns one
+        # dv column. head_k_dim == head_v_dim == 128 here, so feeding mlx's
+        # layout straight through is silently wrong rather than a shape error.
+        "recur_state_f32": _f32(mx.swapaxes(recur_state, -1, -2)),
+        "recur_state_out_f32": _f32(mx.swapaxes(cache[1], -1, -2)),
+        "norm1_gamma_f16": _f16(w[PRE + "input_layernorm.weight"]),
+        "conv1d_f16": _f16(w[PRE + "linear_attn.conv1d.weight"]),
+        "A_log_f32": _f32(w[PRE + "linear_attn.A_log"]),
+        "dt_bias_f32": _f32(w[PRE + "linear_attn.dt_bias"]),
+        "gnorm_gamma_f16": _f16(w[PRE + "linear_attn.norm.weight"]),
+    }
+    for name, key in (("qkv", "in_proj_qkv"), ("z", "in_proj_z"),
+                      ("a", "in_proj_a"), ("b", "in_proj_b"), ("out", "out_proj")):
+        _affine(w, PRE + "linear_attn." + key, arrays, name)
+
+    return {
+        "arrays": arrays,
+        "meta": {"kernel": "qwen36_gdn",
+                 "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
+                 "tensor": "layers.0 (input_layernorm + linear_attn), decode step 3",
+                 "reference": "mlx_lm qwen3_5.GatedDeltaNet",
+                 "hidden": int(args.hidden_size),
+                 "kHeads": int(args.linear_num_key_heads), "vHeads": int(args.linear_num_value_heads),
+                 "headK": int(args.linear_key_head_dim), "headV": int(args.linear_value_head_dim),
+                 "convK": int(args.linear_conv_kernel_dim),
+                 "convDim": int(args.linear_key_head_dim * args.linear_num_key_heads * 2
+                                + args.linear_value_head_dim * args.linear_num_value_heads),
+                 "group": qz["group_size"], "rmsEps": float(args.rms_norm_eps),
+                 "prefill": PREFILL, "state_shape": state_shape, "state_layout": "h,dk,dv (transposed from mlx h,dv,dk)",
+                 "note": "r = linear_attn(input_layernorm(x)) at position 3, conv+recurrent "
+                         "state seeded by 3 prefill tokens; residual/MoE are NOT included"},
+    }
+
+
+def qwen36attn(seed: int):
+    """Layer 3's gated-attention sub-block: input_layernorm -> self_attn -> r.
+
+    Layer 3 because is_linear = (i+1) % full_attention_interval != 0, so layers
+    3, 7, ... 39 are the ten full-attention layers.
+
+    q_proj emits 8192 rows for 16 heads x 256: the second 4096 are the SIGMOID
+    GATE, not query rows. Same decode-with-seeded-cache shape as qwen36gdn.
+    """
+    import mlx.core as mx, mlx.nn as nn
+    from mlx_lm.models.qwen3_5 import Attention
+    from mlx_lm.models.cache import KVCache
+
+    W, cfg, args = _qwen36_args()
+    qz = cfg["quantization"]
+    attn = Attention(args)
+    norm1 = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+    nn.quantize(attn, group_size=qz["group_size"], bits=qz["bits"])
+
+    PRE = "language_model.model.layers.3."
+    w = mx.load(os.path.join(W, "model-00001-of-00004.safetensors"))
+    attn.load_weights([(k[len(PRE + "self_attn."):], v) for k, v in w.items()
+                       if k.startswith(PRE + "self_attn.")])
+    norm1.load_weights([("weight", w[PRE + "input_layernorm.weight"])])
+    mx.eval(attn.parameters(), norm1.parameters())
+
+    rng = np.random.default_rng(seed)
+    D, PREFILL = args.hidden_size, 3
+    hs = mx.array(rng.standard_normal((1, PREFILL + 1, D)).astype(np.float32)).astype(mx.bfloat16)
+
+    cache = KVCache()
+    attn(norm1(hs[:, :PREFILL]), mask=None, cache=cache)
+    mx.eval(cache.keys, cache.values)
+    k_seed, v_seed = cache.state[0][:, :, :PREFILL], cache.state[1][:, :, :PREFILL]
+    mx.eval(k_seed, v_seed)
+
+    x = hs[:, PREFILL:]
+    xn = norm1(x)
+    r = attn(xn, mask=None, cache=cache)
+    mx.eval(xn, r)
+
+    arrays = {
+        "x_f16": _f16(x), "xnorm_ref_f32": _f32(xn), "y_ref_f32": _f32(r),
+        "k_cache_f16": _f16(k_seed), "v_cache_f16": _f16(v_seed),
+        "norm1_gamma_f16": _f16(w[PRE + "input_layernorm.weight"]),
+        "q_norm_f16": _f16(w[PRE + "self_attn.q_norm.weight"]),
+        "k_norm_f16": _f16(w[PRE + "self_attn.k_norm.weight"]),
+    }
+    for name, key in (("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj"), ("o", "o_proj")):
+        _affine(w, PRE + "self_attn." + key, arrays, name)
+
+    return {
+        "arrays": arrays,
+        "meta": {"kernel": "qwen36_attn",
+                 "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
+                 "tensor": "layers.3 (input_layernorm + self_attn), decode step 3",
+                 "reference": "mlx_lm qwen3_next.Qwen3NextAttention",
+                 "hidden": int(args.hidden_size), "heads": int(args.num_attention_heads),
+                 "kvHeads": int(args.num_key_value_heads), "headDim": int(args.head_dim),
+                 "rotaryDim": int(args.head_dim * args.partial_rotary_factor),
+                 "ropeTheta": float(args.rope_theta),
+                 "group": qz["group_size"], "rmsEps": float(args.rms_norm_eps),
+                 "prefill": PREFILL, "pos": PREFILL,
+                 "note": "q_proj rows [0,4096) are queries and [4096,8192) the sigmoid gate; "
+                         "residual/MoE are NOT included"},
+    }
+
+
+PRODUCERS = {"qwen36moe": qwen36moe, "qwen36moe_block": qwen36moe_block,
+             "qwen36gdn": qwen36gdn, "qwen36attn": qwen36attn}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

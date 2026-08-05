@@ -22,7 +22,7 @@ import { getDevice, pipelineFor, buffer, runCompute, BU, MM } from './gpu.mjs'
 import { f16Array, f16BitsToF32 } from './half.mjs'
 import { int4MatmulWGSL, int4MatmulEntry } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import { withPrelude } from '../../src/compiler/shader-prelude.ts'
-import { QWEN35_4B } from '../../src/compiler/model-spec.ts'
+import { QWEN35_4B, makeModelSpec } from '../../src/compiler/model-spec.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const REFS = join(ROOT, '.weights-local/kernel-refs')
@@ -213,21 +213,185 @@ async function moeBlock(device, dir, meta) {
   await outBuf.mapAsync(MM.READ)
   const got = new Float32Array(outBuf.getMappedRange().slice(0))
 
-  // Tolerance is set by the REFERENCE's precision, not ours: mlx runs the block
-  // in bfloat16 (~4e-3) and gate→silu→down→sum compounds it. Evidence this is
-  // not covering a bug — the same algorithm in f32 on CPU gives the same figure,
-  // and the error is spread across all 2048 outputs rather than concentrated in
-  // a few, which is what an indexing or routing mistake looks like.
+  // The reference runs in f32, so this tolerance is set by OUR f16 activations
+  // and int4 weights rather than by the reference's own rounding. It was 0.012
+  // when the reference was bfloat16 — that is not a tolerance, it is the
+  // reference's noise floor, and it is wide enough to hide a real bug.
   const scale = Math.max(...Array.from(yRef, Math.abs))
   let maxRel = 0
   for (let i2 = 0; i2 < D; i2++) maxRel = Math.max(maxRel, Math.abs(got[i2] - yRef[i2]) / scale)
   return {
-    pass: maxRel < 0.012 && scoreErr < 0.01,
+    pass: maxRel < 0.005 && scoreErr < 0.005,
     detail: `router top-${K} exact, scores ${scoreErr.toExponential(2)} | full block ${maxRel.toExponential(2)} | ${SLOTS} slots in 6 dispatches`,
   }
 }
 
-const KERNELS = { affine_matmul: affineMatmul, moe_block: moeBlock }
+
+// ── Qwen3.6-35B-A3B shape ────────────────────────────────────────────────────
+//
+// Derived here rather than added to model-spec.ts: a shipped spec also has to
+// carry `paramNaming`, and Qwen3.6 loads from MLX safetensors (weight/scales/
+// BIASES triples) rather than the MLC records every existing spec names — that
+// interface change belongs with the loader, not ahead of it. Only the shape
+// fields matter to the shader prelude, and they are what these tests exercise.
+// GDN dims are IDENTICAL to Qwen3.5's, which is why its kernels carry over.
+const QWEN36 = makeModelSpec({
+  ...QWEN35_4B,
+  id: 'qwen36-35b-a3b',
+  d: 2048,
+  layers: 40,
+  kvHeads: 2,
+  ffn: 512,                 // moe_intermediate_size — silu_mul's per-slot stride
+  tiedEmbeddings: false,    // lm_head is its own 248320 x 2048 tensor
+  hfRepo: 'lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit',
+})
+
+/** Chain kernels in one pass, then read the requested buffers back. */
+async function runChain(device, steps, reads) {
+  const enc = device.createCommandEncoder()
+  const pass = enc.beginComputePass()
+  for (const [pipeline, entries, wg] of steps) {
+    pass.setPipeline(pipeline)
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: entries.map((e, i) => ({ binding: i, resource: e.buffer ? e : { buffer: e } })),
+    }))
+    pass.dispatchWorkgroups(wg[0], wg[1] ?? 1, wg[2] ?? 1)
+  }
+  pass.end()
+  device.queue.submit([enc.finish()])
+  return readBack(device, reads)
+}
+
+/** max |got - ref| / max|ref| over the whole vector. Loops rather than
+ *  spreading into Math.max — these run to 500k elements. */
+function relErr(got, ref) {
+  let scale = 0
+  for (let i = 0; i < ref.length; i++) scale = Math.max(scale, Math.abs(ref[i]))
+  let m = 0
+  for (let i = 0; i < ref.length; i++) m = Math.max(m, Math.abs(got[i] - ref[i]) / scale)
+  return m
+}
+
+/**
+ * Layer 0's gated-DeltaNet sub-block against mlx_lm's own GatedDeltaNet.
+ *
+ * The GDN kernels are already checked against a JS reference at Qwen3.5 dims
+ * (compile-qwen35.mjs). This checks the two things that reference cannot: the
+ * weights are MLX-affine rather than MLC-symmetric, and a reference we wrote
+ * ourselves can share a misreading with the kernel we wrote ourselves.
+ *
+ * The four input projections are CONCATENATED into one [gdnProjRows, d] matmul
+ * here, the way the engine's loader fuses them, so `z` and `[a|b]` are read out
+ * of one buffer by 256-aligned bind offsets — which is also what makes
+ * z_stride / ab_stride = gdnProjRows the natural setting.
+ */
+async function qwen36Gdn(device, dir, meta) {
+  const S = QWEN36
+  const rd = (n, T) => read(dir, n, T)
+  const st = (n, T) => buffer(device, rd(n, T), BU.STORAGE | BU.COPY_DST)
+  const shader = (f, e) => pipelineFor(device, withPrelude(readFileSync(join(SHADERS, f), 'utf8'), S), e)
+  const D = S.d, QKV = S.gdnQkvDim, VD = S.gdnVDim, ROWS = S.gdnProjRows, VH = S.gdnVHeads
+
+  // One fused [ROWS, D] affine projection: qkv | z | a | b.
+  const cat = (names, T) => {
+    const parts = names.map((n) => rd(n, T))
+    const out = new T(parts.reduce((a, p) => a + p.length, 0))
+    let o = 0
+    for (const p of parts) { out.set(p, o); o += p.length }
+    return buffer(device, out, BU.STORAGE | BU.COPY_DST)
+  }
+  const P = ['qkv', 'z', 'a', 'b']
+  const projW = cat(P.map((n) => `${n}_w_u32`), Uint32Array)
+  const projS = cat(P.map((n) => `${n}_s_f16`), Uint16Array)
+  const projB = cat(P.map((n) => `${n}_b_f16`), Uint16Array)
+
+  const MM = { affine: true, subgroups: true, rowsPerWG: 4 }
+  const F32 = { affine: true, subgroups: true, rowsPerWG: 4, outF32: true }
+  const mm = pipelineFor(device, withPrelude(int4MatmulWGSL(MM), S), int4MatmulEntry(MM))
+  const mmF32 = pipelineFor(device, withPrelude(int4MatmulWGSL(F32), S), int4MatmulEntry(F32))
+  const RPW = 4
+  const norm = shader('rms_norm.wgsl', 'rms_norm')
+  const conv = shader('gdn_conv.wgsl', 'gdn_conv')
+  const gates = shader('gdn_gates.wgsl', 'gdn_gates')
+  const recur = shader('gdn_recur.wgsl', 'gdn_recur')
+  const gnorm = shader('gdn_norm_out.wgsl', 'gdn_norm_out')
+
+  const u32 = (a) => buffer(device, new Uint32Array(a), BU.UNIFORM | BU.COPY_DST)
+  const i32 = (a) => buffer(device, new Int32Array(a), BU.UNIFORM | BU.COPY_DST)
+  const sb = (n) => device.createBuffer({ size: n, usage: BU.STORAGE | BU.COPY_SRC })
+
+  const xBuf = st('x_f16', Uint16Array)
+  const xn = sb(D * 2)
+  const proj = sb(ROWS * 2)                 // [qkv | z | a | b], f16
+  const convOut = sb(QKV * 2)
+  const gateBuf = sb(2 * VH * 4)
+  const recurOut = sb(VD * 4)
+  const gnormOut = sb(VD * 2)
+  const y = sb(D * 4)
+  const convState = st('conv_state_f16', Uint16Array)
+  const state = buffer(device, rd('recur_state_f32', Float32Array), BU.STORAGE | BU.COPY_DST | BU.COPY_SRC)
+
+  // CONTROL: the same projection driven by mlx's OWN normalised input instead of
+  // ours. Separates "our matmul is wrong" from "our f16 input differs slightly
+  // and the dot products cancel" — without it the projection's error is the
+  // largest in the chain with no way to say why.
+  const xnRef = buffer(device, f16Array(rd('xnorm_ref_f32', Float32Array)), BU.STORAGE | BU.COPY_DST)
+  const projCtl = sb(ROWS * 2)
+
+  const zOff = QKV * 2, abOff = (QKV + VD) * 2   // 16384 and 24576 bytes — both 256-aligned
+  const steps = [
+    [norm, [xn, xBuf, st('norm1_gamma_f16', Uint16Array), u32([D])], [1]],
+    [mm, [proj, xn, projS, projW, u32([D / 8, D / 64, ROWS]), projB], [ROWS / RPW]],
+    [conv, [convOut, { buffer: proj, offset: 0, size: QKV * 2 }, convState,
+            st('conv1d_f16', Uint16Array), i32([meta.prefill, Math.ceil(QKV / 256)])],
+     [Math.ceil(QKV / 256)]],
+    [gates, [gateBuf, { buffer: proj, offset: abOff, size: ROWS * 2 - abOff },
+             st('A_log_f32', Float32Array), st('dt_bias_f32', Float32Array), i32([1, ROWS, 1])], [1]],
+    [recur, [recurOut, convOut, gateBuf, state, i32([1, VH])], [VH]],
+    [gnorm, [gnormOut, recurOut, st('gnorm_gamma_f16', Uint16Array),
+             { buffer: proj, offset: zOff, size: ROWS * 2 - zOff }, i32([1, ROWS, VH])], [VH]],
+    // out_proj writes f32 so the comparison is not limited by an f16 round-trip.
+    [mmF32, [y, gnormOut, st('out_s_f16', Uint16Array), st('out_w_u32', Uint32Array),
+             u32([VD / 8, VD / 64, D]), st('out_b_f16', Uint16Array)], [D / RPW]],
+    [mm, [projCtl, xnRef, projS, projW, u32([D / 8, D / 64, ROWS]), projB], [ROWS / RPW]],
+  ]
+
+  // Every stage is compared, not just the ends: an error that grows smoothly is
+  // f16/int4 compounding through a recurrence, one that jumps is a bug, and the
+  // two are indistinguishable from the block output alone.
+  const bytes = await runChain(device, steps, [
+    [xn, D * 2], [proj, ROWS * 2], [convOut, QKV * 2], [recurOut, VD * 4],
+    [gnormOut, VD * 2], [y, D * 4], [state, VH * S.gdnStatePerHead * 4],
+    [projCtl, ROWS * 2],
+  ])
+  const h = (b) => Array.from(new Uint16Array(b), f16BitsToF32)
+  const f = (b) => new Float32Array(b)
+  const stages = [
+    ['input_layernorm', h(bytes[0]), 'xnorm_ref_f32'],
+    ['fused proj', h(bytes[1]), 'proj_ref_f32'],
+    ['conv+silu', h(bytes[2]), 'conv_ref_f32'],
+    ['recurrence', f(bytes[3]), 'recur_ref_f32'],
+    ['gated norm', h(bytes[4]), 'gnorm_ref_f32'],
+    ['out_proj', f(bytes[5]), 'y_ref_f32'],
+    ['state out', f(bytes[6]), 'recur_state_out_f32'],
+    ['proj(ref x)', h(bytes[7]), 'proj_ref_f32'],
+  ].map(([name, got, ref]) => [name, relErr(got, rd(ref, Float32Array))])
+
+  // The reference is f32, so these numbers are ours: f16 activations through
+  // int4 weights. They should rise SMOOTHLY along the chain (~5e-4 at the first
+  // projection to ~2e-3 after out_proj) — a jump between neighbours is a bug,
+  // a slow climb is compounding. Reading the block output alone cannot tell
+  // those apart, which is why every stage is compared.
+  const worst = Math.max(...stages.map(([, e]) => e))
+  return {
+    pass: worst < 0.005,
+    detail: stages.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ')
+          + ` (${ROWS}-row fused proj, 7 dispatches)`,
+  }
+}
+
+const KERNELS = { affine_matmul: affineMatmul, moe_block: moeBlock, qwen36_gdn: qwen36Gdn }
 
 async function main() {
   if (!existsSync(REFS) || readdirSync(REFS).length === 0) {
