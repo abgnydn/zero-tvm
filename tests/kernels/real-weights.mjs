@@ -391,7 +391,134 @@ async function qwen36Gdn(device, dir, meta) {
   }
 }
 
-const KERNELS = { affine_matmul: affineMatmul, moe_block: moeBlock, qwen36_gdn: qwen36Gdn }
+
+/**
+ * Layer 3's gated-attention sub-block against mlx_lm's own Qwen3NextAttention.
+ * (is_linear = (i+1) % full_attention_interval != 0, so 3, 7, ... 39 are the
+ * ten full-attention layers.)
+ *
+ * q_proj emits 8192 rows for 16 heads x 256: per head the first 256 are the
+ * query and the next 256 are the SIGMOID GATE — already the interleaving
+ * gated_qkv_split expects, so c_attn is just q_proj ++ k_proj ++ v_proj.
+ *
+ * The KV pages are SEEDED FROM MLX'S OWN CACHE rather than built by prefilling
+ * through our chain. That is the stronger test: our RoPE has to agree with
+ * mlx's for the current token AND our page layout has to match what mlx stored,
+ * whereas a self-prefilled cache would be consistent with our own conventions
+ * even if both were wrong.
+ */
+async function qwen36Attn(device, dir, meta) {
+  const S = QWEN36
+  const rd = (n, T) => read(dir, n, T)
+  const st = (n, T) => buffer(device, rd(n, T), BU.STORAGE | BU.COPY_DST)
+  const shader = (f, e) => pipelineFor(device, withPrelude(readFileSync(join(SHADERS, f), 'utf8'), S), e)
+  const D = S.d, HD = S.headDim, POS = meta.pos, PAGES = 1   // 4 tokens fit one 16-slot page
+
+  const cat = (names, T) => {
+    const parts = names.map((n) => rd(n, T))
+    const out = new T(parts.reduce((a, p) => a + p.length, 0))
+    let o = 0
+    for (const p of parts) { out.set(p, o); o += p.length }
+    return buffer(device, out, BU.STORAGE | BU.COPY_DST)
+  }
+  const P = ['q', 'k', 'v']
+  const cW = cat(P.map((n) => `${n}_w_u32`), Uint32Array)
+  const cS = cat(P.map((n) => `${n}_s_f16`), Uint16Array)
+  const cB = cat(P.map((n) => `${n}_b_f16`), Uint16Array)
+
+  const MM = { affine: true, subgroups: true, rowsPerWG: 4 }
+  const F32 = { ...MM, outF32: true }
+  const mm = pipelineFor(device, withPrelude(int4MatmulWGSL(MM), S), int4MatmulEntry(MM))
+  const mmF32 = pipelineFor(device, withPrelude(int4MatmulWGSL(F32), S), int4MatmulEntry(F32))
+  const RPW = 4
+  const norm = shader('rms_norm.wgsl', 'rms_norm')
+  const split = shader('gated_qkv_split.wgsl', 'gated_qkv_split')
+  const qkNorm = shader('qk_norm.wgsl', 'qk_norm')
+  const rope = shader('rope.wgsl', 'rope_kernel')
+  const kvAppend = shader('kv_append.wgsl', 'kv_append')
+  const attention = shader('attention.wgsl', 'attention')
+  const gateK = shader('attn_gate.wgsl', 'attn_gate')
+
+  const u32 = (a) => buffer(device, new Uint32Array(a), BU.UNIFORM | BU.COPY_DST)
+  const i32 = (a) => buffer(device, new Int32Array(a), BU.UNIFORM | BU.COPY_DST)
+  const sb = (n) => device.createBuffer({ size: n, usage: BU.STORAGE | BU.COPY_SRC })
+
+  // mlx cache is [1, kvHeads, seq, headDim]; the page is
+  // [head][slot][dim] for K, the same shifted by vPageOffset for V.
+  const seedPages = () => {
+    const pg = new Uint16Array(PAGES * S.kvPageStride)
+    const k = rd('k_cache_f16', Uint16Array), v = rd('v_cache_f16', Uint16Array)
+    for (let h = 0; h < S.kvHeads; h++) {
+      for (let p = 0; p < POS; p++) {
+        for (let d = 0; d < HD; d++) {
+          const src = (h * POS + p) * HD + d
+          const dst = h * S.headPageStride + p * HD + d
+          pg[dst] = k[src]
+          pg[dst + S.vPageOffset] = v[src]
+        }
+      }
+    }
+    return buffer(device, pg, BU.STORAGE | BU.COPY_DST | BU.COPY_SRC)
+  }
+
+  const xn = sb(D * 2)
+  const cAttn = sb(S.cAttnDim * 2)
+  const qkv = sb(S.qkvDim * 2)
+  const gate = sb(S.qDim * 2)
+  const qB = sb(S.qDim * 2), kB = sb(S.kvDim * 2), vB = sb(S.kvDim * 2)
+  const attnOut = sb(S.qDim * 2)
+  const y = sb(D * 4)
+  const pages = seedPages()
+  // position_map / length_info are STORAGE, not uniform — rope, kv_append and
+  // attention all read them as arrays.
+  const pos = buffer(device, new Int32Array([POS]), BU.STORAGE | BU.COPY_DST)
+  const len = buffer(device, new Int32Array([POS + 1]), BU.STORAGE | BU.COPY_DST)
+  const WGS_NORM = S.heads + S.kvHeads
+
+  const steps = [
+    [norm, [xn, st('x_f16', Uint16Array), st('norm1_gamma_f16', Uint16Array), u32([D])], [1]],
+    [mm, [cAttn, xn, cS, cW, u32([D / 8, D / 64, S.cAttnDim]), cB], [S.cAttnDim / RPW]],
+    [split, [qkv, gate, cAttn, i32([1, S.cAttnDim / 256])], [S.cAttnDim / 256]],
+    [qkNorm, [qkv, st('q_norm_f16', Uint16Array), st('k_norm_f16', Uint16Array),
+              i32([1, WGS_NORM])], [WGS_NORM]],
+    [rope, [qB, kB, vB, qkv, pos, u32([1, 0, 1, S.qkvDim / 256])], [S.qkvDim / 256]],
+    [kvAppend, [kB, vB, pages, pos, u32([1, PAGES, 0, 0, S.kvDim / 256])], [S.kvDim / 256]],
+    [attention, [qB, buffer(device, new Int32Array([0, PAGES]), BU.STORAGE | BU.COPY_DST),
+                 buffer(device, new Int32Array([0]), BU.STORAGE | BU.COPY_DST), pages, len, attnOut,
+                 buffer(device, (() => { const b = new ArrayBuffer(64); const iv = new Int32Array(b)
+                   iv[0] = 1; iv[1] = PAGES; iv[2] = PAGES; new Float32Array(b)[7] = 1 / Math.sqrt(HD)
+                   iv[8] = 1; return new Uint8Array(b) })(), BU.UNIFORM | BU.COPY_DST)], [1, S.heads]],
+    [gateK, [attnOut, gate, u32([S.qDim / 256])], [S.qDim / 256]],
+    [mmF32, [y, attnOut, st('o_s_f16', Uint16Array), st('o_w_u32', Uint32Array),
+             u32([S.qDim / 8, S.qDim / 64, D]), st('o_b_f16', Uint16Array)], [D / RPW]],
+  ]
+
+  const bytes = await runChain(device, steps, [
+    [xn, D * 2], [cAttn, S.cAttnDim * 2], [qB, S.qDim * 2], [kB, S.kvDim * 2],
+    [attnOut, S.qDim * 2], [y, D * 4],
+  ])
+  const h = (b) => Array.from(new Uint16Array(b), f16BitsToF32)
+  const stages = [
+    ['input_layernorm', h(bytes[0]), 'xnorm_ref_f32'],
+    ['c_attn', h(bytes[1]), 'cattn_ref_f32'],
+    ['q norm+rope', h(bytes[2]), 'q_rope_ref_f32'],
+    ['k norm+rope', h(bytes[3]), 'k_rope_ref_f32'],
+    ['attn*sigmoid(gate)', h(bytes[4]), 'gated_ref_f32'],
+    ['o_proj', new Float32Array(bytes[5]), 'y_ref_f32'],
+  ].map(([name, got, ref]) => [name, relErr(got, rd(ref, Float32Array))])
+
+  const worst = Math.max(...stages.map(([, e]) => e))
+  return {
+    pass: worst < 0.005,
+    detail: stages.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ')
+          + ` (pos ${POS}, KV pages seeded from mlx, 9 dispatches)`,
+  }
+}
+
+const KERNELS = {
+  affine_matmul: affineMatmul, moe_block: moeBlock,
+  qwen36_gdn: qwen36Gdn, qwen36_attn: qwen36Attn,
+}
 
 async function main() {
   if (!existsSync(REFS) || readdirSync(REFS).length === 0) {

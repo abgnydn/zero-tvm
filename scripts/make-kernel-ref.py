@@ -384,9 +384,14 @@ def qwen36attn(seed: int):
     norm1.load_weights([("weight", w[PRE + "input_layernorm.weight"])])
     mx.eval(attn.parameters(), norm1.parameters())
 
+    # f32 for the same reason as qwen36gdn: a bfloat16 reference is further from
+    # f32 truth than our f16 path is, so it would set the tolerance itself.
+    attn.set_dtype(mx.float32)
+    norm1.set_dtype(mx.float32)
+    mx.eval(attn.parameters(), norm1.parameters())
     rng = np.random.default_rng(seed)
     D, PREFILL = args.hidden_size, 3
-    hs = mx.array(rng.standard_normal((1, PREFILL + 1, D)).astype(np.float32)).astype(mx.bfloat16)
+    hs = mx.array(rng.standard_normal((1, PREFILL + 1, D)).astype(np.float32))
 
     cache = KVCache()
     attn(norm1(hs[:, :PREFILL]), mask=None, cache=cache)
@@ -396,12 +401,43 @@ def qwen36attn(seed: int):
 
     x = hs[:, PREFILL:]
     xn = norm1(x)
+
+    # Stage-by-stage transcription of Qwen3NextAttention.__call__, asserted
+    # against the module's own output below.
+    from mlx_lm.models.base import scaled_dot_product_attention
+    H, KVH, HD = args.num_attention_heads, args.num_key_value_heads, args.head_dim
+    qp = attn.q_proj(xn)
+    q_, gate = mx.split(qp.reshape(1, 1, H, -1), 2, axis=-1)
+    gate = gate.reshape(1, 1, -1)
+    k_, v_ = attn.k_proj(xn), attn.v_proj(xn)
+    q_ = attn.q_norm(q_).transpose(0, 2, 1, 3)
+    kh = attn.k_norm(k_.reshape(1, 1, KVH, -1)).transpose(0, 2, 1, 3)
+    vh = v_.reshape(1, 1, KVH, -1).transpose(0, 2, 1, 3)
+    q_r = attn.rope(q_, offset=PREFILL)
+    k_r = attn.rope(kh, offset=PREFILL)
+    kk = mx.concatenate([k_seed, k_r], axis=2)
+    vv = mx.concatenate([v_seed, vh], axis=2)
+    o = scaled_dot_product_attention(q_r, kk, vv, cache=None, scale=attn.scale, mask=None)
+    o = o.transpose(0, 2, 1, 3).reshape(1, 1, -1)
+    gated = o * mx.sigmoid(gate)
+    y_mine = attn.o_proj(gated)
+
     r = attn(xn, mask=None, cache=cache)
-    mx.eval(xn, r)
+    mx.eval(xn, r, qp, k_, v_, q_r, k_r, o, gated, y_mine)
+    rel = float(mx.abs(y_mine - r).max() / (mx.abs(r).max() + 1e-9))
+    if rel > 1e-5:
+        sys.exit(f"stage-by-stage transcription disagrees with the module (rel {rel:.2e}) "
+                 "— refusing to write")
 
     arrays = {
         "x_f16": _f16(x), "xnorm_ref_f32": _f32(xn), "y_ref_f32": _f32(r),
         "k_cache_f16": _f16(k_seed), "v_cache_f16": _f16(v_seed),
+        # c_attn as the engine lays it out: per-head [Q|gate] (already how
+        # q_proj emits it), then K, then V.
+        "cattn_ref_f32": np.concatenate([_f32(qp), _f32(k_), _f32(v_)]),
+        "q_rope_ref_f32": _f32(q_r.transpose(0, 2, 1, 3)),
+        "k_rope_ref_f32": _f32(k_r.transpose(0, 2, 1, 3)),
+        "attn_ref_f32": _f32(o), "gated_ref_f32": _f32(gated),
         "norm1_gamma_f16": _f16(w[PRE + "input_layernorm.weight"]),
         "q_norm_f16": _f16(w[PRE + "self_attn.q_norm.weight"]),
         "k_norm_f16": _f16(w[PRE + "self_attn.k_norm.weight"]),
