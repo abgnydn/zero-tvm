@@ -14,20 +14,11 @@
  * starts a 2.6 GB download — the label turns a surprise into a choice.
  */
 
-import { PHI3, QWEN3_4B, QWEN35_4B, QWEN36_35B_A3B, QWEN36_35B_A3B_Q3, type ModelSpec } from '../compiler/model-spec.js'
-import { modelBranding } from './model-select.js'
+import { type ModelSpec } from '../compiler/model-spec.js'
+import { modelBranding, SHIPPED_MODELS } from './model-registry.js'
 import { opfsDirFor } from './weight-loader.js'
 
-/** URL `?model=` value for each spec; Phi-3 is the no-flag default. */
-const MODELS: { param: string; spec: ModelSpec }[] = [
-  { param: '', spec: PHI3 },
-  { param: 'qwen3', spec: QWEN3_4B },
-  { param: 'qwen35', spec: QWEN35_4B },
-  // The 35B MoE ships twice: 3-bit experts first (the one most machines can
-  // actually run — ~20 GB free RAM), full 4-bit for the boxes that can.
-  { param: 'qwen36q3', spec: QWEN36_35B_A3B_Q3 },
-  { param: 'qwen36', spec: QWEN36_35B_A3B },
-]
+const MODELS = SHIPPED_MODELS
 
 /**
  * Reload onto `param`, keeping every other query flag. Bench runs drive this

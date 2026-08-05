@@ -1,7 +1,7 @@
 {
   "name": "zero-tvm",
   "version": "0.2.0",
-  "description": "Phi-3-mini running in a browser on 10 hand-written kernel roles across 55 WGSL kernels (37 files + an 18-variant generator). No TVM, no WebLLM runtime, no compiler.",
+  "description": "Browser LLM inference on hand-written WGSL kernels \u2014 models from a 3.8B dense to a 35B sparse MoE, no TVM, no WebLLM runtime, no compiler. Measured against WebLLM on identical weights; every number in BENCH.md.",
   "type": "module",
   "license": "MIT",
   "author": "Ahmet Baris Gunaydin",

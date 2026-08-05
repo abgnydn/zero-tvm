@@ -477,6 +477,7 @@
     <a href="#weights" class="sidebar-link">Weight naming</a>
     <a href="#qwen3" class="sidebar-link">Qwen3-4B port</a>
     <a href="#qwen35" class="sidebar-link">Qwen3.5-4B hybrid</a>
+<a href="#qwen36" class="sidebar-link">Qwen3.6 MoE</a>
   </div>
 
   <div class="sidebar-section">
@@ -501,14 +502,14 @@
   <h1>Zero TVM Documentation</h1>
   <p class="lead">
     A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
-    10 hand-written WGSL kernel roles (37 files, 4,228 LOC), a BPE tokenizer, and raw WebGPU.
+    10 hand-written WGSL kernel roles (42 files + 28 generated int4-matmul variants, ~4,600 LOC), a BPE tokenizer, and raw WebGPU.
     Measured +16.0% on total wall-clock throughput and +31.4% on decode against WebLLM's TVM-autotuned 85
     kernels, identical weights, same session (M2 Max, 2026-07-30).
   </p>
 
   <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
     <span class="pill green">WebGPU</span>
-    <span class="pill purple">10 kernel roles · 37 WGSL files</span>
+    <span class="pill purple">10 kernel roles · 42 WGSL files + 28 generated</span>
     <span class="pill yellow">Q4F16_1</span>
     <span class="pill green">Phi-3-mini 3.8B</span>
     <span class="pill purple">Paged KV Cache</span>
@@ -595,7 +596,7 @@
     <tr><td><code>src/zero-tvm/chat.ts</code></td><td>Main decode engine + UI. Allocates buffers, builds bind groups, runs the decode loop.</td></tr>
     <tr><td><code>src/zero-tvm/weight-loader.ts</code></td><td>Fetches ndarray-cache.json, downloads shards, uploads to GPU buffers.</td></tr>
     <tr><td><code>src/zero-tvm/tokenizer.ts</code></td><td>BPE tokenizer: encode text → token IDs, decode IDs → text.</td></tr>
-    <tr><td><code>src/compiler/compiler.ts</code></td><td>Compiles all 37 WGSL files (10 kernel roles + tiled/subgroup variants) into <code>GPUComputePipeline</code> objects.</td></tr>
+    <tr><td><code>src/compiler/compiler.ts</code></td><td>Compiles all 70 shaders — 42 WGSL files plus 28 generated int4-matmul variants (tiled/subgroup/affine/MoE) — into <code>GPUComputePipeline</code> objects.</td></tr>
   </tbody>
 </table>
 
@@ -1084,6 +1085,24 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 </div>
 
 <!-- PORTING -->
+<h2 id="qwen36">Qwen3.6-35B-A3B MoE (<code>?model=qwen36q3</code> / <code>?model=qwen36</code>)</h2>
+<p>
+  The fourth model, shipped 2026-08-05, and three firsts at once: the first sparse MoE
+  (256 experts, top-8 plus a shared expert on every layer), the first MLX-format
+  checkpoint (affine <code>w&nbsp;=&nbsp;s·q&nbsp;+&nbsp;b</code>, group 64, per-tensor
+  biases, loaded by byte range — a 5.3&nbsp;GB safetensors shard is never one
+  <code>ArrayBuffer</code>), and the first model here with <strong>no WebLLM build to
+  benchmark against</strong>. <code>?model=qwen36q3</code> is the 3-bit-expert build
+  (~16.4&nbsp;GB, needs ~20&nbsp;GB free RAM, ~55&nbsp;tok/s on a quiet 32&nbsp;GB
+  M2&nbsp;Max); <code>?model=qwen36</code> is full 4-bit (~19.5&nbsp;GB, needs
+  ~24&nbsp;GB free RAM). The MoE block runs in 7 dispatches with the expert index in
+  grid&nbsp;<code>z</code>; every layer is validated against mlx_lm's own modules
+  (<code>npm run test:kernels:real</code>). Full engineering notes live in the repo:
+  <a href="https://github.com/abgnydn/zero-tvm#readme">README</a>,
+  <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">BENCH.md</a>,
+  <a href="https://github.com/abgnydn/zero-tvm/blob/main/CLAUDE.md">CLAUDE.md</a>.
+</p>
+
 <h2 id="porting">Port to Phi-4-mini or Qwen3</h2>
 
 <p>Both are available as MLC Q4F16 packages. The Qwen3 port has since landed (see <a href="#qwen3">Qwen3-4B</a> above) — these are the steps it followed, and the recipe for the next model:</p>
@@ -1190,7 +1209,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Time to first token (~35-token prompt)</td><td>291 ms</td><td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM ahead</td></tr>
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
     <tr><td>Dispatches / token</td><td>228 (260 with <code>?int8kv=1</code>)</td><td>342</td></tr>
-    <tr><td>Distinct shaders</td><td>10 kernel roles · 37 .wgsl files · 4,228 LOC</td><td>85 TVM-generated shaders · 12,962 LOC</td></tr>
+    <tr><td>Distinct shaders</td><td>10 kernel roles · 42 .wgsl files + 28 generated · ~4,600 LOC</td><td>85 TVM-generated shaders · 12,962 LOC</td></tr>
     <tr><td>Shipped JS bundle</td><td>157 kB / 33 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (<code>compiler-chat.html</code>)</td></tr>
     <tr><td>Bandwidth utilization (total / decode)</td><td>~31% / ~37% of the 222 tok/s ceiling</td><td>~27% / ~28% of the same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
@@ -1208,7 +1227,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 
 <h3>The advantage grows with architecture recency</h3>
 
-<p>Monotonic on both metrics across the three models, all measured 2026-07-30 on the same machine:</p>
+<p>Monotonic on both metrics across the three models then shipped, all measured 2026-07-30 on the same machine (Qwen3.6-35B-A3B came later and has no WebLLM baseline to pair against — see BENCH.md):</p>
 
 <table>
   <thead><tr><th>Model</th><th>Architecture released</th><th>Δ total</th><th>Δ decode</th></tr></thead>

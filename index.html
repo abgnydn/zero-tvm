@@ -3,17 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zero-TVM — Phi-3 &amp; Qwen3 in your browser · 10 kernels across 37 WGSL files</title>
-  <meta name="description" content="Phi-3-mini, Qwen3-4B, Qwen3.5-4B and the Qwen3.6-35B-A3B MoE decoding in the browser on hand-written WGSL — 10 kernel roles, ~2,000 lines of TypeScript, no TVM, no WebLLM runtime, readable end-to-end. The 35B MoE runs at ~55 tok/s on a 32 GB M2 Max.">
+  <title>Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE</title>
+  <meta name="description" content="Phi-3-mini, Qwen3-4B, Qwen3.5-4B and the Qwen3.6-35B-A3B MoE decoding in the browser on hand-written WGSL — 10 kernel roles, ~2,000 lines of TypeScript, no TVM, no WebLLM runtime, readable end-to-end.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zerotvm.com/">
-  <meta property="og:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files">
+  <meta property="og:title" content="Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE">
   <meta property="og:description" content="Four models — up to a 35B sparse MoE — decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. No TVM, no WebLLM runtime, readable end-to-end.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Zero-TVM — Phi-3 in your browser · 10 kernels across 37 WGSL files">
+  <meta name="twitter:title" content="Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE">
   <meta name="twitter:description" content="Four models — up to a 35B sparse MoE — decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. No TVM, no WebLLM runtime, readable end-to-end.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <link rel="canonical" href="https://zerotvm.com/">
@@ -28,7 +28,7 @@
         "url": "https://zerotvm.com",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Any (WebGPU browser, Chrome or Edge)",
-        "description": "Phi-3-mini, Qwen3-4B, Qwen3.5-4B and the Qwen3.6-35B-A3B MoE decoding in the browser on hand-written WGSL — 10 kernel roles, ~2,000 lines of TypeScript, no TVM, no WebLLM runtime, readable end-to-end. The 35B MoE runs at ~55 tok/s on a 32 GB M2 Max.",
+        "description": "Phi-3-mini, Qwen3-4B, Qwen3.5-4B and the Qwen3.6-35B-A3B MoE decoding in the browser on hand-written WGSL — 10 kernel roles, ~2,000 lines of TypeScript, no TVM, no WebLLM runtime, readable end-to-end.",
         "author": { "@id": "https://zerotvm.com#author" },
         "isPartOf": {
           "@type": "CreativeWork",
@@ -692,6 +692,35 @@
       z-index: 300;
     }
     .copied-toast.show { opacity: 1; }
+
+    /* ── model picker cards (rendered by src/landing.ts from the registry) ── */
+    .model-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 1rem; margin-top: 2.25rem; text-align: left;
+    }
+    .model-card {
+      display: block; padding: 1.1rem 1.2rem; border-radius: 14px;
+      background: var(--surface); border: 1px solid rgba(255,255,255,0.07);
+      text-decoration: none; color: inherit;
+      transition: transform .15s ease, border-color .15s ease;
+    }
+    .model-card:hover { transform: translateY(-2px); border-color: var(--accent); }
+    .mc-name { font-weight: 800; font-size: 1.05rem; letter-spacing: -0.02em; }
+    .mc-params { color: var(--muted); font-size: 0.8rem; margin-top: 0.15rem; }
+    .mc-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.7rem; }
+    .mc-chip {
+      font-size: 0.72rem; padding: 0.16rem 0.55rem; border-radius: 999px;
+      background: rgba(124,108,255,0.14); color: var(--accent); font-weight: 600;
+    }
+    .mc-chip.g { background: rgba(61,220,151,0.12); color: var(--green); }
+    .mc-chip.m { background: rgba(255,255,255,0.06); color: var(--muted); }
+    .mc-ram { color: var(--muted); font-size: 0.72rem; margin-top: 0.5rem; }
+    .mc-go { margin-top: 0.85rem; font-size: 0.85rem; font-weight: 600; color: var(--accent); }
+    .mc-cached { color: var(--green); font-weight: 500; font-size: 0.78rem; }
+    .mc-webgpu-note { grid-column: 1 / -1; color: var(--muted); font-size: 0.85rem; }
+    .why-links { display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: center; margin-top: 2rem; }
+    #why .section-sub { margin-left: auto; margin-right: auto; }
   </style>
 </head>
 <body>
@@ -700,11 +729,9 @@
 <nav>
   <a href="#" class="nav-logo">Zero<span>TVM</span></a>
   <ul>
-    <li><a href="#how">How it works</a></li>
-    <li><a href="#shaders">Shaders</a></li>
-    <li><a href="#compare">Compare</a></li>
+    <li><a href="#models">Models</a></li>
+    <li><a href="#why">Why</a></li>
     <li><a href="#tools">Tools</a></li>
-    <li><a href="#related">Related</a></li>
     <li><a href="docs.html">Docs</a></li>
     <li><a href="zero-tvm.html" class="nav-cta">Try it →</a></li>
   </ul>
@@ -712,52 +739,39 @@
 
 <!-- ── HERO ── -->
 <section class="hero">
-  <div class="hero-badge">⚡ WebGPU · No Framework · No TVM</div>
+  <div class="hero-badge">⚡ WebGPU · No frameworks · Readable end-to-end</div>
 
   <h1>
-    Run <span class="accent">a 35B MoE</span><br>
-    in your browser on <span class="green">10&nbsp;kernels</span>
+    <span class="accent">Hand-written</span> WebGPU inference.<br>
+    <span class="green">Pick a model. It runs in your tab.</span>
   </h1>
 
   <p class="hero-sub">
-    In <strong>February 2026</strong>, Hugging Face shipped Transformers.js v4 — a C++ WebGPU runtime built with
-    Microsoft's ONNX Runtime team — as the production answer for browser LLM inference.
-    This repo shows that for decoder-only models of this shape — Phi-3-mini, Qwen3-4B, the
-    Qwen3.5-4B hybrid with gated DeltaNet, and now <strong>Qwen3.6-35B-A3B</strong>, a
-    256-expert sparse MoE that WebLLM does not ship at all — the answer is
-    <span class="green">10 kernel roles of hand-written WGSL</span> and ~2,000 lines of TypeScript.
-    No WebLLM, no TVM, no ONNX, no WASM runtime. The MoE decodes at ~55 tok/s on a
-    32 GB M2 Max with 3-bit expert stacks, every layer validated against mlx_lm's own modules.
+    Every model below — from a 3.8B dense to a 256-expert sparse MoE — decodes on the
+    same small set of hand-written WGSL kernels and ~2,000 lines of TypeScript.
+    No WebLLM, no TVM, no ONNX, no WASM runtime; the forward pass is readable end-to-end.
+    The full argument, the numbers and the measurement protocol live
+    <a href="https://github.com/abgnydn/zero-tvm" style="color:var(--accent);">in the repo</a>.
   </p>
 
   <div class="hero-actions">
-    <a href="zero-tvm.html" class="btn-primary">Open Chat →</a>
-    <a href="zero-tvm.html?model=qwen36q3" class="btn-ghost">Chat with Qwen3.6-35B MoE →</a>
-    <a href="zero-tvm.html?model=qwen35" class="btn-ghost">Chat with Qwen3.5-4B →</a>
+    <a href="#models" class="btn-primary">Pick a model ↓</a>
     <a href="https://github.com/abgnydn/zero-tvm" class="btn-ghost" target="_blank" rel="noopener">GitHub ↗</a>
     <button class="btn-ghost" onclick="document.getElementById('share-modal').classList.add('open')" style="cursor:pointer;font-family:inherit;">Share</button>
   </div>
+</section>
 
-  <div class="hero-stats">
-    <div class="hero-stat">
-      <div class="val g"><!--bench:zt-->69.55<!--/bench:zt--></div>
-      <div class="lbl">tok/s total on M2 Max (83.1 decode)</div>
-    </div>
-    <div class="hero-stat">
-      <div class="val p">10 / 37</div>
-      <div class="lbl">kernel roles / WGSL files</div>
-    </div>
-    <div class="hero-stat">
-      <div class="val">3</div>
-      <div class="lbl">models · 3.8B–4B</div>
-    </div>
-    <div class="hero-stat">
-      <div class="val g">0</div>
-      <div class="lbl">ML framework deps</div>
-    </div>
-    <div class="hero-stat">
-      <div class="val">2.1 GB</div>
-      <div class="lbl">weights, Q4F16</div>
+<!-- ── MODELS ── -->
+<section id="models">
+  <div class="section-inner">
+    <div class="section-label">Models</div>
+    <h2 class="section-title">Weights stream once, then cache in your browser.</h2>
+    <p class="section-sub">
+      These cards render from the same model table the engine compiles from —
+      this list cannot go stale, because updating it <em>is</em> how a model ships.
+    </p>
+    <div id="model-cards" class="model-cards">
+      <noscript><p class="mc-webgpu-note">JavaScript required — the cards render from the engine's own model table.</p></noscript>
     </div>
   </div>
 </section>
@@ -773,7 +787,7 @@
     </div>
     <div class="terminal-body">
       <div><span class="t-dim">// No WebLLM. No TVM. No WASM runtime.</span></div>
-      <div><span class="t-dim">// 10 kernel roles · 37 WGSL files · raw WebGPU.</span></div>
+      <div><span class="t-dim">// hand-written WGSL · raw WebGPU · no frameworks.</span></div>
       <br>
       <div><span class="t-green">[local]</span> <span class="t-white">ndarray-cache.json</span></div>
       <div><span class="t-green">[cache]</span> <span class="t-white">params_shard_0.bin</span> <span class="t-dim">49.3 MB</span></div>
@@ -794,345 +808,37 @@
 <hr class="divider">
 
 <!-- ── HOW IT WORKS ── -->
-<section id="how">
-  <div class="section-inner">
-    <div class="section-label">Architecture</div>
-    <h2 class="section-title">How it works</h2>
+<section id="why">
+  <div class="section-inner" style="text-align:center;">
+    <div class="section-label">Why this exists</div>
+    <h2 class="section-title">One readable answer to a compiled stack.</h2>
     <p class="section-sub">
-      Every step from token to token — weights, tokenizer, attention, sampling — runs in the browser with no external calls during inference.
+      Browser LLM runtimes ship compiler-emitted shader blobs. This repo makes the
+      opposite bet: a forward pass you can read in one sitting, competitive with the
+      compiled stacks on identical weights &mdash; and reaching where they haven't shipped:
+      the newest model here is a 35B sparse MoE that no compiler stack offers a build
+      of at all. Every layer is validated against the reference implementation's own
+      modules before it ships, and every performance claim is measured under a written
+      protocol &mdash; including the ones we withdrew.
     </p>
-
-    <div class="steps">
-      <div class="step-card">
-        <div class="step-num">STEP 01</div>
-        <div class="step-icon">📦</div>
-        <h3>Load weights</h3>
-        <p>Fetches MLC Q4F16 shards from HuggingFace (or browser cache from a prior WebLLM session). Uploads directly to GPU buffers.</p>
-      </div>
-      <div class="step-card">
-        <div class="step-num">STEP 02</div>
-        <div class="step-icon">🔤</div>
-        <h3>Tokenize</h3>
-        <p>Hand-written BPE tokenizer reads tokenizer.json. Applies Metaspace pre-tokenization and Phi-3 chat template — no tokenizer WASM.</p>
-      </div>
-      <div class="step-card">
-        <div class="step-num">STEP 03</div>
-        <div class="step-icon">⚡</div>
-        <h3>GPU forward pass</h3>
-        <p>32 transformer layers on the GPU. Embedding → RMSNorm → (QKV + RoPE + KV-append, fused) → Paged Attention → Fused FFN → LM Head. All WGSL, 228 dispatches per token.</p>
-      </div>
-      <div class="step-card">
-        <div class="step-num">STEP 04</div>
-        <div class="step-icon">🎯</div>
-        <h3>Argmax + decode</h3>
-        <p>GPU argmax over 32,064 logits selects the next token. BPE decode maps IDs back to text. Streams to the UI incrementally.</p>
-      </div>
-    </div>
-
-    <!-- Architecture flow -->
-    <div style="margin-top:3rem;">
-      <div class="arch-flow">
-        <div class="arch-box"><div class="icon">💬</div><div class="name">Prompt</div><div class="sub">text</div></div>
-        <div class="arch-arrow">→</div>
-        <div class="arch-box highlight"><div class="icon">🔤</div><div class="name">BPE Tokenizer</div><div class="sub">JS · no WASM</div></div>
-        <div class="arch-arrow">→</div>
-        <div class="arch-box highlight"><div class="icon">🔢</div><div class="name">Embedding</div><div class="sub">shader 1</div></div>
-        <div class="arch-arrow">→</div>
-        <div class="arch-box highlight"><div class="icon">🔁</div><div class="name">× 32 Layers</div><div class="sub">6 fused kernels</div></div>
-        <div class="arch-arrow">→</div>
-        <div class="arch-box highlight"><div class="icon">🎯</div><div class="name">LM Head + Argmax</div><div class="sub">int4 + reduce</div></div>
-        <div class="arch-arrow">→</div>
-        <div class="arch-box"><div class="icon">💬</div><div class="name">Token</div><div class="sub">streamed</div></div>
-      </div>
+    <div class="why-links">
+      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm#readme" target="_blank" rel="noopener">The full argument &#8599;</a>
+      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md" target="_blank" rel="noopener">Numbers &amp; protocol &#8599;</a>
+      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm/tree/main/src/compiler/shaders" target="_blank" rel="noopener">Read our kernels &#8599;</a>
     </div>
   </div>
 </section>
 
-<hr class="divider">
-
-<!-- ── SHADERS ── -->
-<section id="shaders" style="background: var(--surface);">
-  <div class="section-inner">
-    <div class="section-label">WGSL Shaders</div>
-    <h2 class="section-title">10 kernel roles. 37 WGSL files.</h2>
-    <p class="section-sub">
-      Every compute step is a readable WGSL file you can open and understand. No auto-generated code. No compiled blobs. The extra files are A/B variants — subgroup-reduced kernels, tiled matmuls, and an opt-in int8 KV cache path.
-    </p>
-
-    <div class="pill-row">
-      <span class="pill purple">Q4F16 dequant</span>
-      <span class="pill green">f16 arithmetic</span>
-      <span class="pill yellow">paged KV cache</span>
-      <span class="pill purple">RoPE</span>
-      <span class="pill green">RMSNorm</span>
-      <span class="pill yellow">SiLU</span>
-    </div>
-
-    <div class="shaders-grid">
-      <div class="shader-card">
-        <span class="shader-num">01</span>
-        <span class="shader-icon-lg">🔤</span>
-        <div>
-          <h4>Embedding</h4>
-          <p>Token ID lookup with Q4F16 dequantization. Group size 32, int4 packed as uint32.</p>
-          <span class="shader-tag">embedding.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">02</span>
-        <span class="shader-icon-lg">📐</span>
-        <div>
-          <h4>RMSNorm</h4>
-          <p>Root mean square layer normalization. Tree-reduce in workgroup shared memory.</p>
-          <span class="shader-tag">rms_norm.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">03</span>
-        <span class="shader-icon-lg">🌀</span>
-        <div>
-          <h4>QKV + RoPE + KV-append (fused)</h4>
-          <p>Q/K/V projection, rotary embeddings, and paged-KV write in a single dispatch per layer. TVM ships these as three separate kernels.</p>
-          <span class="shader-tag">qkv_fused.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">04</span>
-        <span class="shader-icon-lg">👁️</span>
-        <div>
-          <h4>Paged Attention</h4>
-          <p>Multi-head attention over the paged KV cache. Online softmax, scaled dot-product, page-table read folded in.</p>
-          <span class="shader-tag">attention.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">05</span>
-        <span class="shader-icon-lg">✖️</span>
-        <div>
-          <h4>Int4 Matmul (O-proj)</h4>
-          <p>Q4F16 output projection from attention. Same kernel family powers FFN-down and LM-head. Eight tile/subgroup variants for GPU portability.</p>
-          <span class="shader-tag">int4_matmul*.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">06</span>
-        <span class="shader-icon-lg">➕</span>
-        <div>
-          <h4>Add + RMSNorm (fused)</h4>
-          <p>Residual add and normalize in one pass. Ping-pong buffers avoid GPU aliasing.</p>
-          <span class="shader-tag">add_norm.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">07</span>
-        <span class="shader-icon-lg">⚡</span>
-        <div>
-          <h4>Fused FFN (Gate · Up · SiLU)</h4>
-          <p>Gate and up projections with SiLU activation fused. Q4F16, 8192-dim intermediate. Tiled-subgroup variant available via <code>?ffnsg=1</code>.</p>
-          <span class="shader-tag">fused_ffn.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">08</span>
-        <span class="shader-icon-lg">🎯</span>
-        <div>
-          <h4>LM Head + Argmax</h4>
-          <p>Projects hidden state to 32,064 vocab logits (int4 matmul), then GPU argmax selects the next token. No CPU roundtrip.</p>
-          <span class="shader-tag">argmax.wgsl + int4_matmul.wgsl</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">09</span>
-        <span class="shader-icon-lg">🧪</span>
-        <div>
-          <h4>Subgroup variants</h4>
-          <p>Subgroup-reduced versions of attention, QKV, argmax, and matmul — same math, one hardware-accelerated reduction step instead of workgroup shared memory.</p>
-          <span class="shader-tag">*_sg.wgsl (6 files)</span>
-        </div>
-      </div>
-      <div class="shader-card">
-        <span class="shader-num">10</span>
-        <span class="shader-icon-lg">💾</span>
-        <div>
-          <h4>Int8 KV cache (opt-in)</h4>
-          <p>Per-page int8 quantization of K and V with an attention kernel that dequantizes on read. Halves KV memory at a small accuracy cost. Gate with <code>?kv8=1</code>.</p>
-          <span class="shader-tag">kv_quantize_int8 + attention_int8</span>
-        </div>
-      </div>
-    </div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<!-- ── COMPARE ── -->
-<section id="compare">
-  <div class="section-inner">
-    <div class="section-label">Comparison</div>
-    <h2 class="section-title">vs WebLLM vs transformers.js</h2>
-    <p class="section-sub">
-      Similar goal, very different philosophy. We trade peak speed for full transparency and zero dependencies.
-    </p>
-
-    <div style="overflow-x:auto;">
-      <table class="compare-table">
-        <thead>
-          <tr>
-            <th></th>
-            <th class="col-ours">Zero TVM (ours)</th>
-            <th>TVM / WebLLM</th>
-            <th>Transformers.js v4 + ORT-WebGPU</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>Unique WGSL kernels</td>
-            <td class="ours">10 roles / 37 files</td>
-            <td>85 captured</td>
-            <td>ORT-generated (not user-visible)</td>
-          </tr>
-          <tr>
-            <td>Hand-written WGSL LOC</td>
-            <td class="ours">4,228 (incl. A/B variants)</td>
-            <td>12,962 (compiler-generated)</td>
-            <td>0 (runtime-generated)</td>
-          </tr>
-          <tr>
-            <td>Dispatches / decode token</td>
-            <td class="ours">228 (f16 KV) / 260 (int8 KV)</td>
-            <td>342 (measured)</td>
-            <td>not measured here</td>
-          </tr>
-          <tr>
-            <td>Runtime language</td>
-            <td class="ours">TypeScript</td>
-            <td>Apache TVM WASM</td>
-            <td>C++ via ONNX Runtime</td>
-          </tr>
-          <tr>
-            <td>JS bundle (chat page, excl. weights)</td>
-            <td class="ours">157 kB / 33 kB gz</td>
-            <td>5.9 MB / 2.1 MB gz</td>
-            <td>~10 MB JS + native</td>
-          </tr>
-          <tr>
-            <td>Total throughput, prefill + decode (Phi-3, M2 Max, 2026-07-30)</td>
-            <td class="ours"><!--bench:zt-->69.55<!--/bench:zt--> tok/s <span style="color:var(--text-dim);">(+16.0%)</span></td>
-            <td><!--bench:webllm-->60.0<!--/bench:webllm--> tok/s</td>
-            <td>not measured here</td>
-          </tr>
-          <tr>
-            <td>Decode only (Phi-3, same pair)</td>
-            <td class="ours">83.10 tok/s <span style="color:var(--text-dim);">(+31.4%)</span></td>
-            <td>63.23 tok/s (self-reported)</td>
-            <td>not measured here</td>
-          </tr>
-          <tr>
-            <td>Qwen3-4B (M2 Max, 2026-07-30) — total / decode</td>
-            <td class="ours">59.85 / 75.49 tok/s <span style="color:var(--text-dim);">(+31.7% / +58.0%)</span></td>
-            <td>45.46 / 47.77 tok/s (prebuilt Qwen3 lib, WebLLM 0.2.84)</td>
-            <td>not measured here</td>
-          </tr>
-          <tr>
-            <td>Qwen3.5-4B hybrid (M2 Max, 2026-07-30) — total / decode</td>
-            <td class="ours">65.28 / 73.30 tok/s <span style="color:var(--text-dim);">(+100.5% / +113.6%)</span></td>
-            <td>32.56 / 34.32 tok/s (prebuilt Qwen3.5 lib, WebLLM 0.2.84)</td>
-            <td>not measured here</td>
-          </tr>
-          <tr>
-            <td>Time to first token (~35-token prompt, Phi-3)</td>
-            <td class="ours">291 ms</td>
-            <td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM wins</td>
-            <td>not measured here</td>
-          </tr>
-          <tr>
-            <td>Model scope</td>
-            <td class="ours">Phi-3 Mini (default) + Qwen3-4B (<code>?model=qwen3</code>) + Qwen3.5-4B hybrid (<code>?model=qwen35</code>), Q4F16_1 — plus Qwen3.6-35B-A3B MoE (<code>?model=qwen36q3</code>, MLX 3-bit experts; <code>?model=qwen36</code> full 4-bit), which WebLLM ships no build of at all</td>
-            <td>~20 MLC-compiled models</td>
-            <td>~200 architectures</td>
-          </tr>
-          <tr>
-            <td>Readable source</td>
-            <td class="ours check">✓ 37 WGSL files</td>
-            <td class="cross">✗ Compiled blob</td>
-            <td class="cross">✗ Generated ops</td>
-          </tr>
-          <tr>
-            <td>Designed for</td>
-            <td class="ours">"Readable in one sitting"</td>
-            <td>General production</td>
-            <td>General production</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <p style="margin-top:1.25rem;font-size:0.9rem;color:var(--text-dim);max-width:720px;">
-      Three models, all faster than WebLLM on identical weights, same session — each pair one machine, one
-      session, measured 2026-07-30 under the corrected protocol (both engines pay a full prefill on every
-      run; total and decode reported side by side, never one alone). The Phi-3 row syncs from
-      <code>bench/results.json</code>; the Qwen rows are static dated measurements recorded in
-      <code>bench/results/</code>. Read the gaps cautiously — one pair each, protocol and caveats in
-      BENCH.md, which also documents the harness defect that invalidated the previously published
-      2026-07-29 Qwen pairs.
-      <a href="zero-tvm.html?model=qwen35" style="color:var(--accent);text-decoration:none;">Chat with Qwen3.5-4B →</a>
-    </p>
-
-    <p style="margin-top:1rem;font-size:0.9rem;color:var(--text-dim);max-width:720px;">
-      <strong>The gap grows with how recent the architecture is</strong> — +16% / +31% on 2024's Phi-3,
-      +32% / +58% on 2025's Qwen3, +100% / +114% on 2026's Qwen3.5 (total / decode), monotonic on both
-      metrics. The reading that fits: compiler stacks have had less time to tune newer architectures. That
-      is an observation across three points on one machine, not a proven law — no mechanism was isolated.
-      <strong>And one honest loss:</strong> WebLLM has the better time-to-first-token on short prompts
-      (~150 ms implied vs our 291 ms on Phi-3, 453 ms on Qwen3-4B). We win sustained throughput and lose the
-      first-token sprint; our chunked prefill only pulls even on long prompts (202 tok/s at 816 tokens).
-    </p>
-
-    <p style="margin-top:2rem;font-size:0.95rem;color:var(--text-dim);max-width:720px;">
-      <strong>Transformers.js v4 is the right choice for most production work.</strong> Zero-TVM is not trying
-      to replace it. The point of the contrast: when a stack can assume a single model and precision, most of
-      the compiler and runtime surface is optional.
-    </p>
-
-    <!-- What this repo is NOT -->
-    <div style="margin-top:3rem;padding:1.5rem 1.75rem;border:1px solid var(--surface);border-radius:12px;background:var(--surface);max-width:860px;">
-      <h3 style="margin-top:0;margin-bottom:0.75rem;">What this repo is <em>not</em></h3>
-      <ul style="margin:0;padding-left:1.25rem;line-height:1.7;color:var(--text-dim);">
-        <li><strong>Not a compiler.</strong> Nothing here emits WGSL — the 27 shader files are human-written.</li>
-        <li><strong>Not cross-architecture.</strong> Three models — Phi-3 Mini (default), Qwen3-4B (<code>?model=qwen3</code>), and the Qwen3.5-4B GDN+attention hybrid (<code>?model=qwen35</code>), all Q4F16_1. No Llama / Gemma path without shader work.</li>
-        <li><strong>Not cross-runtime.</strong> Browser WebGPU only. No Node / Bun / Deno target.</li>
-        <li><strong>Not a production replacement for Transformers.js v4.</strong> It does fewer things, on purpose.</li>
-        <li><strong>Not a benchmark sweep.</strong> The +16%-total / +31%-decode result is one machine (M2 Max), one model, one browser, one same-session pair, short context. An earlier M2 Pro measurement with an older engine read 22% <em>behind</em>, and two 2026-07-29 Qwen pairs were withdrawn after a bench-harness defect stopped our half paying prefill — all of it lives in BENCH.md, none of it retconned.</li>
-        <li><strong>Not faster at everything.</strong> WebLLM reaches the first token sooner on short prompts. We win sustained throughput, not latency-to-first-byte.</li>
-      </ul>
-      <p style="margin-top:1rem;margin-bottom:0;color:var(--text);">
-        It <strong>is</strong> a minimal-surface-area demonstration that for one fixed model shape, the
-        compiler/runtime complexity is not required to do browser LLM inference end-to-end.
-      </p>
-    </div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<!-- ── MORE TOOLS ── -->
 <section id="tools">
   <div class="section-inner">
     <div class="section-label">Explore deeper</div>
     <h2 class="section-title">Every page is a milestone of the argument.</h2>
     <p class="section-sub">
-      The repo is organized so each HTML file demonstrates one claim. Open any of them to inspect the stack at a different layer.
+      The repo is organized so each HTML file demonstrates one claim — some are dated snapshots of the argument as it stood, kept rather than rewritten. Open any of them to inspect the stack at a different layer.
     </p>
 
     <div class="shaders-grid">
-      <a class="shader-card" href="zero-tvm.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">💬</span>
-        <div>
-          <h4>Zero-TVM Chat</h4>
-          <p>The result: Phi-3-mini decoding on 10 hand-written WGSL kernels. WebLLM is never touched.</p>
-          <span class="shader-tag">/zero-tvm.html</span>
-        </div>
-      </a>
+      
       <a class="shader-card" href="webllm-bench.html" style="text-decoration:none;color:inherit;">
         <span class="shader-icon-lg">📊</span>
         <div>
@@ -1161,7 +867,7 @@
         <span class="shader-icon-lg">🎬</span>
         <div>
           <h4>Dispatch Visualization</h4>
-          <p>Interactive timeline of every GPU dispatch — 342 for WebLLM, 228 for Zero-TVM.</p>
+          <p>Interactive timeline of every GPU dispatch of the Phi-3 decode — 342 for WebLLM, 228 for Zero-TVM.</p>
           <span class="shader-tag">/demo.html</span>
         </div>
       </a>
@@ -1189,19 +895,12 @@
           <span class="shader-tag">/shaders.html</span>
         </div>
       </a>
-      <a class="shader-card" href="docs.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">📖</span>
-        <div>
-          <h4>Docs</h4>
-          <p>Shader catalog, URL flags, BPE tokenizer, weight loader, benchmarks reference.</p>
-          <span class="shader-tag">/docs.html</span>
-        </div>
-      </a>
+      
       <a class="shader-card" href="https://github.com/abgnydn/zero-tvm" style="text-decoration:none;color:inherit;" target="_blank" rel="noopener">
         <span class="shader-icon-lg">⭐</span>
         <div>
           <h4>Source on GitHub</h4>
-          <p>37 WGSL files and ~2,000 lines of TypeScript. Read it in one sitting.</p>
+          <p>Hand-written WGSL and ~2,000 lines of TypeScript. Read it in one sitting.</p>
           <span class="shader-tag">github.com/abgnydn/zero-tvm</span>
         </div>
       </a>
@@ -1212,49 +911,7 @@
 <hr class="divider">
 
 <!-- ── RELATED WORK ── -->
-<section id="related" class="related-section">
-  <div class="section-inner">
-    <div class="section-label">Related work</div>
-    <h2 style="font-size:clamp(1.5rem,2.5vw,2rem);font-weight:800;letter-spacing:-0.03em;margin-bottom:0.5rem;">Companion projects</h2>
-    <p style="font-size:0.92rem;color:var(--muted);max-width:640px;line-height:1.7;">
-      Zero-TVM sits inside a broader line of work on GPU-resident compute in the browser. The research hub, the open
-      benchmark suite, and one applied project live at the sites below.
-    </p>
 
-    <div class="related-grid">
-      <a class="related-card" href="https://kernelfusion.dev" target="_blank" rel="noopener">
-        <span class="related-tag">Research</span>
-        <h4>kernelfusion.dev</h4>
-        <p>The research hub. Two preprints, open SDK (<code style="background:#0001;padding:1px 4px;border-radius:3px;">@wgpu-fusion/core</code>), 592 devices tested — up to 2,865× on Apple Silicon.</p>
-        <span class="related-cta">Read the papers →</span>
-      </a>
-      <a class="related-card" href="https://gpubench.dev" target="_blank" rel="noopener">
-        <span class="related-tag">Benchmarks</span>
-        <h4>gpubench.dev</h4>
-        <p>&ldquo;How fast is your GPU in the browser?&rdquo; Open WebGPU compute benchmarks on real devices — Rastrigin, N-body, Monte Carlo Pi, RL environments.</p>
-        <span class="related-cta">Benchmark your GPU →</span>
-      </a>
-      <a class="related-card" href="https://webgpudna.com" target="_blank" rel="noopener">
-        <span class="related-tag">Radiobiology</span>
-        <h4>webgpu-dna</h4>
-        <p>Geant4-DNA electron track-structure Monte Carlo in the browser. Same one-dispatch, full-history pattern applied to radiobiology physics.</p>
-        <span class="related-cta">See the simulation →</span>
-      </a>
-      <a class="related-card" href="https://neuropulse.live" target="_blank" rel="noopener">
-        <span class="related-tag">Visualization</span>
-        <h4>neuropulse.live</h4>
-        <p>Same Phi-3-mini forward pass, visualised tensor by tensor. Every glow is a live WebGPU activation read-back — 3.8B parameters, zero server, zero API key.</p>
-        <span class="related-cta">Watch it think →</span>
-      </a>
-      <a class="related-card" href="https://webgpu-q.vercel.app" target="_blank" rel="noopener">
-        <span class="related-tag">Quantum</span>
-        <h4>webgpu-q</h4>
-        <p>Full-featured quantum circuit simulator in a single browser tab. Statevector + MPS engines on commodity hardware via WebGPU compute — same one-dispatch pattern as Zero-TVM, applied to quantum circuits at 70+ qubits.</p>
-        <span class="related-cta">Open the simulator →</span>
-      </a>
-    </div>
-  </div>
-</section>
 
 <hr class="divider">
 
@@ -1263,7 +920,7 @@
   <div class="section-inner" style="display:flex;flex-direction:column;align-items:center;">
     <div class="section-label">Try it</div>
     <h2>Open the chat. No install. No account.</h2>
-    <p>Phi-3-mini runs entirely on your GPU. Your conversation never leaves your browser.</p>
+    <p>Every model runs entirely on your GPU. Your conversation never leaves your browser.</p>
     <div class="hero-actions">
       <a href="zero-tvm.html" class="btn-primary">Open Zero TVM Chat →</a>
     </div>
@@ -1273,8 +930,8 @@
 <!-- ── FOOTER ── -->
 <footer>
   <p>
-    Built with WebGPU · 10 kernel roles · 37 WGSL files · Phi-3-mini-4k-instruct Q4F16<br>
-    Weights via <a href="https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC" style="color:var(--accent);text-decoration:none;">mlc-ai on HuggingFace</a> · No server. No framework. No TVM.
+    Built with WebGPU · hand-written WGSL · models from 3.8B dense to a 35B sparse MoE<br>
+    Weights stream from <a href="https://huggingface.co/abgunaydin" style="color:var(--accent);text-decoration:none;">HuggingFace</a> and cache in your browser · No server. No framework. No TVM.
   </p>
   <div class="footer-links">
     <a href="https://github.com/abgnydn/zero-tvm" target="_blank" rel="noopener" style="color:var(--accent)">★ Star on GitHub</a>
@@ -1294,22 +951,22 @@
 
     <a class="share-option" target="_blank" rel="noopener" id="share-x">
       <span class="platform">X / Twitter</span>
-      <span class="msg">Zero-TVM: Phi-3-mini in a browser on 10 hand-written WGSL kernels (37 files, 4,228 LOC). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. Measured +16% total throughput / +31% decode vs the autotuned compiler on M2 Max — and the gap grows on newer architectures (+100% / +114% on Qwen3.5). Fully readable in one sitting.</span>
+      <span class="msg">Zero-TVM: a 35B sparse MoE (Qwen3.6-A3B) decoding in a browser tab on hand-written WGSL — a model no compiler stack (WebLLM/TVM) even ships. Same engine beats WebLLM by +100% / +114% on Qwen3.5-4B with identical weights. Forward pass readable in one sitting; every layer validated against mlx_lm's own modules.</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-linkedin">
       <span class="platform">LinkedIn</span>
-      <span class="msg">I built a from-scratch LLM inference engine that runs Phi-3-mini (3.8B params) entirely in the browser using 10 hand-written WebGPU kernel roles (37 WGSL files total). It replaces the 85 auto-generated shaders and WASM scheduler from Apache TVM / WebLLM with ~2,000 lines of TypeScript. Measured +16% on total throughput and +31% on decode vs WebLLM on an M2 Max, same weights, same session — and the advantage grows with architecture recency (+100% / +114% on Qwen3.5-4B). WebLLM still reaches the first token faster on short prompts; that is published too. The whole forward pass (32 layers, paged KV cache, int4 dequant, fused QKV+RoPE+KV-append, fused FFN, attention, argmax) is readable end-to-end.</span>
+      <span class="msg">I built a from-scratch LLM inference engine that runs models from Phi-3-mini up to Qwen3.6-35B-A3B — a 256-expert sparse MoE — entirely in the browser on hand-written WebGPU kernels and ~2,000 lines of TypeScript. No WebLLM, no TVM, no ONNX, no WASM runtime. The MoE is a model the compiler stacks ship no build of at all: MLX-affine weights loaded by byte range, a 7-dispatch MoE block with the expert index in the GPU grid, 3-bit expert stacks chosen by measurement (block cosine 0.936 vs 0.785 for 2-bit), ~55 tok/s on a 32 GB M2 Max. On the models WebLLM does ship, the same engine measures +100% / +114% on Qwen3.5-4B with identical weights. Every layer is validated against the reference implementation's own modules; every claim — including the withdrawn ones — is in BENCH.md.</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-hn">
       <span class="platform">Hacker News</span>
-      <span class="msg">Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (+16% total, +31% decode vs WebLLM)</span>
+      <span class="msg">Zero-TVM: a 35B sparse MoE decoding in the browser on hand-written WGSL (WebLLM ships no build of it)</span>
     </a>
 
     <a class="share-option" target="_blank" rel="noopener" id="share-reddit">
       <span class="platform">Reddit</span>
-      <span class="msg">I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini runs at 69.6 tok/s total / 83.1 tok/s decode in the browser — +16% / +31% vs WebLLM on the same weights.</span>
+      <span class="msg">I replaced TVM's autotuned shader stack with hand-written WGSL — and it now runs Qwen3.6-35B-A3B, a 256-expert MoE, in a browser tab (~55 tok/s on a 32 GB M2 Max, 3-bit experts). On the 4B models WebLLM does ship, it measures +100%/+114% on identical weights.</span>
     </a>
 
     <a class="share-option" id="share-copy" style="cursor:pointer;">
@@ -1326,14 +983,14 @@
   var url = window.location.origin + '/';
   var repo = 'https://github.com/abgnydn/zero-tvm';
 
-  var xText = "Zero-TVM: Phi-3-mini in a browser on 10 hand-written WGSL kernels (37 files). Replaces WebLLM's 85 TVM-generated shaders + WASM runtime. +16% total throughput / +31% decode vs the autotuned compiler, fully readable in one sitting.\n\n" + url;
+  var xText = "Zero-TVM: a 35B sparse MoE (Qwen3.6-A3B) decoding in a browser tab on hand-written WGSL — a model no compiler stack even ships. +100%/+114% vs WebLLM on Qwen3.5-4B, identical weights. Readable in one sitting.\n\n" + url;
   document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(xText);
 
   document.getElementById('share-linkedin').href = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(url);
 
-  document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent("Zero-TVM: Phi-3 in a browser on 10 hand-written WGSL kernels (+16% total, +31% decode vs WebLLM)");
+  document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent("Zero-TVM: a 35B sparse MoE decoding in the browser on hand-written WGSL (WebLLM ships no build of it)");
 
-  document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent("I replaced TVM's 85 autotuned shaders with 10 hand-written WGSL kernels. Phi-3-mini runs at 69.6 tok/s total / 83.1 tok/s decode in the browser, +16% / +31% vs WebLLM on the same weights.");
+  document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent("I replaced TVM's autotuned shader stack with hand-written WGSL — it now runs Qwen3.6-35B-A3B, a 256-expert MoE, in a browser tab (~55 tok/s on a 32 GB M2 Max). +100%/+114% vs WebLLM on the 4B models, same weights.");
 
   document.getElementById('share-url').textContent = url;
 
@@ -1348,5 +1005,6 @@
 })();
 </script>
 
+  <script type="module" src="/src/landing.ts"></script>
 </body>
 </html>

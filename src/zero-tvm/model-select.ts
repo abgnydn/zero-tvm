@@ -34,34 +34,8 @@ export function specFromSearch(search: string): ModelSpec {
   return PHI3
 }
 
-/** Page-facing copy for the active model (gate dialog, header, hints). */
-export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: string; rateLabel: string } {
-  // rateLabel is the TOTAL wall-clock median (prefill + decode) from the
-  // 2026-07-30 corrected protocol — the conservative number a user actually
-  // experiences. Decode-only rates run higher (83 / 75 / 73 t/s); see BENCH.md.
-  if (spec.id === QWEN36_35B_A3B_Q3.id) {
-    // ~55 t/s measured by the machine owner on a quiet 32 GB M2 Max
-    // (2026-08-05); ~11 t/s under heavy memory pressure. Quote the quiet one —
-    // the gate already states the RAM requirement.
-    return { name: 'Qwen3.6-35B-A3B (3-bit experts)',
-             sizeLabel: '~16.4 GB — needs ~20 GB free RAM', rateLabel: '~55 t/s' }
-  }
-  if (spec.id === QWEN36_35B_A3B.id) {
-    // No rate label: correctness is verified against mlx_lm (identical argmax),
-    // but decode speed is set by whether ~21 GB fits in PHYSICAL RAM. On a
-    // 32 GB Mac running a normal desktop it does not — measured 2026-08-05:
-    // ~30 s/token with 167 GB/3-tokens of memory-compressor churn. On 64 GB
-    // the kernel benchmarks project ~50-60 t/s. Printing either number as
-    // "the" rate would be wrong for half the audience.
-    return { name: 'Qwen3.6-35B-A3B', sizeLabel: '~19.5 GB — needs ~24 GB free RAM (64 GB Mac recommended)', rateLabel: '' }
-  }
-  if (spec.id === QWEN35_4B.id) {
-    return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~65 t/s' }  // 65.28 total, M2 Max (BENCH.md 2026-07-30)
-  }
-  return spec.id === QWEN3_4B.id
-    ? { name: 'Qwen3-4B', sizeLabel: '~2.3 GB', rateLabel: '~60 t/s' }  // 59.85 total, M2 Max (BENCH.md 2026-07-30)
-    : { name: 'Phi-3-mini', sizeLabel: '~2 GB', rateLabel: '~70 t/s' }  // 69.55 total, M2 Max (BENCH.md 2026-07-30)
-}
+export { modelBranding, SHIPPED_MODELS } from './model-registry.js'
+export type { ModelBrand } from './model-registry.js'
 
 /**
  * Load the tokenizer the spec declares (spec.tokenizerKind), fetching

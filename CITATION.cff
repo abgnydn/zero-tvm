@@ -1,12 +1,8 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "Zero-TVM: Phi-3-mini in the browser on hand-written WGSL kernels"
+title: "Zero-TVM: browser LLM inference on hand-written WGSL kernels"
 abstract: >-
-  A browser-native Phi-3-mini inference engine built on 10 hand-written WGSL
-  kernel roles (37 files) and ~2,000 lines of TypeScript, replacing WebLLM /
-  MLC-LLM's TVM-compiled 85-kernel stack while measuring 16% higher total
-  throughput and 31% higher decode throughput on identical quantized weights
-  (Apple M2 Max, 2026-07-30 same-session head-to-head).
+  Browser LLM inference on hand-written WGSL kernels — models from a 3.8B dense to a 35B sparse MoE, no TVM, no WebLLM runtime, no compiler. Measured against WebLLM on identical weights; every number in BENCH.md.
 type: software
 authors:
   - family-names: Gunaydin

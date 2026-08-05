@@ -25,9 +25,9 @@ models:
 
 # Zero-TVM
 
-**Three models running in your browser on ~4,200 lines of hand-written WGSL. No TVM. No ONNX. No WASM runtime.**
+**Models from a 3.8B dense to a 35B sparse MoE, running in your browser on ~4,600 lines of hand-written WGSL. No TVM. No ONNX. No WASM runtime.**
 
-The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles (55 WGSL implementations — 37 files + 18 generated int4 variants, counting subgroup / tiled / int8 variants) and about 2,000 lines of TypeScript**, using the same Phi-3-mini-q4f16_1 weights.
+The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles (70 WGSL shaders — 42 files + 28 generated int4 variants, counting subgroup / tiled / int8 / affine / MoE variants) and about 2,000 lines of TypeScript** — and runs models WebLLM ships (same weights, measured faster) as well as one it does not: Qwen3.6-35B-A3B, a 256-expert sparse MoE.
 
 The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
 
@@ -37,7 +37,7 @@ Measured on an Apple M2 Max (Chrome 150, WebLLM v0.2.80, identical Phi-3-mini-q4
 
 | | WebLLM (TVM) | Zero-TVM |
 |---|---|---|
-| Unique WGSL kernels | **85** | **10 roles / 37 files** |
+| Unique WGSL kernels | **85** | **10 roles / 42 files (+28 generated)** |
 | Total WGSL lines | **12,962** (generated) | **4,228** (hand-written) |
 | Dispatches per decode step | **342** | **228** |
 | Total throughput (prefill + decode) | **59.95 tok/s** | **69.55 tok/s** — **+16.0%** |
