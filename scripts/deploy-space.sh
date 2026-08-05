@@ -39,11 +39,20 @@ cp "$ROOT/hf-space/README.md" "$WORK_DIR/README.md"
 echo "==> Pushing to $SPACE_PATH as github@${SHORT_SHA}"
 cd "$WORK_DIR"
 git init -q -b main
+# HF's pre-receive rejects binaries outside LFS/xet — track them explicitly
+# (the 65 kB og.png used to slip under the radar; a regenerated one did not).
+# NO error-swallowing here: an earlier version passed -q, which git-lfs
+# rejects, the || true ate the failure, and raw binaries went up anyway.
+git lfs install --local
+git lfs track "*.png" "*.jpg" "*.webp" "*.woff2" >/dev/null
 git add -A
 git -c user.name="zero-tvm deploy" \
     -c user.email="abgunaydin94@gmail.com" \
     -c commit.gpgsign=false \
     commit -q -m "sync from github@${SHORT_SHA}"
+# Refuse to push if LFS did not actually take: a raw binary push "succeeds"
+# locally and dies at HF's pre-receive with a half-useful message.
+git lfs ls-files | grep -q 'og\.png' || { echo "og.png is not an LFS pointer — aborting" >&2; exit 1; }
 # Single-commit force push: the Space is a mirror of dist/, not a history.
 git remote add space "$SPACE_URL"
 git push -q --force space main
