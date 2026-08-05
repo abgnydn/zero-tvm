@@ -532,9 +532,12 @@ export const QWEN35_4B: ModelSpec = makeModelSpec({
  * width: it is what silu_mul strides by between slots.
  *
  * maxPages: one position costs 2 (K+V) × 2 kvHeads × 256 headDim × 2 B × 10
- * attention layers = 20 KiB, so 3072 pages is 49152 tokens on a 960 MiB KV
- * budget. maxSeq is 262144; that would be 5 GiB of KV on top of a 19.5 GiB
- * model.
+ * attention layers = 20 KiB. 384 pages = 6144 tokens on a 126 MiB KV budget —
+ * deliberately small, because the MODEL is 19.5 GiB resident and decode dies
+ * the moment the total working set exceeds physical RAM (measured 2026-08-05:
+ * the GPU process is killed mid-prefill at 0.1 GB free; every hundred MiB of
+ * headroom is worth more than context length here). maxSeq is 262144; even
+ * the old 3072-page budget (49k tokens, 960 MiB) was 1/5th of that.
  *
  * The checkpoint is MULTIMODAL — every text record sits under
  * `language_model.`, and `vision_tower.*` (0.89 GB) is never read for text.
@@ -549,7 +552,7 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
   ffn: 512,        // moe_intermediate_size — per-expert, not a dense FFN width
   vocab: 248320,
   pageSize: 16,
-  maxPages: 3072,
+  maxPages: 384,
   maxSeq: 262144,
   ropeTheta: 1e7,
   rmsEps: 1e-6,
