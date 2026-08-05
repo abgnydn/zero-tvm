@@ -391,13 +391,15 @@ async function main(): Promise<void> {
     // The KV slots it writes are overwritten by the first real turn's
     // prefill (chat always prefills from 0).
     warmup: async (engine, tokenizer, log) => {
-      const warmupIds = buildChatPromptFor(SPEC, [{ role: 'user', content: 'Hi.' }], tokenizer)
-      // This was silent, and on a big MoE model it is anything but: chunked
-      // prefill is off for MoE, so this is warmupIds.length per-token forward
-      // passes — on a memory-starved machine, MINUTES stuck on the previous
-      // log line looking exactly like a hang.
+      // One forward pass warms every pipeline — all 40 layers dispatch the same
+      // ones. The full-prompt warmup is a POLISH step (first message streams at
+      // steady state) and it costs promptLen per-token passes, because chunked
+      // prefill is off for MoE. On a big model that polish is minutes of dead
+      // screen; the first message can pay its own warm cost instead.
+      const full = buildChatPromptFor(SPEC, [{ role: 'user', content: 'Hi.' }], tokenizer)
+      const warmupIds = SPEC.moe ? full.slice(0, 1) : full
       const t0 = performance.now()
-      log?.(`Warming up pipeline — ${warmupIds.length}-token prompt, per-token prefill…`)
+      log?.(`Warming up pipeline — ${warmupIds.length} token(s)${SPEC.moe ? ' (single-pass: MoE)' : ''}…`)
       await engine.generatePipelined(warmupIds, 1, () => {})
       log?.(`Warmup done in ${((performance.now() - t0) / 1000).toFixed(1)}s`)
     },
