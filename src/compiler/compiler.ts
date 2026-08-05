@@ -162,6 +162,9 @@ export interface Pipelines {
    *  running the dense FFN. */
   moeRouterTopk: GPUComputePipeline | null
   moeMatmul: GPUComputePipeline | null
+  /** 3-bit sibling of moeMatmul (MLX bits=3 bitstream) — used when the spec's
+   *  MoeDims.bits is 3. Same bindings, different unpack. */
+  moeMatmulQ3: GPUComputePipeline | null
   moeCombine: GPUComputePipeline
 }
 
@@ -291,6 +294,7 @@ export function compile(
     moeRouterLogits: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits'),
     moeRouterTopk: subgroups ? createPipeline(device, moeRouterTopkSrc, 'moe_router_topk') : null,
     moeMatmul: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4 }) : null,
+    moeMatmulQ3: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: true }) : null,
     moeCombine: createPipeline(device, moeCombineSrc, 'moe_combine'),
   }
 

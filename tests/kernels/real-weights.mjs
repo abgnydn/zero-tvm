@@ -43,9 +43,11 @@ const readBack = async (device, pairs) => {
   return outs.map((b) => b.getMappedRange().slice(0))
 }
 
-/** int4 affine matmul (MLX layout) against a bundle produced from real weights. */
+/** int4/int3 affine matmul (MLX layout) against a bundle from real weights.
+ *  The bundle's meta.kernel picks the variant, so one function serves both. */
 async function affineMatmul(device, dir, meta) {
   const { N, K, K_PACKED: KP, GROUPS_PER_ROW: SPR } = meta
+  const q3 = meta.kernel === 'affine_matmul_q3'
   const weights = read(dir, 'weights_u32', Uint32Array)
   const scales = read(dir, 'scales_f16', Uint16Array)
   const bias = read(dir, 'bias_f16', Uint16Array)
@@ -53,8 +55,8 @@ async function affineMatmul(device, dir, meta) {
   const ref = read(dir, 'y_ref_f32', Float32Array)
 
   // withPrelude keeps `enable` directives first — WGSL rejects them after globals.
-  const src = withPrelude(int4MatmulWGSL({ affine: true }))
-  const entry = int4MatmulEntry({ affine: true })
+  const src = withPrelude(int4MatmulWGSL({ affine: true, q3 }))
+  const entry = int4MatmulEntry({ affine: true, q3 })
   const outBytes = N * 2
   const out = device.createBuffer({ size: outBytes, usage: BU.STORAGE | BU.COPY_SRC })
   const buffers = [
@@ -86,6 +88,7 @@ async function affineMatmul(device, dir, meta) {
 //
 async function moeBlock(device, dir, meta) {
   const D = meta.hidden, F = meta.moe_intermediate, K = meta.top_k
+  const bits = meta.bits ?? 4               // expert precision; router is always 8
   const SLOTS = K + 1                       // top-k routed + 1 shared
   const rd = (n, T) => read(dir, n, T)
   const x = rd('x_f16', Uint16Array)
@@ -154,7 +157,7 @@ async function moeBlock(device, dir, meta) {
 
   // Tiled + subgroups: 4 output rows per workgroup, subgroupAdd instead of a
   // tree reduction, so the 8 activations a thread loads are reused 4 times.
-  const MOE_OPTS = { affine: true, moe: true, subgroups: true, rowsPerWG: 4 }
+  const MOE_OPTS = { affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: bits === 3 }
   const mmMoe = pipelineFor(device, withPrelude(int4MatmulWGSL(MOE_OPTS)), int4MatmulEntry(MOE_OPTS))
   const RPW = 4
   const silu = pipelineFor(device, withPrelude(readFileSync(join(SHADERS, 'silu_mul.wgsl'), 'utf8'),
@@ -163,8 +166,9 @@ async function moeBlock(device, dir, meta) {
 
   const u32 = (a) => buffer(device, new Uint32Array(a), BU.UNIFORM | BU.COPY_DST)
   // IN_SLOT_STRIDE 0 = every slot reads the same activation (gate/up); D/F for down.
-  const podGateMoe = u32([D / 8, D / 64, F, 0, 2 * F])
-  const podDownMoe = u32([F / 8, F / 64, D, F, D])
+  // K_PACKED is words per row: K*bits/32 (4-bit: K/8, 3-bit: 3K/32).
+  const podGateMoe = u32([(D * bits) / 32, D / 64, F, 0, 2 * F])
+  const podDownMoe = u32([(F * bits) / 32, F / 64, D, F, D])
 
   const bgMoe = (out, outOff, outSize, inp, proj, pod) => device.createBindGroup({
     layout: mmMoe.getBindGroupLayout(0),
@@ -691,7 +695,8 @@ async function affineEmbedding(device, dir, meta) {
 }
 
 const KERNELS = {
-  affine_matmul: affineMatmul, affine_embedding: affineEmbedding, moe_block: moeBlock,
+  affine_matmul: affineMatmul, affine_matmul_q3: affineMatmul,
+  affine_embedding: affineEmbedding, moe_block: moeBlock,
   qwen36_gdn: qwen36Gdn, qwen36_attn: qwen36Attn, qwen36_layer: qwen36Layer,
 }
 

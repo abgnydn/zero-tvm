@@ -313,7 +313,11 @@ export function buildDecodeEngine(
   // engine runs the DENSE FFN against weights that are not laid out for it —
   // which produces tokens, just not the model's. buildDecodeEngine defaults to
   // SCALAR_VARIANTS, so this is the configuration validate.ts uses.
-  if (S.moe && !(P.moeRouterTopk && P.moeMatmul)) {
+  // Which expert-matmul serves this spec is a property of the CHECKPOINT
+  // (MoeDims.bits), resolved once — bind groups and dispatches must use the
+  // same object, since layout:'auto' pipelines each own a distinct layout.
+  const moeMM = S.moe?.bits === 3 ? P.moeMatmulQ3 : P.moeMatmul
+  if (S.moe && !(P.moeRouterTopk && moeMM)) {
     throw new Error(
       'buildDecodeEngine: a MoE spec requires the subgroups feature — moe_router_topk '
       + 'and the grid-z expert matmul have no scalar variant. Pass { subgroups: true } to compile().',
@@ -457,11 +461,13 @@ export function buildDecodeEngine(
   const moeTopkU = S.moe
     ? uniformBuf(device, [u32(S.moe.experts), u32(S.moe.topK), u32(S.moe.normTopkProb ? 1 : 0)])
     : null
+  // K_PACKED is words per weight row: K*bits/32 (4-bit: K/8, 3-bit: 3K/32).
+  const moeBits = S.moe?.bits ?? 4
   const moeGateU = S.moe
-    ? uniformBuf(device, [u32(S.d / 8), u32(S.d / 64), u32(S.ffn), u32(0), u32(2 * S.ffn)])
+    ? uniformBuf(device, [u32((S.d * moeBits) / 32), u32(S.d / 64), u32(S.ffn), u32(0), u32(2 * S.ffn)])
     : null
   const moeDownU = S.moe
-    ? uniformBuf(device, [u32(S.ffn / 8), u32(S.ffn / 64), u32(S.d), u32(S.ffn), u32(S.d)])
+    ? uniformBuf(device, [u32((S.ffn * moeBits) / 32), u32(S.ffn / 64), u32(S.d), u32(S.ffn), u32(S.d)])
     : null
   const moeSiluU = S.moe
     ? uniformBuf(device, [i32(S.moeSlots), i32(Math.ceil(S.moeSlots * S.ffn / 256))])
@@ -923,14 +929,14 @@ export function buildDecodeEngine(
           // gate and up write interleaved halves of one [slot][2*ffn] buffer:
           // same kernel, `up` bound ffn*2 bytes in, which is the layout silu_mul
           // reads. The bind OFFSET must stay 256-aligned — ffn*2 = 1024 here.
-          gate: bg(device, P.moeMatmul!, [
+          gate: bg(device, moeMM!, [
             { buffer: B.moeGateUp!, offset: 0, size: S.moeSlots * 2 * S.ffn * 2 },
             B.hidden1, m.gateScales, m.gateWeights, moeGateU!, m.gateBiases, B.moeIds!]),
-          up: bg(device, P.moeMatmul!, [
+          up: bg(device, moeMM!, [
             { buffer: B.moeGateUp!, offset: S.ffn * 2, size: S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
             B.hidden1, m.upScales, m.upWeights, moeGateU!, m.upBiases, B.moeIds!]),
           silu: bg(device, P.siluMul, [B.moeH!, B.moeGateUp!, moeSiluU!]),
-          down: bg(device, P.moeMatmul!, [
+          down: bg(device, moeMM!, [
             { buffer: B.moeDown!, offset: 0, size: S.moeSlots * S.d * 2 },
             B.moeH!, m.downScales, m.downWeights, moeDownU!, m.downBiases, B.moeIds!]),
           combine: bg(device, P.moeCombine, [B.hidden2, B.moeDown!, B.moeScores!, moeCombU!]),
@@ -1095,10 +1101,10 @@ export function buildDecodeEngine(
           dispatch(enc, P.moeRouterLogits, blk.moe.routerLogits, M.experts + 1, 1, 1, 'moeRouterLogits')
           dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, 1, 1, 1, 'moeRouterTopk')
           const rows = S.ffn / MOE_RPW
-          dispatch(enc, P.moeMatmul!, blk.moe.gate, rows, 1, S.moeSlots, 'moeGate')
-          dispatch(enc, P.moeMatmul!, blk.moe.up, rows, 1, S.moeSlots, 'moeUp')
+          dispatch(enc, moeMM!, blk.moe.gate, rows, 1, S.moeSlots, 'moeGate')
+          dispatch(enc, moeMM!, blk.moe.up, rows, 1, S.moeSlots, 'moeUp')
           dispatch(enc, P.siluMul, blk.moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
-          dispatch(enc, P.moeMatmul!, blk.moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
+          dispatch(enc, moeMM!, blk.moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
           dispatch(enc, P.moeCombine, blk.moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
         } else {
         // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut

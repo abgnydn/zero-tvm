@@ -74,22 +74,50 @@ function podBuffer(device, fields) {
 //               per iteration)
 //   rowsPerWG — output rows per workgroup (dispatch M / rowsPerWG)
 //   outF32    — read the output as f32 (LM-head variants)
-function makeInt4MatmulTest(src, entry, { K = 512, rowsPerWG = 1, outF32 = false, affine = false } = {}) {
+function makeInt4MatmulTest(src, entry, { K = 512, rowsPerWG = 1, outF32 = false, affine = false, q3 = false } = {}) {
   return function int4MatmulTest(device) {
     const r = rng(1)
     // affine (MLX): one scale+bias per 64 values; symmetric (MLC): one scale per 32.
-    const M = 8, KP = K / 8, SPR = K / (affine ? 64 : 32)
+    // q3: 3-bit values as a continuous LSB-first bitstream, 3K/32 words per row.
+    const M = 8, KP = q3 ? (K * 3) / 32 : K / 8, SPR = K / (affine ? 64 : 32)
     const input = arr(K, () => toF16(r() * 2 - 1))
     const scales = arr(M * SPR, () => toF16(r() * 0.05 + 0.01))
     const biases = affine ? arr(M * SPR, () => toF16(r() * 0.1 - 0.05)) : null
-    const weights = Uint32Array.from(arr(M * KP, () => (r() * 0xffffffff) >>> 0))
+    let weights, q
+    if (q3) {
+      // Pack the row's values bit-serially so the STREAM layout itself is what
+      // the kernel is tested against (values straddle word boundaries).
+      q = arr(M * K, () => Math.floor(r() * 8))
+      weights = new Uint32Array(M * KP)
+      for (let row = 0; row < M; row++) {
+        for (let i = 0; i < K; i++) {
+          const v = q[row * K + i]
+          const bit = 3 * i
+          const w = row * KP + (bit >> 5)
+          const sh = bit & 31
+          weights[w] |= (v << sh) >>> 0
+          if (sh > 29) weights[w + 1] |= v >>> (32 - sh)
+        }
+      }
+    } else {
+      weights = Uint32Array.from(arr(M * KP, () => (r() * 0xffffffff) >>> 0))
+    }
 
     // Mirrors the kernel exactly: per weight word, one (scale, bias) pair; the
     // bias multiplies only THAT word's 8 activations, so summing the words lands
     // each group's bias term once (see the `affine` note in int4_matmul.gen.ts).
     const ref = arr(M, (_, row) => {
       let acc = 0
-      for (let w = 0; w < KP; w++) {
+      if (q3) {
+        // Per value: s_g·x·q + b_g·x, groups of 64 — same algebra as affine;
+        // the packing difference lives entirely in the weights buffer above.
+        for (let i = 0; i < K; i++) {
+          const g = i >> 6
+          acc += scales[row * SPR + g] * input[i] * q[row * K + i] + biases[row * SPR + g] * input[i]
+        }
+        return outF32 ? acc : toF16(acc)
+      }
+      for (let w = 0; w < K / 8; w++) {
         const packed = weights[row * KP + w]
         const g = affine ? w >> 3 : w >> 2
         const scale = scales[row * SPR + g]
@@ -760,6 +788,25 @@ const TESTS = [
       int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, affine: true }),
       'int4_matmul_tiled_affine',
       { affine: true, rowsPerWG: 4 },
+    ),
+    minSg: 32,
+  },
+  {
+    // 3-bit experts (MLX bits=3): continuous-bitstream packing. The test's own
+    // packer straddles word boundaries, so a kernel that mishandles the
+    // straddle fails HERE, not inside a 15 GB model.
+    label: 'int4_matmul_affine_q3',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ affine: true, q3: true }), 'int4_matmul_affine_q3', {
+      affine: true,
+      q3: true,
+    }),
+  },
+  {
+    label: 'int4_matmul_tiled_affine_q3',
+    fn: makeInt4MatmulTest(
+      int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, affine: true, q3: true }),
+      'int4_matmul_tiled_affine_q3',
+      { affine: true, q3: true, rowsPerWG: 4 },
     ),
     minSg: 32,
   },

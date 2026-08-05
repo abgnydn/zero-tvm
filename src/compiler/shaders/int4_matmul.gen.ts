@@ -110,11 +110,31 @@ export interface Int4MatmulOpts {
    * down (both strided). Requires `affine`.
    */
   moe?: boolean
+  /**
+   * 3-bit weights (MLX bits=3) instead of 4-bit nibbles. The values are a
+   * CONTINUOUS LSB-first bitstream per row — value i occupies bits
+   * [3i, 3i+3), crossing u32 boundaries freely (discovered empirically:
+   * 10 values in a word's low 30 bits, the 11th straddling into the next).
+   *
+   * The kernel walks 8-VALUE BLOCKS: one block is 24 bits starting at
+   * bit w_offset*24, so the in-word shift cycles {0,8,16,24} and a block
+   * spans at most two words — and never past the row's final word, because
+   * rows are 3K/32 words and the sh=24 case cannot fall on the last block
+   * (K % 64 == 0 makes the row's bit length a multiple of 192).
+   *
+   * Group-64 boundaries stay word-aligned (192 bits = 6 words), so
+   * SCALES_PER_ROW keeps meaning K/64 and sc_idx keeps being
+   * blockIndex >> 3. PODArgs.K_PACKED becomes 3K/32 (words per row) —
+   * the LOOP bound is derived from SCALES_PER_ROW instead, since K_PACKED
+   * no longer counts 8-value blocks. Requires `affine` (the q3 experts are
+   * MLX-affine); K % 256 == 0 for the 32-thread variants.
+   */
+  q3?: boolean
 }
 
 /** Entry-point name for a variant (same names the old .wgsl files used). */
 export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false, q3 = false } = opts
   if (mDyn) return 'int4_matmul_batched_dyn'
   if (m === 4) return 'int4_matmul_batched_m4'
   let name = 'int4_matmul'
@@ -125,6 +145,7 @@ export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
   if (vec4) name += '_vec4'
   else if (vec4Half) name += '_vec4h'
   if (affine) name += '_affine'
+  if (q3) name += '_q3'
   if (moe) name += '_moe'
   return name
 }
@@ -146,8 +167,9 @@ function dequantDot(p: string, x: (i: number) => string, indent: string, offset 
 
 /** Render the WGSL for one variant. */
 export function int4MatmulWGSL(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false, q3 = false } = opts
   if (moe && !affine) throw new Error('moe requires affine (the MoE weights are MLX affine-quantised)')
+  if (q3 && !affine) throw new Error('q3 requires affine (3-bit ships only in the MLX-affine layout)')
   if (affine && (m !== 1 || vec4 || vec4Half || mDyn))
     throw new Error('affine is implemented for the scalar path only (m=1, no vec4/vec4Half/mDyn)')
   if (rowsPerWG !== 1 && !subgroups) throw new Error('rowsPerWG > 1 requires subgroups')
@@ -338,7 +360,46 @@ ${affine ? `      let b = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_
     }`,
       )
       .join('\n')
-    body = `
+    const rowBlocksQ3 = rows
+      .map(
+        (r) => `    { // row r${r}: 24-bit window from the row's bitstream, one (scale, bias) load
+      let wi${r} : u32 = ${moe ? 'wBase + ' : ''}r${r} * K_PACKED + (bit >> 5u);
+      var win${r} : u32 = weights[wi${r}] >> sh;
+      if (sh > 8u) { win${r} = win${r} | (weights[wi${r} + 1u] << (32u - sh)); }
+      let s${r} = f32(scales[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);
+      let b${r} = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);
+      acc${r} = acc${r} + s${r} * (
+          i0 * f32(win${r} & 7u)          + i1 * f32((win${r} >>  3u) & 7u)
+        + i2 * f32((win${r} >>  6u) & 7u) + i3 * f32((win${r} >>  9u) & 7u)
+        + i4 * f32((win${r} >> 12u) & 7u) + i5 * f32((win${r} >> 15u) & 7u)
+        + i6 * f32((win${r} >> 18u) & 7u) + i7 * f32((win${r} >> 21u) & 7u)) + b${r} * xs;
+    }`,
+      )
+      .join('\n')
+    body = q3
+      ? `
+${accDecl}
+
+${rowDecl}
+
+  // 8-value blocks; K_PACKED is 3K/32 here, so the loop bound comes from
+  // SCALES_PER_ROW (= K/64): blocks per thread pass = K/8 / ${wgSize}.
+  for (var chunk : u32 = 0u; chunk < SCALES_PER_ROW * 8u / ${wgSize}u; chunk = chunk + 1u) {
+    let w_offset : u32 = tid + chunk * ${wgSize}u;   // 8-value block index
+    let base : u32 = ${moe ? 'inBase + ' : ''}w_offset * 8u;
+    let sc_idx : u32 = w_offset >> 3u;
+    let bit : u32 = w_offset * 24u;
+    let sh : u32 = bit & 31u;   // cycles 0,24,16,8
+
+${loads}
+
+    // Σx over exactly this thread's 8 values — see the affine note above.
+    let xs : f32 = i0 + i1 + i2 + i3 + i4 + i5 + i6 + i7;
+
+${rowBlocksQ3}
+  }
+`
+      : `
 ${accDecl}
 
 ${rowDecl}
@@ -612,7 +673,11 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   { outF32: true, subgroups: true, rowsPerWG: 4, affine: true }, // int4_matmul_f32_tiled_affine
   // MoE: workgroup_id.z is the SLOT and the expert row comes from ids[] at
   // @binding(6), so one dispatch covers every selected expert.
-  { affine: true, moe: true, subgroups: true, rowsPerWG: 4 } // int4_matmul_tiled_affine_moe
+  { affine: true, moe: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_tiled_affine_moe
+  // 3-bit experts (MLX bits=3, continuous bitstream — see the q3 option note).
+  { affine: true, q3: true }, // int4_matmul_affine_q3
+  { affine: true, q3: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_tiled_affine_q3
+  { affine: true, q3: true, moe: true, subgroups: true, rowsPerWG: 4 } // int4_matmul_tiled_affine_q3_moe
 ]
 
 /** Human-auditable dump of every shipped variant. */

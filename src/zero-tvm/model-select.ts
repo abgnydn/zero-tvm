@@ -16,8 +16,8 @@
  *   - display copy (model name + approximate download size) for gate/header UI
  */
 
-import { PHI3, QWEN3_4B, QWEN35_4B, QWEN36_35B_A3B, type ModelSpec } from '../compiler/model-spec.js'
-import { modelBaseUrl } from './weight-loader.js'
+import { PHI3, QWEN3_4B, QWEN35_4B, QWEN36_35B_A3B, QWEN36_35B_A3B_Q3, type ModelSpec } from '../compiler/model-spec.js'
+import { resolveModelBase } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
 import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt } from './tokenizer-bpe.js'
 
@@ -27,6 +27,7 @@ export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: stri
  *  default (and anything else) is PHI3. */
 export function specFromSearch(search: string): ModelSpec {
   const model = new URLSearchParams(search).get('model')
+  if (model === 'qwen36q3') return QWEN36_35B_A3B_Q3
   if (model === 'qwen36') return QWEN36_35B_A3B
   if (model === 'qwen35') return QWEN35_4B
   if (model === 'qwen3') return QWEN3_4B
@@ -38,6 +39,10 @@ export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: strin
   // rateLabel is the TOTAL wall-clock median (prefill + decode) from the
   // 2026-07-30 corrected protocol — the conservative number a user actually
   // experiences. Decode-only rates run higher (83 / 75 / 73 t/s); see BENCH.md.
+  if (spec.id === QWEN36_35B_A3B_Q3.id) {
+    return { name: 'Qwen3.6-35B-A3B (3-bit experts)',
+             sizeLabel: '~16.4 GB — needs ~20 GB free RAM', rateLabel: '' }
+  }
   if (spec.id === QWEN36_35B_A3B.id) {
     // No rate label: correctness is verified against mlx_lm (identical argmax),
     // but decode speed is set by whether ~21 GB fits in PHYSICAL RAM. On a
@@ -65,7 +70,7 @@ export async function loadTokenizerFor(
   spec: ModelSpec,
   onProgress?: (msg: string) => void,
 ): Promise<Tokenizer> {
-  const base = modelBaseUrl(spec)
+  const base = await resolveModelBase(spec)
   return spec.tokenizerKind === 'byteLevel'
     ? loadByteLevelTokenizer(onProgress, base)
     : loadTokenizer(onProgress, base)

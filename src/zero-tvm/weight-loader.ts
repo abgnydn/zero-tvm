@@ -306,6 +306,24 @@ function localMirrorBase(spec: ModelSpec): string | null {
   return DEV ? `/local-weights/${spec.hfRepo.split('/')[1]}/` : null
 }
 
+/**
+ * Base URL for a spec's SMALL files (tokenizer, templates): the dev mirror when
+ * it is primed, the HF repo otherwise. Exists because the tokenizer went
+ * straight to HF, which works only when the repo is PUBLISHED — a
+ * locally-converted checkpoint (the Qwen3.6 q3-expert build) has no HF repo,
+ * and its boot died on a 401 for tokenizer.json. Probes with HEAD so an 11 MB
+ * tokenizer is not downloaded twice.
+ */
+export async function resolveModelBase(spec: ModelSpec, probeFile = 'tokenizer.json'): Promise<string> {
+  const mirror = localMirrorBase(spec)
+  if (mirror) {
+    try {
+      if ((await fetch(mirror + probeFile, { method: 'HEAD' })).ok) return mirror
+    } catch { /* mirror down — fall through to HF */ }
+  }
+  return modelBaseUrl(spec)
+}
+
 async function fetchShard(
   url: string,
   dataPath: string,

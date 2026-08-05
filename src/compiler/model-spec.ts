@@ -84,6 +84,10 @@ export interface MoeDims {
   sharedIntermediate: number  // shared_expert_intermediate_size
   normTopkProb: boolean       // renormalise the top-K probabilities to sum to 1
   routerBits: 4 | 8           // the router ships at 8 bits while the FFN is 4
+  /** Expert-stack precision. 3 selects the q3 bitstream kernels and a
+   *  checkpoint whose switch_mlp/shared_expert were requantised to 3 bits
+   *  (scripts/convert-q3-experts.py). Default 4. */
+  bits?: 3 | 4
 }
 
 // ============================================================
@@ -617,4 +621,27 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
       }
     },
   },
+})
+
+/**
+ * The 3-bit-expert build of QWEN36_35B_A3B — same architecture, same router,
+ * same attention/GDN/lm_head precision; only the expert stacks (and the shared
+ * expert inside them) are 3-bit.
+ *
+ * WHY IT EXISTS: the 4-bit build is 19.7 GB resident and a 32 GB Mac kills the
+ * GPU process the moment the working set exceeds physical RAM (measured
+ * 2026-08-05, mid-prefill, 0.1 GB free). 3-bit experts bring resident to
+ * ~15.7 GB — real headroom. The cost is measured, not guessed: block-output
+ * cosine 0.936 vs the 4-bit block (2-bit measured 0.79 and is not offered).
+ *
+ * The checkpoint is produced locally by scripts/convert-q3-experts.py; the
+ * hfRepo below is where an upload WOULD live and what names the dev-mirror
+ * directory — until it is uploaded, this spec only works where the converted
+ * checkpoint exists on disk.
+ */
+export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
+  ...QWEN36_35B_A3B,
+  id: 'qwen36-35b-a3b-q3',
+  hfRepo: 'abgnydn/Qwen3.6-35B-A3B-MLX-q3exp',
+  moe: { ...QWEN36_35B_A3B.moe!, bits: 3 },
 })

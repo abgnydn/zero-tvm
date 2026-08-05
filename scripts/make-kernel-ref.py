@@ -25,11 +25,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_ROOT = os.path.join(ROOT, ".weights-local/kernel-refs")
 
 
-def qwen36moe(seed: int):
-    """MLX affine int4 (group 64) — one expert slice of a Qwen3.6 MoE FFN projection."""
+def qwen36moe(seed: int, ckpt: str = "Qwen3.6-35B-A3B-MLX-4bit", bits: int = 4):
+    """MLX affine int4/int3 (group 64) — one expert slice of a Qwen3.6 MoE FFN projection."""
     import mlx.core as mx
 
-    src = os.path.join(ROOT, ".weights-local/Qwen3.6-35B-A3B-MLX-4bit/model-00001-of-00004.safetensors")
+    src = os.path.join(ROOT, f".weights-local/{ckpt}/model-00001-of-00004.safetensors")
     if not os.path.exists(src):
         sys.exit(f"missing checkpoint: {src}\n"
                  "  huggingface-cli download lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit "
@@ -42,7 +42,8 @@ def qwen36moe(seed: int):
     B = np.array(w[key + ".biases"][expert].astype(mx.float32))
 
     N, KP = Wq.shape
-    K, G = KP * 8, 64
+    G = 64
+    K = KP * 32 // bits          # 4-bit: 8 values/word; 3-bit: 32/3 per word
     NG = K // G
     assert S.shape == (N, NG), f"scales {S.shape} != {(N, NG)}"
 
@@ -51,9 +52,15 @@ def qwen36moe(seed: int):
     scales_f16, bias_f16 = f16(S), f16(B)
     x_f16 = f16(np.random.default_rng(seed).standard_normal(K) * 0.05)
 
-    nib = np.zeros((N, K), dtype=np.float32)
-    for i in range(8):
-        nib[:, i::8] = (Wq >> (4 * i)) & 0xF
+    if bits == 4:
+        nib = np.zeros((N, K), dtype=np.float32)
+        for i in range(8):
+            nib[:, i::8] = (Wq >> (4 * i)) & 0xF
+    else:
+        # 3-bit: continuous LSB-first bitstream per row, straddling word edges.
+        bitsarr = np.unpackbits(Wq.astype("<u4").view(np.uint8), axis=1, bitorder="little")
+        nib = (bitsarr[:, 0::3][:, :K] + 2.0 * bitsarr[:, 1::3][:, :K]
+               + 4.0 * bitsarr[:, 2::3][:, :K]).astype(np.float32)
     xg = x_f16.astype(np.float32).reshape(NG, G)
     dot = (nib.reshape(N, NG, G) * xg[None]).sum(axis=2)
     y = (scales_f16.astype(np.float32) * dot).sum(1) + (bias_f16.astype(np.float32) * xg.sum(1)[None]).sum(1)
@@ -61,7 +68,7 @@ def qwen36moe(seed: int):
     # Independent cross-check against the vendor's own dequantiser. If this
     # disagrees, our understanding of the format is wrong and the bundle is void.
     W_true = np.array(mx.dequantize(w[key + ".weight"][expert], w[key + ".scales"][expert],
-                                    w[key + ".biases"][expert], group_size=G, bits=4).astype(mx.float32))
+                                    w[key + ".biases"][expert], group_size=G, bits=bits).astype(mx.float32))
     y_true = W_true @ x_f16.astype(np.float32)
     rel = float(np.abs(y - y_true).max() / (np.abs(y_true).max() + 1e-9))
     if rel > 5e-3:
@@ -70,8 +77,8 @@ def qwen36moe(seed: int):
     return {
         "arrays": {"weights_u32": Wq.astype(np.uint32), "scales_f16": scales_f16,
                    "bias_f16": bias_f16, "x_f16": x_f16, "y_ref_f32": y.astype(np.float32)},
-        "meta": {"kernel": "affine_matmul",
-                 "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
+        "meta": {"kernel": "affine_matmul" if bits == 4 else "affine_matmul_q3",
+                 "model": ckpt,
                  "tensor": f"{key} [expert {expert}]",
                  "reference": "mlx.core.dequantize",
                  "N": int(N), "K": int(K), "K_PACKED": int(KP), "GROUP": G,
@@ -81,7 +88,7 @@ def qwen36moe(seed: int):
     }
 
 
-def qwen36moe_block(seed: int):
+def qwen36moe_block(seed: int, ckpt: str = "Qwen3.6-35B-A3B-MLX-4bit", bits: int = 4):
     """Whole SparseMoeBlock of layer 0 — reference computed by MLX's OWN block.
 
     Staged deliberately: the routed-expert path is the part with no precedent in
@@ -93,7 +100,7 @@ def qwen36moe_block(seed: int):
     import mlx.core as mx, mlx.nn as nn
     from mlx_lm.models.qwen3_5 import TextModelArgs, SparseMoeBlock
 
-    W = os.path.join(ROOT, ".weights-local/Qwen3.6-35B-A3B-MLX-4bit")
+    W = os.path.join(ROOT, f".weights-local/{ckpt}")
     if not os.path.exists(W):
         sys.exit(f"missing checkpoint: {W}")
     cfg = json.load(open(os.path.join(W, "config.json")))
@@ -102,7 +109,9 @@ def qwen36moe_block(seed: int):
 
     blk = SparseMoeBlock(args)
     qz = cfg["quantization"]
-    nn.quantize(blk, group_size=qz["group_size"], bits=qz["bits"])
+    # `bits` is the EXPERT precision (switch_mlp + the stacked shared_expert);
+    # the router/shared gate get re-created at their own bits below.
+    nn.quantize(blk, group_size=qz["group_size"], bits=bits)
     PRE = "language_model.model.layers.0.mlp."
     g8 = qz.get(PRE + "gate")          # the router ships at 8 bits, not 4
     if g8:
@@ -179,14 +188,14 @@ def qwen36moe_block(seed: int):
     return {
         "arrays": arrays,
         "meta": {"kernel": "moe_block",
-                 "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
+                 "model": ckpt,
                  "tensor": "layers.0.mlp (SparseMoeBlock)",
                  "reference": "mlx_lm qwen3_next.Qwen3NextSparseMoeBlock",
                  "hidden": int(args.hidden_size), "num_experts": int(args.num_experts),
                  "top_k": int(k), "moe_intermediate": int(args.moe_intermediate_size),
                  "shared_intermediate": int(args.shared_expert_intermediate_size),
                  "norm_topk_prob": bool(args.norm_topk_prob),
-                 "group": qz["group_size"],
+                 "group": qz["group_size"], "bits": bits,
                  "shared_expert_index": int(args.num_experts),
                  "exp_shapes": {p: shp(f"switch_mlp.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
                  "shd_shapes": {p: shp(f"shared_expert.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
@@ -602,7 +611,9 @@ def qwen36embed(seed: int):
 
 PRODUCERS = {"qwen36moe": qwen36moe, "qwen36moe_block": qwen36moe_block,
              "qwen36gdn": qwen36gdn, "qwen36attn": qwen36attn,
-             "qwen36layer": qwen36layer, "qwen36embed": qwen36embed}
+             "qwen36layer": qwen36layer, "qwen36embed": qwen36embed,
+             "qwen36moe3": lambda seed: qwen36moe(seed, "Qwen3.6-35B-A3B-MLX-q3exp", 3),
+             "qwen36moe_block3": lambda seed: qwen36moe_block(seed, "Qwen3.6-35B-A3B-MLX-q3exp", 3)}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
