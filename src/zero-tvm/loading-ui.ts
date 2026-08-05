@@ -144,7 +144,7 @@ export interface BootEngineOptions {
    * buildDecodeEngine defaults (unfused reference path, scalar shaders). */
   buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean; spec: ModelSpec }) => DecodeEngine
   /** Warm the lazily-JIT'd pipelines. Default: one forwardLogits pass. */
-  warmup?: (engine: DecodeEngine, tokenizer: Tokenizer) => Promise<void>
+  warmup?: (engine: DecodeEngine, tokenizer: Tokenizer, log?: (msg: string) => void) => Promise<void>
 }
 
 /**
@@ -277,7 +277,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   setProgress(98, 'Warming up GPU pipelines...')
   const warmupT0 = performance.now()
   if (opts.warmup) {
-    await opts.warmup(engine, tokenizer)
+    await opts.warmup(engine, tokenizer, log)
   } else {
     const warmupIds = buildChatPromptFor(
       spec,

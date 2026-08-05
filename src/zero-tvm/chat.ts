@@ -390,9 +390,16 @@ async function main(): Promise<void> {
     // progress bar so the first chat message streams at steady-state speed.
     // The KV slots it writes are overwritten by the first real turn's
     // prefill (chat always prefills from 0).
-    warmup: async (engine, tokenizer) => {
+    warmup: async (engine, tokenizer, log) => {
       const warmupIds = buildChatPromptFor(SPEC, [{ role: 'user', content: 'Hi.' }], tokenizer)
+      // This was silent, and on a big MoE model it is anything but: chunked
+      // prefill is off for MoE, so this is warmupIds.length per-token forward
+      // passes — on a memory-starved machine, MINUTES stuck on the previous
+      // log line looking exactly like a hang.
+      const t0 = performance.now()
+      log?.(`Warming up pipeline — ${warmupIds.length}-token prompt, per-token prefill…`)
       await engine.generatePipelined(warmupIds, 1, () => {})
+      log?.(`Warmup done in ${((performance.now() - t0) / 1000).toFixed(1)}s`)
     },
   })
   if (!boot.ok) {
