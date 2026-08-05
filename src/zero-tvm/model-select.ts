@@ -39,10 +39,13 @@ export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: strin
   // 2026-07-30 corrected protocol — the conservative number a user actually
   // experiences. Decode-only rates run higher (83 / 75 / 73 t/s); see BENCH.md.
   if (spec.id === QWEN36_35B_A3B.id) {
-    // No rate here yet. The kernels are validated layer by layer against
-    // mlx_lm but no end-to-end decode has been measured in a browser, and this
-    // string is user-facing — the only honest thing to print is nothing.
-    return { name: 'Qwen3.6-35B-A3B', sizeLabel: '~19.5 GB', rateLabel: '' }
+    // No rate label: correctness is verified against mlx_lm (identical argmax),
+    // but decode speed is set by whether ~21 GB fits in PHYSICAL RAM. On a
+    // 32 GB Mac running a normal desktop it does not — measured 2026-08-05:
+    // ~30 s/token with 167 GB/3-tokens of memory-compressor churn. On 64 GB
+    // the kernel benchmarks project ~50-60 t/s. Printing either number as
+    // "the" rate would be wrong for half the audience.
+    return { name: 'Qwen3.6-35B-A3B', sizeLabel: '~19.5 GB — needs ~24 GB free RAM (64 GB Mac recommended)', rateLabel: '' }
   }
   if (spec.id === QWEN35_4B.id) {
     return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~65 t/s' }  // 65.28 total, M2 Max (BENCH.md 2026-07-30)

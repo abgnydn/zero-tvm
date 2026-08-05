@@ -1,0 +1,57 @@
+<!doctype html><meta charset="utf-8"><title>Qwen3.6 decode probe</title>
+<body style="font:13px ui-monospace,monospace;padding:1rem"><pre id="log">…</pre>
+<script type="module">
+const L=[],el=document.getElementById('log')
+const say=(...a)=>{L.push(a.join(' '));el.textContent=L.slice(-60).join('\n');console.log('[T]',a.join(' '))}
+window.__phase='boot'; window.__done=false
+try{
+  const { QWEN36_35B_A3B } = await import('/src/compiler/model-spec.ts')
+  const { compile } = await import('/src/compiler/compiler.ts')
+  const { loadWeights } = await import('/src/zero-tvm/weight-loader.ts')
+  const { buildDecodeEngine, allocKVPages } = await import('/src/zero-tvm/engine-core.ts')
+  const { SCALAR_VARIANTS } = await import('/src/zero-tvm/variants.ts')
+  const S = QWEN36_35B_A3B
+
+  const ad = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' })
+  const feats = [...ad.features].filter(f=>/shader-f16|subgroups/.test(f))
+  const dev = await ad.requestDevice({ requiredFeatures: feats, requiredLimits: {
+    maxBufferSize: ad.limits.maxBufferSize,
+    maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize,
+  }})
+  let gpuErrs = 0
+  dev.addEventListener('uncapturederror', e => { gpuErrs++; say('GPU ERROR:', e.error.message.split('\n')[0]) })
+
+  const t0 = performance.now()
+  const weights = await loadWeights(dev, m => { if(/ready|headers/.test(m)) say(m) }, null, S)
+  say(`WEIGHTS OK in ${((performance.now()-t0)/1000).toFixed(0)}s`)
+  const { pipelines } = compile(dev, { subgroups: true }, S)
+  const kv = allocKVPages(dev, S)
+  const engine = buildDecodeEngine(dev, weights, kv, {
+    spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' },
+  })
+  say('engine built — decode fazina gecmeden once bekliyor')
+
+  // Yukleme fazi bitti: Node tarafi vm_stat'i SIMDI orneklesin diye isaret ver,
+  // onay bekle. Boylece pagein sayaci yalnizca decode'u kapsar.
+  window.__phase='loaded'
+  await new Promise(r => { window.__go = r })
+
+  // GERCEK decode: motorun kendi generate() dongusu, tek prompt, 16 token.
+  const ids = [248045, 9707, 248046, 198]
+  const times=[]
+  let last = performance.now()
+  const t1 = performance.now()
+  const out = await engine.generate(ids, 0, 6, (id) => {
+    const now = performance.now(); times.push(now-last); last=now
+  })
+  const total = performance.now()-t1
+  say(`generate: ${out.length} token, toplam ${(total/1000).toFixed(1)}s`)
+  say('token sureleri (ms): ' + times.map(t=>t.toFixed(0)).join(' '))
+  const tail = times.slice(-8)
+  const med = [...tail].sort((a,b)=>a-b)[tail.length>>1]
+  say(`son-8 medyan: ${med.toFixed(0)} ms/token -> ${(1000/med).toFixed(2)} tok/s`)
+  say(`uretilen: [${out.join(', ')}]`)
+  say(`RESULT tokens=${out.length} med_ms=${med.toFixed(0)} gpu_errs=${gpuErrs}`)
+}catch(e){ say('ERROR:', e && e.stack ? e.stack.split('\n').slice(0,4).join(' | ') : String(e)) }
+window.__phase='done'; window.__done=true
+</script>
