@@ -12,6 +12,13 @@
 //   export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
 //
 // lavapipe is slow, so this suite checks CORRECTNESS, never throughput.
+//
+// That is not just a lavapipe caveat — it holds on a real GPU too. Measured
+// 2026-08-05 on an M2 Max: `queue.onSubmittedWorkDone()` here resolves on a
+// fixed ~100 ms tick, so ANY submit costs ~100 ms regardless of what is in it.
+// An empty kernel, 1 dispatch or 100, 1 workgroup or 4096 — all 100 ms. A MoE
+// block timed 100.7 ms here and 13.4 ms in Chrome for identical work (7.5x).
+// Time kernels in a browser; use this harness to decide whether they are right.
 
 import gpu from '@kmamal/gpu'
 
