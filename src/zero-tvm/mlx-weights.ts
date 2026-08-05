@@ -269,7 +269,7 @@ export function planBytes(plan: BufferPlan, sourceBytes: (record: string) => num
 export function buildBuffer(
   plan: BufferPlan,
   readRecord: (name: string) => Uint8Array,
-): { data: Uint8Array; overflow: number } {
+): { data: Uint8Array<ArrayBuffer>; overflow: number } {
   const pieces: Uint8Array[] = []
   let overflow = 0
   for (const part of plan.parts) {
@@ -288,7 +288,7 @@ export function buildBuffer(
     }
   }
   const total = pieces.reduce((a, b) => a + b.byteLength, 0)
-  const data = new Uint8Array(total)
+  const data = new Uint8Array(new ArrayBuffer(total))
   let o = 0
   for (const piece of pieces) { data.set(piece, o); o += piece.byteLength }
   // A clamped scale is not a rounding error, it is a wrong weight, and it

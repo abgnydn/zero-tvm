@@ -12,6 +12,7 @@
  */
 
 import { PHI3, type ModelSpec } from '../compiler/model-spec.js'
+import { openMlxCheckpoint, assembleMlx, planModel, type MlxSource } from './weight-loader-mlx.js'
 import { mapLimited, backoffMs } from './map-limited.js'
 
 // ============================================================
@@ -359,6 +360,57 @@ async function fetchShard(
   return buf
 }
 
+/**
+ * Ranged reads over the checkpoint's shards, with the same retry/backoff the
+ * shard fetcher uses.
+ *
+ * The Cache API tier is skipped deliberately: it is populated by WebLLM's
+ * tvmjs for MLC repos and is a guaranteed miss for a safetensors checkpoint,
+ * so probing it 2841 times would only cost time. OPFS caching happens a level
+ * up, keyed by BUILT buffer rather than by shard.
+ */
+function mlxSource(
+  baseUrl: string,
+  mirrorBase: string | null,
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
+): MlxSource {
+  const url = (file: string) => (mirrorBase ?? baseUrl) + file
+  return {
+    whole: async (file) => new Uint8Array(await fetchBufWithRetry(url(file), signal, onProgress)),
+    range: async (file, begin, end) => {
+      let lastErr: unknown
+      for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, backoffMs(attempt - 1)))
+        try {
+          const resp = await fetch(url(file), {
+            credentials: 'omit',
+            signal,
+            headers: { Range: `bytes=${begin}-${end - 1}` },
+          })
+          // A server that ignores Range answers 200 with the WHOLE file — which
+          // for a 5.3 GB shard is exactly the allocation this design exists to
+          // avoid. Refuse rather than OOM.
+          if (resp.status === 200) {
+            throw new Error(`${file}: server ignored Range (200, not 206) — cannot stream a multi-GB shard`)
+          }
+          if (!resp.ok) throw new Error(`${file}: HTTP ${resp.status}`)
+          const buf = new Uint8Array(await resp.arrayBuffer())
+          if (buf.byteLength !== end - begin) {
+            throw new Error(`${file}: asked for ${end - begin} bytes, got ${buf.byteLength}`)
+          }
+          return buf
+        } catch (e) {
+          if (signal?.aborted) throw e
+          lastErr = e
+          onProgress?.(`[retry ${attempt + 1}/${FETCH_RETRIES}] ${file} ${begin}-${end} (${e})`)
+        }
+      }
+      throw new Error(`range fetch failed after ${FETCH_RETRIES} retries: ${lastErr}`)
+    },
+  }
+}
+
 async function openAllCacheStores(): Promise<Cache[]> {
   try {
     if (typeof caches === 'undefined') return []
@@ -468,6 +520,47 @@ export async function loadWeights(
   // Tracks fire-and-forget OPFS writes so loadWeights doesn't resolve while
   // shards are still being persisted (would leave a torn cache on tab close).
   const pendingWrites: Promise<void>[] = []
+
+  // ── MLX safetensors path ─────────────────────────────────────────────────
+  // Branches HERE, after the OPFS/Cache setup above (which is format-agnostic
+  // and stays single-sourced) and before the manifest read below, which is
+  // MLC-shaped. The unit of work is a BufferPlan, never a shard — see
+  // weight-loader-mlx.ts for why a 5.3 GB shard cannot be one ArrayBuffer.
+  if (spec.weightFormat === 'mlx-safetensors') {
+    const src = mlxSource(baseUrl, mirrorBase, onProgress)
+    onProgress?.('Reading safetensors headers…')
+    const { locate, shards } = await openMlxCheckpoint(src)
+    const total = planModel(spec).length
+    onProgress?.(`${shards.length} shards, ${total} buffers to build`)
+    const t0 = performance.now()
+    const lw = await assembleMlx(device, spec, src, locate, USAGE, {
+      onProgress,
+      cacheRead: (key) => opfsRead(opfs, key),
+      // Not when serving from the dev mirror: the bytes are already on local
+      // disk and OPFS-caching them would write a second 19.5 GB copy.
+      cacheWrite: mirrorBase ? undefined
+        : (key, data) => { pendingWrites.push(opfsWrite(opfs, key, data)) },
+      onBuffer: (done, n, bytes) => {
+        // Every 25th, so a 947-buffer load does not spend its time on strings.
+        if (done % 25 !== 0 && done !== n) return
+        const el = (performance.now() - t0) / 1000
+        // Buffers stand in for shards here — same progress semantics, different
+        // unit, because a plan is what this loader actually completes.
+        const est = bytes / (done / n)
+        onProgress?.(`${done}/${n} buffers — ${(bytes / 1e9).toFixed(2)} GB in ${el.toFixed(0)}s`)
+        onStats?.({
+          shardsLoaded: done, totalShards: n,
+          bytesLoaded: bytes, totalBytes: Math.round(est),
+          mbPerSec: el > 0 ? bytes / 1e6 / el : 0,
+          etaSec: done > 0 ? (el / done) * (n - done) : 0,
+          persisted,
+        })
+      },
+    })
+    await Promise.all(pendingWrites)
+    onProgress?.(`Weights ready (${((performance.now() - t0) / 1000).toFixed(0)}s)`)
+    return lw as unknown as LoadedWeights
+  }
 
   const manifestBytes = await fetchShard(
     baseUrl + manifestName,

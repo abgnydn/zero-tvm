@@ -24,10 +24,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
  */
 const PHI3_REPO_NAME = 'Phi-3-mini-4k-instruct-q4f16_1-MLC'
 
-// A primed snapshot carries one of the two MLC weight-manifest names
-// (newer MLC repos, e.g. Qwen3.5, renamed ndarray-cache.json → tensor-cache.json).
-const hasManifest = (dir: string): boolean =>
-  existsSync(join(dir, 'ndarray-cache.json')) || existsSync(join(dir, 'tensor-cache.json'))
+// A primed snapshot carries one of the three weight-manifest names: the two
+// MLC ones (newer MLC repos, e.g. Qwen3.5, renamed ndarray-cache.json →
+// tensor-cache.json) or a safetensors index for an MLX checkpoint (Qwen3.6).
+const MANIFESTS = ['ndarray-cache.json', 'tensor-cache.json', 'model.safetensors.index.json']
+const hasManifest = (dir: string): boolean => MANIFESTS.some((m) => existsSync(join(dir, m)))
 
 function findMlcSnapshotDir(repoName: string = PHI3_REPO_NAME): string | null {
   // Repo-local: where scripts/download-weights.mjs puts the snapshot.
@@ -39,15 +40,12 @@ function findMlcSnapshotDir(repoName: string = PHI3_REPO_NAME): string | null {
   if (hasManifest(flatMirror)) return flatMirror
 
   // Fallback: HF hub snapshot dir (hf download populates this).
-  const cacheRoot = join(
-    homedir(),
-    '.cache',
-    'huggingface',
-    'hub',
-    `models--mlc-ai--${repoName}`,
-    'snapshots',
-  )
-  if (!existsSync(cacheRoot)) return null
+  // MLC repos live under mlc-ai/; MLX ones under whichever org published them,
+  // so try both org spellings before giving up.
+  const cacheRoot = ['mlc-ai', 'lmstudio-community']
+    .map((org) => join(homedir(), '.cache', 'huggingface', 'hub', `models--${org}--${repoName}`, 'snapshots'))
+    .find(existsSync) ?? ''
+  if (!cacheRoot) return null
   const entries = readdirSync(cacheRoot)
     .map((name) => join(cacheRoot, name))
     .filter((p) => statSync(p).isDirectory())
@@ -132,12 +130,36 @@ function localWeightsPlugin() {
           return
         }
         const st = statSync(target)
-        res.setHeader('Content-Length', String(st.size))
         res.setHeader(
           'Content-Type',
           target.endsWith('.json') ? 'application/json' : 'application/octet-stream',
         )
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+        res.setHeader('Accept-Ranges', 'bytes')
+
+        // RANGE support. The MLX loader reads BYTE RANGES, never whole shards —
+        // a Qwen3.6 shard is 5.3 GB and a single ArrayBuffer caps near 4.29 GB —
+        // and it refuses a 200 answer to a Range request rather than risk that
+        // allocation. Without this the dev mirror is unusable for safetensors,
+        // which is the whole point of the mirror.
+        const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers?.range ?? '')
+        if (range) {
+          const start = Number(range[1])
+          const end = range[2] === '' ? st.size - 1 : Math.min(Number(range[2]), st.size - 1)
+          if (start >= st.size || end < start) {
+            res.statusCode = 416
+            res.setHeader('Content-Range', `bytes */${st.size}`)
+            res.end()
+            return
+          }
+          res.statusCode = 206
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${st.size}`)
+          res.setHeader('Content-Length', String(end - start + 1))
+          createReadStream(target, { start, end }).pipe(res)
+          return
+        }
+
+        res.setHeader('Content-Length', String(st.size))
         createReadStream(target).pipe(res)
         void next
       })

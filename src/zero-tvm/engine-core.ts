@@ -280,15 +280,22 @@ export function buildDecodeEngine(
   // gated_qkv_split and the win is 2 of 12 dispatches on 8 of 32 layers).
   const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm
 
-  // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and SCALES = K/32.
-  // K = d for the QKV/gate_up projections, qDim for o_proj (== d when
-  // heads == kvHeads), ffn for down_proj.
+  // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and
+  // SCALES = K/QGROUP. K = d for the QKV/gate_up projections, qDim for o_proj
+  // (== d when heads == kvHeads), ffn for down_proj.
+  //
+  // QGROUP, not the module's GROUP: MLC quantises in groups of 32, MLX-affine
+  // in groups of 64. The kernels read SCALES_PER_ROW straight out of these
+  // uniforms and index the scale array with it, so a 32 here against 64-wide
+  // groups reads the WRONG SCALE for everything past the first group. It runs
+  // clean, every value is finite, and the logits are nonsense.
+  const QGROUP = S.weightFormat === 'mlx-safetensors' ? 64 : GROUP
   const QKV_K_PACKED    = S.d / PACK          // Phi-3: 384  (K=3072)
-  const QKV_SCALES      = S.d / GROUP         // Phi-3: 96
+  const QKV_SCALES      = S.d / QGROUP        // Phi-3: 96
   const OPROJ_K_PACKED  = S.qDim / PACK       // Phi-3: 384 (qDim == d)
-  const OPROJ_SCALES    = S.qDim / GROUP      // Phi-3: 96
+  const OPROJ_SCALES    = S.qDim / QGROUP     // Phi-3: 96
   const FFN_DN_K_PACKED = S.ffn / PACK        // Phi-3: 1024 (K=8192)
-  const FFN_DN_SCALES   = S.ffn / GROUP       // Phi-3: 256
+  const FFN_DN_SCALES   = S.ffn / QGROUP      // Phi-3: 256
 
   // Elementwise workgroup counts (one wg per WG_SIZE_D elements).
   const D_WGS   = S.d / WG_SIZE_D             // Phi-3: 12   (3072/256)
@@ -491,9 +498,9 @@ export function buildDecodeEngine(
   const ATTN_GATE_WGS = hybrid ? Math.ceil(S.qDim / WG_SIZE_D) : 0
   // Fused GDN input projection: one 12352-row (Qwen3.5) K=d matmul replaces
   // the 4 separate in_proj_qkv/z/a/b dispatches (weights packed by the loader).
-  const gdnProjU = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnProjRows)]) : null
-  const gdnOutU  = hybrid ? uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / GROUP), u32(S.d)]) : null
-  const cAttnU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.cAttnDim)]) : null
+  const gdnProjU = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.gdnProjRows)]) : null
+  const gdnOutU  = hybrid ? uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / QGROUP), u32(S.d)]) : null
+  const cAttnU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.cAttnDim)]) : null
   const gdnConvU = hybrid ? uniformBuf(device, [i32(0), u32(GDN_CONV_WGS)]) : null  // pos rewritten per token
   // gdn_gates / gdn_norm_out are seq-capable (chunked prefill): the decode
   // uniforms pin seq_len=1 with tightly-packed strides (the region views the
@@ -685,19 +692,37 @@ export function buildDecodeEngine(
   // the same state, so the bind groups are identical for every layer.
   // ============================================================
 
+  // Affine (MLX) matmuls bind a per-group bias at @binding(5); the symmetric
+  // kernels have no such binding. Appending it exactly when the spec is affine
+  // is what keeps ONE bind-group construction serving both families — and a
+  // mismatch is a loud bind-group validation error ("5 entries, expected 6"),
+  // not a wrong number, which is the only reason this is safe to centralise.
+  const AFFINE = S.weightFormat === 'mlx-safetensors'
+  const withBias = (entries: BindEntry[], bias: GPUBuffer | undefined, what: string): BindEntry[] => {
+    if (!AFFINE) return entries
+    if (!bias) throw new Error(`buildDecodeEngine: ${S.id} is affine but ${what} has no bias buffer`)
+    return [...entries, bias]
+  }
+
   // Global (non-per-layer) bind groups
-  const bgEmbedding = bg(device, P.embedding, [
-    B.residual, B.inputIds, weights.embdScales, weights.embdWeights, embU,
-  ])
+  // embedding.wgsl is hard-symmetric — (nibble-7)*scale over groups of 32, no
+  // bias — so an affine table needs the other kernel, not just an extra entry.
+  // One name for both the bind group and the dispatch: with layout:'auto' each
+  // pipeline owns a DISTINCT layout object even when structurally identical, so
+  // binding against one and dispatching the other is a validation error.
+  const embeddingPipeline = AFFINE ? P.embeddingAffine : P.embedding
+  const bgEmbedding = bg(device, embeddingPipeline, withBias(
+    [B.residual, B.inputIds, weights.embdScales, weights.embdWeights, embU],
+    weights.embdBiases, 'embed_tokens'))
   const bgInitNorm = bg(device, P.rmsNorm, [
     B.hidden1, B.residual, weights.layers[0].normGamma1, normU,
   ])
   const bgRope = fused ? null : bg(device, P.rope, [
     B.qOut, B.kOut!, B.vOut!, B.qkvOut!, B.posMap, ropeU!,
   ])
-  const bgLmHead = bg(device, R.matmulF32, [
-    B.logits, B.hidden1, weights.lmHeadScales, weights.lmHeadWeights, lmHdU,
-  ])
+  const bgLmHead = bg(device, R.matmulF32, withBias(
+    [B.logits, B.hidden1, weights.lmHeadScales, weights.lmHeadWeights, lmHdU],
+    weights.lmHeadBiases, 'lm_head'))
   const bgArgmax = bg(device, R.argmax, [
     B.logits, B.tokenOut, argmaxU,
   ])
@@ -797,7 +822,8 @@ export function buildDecodeEngine(
       const zRegion  = { buffer: B.gdnProjOut!, offset: S.gdnQkvDim * 2, size: S.gdnVDim * 2 }
       const abRegion = { buffer: B.gdnProjOut!, offset: (S.gdnQkvDim + S.gdnVDim) * 2, size: 2 * S.gdnVHeads * 2 }
       gdnBG = {
-        proj: bg(device, R.matmul, [B.gdnProjOut!, B.hidden1, gw.projScales, gw.projWeights, gdnProjU!]),
+        proj: bg(device, R.matmul, withBias(
+          [B.gdnProjOut!, B.hidden1, gw.projScales, gw.projWeights, gdnProjU!], gw.projBiases, 'gdn in_proj')),
         // gdn_conv's qkv_raw binding sees the whole packed buffer; it only
         // reads channels < GDN_QKV_DIM (the qkv region at offset 0).
         conv: bg(device, P.gdnConv, [B.gdnConvOut!, B.gdnProjOut!, gdnConvState[L]!, gw.convWeight, gdnConvU!]),
@@ -805,12 +831,12 @@ export function buildDecodeEngine(
         recur: bg(device, P.gdnRecur, [B.gdnRecurOut!, B.gdnConvOut!, B.gdnGates!, gdnRecurState[L]!, gdnRecurU!]),
         normOut: bg(device, P.gdnNormOut, [B.gdnNormed!, B.gdnRecurOut!, gw.normGamma, zRegion, gdnNormU!]),
       }
-      oProjBG = bg(device, matmulGdnOut!, [B.hidden2, B.gdnNormed!, gw.outScales, gw.outWeights, gdnOutU!])
+      oProjBG = bg(device, matmulGdnOut!, withBias(
+        [B.hidden2, B.gdnNormed!, gw.outScales, gw.outWeights, gdnOutU!], gw.outBiases, 'gdn out_proj'))
     } else if (hybrid) {
       // Gated attention layer: c_attn packs per-head [Q|gate] before K‖V.
-      qkvBG = bg(device, R.matmul, [
-        B.cAttnOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, cAttnU!,
-      ])
+      qkvBG = bg(device, R.matmul, withBias(
+        [B.cAttnOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, cAttnU!], lw.qkvBiases, 'c_attn'))
       gatedSplitBG = bg(device, P.gatedQkvSplit, [B.qkvOut!, B.attnGateRaw!, B.cAttnOut!, gatedSplitU!])
       if (S.qkNorm) qkNormBG = qkNormBGFor()
       kvAppBG = bg(device, P.kvAppend, [
@@ -818,7 +844,8 @@ export function buildDecodeEngine(
       ])
       attnBG = attnF16BG()
       attnGateBG = bg(device, P.attnGate, [B.attnOut, B.attnGateRaw!, attnGateU!])
-      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
+      oProjBG = bg(device, R.matmulOProj, withBias(
+        [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
     } else if (!fused) {
       qkvBG = bg(device, R.matmul, [
         B.qkvOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, qkvU!,
@@ -971,7 +998,7 @@ export function buildDecodeEngine(
    */
   function recordForward(enc: GPUCommandEncoder): void {
     // --- EMBEDDING → B.residual (ping) ---
-    dispatch(enc, P.embedding, bgEmbedding, D_WGS, 1, 1, 'embedding')
+    dispatch(enc, embeddingPipeline, bgEmbedding, D_WGS, 1, 1, 'embedding')
     // --- INITIAL RMSNORM: B.residual → B.hidden1 (layer 0's normGamma1) ---
     dispatch(enc, P.rmsNorm, bgInitNorm, 1, 1, 1, 'rmsNorm_init')
 
@@ -1423,12 +1450,12 @@ export function buildDecodeEngine(
     const cU = {
       emb:   uniformBuf(device, [i32(0), u32(0)]),
       norm:  uniformBuf(device, [u32(0)]),
-      gdnProj: uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.gdnProjRows), u32(0)]),
-      gdnOut:  uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / GROUP), u32(S.d), u32(0)]),
-      cAttn:   uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(S.cAttnDim), u32(0)]),
-      oProj:   uniformBuf(device, [u32(S.qDim / PACK), u32(S.qDim / GROUP), u32(S.d), u32(0)]),
-      gateUp:  uniformBuf(device, [u32(S.dPacked), u32(S.dScales), u32(2 * S.ffn), u32(0)]),
-      ffnDown: uniformBuf(device, [u32(S.ffn / PACK), u32(S.ffn / GROUP), u32(S.d), u32(0)]),
+      gdnProj: uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.gdnProjRows), u32(0)]),
+      gdnOut:  uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / QGROUP), u32(S.d), u32(0)]),
+      cAttn:   uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.cAttnDim), u32(0)]),
+      oProj:   uniformBuf(device, [u32(S.qDim / PACK), u32(S.qDim / QGROUP), u32(S.d), u32(0)]),
+      gateUp:  uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(2 * S.ffn), u32(0)]),
+      ffnDown: uniformBuf(device, [u32(S.ffn / PACK), u32(S.ffn / QGROUP), u32(S.d), u32(0)]),
       gatedSplit: uniformBuf(device, [i32(0), u32(0)]),
       qkNorm: uniformBuf(device, [i32(0), u32(0)]),
       rope:   uniformBuf(device, [i32(1), i32(0), i32(0), u32(0)]),

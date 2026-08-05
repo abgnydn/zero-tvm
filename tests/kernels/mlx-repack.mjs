@@ -18,9 +18,11 @@
 import { existsSync, openSync, readSync, closeSync, readFileSync } from 'node:fs'
 import { resolve, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { parseSafetensorsHeader, planLayer, buildBuffer, bf16ToF16, bf16ToF32 }
+import { parseSafetensorsHeader, planLayer, planGlobal, planBytes, buildBuffer, bf16ToF16, bf16ToF32 }
   from '../../src/zero-tvm/mlx-weights.ts'
 import { QWEN36_35B_A3B } from '../../src/compiler/model-spec.ts'
+import { openMlxCheckpoint, planModel, planKey, buildPlan, modelBytes }
+  from '../../src/zero-tvm/weight-loader-mlx.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const CKPT = join(ROOT, '.weights-local/Qwen3.6-35B-A3B-MLX-4bit')
@@ -48,7 +50,12 @@ function openCheckpoint(dir) {
     readSync(s.fd, buf, 0, buf.length, s.dataStart + info.begin)
     return new Uint8Array(buf.buffer, buf.byteOffset, buf.length)
   }
-  return { read, close: () => Object.values(shards).forEach((s) => closeSync(s.fd)) }
+  const info = (name) => {
+    const file = map[name]
+    if (!file) throw new Error(`record not in checkpoint: ${name}`)
+    return shards[file].tensors[name]
+  }
+  return { read, info, close: () => Object.values(shards).forEach((s) => closeSync(s.fd)) }
 }
 
 const same = (a, b) => {
@@ -182,6 +189,130 @@ if (!existsSync(CKPT)) {
       `${checked} buffers byte-identical to the mlx-validated bundle`
       + (totalOverflow ? `, ${totalOverflow} bf16 OVERFLOWS` : ''),
       bad.length === 0 && totalOverflow === 0)
+  }
+
+  // ── planGlobal: embed / lm_head / final_norm ──────────────────────────────
+  {
+    const dir = join(REFS, 'qwen36embed')
+    const plans = Object.fromEntries(planGlobal(S).map((p) => [p.name, p]))
+    const bad = []
+    if (existsSync(dir)) {
+      for (const [planName, refName] of Object.entries({
+        embed_w: 'weights_u32', embed_s: 'scales_f16', embed_b: 'bias_f16',
+      })) {
+        const { data } = buildBuffer(plans[planName], ck.read)
+        const diff = same(data, new Uint8Array(readFileSync(join(dir, `${refName}.bin`))))
+        if (diff) bad.push(`${planName}: ${diff}`)
+      }
+    }
+    // lm_head and final_norm have no bundle; assert they RESOLVE, which is the
+    // thing that is easy to get wrong — lm_head sits one prefix level above the
+    // decoder stack (language_model.lm_head, not language_model.model.lm_head).
+    for (const n of ['lm_head_w', 'lm_head_s', 'lm_head_b', 'final_norm']) {
+      try { buildBuffer(plans[n], ck.read) } catch (e) { bad.push(`${n}: ${e.message}`) }
+    }
+    for (const b of bad) console.error(`      ${b}`)
+    check('planGlobal', `embed byte-identical, lm_head + final_norm resolve`, bad.length === 0)
+  }
+
+  // ── whole-model budget, straight from the plan ────────────────────────────
+  // The residency question answered by the thing that will actually allocate,
+  // rather than by an estimate: every plan for every layer, plus globals.
+  {
+    const src = (name) => { const s2 = ck.info(name); return s2.end - s2.begin }
+    let total = 0, biggest = { name: '', bytes: 0 }, count = 0
+    const tally = (plans) => {
+      for (const p of plans) {
+        const b = planBytes(p, src)
+        total += b; count++
+        if (b > biggest.bytes) biggest = { name: p.name, bytes: b }
+      }
+    }
+    for (let L = 0; L < S.layers; L++) tally(planLayer(S, L))
+    tally(planGlobal(S))
+    // KV lives only on attention layers; the GDN recurrent state only on the rest.
+    const attnLayers = S.layerKinds.filter((k) => k === 'attn').length
+    const kv = attnLayers * S.maxPages * S.kvPageStride * 2
+    const gdnState = (S.layers - attnLayers) * S.gdnVHeads * S.gdnStatePerHead * 4
+    const GB = (n) => (n / 1e9).toFixed(2)
+    const LIMIT = 134217728   // WebGPU's default maxStorageBufferBindingSize
+    const overLimit = biggest.bytes > LIMIT
+    check('model budget',
+      `${count} weight buffers ${GB(total)} GB + KV ${GB(kv)} GB + GDN state ${GB(gdnState)} GB `
+      + `= ${GB(total + kv + gdnState)} GB resident; largest buffer ${biggest.name} `
+      + `${(biggest.bytes / 1048576).toFixed(1)} MiB`
+      + (overLimit ? ` — OVER the 128 MiB WebGPU default, needs a raised requiredLimit` : ''),
+      total + kv + gdnState < 21e9)
+  }
+
+  // ── loader replay: the exact ranges the browser will request ─────────────
+  // The repack tests above hand buildBuffer whole records off local fs. The
+  // browser cannot do that — a 5.3 GB shard is not one ArrayBuffer — so it
+  // reads BYTE RANGES through weight-loader-mlx. Replaying that path over the
+  // same files, against the same Python bundles, covers the I/O planning and
+  // not just the layout.
+  {
+    const opened = openSync(join(CKPT, 'model.safetensors.index.json'), 'r')
+    closeSync(opened)
+    const fds = {}
+    const src = {
+      whole: async (file) => new Uint8Array(readFileSync(join(CKPT, file))),
+      range: async (file, begin, end) => {
+        fds[file] ??= openSync(join(CKPT, file), 'r')
+        const buf = Buffer.alloc(end - begin)
+        readSync(fds[file], buf, 0, buf.length, begin)
+        return new Uint8Array(buf.buffer, buf.byteOffset, buf.length)
+      },
+    }
+    const bad = []
+    // Count header reads SEPARATELY from plan reads — the interesting number is
+    // what it costs to learn the layout of 20 GB, and mixing the two hid it.
+    let headerBytes = 0
+    const headerSrc = { ...src, range: async (f, b, e) => { headerBytes += e - b; return src.range(f, b, e) } }
+    const { locate, shards } = await openMlxCheckpoint(headerSrc)
+    let planBytesRead = 0
+    const counting = { ...src, range: async (f, b, e) => { planBytesRead += e - b; return src.range(f, b, e) } }
+
+    // Same three bundles, now via ranges instead of whole records.
+    for (const [layer, bundle, map] of [
+      [0, 'qwen36gdn', { gdn_proj_w: 'qkv_w_u32|z_w_u32|a_w_u32|b_w_u32', gdn_a_log: 'A_log_f32' }],
+      [3, 'qwen36attn', { c_attn_w: 'q_w_u32|k_w_u32|v_w_u32', q_norm: 'q_norm_f16' }],
+      [0, 'qwen36moe_block', { moe_gate_proj_w: 'exp_gate_proj_w_u32', router_s: 'router_s_f16' }],
+    ]) {
+      const dir = join(REFS, bundle)
+      if (!existsSync(dir)) continue
+      const plans = Object.fromEntries(planLayer(S, layer).map((p) => [p.name, p]))
+      for (const [planName, refNames] of Object.entries(map)) {
+        const data = await buildPlan(plans[planName], locate, counting)
+        const parts = refNames.split('|').map((n) => readFileSync(join(dir, `${n}.bin`)))
+        const ref = new Uint8Array(parts.reduce((a, b) => a + b.length, 0))
+        let o = 0
+        for (const part of parts) { ref.set(part, o); o += part.length }
+        const diff = same(data, ref)
+        if (diff) bad.push(`L${layer} ${planName}: ${diff}`)
+      }
+    }
+
+    // Every plan must RESOLVE — a typo'd record name is the whole failure mode
+    // of a naming-driven loader, and it costs one index lookup to rule out.
+    const all = planModel(S)
+    const keys = new Set()
+    for (const { plan, layer } of all) {
+      const k = planKey(plan.name, layer)
+      if (keys.has(k)) bad.push(`duplicate plan key ${k}`)
+      keys.add(k)
+      for (const part of plan.parts) {
+        try { locate(part.record) } catch (e) { bad.push(e.message) }
+      }
+    }
+    const total = modelBytes(S, locate)
+    for (const b of bad.slice(0, 8)) console.error(`      ${b}`)
+    check('loader replay',
+      `${all.length} plans over ${shards.length} shards resolve, byte-identical via ranges; `
+      + `${(headerBytes / 1024).toFixed(0)} KB of headers maps all ${(total / 1e9).toFixed(2)} GB `
+      + `(${(planBytesRead / 1e6).toFixed(0)} MB read for the 6 compared plans)`,
+      bad.length === 0)
+    Object.values(fds).forEach(closeSync)
   }
 
   ck.close()
