@@ -31,17 +31,20 @@ try{
   })
   say('engine built — decode fazina gecmeden once bekliyor')
 
-  // Yukleme fazi bitti: Node tarafi vm_stat'i SIMDI orneklesin diye isaret ver,
-  // onay bekle. Boylece pagein sayaci yalnizca decode'u kapsar.
+  // Yukleme fazi bitti. Otomasyon window.__go() cagirir; elle test icin dugme.
   window.__phase='loaded'
-  await new Promise(r => { window.__go = r })
+  const btn = document.createElement('button')
+  btn.textContent = 'Decode\'u baslat (16 token)'
+  btn.style.cssText = 'font:inherit;padding:.5rem 1rem;margin:.5rem 0;cursor:pointer'
+  document.body.insertBefore(btn, el)
+  await new Promise(r => { window.__go = r; btn.onclick = () => { btn.remove(); r() } })
 
   // GERCEK decode: motorun kendi generate() dongusu, tek prompt, 16 token.
   const ids = [248045, 9707, 248046, 198]
   const times=[]
   let last = performance.now()
   const t1 = performance.now()
-  const out = await engine.generate(ids, 0, 6, (id) => {
+  const out = await engine.generate(ids, 0, 16, (id) => {
     const now = performance.now(); times.push(now-last); last=now
   })
   const total = performance.now()-t1
