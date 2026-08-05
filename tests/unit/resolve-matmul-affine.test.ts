@@ -65,3 +65,19 @@ describe('resolveMatmul affine gating', () => {
     expect(phi.matmulLabel).not.toContain('affine')
   })
 })
+
+describe('model selection reachability', () => {
+  it('?model=qwen36 selects the MoE spec, and the three existing mappings are unchanged', async () => {
+    // model-select imports weight-loader, which reads GPUBufferUsage at MODULE
+    // scope — so importing it under Node throws before any code runs. The real
+    // values do not matter here; only that the constant exists.
+    ;(globalThis as { GPUBufferUsage?: unknown }).GPUBufferUsage ??= {
+      STORAGE: 128, COPY_SRC: 4, COPY_DST: 8, UNIFORM: 64, MAP_READ: 1,
+    }
+    const { specFromSearch } = await import('../../src/zero-tvm/model-select.ts')
+    expect(specFromSearch('?model=qwen36').id).toBe('qwen36-35b-a3b')
+    expect(specFromSearch('?model=qwen35').id).toBe(QWEN35_4B.id)
+    expect(specFromSearch('?model=qwen3').id).toBe('qwen3-4b')
+    expect(specFromSearch('').id).toBe(PHI3.id)
+  })
+})

@@ -216,6 +216,49 @@ export function planLayer(spec: ModelSpec, L: number, prefix = 'language_model.m
 }
 
 /**
+ * The buffers that are NOT per-layer: the embedding table, the untied lm_head,
+ * and the final norm.
+ *
+ * `prefix` stops one level higher than planLayer's. The text tower lives under
+ * `language_model.model.` but lm_head is `language_model.lm_head` — a level up,
+ * because it is not part of the decoder stack. Getting that wrong is a missing
+ * record, so it fails loudly; it is called out because it looks like a typo.
+ *
+ * Bias record names come from `spec.paramNaming.biasFor` rather than a suffix
+ * spelled here a second time — that field exists precisely so one place knows
+ * how MLX names companions.
+ */
+export function planGlobal(spec: ModelSpec, prefix = 'language_model.'): BufferPlan[] {
+  const bias = spec.paramNaming.biasFor
+  if (!bias) throw new Error(`${spec.id}: planGlobal needs paramNaming.biasFor (affine checkpoints only)`)
+  const q = (name: string, base: string): BufferPlan[] => [
+    { name: `${name}_w`, parts: [{ record: `${base}.weight`, convert: 'raw' }] },
+    { name: `${name}_s`, parts: [{ record: `${base}.scales`, convert: 'bf16->f16' }] },
+    { name: `${name}_b`, parts: [{ record: bias(`${base}.weight`), convert: 'bf16->f16' }] },
+  ]
+  return [
+    ...q('embed', `${prefix}model.embed_tokens`),
+    ...q('lm_head', `${prefix}lm_head`),          // NOT under model. — see above
+    { name: 'final_norm', parts: [{ record: `${prefix}model.norm.weight`, convert: 'bf16->f16' }] },
+  ]
+}
+
+/** Bytes a plan produces on the GPU, given each record's on-disk byte length.
+ *
+ *  NOT the sum of the source ranges: `bf16->f32` doubles. A_log and dt_bias are
+ *  64 B in the file and 128 B on the GPU, and a half-length A_log buffer poisons
+ *  every GDN decay gate without crashing anything.
+ */
+export function planBytes(plan: BufferPlan, sourceBytes: (record: string) => number): number {
+  let n = 0
+  for (const part of plan.parts) {
+    const b = sourceBytes(part.record)
+    n += part.convert === 'bf16->f32' ? b * 2 : b
+  }
+  return n
+}
+
+/**
  * Build one plan's bytes from already-read record data.
  *
  * `readRecord` returns the raw little-endian bytes of a tensor. Kept as a
@@ -248,5 +291,14 @@ export function buildBuffer(
   const data = new Uint8Array(total)
   let o = 0
   for (const piece of pieces) { data.set(piece, o); o += piece.byteLength }
+  // A clamped scale is not a rounding error, it is a wrong weight, and it
+  // surfaces as NaN logits thousands of dispatches downstream. This checkpoint
+  // produces none; if a future one does, the loader should stop, not warn.
+  if (overflow > 0) {
+    throw new Error(
+      `${plan.name}: ${overflow} bf16 value(s) exceed f16 range and were clamped — `
+      + 'these weights cannot be represented at f16 and the model would run wrong',
+    )
+  }
   return { data, overflow }
 }

@@ -661,12 +661,21 @@ export async function loadWeights(
   }
 }
 
+/**
+ * AFFINE CHECKPOINTS carry a per-group bias beside every scale (`w = s·q + b`),
+ * which the symmetric MLC layout has no analogue for. Every `*Biases` field
+ * below is present exactly when `spec.weightFormat === 'mlx-safetensors'` and
+ * absent otherwise, and every affine bind group binds it at @binding(5) — so a
+ * missing one is a bind-group validation error, not a wrong number.
+ */
 export interface LoadedWeights {
   device: GPUDevice
   embdWeights: GPUBuffer
   embdScales: GPUBuffer
+  embdBiases?: GPUBuffer
   lmHeadWeights: GPUBuffer
   lmHeadScales: GPUBuffer
+  lmHeadBiases?: GPUBuffer
   initNormGamma: GPUBuffer     // layer 0 input_layernorm
   finalNormGamma: GPUBuffer    // model.norm (after all layers)
   layers: Array<{
@@ -674,14 +683,17 @@ export interface LoadedWeights {
     // (always, for pure-attention specs like Phi-3/Qwen3).
     qkvWeights?: GPUBuffer
     qkvScales?: GPUBuffer
+    qkvBiases?: GPUBuffer
     oProjWeights?: GPUBuffer
     oProjScales?: GPUBuffer
+    oProjBiases?: GPUBuffer
     normGamma1: GPUBuffer    // input_layernorm (pre-attention)
     normGamma2: GPUBuffer    // post_attention_layernorm (pre-FFN)
-    ffnWeights: GPUBuffer
-    ffnScales: GPUBuffer
-    ffnDownWeights: GPUBuffer
-    ffnDownScales: GPUBuffer
+    // Dense FFN — absent on a MoE spec, which has `moe` below instead.
+    ffnWeights?: GPUBuffer
+    ffnScales?: GPUBuffer
+    ffnDownWeights?: GPUBuffer
+    ffnDownScales?: GPUBuffer
     qNormGamma?: GPUBuffer   // per-head q RMSNorm over head_dim (Qwen3 only)
     kNormGamma?: GPUBuffer   // per-head k RMSNorm over head_dim (Qwen3 only)
     // GatedDeltaNet records — present iff spec.layerKinds[L] === 'gdn' (Qwen3.5).
@@ -691,12 +703,31 @@ export interface LoadedWeights {
        *  loader so the engine runs ONE matmul dispatch per GDN layer. */
       projWeights: GPUBuffer
       projScales: GPUBuffer
+      projBiases?: GPUBuffer
       aLog: GPUBuffer        // A_log f32 [gdnVHeads]
       dtBias: GPUBuffer      // dt_bias f32 [gdnVHeads]
       convWeight: GPUBuffer  // conv1d_weight f16 [gdnQkvDim * gdnConvK]
       normGamma: GPUBuffer   // gated-RMSNorm gamma f16 [gdnHeadV]
       outWeights: GPUBuffer  // out_proj int4 [d, gdnVDim]
       outScales: GPUBuffer
+      outBiases?: GPUBuffer
+    }
+    /** Sparse-MoE FFN — present iff spec.moe. Every stacked tensor carries the
+     *  SHARED expert at index spec.sharedExpertIndex, and the router carries
+     *  its gate as row E, so the block has no special case for it. */
+    moe?: {
+      routerWeights: GPUBuffer   // int8 affine [experts+1, d]
+      routerScales: GPUBuffer
+      routerBiases: GPUBuffer
+      gateWeights: GPUBuffer     // int4 affine [experts+1, moeIntermediate, d]
+      gateScales: GPUBuffer
+      gateBiases: GPUBuffer
+      upWeights: GPUBuffer
+      upScales: GPUBuffer
+      upBiases: GPUBuffer
+      downWeights: GPUBuffer     // int4 affine [experts+1, d, moeIntermediate]
+      downScales: GPUBuffer
+      downBiases: GPUBuffer
     }
   }>
 }
