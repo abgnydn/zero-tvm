@@ -451,7 +451,12 @@ export function buildDecodeEngine(
   // GDN out_proj is a K = GDN_V_DIM matmul instance — resolve its own
   // pipeline so the vec4 K-divisibility gate applies to the right K
   // (== R.matmulOProj on Qwen3.5, where gdnVDim == qDim == 4096).
-  const matmulGdnOut = hybrid ? resolveMatmul(variants.matmul, P, variants.vec4, S.gdnVDim, variants.vec4Half).pipeline : null
+  // Same affine gate as resolveVariantPipelines — this is the fourth K instance
+  // and it is resolved here rather than there, so it has to repeat the test.
+  const matmulGdnOut = hybrid
+    ? resolveMatmul(variants.matmul, P, variants.vec4, S.gdnVDim, variants.vec4Half,
+                    S.weightFormat === 'mlx-safetensors').pipeline
+    : null
 
   const SM_SCALE = 1.0 / Math.sqrt(S.headDim)
 

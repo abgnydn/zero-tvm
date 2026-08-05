@@ -172,7 +172,26 @@ export function resolveMatmul(
   vec4 = false,
   k?: number,
   vec4Half = vec4,
+  affine = false,
 ): { pipeline: GPUComputePipeline; pipelineF32: GPUComputePipeline; rowsPerWG: number; label: string } {
+  // AFFINE (MLX) weights take a different family entirely and MUST be resolved
+  // first. A symmetric kernel reads the same buffers happily — it just divides
+  // the row into groups of 32 instead of 64 and never applies the bias — so
+  // handing it MLX weights costs no error, only wrong logits. Two of Qwen3.6's
+  // three K instances (d=2048, qDim=4096) even satisfy the vec4 gate, so the
+  // default resolution lands on int4_matmul_tiled_vec4, which is exactly wrong.
+  //
+  // vec4/vec4Half are not available here at all: int4_matmul.gen.ts forbids
+  // affine with vec4/vec4Half/mDyn/m=4, so `k` never matters on this path.
+  if (affine) {
+    if (variant !== 'scalar' && P.int4MatmulTiledAffine && P.int4MatmulF32TiledAffine) {
+      return { pipeline: P.int4MatmulTiledAffine, pipelineF32: P.int4MatmulF32TiledAffine, rowsPerWG: 4, label: 'tiled_affine' }
+    }
+    if (P.int4MatmulSgAffine && P.int4MatmulF32SgAffine) {
+      return { pipeline: P.int4MatmulSgAffine, pipelineF32: P.int4MatmulF32SgAffine, rowsPerWG: 1, label: 'sg_affine' }
+    }
+    return { pipeline: P.int4MatmulAffine, pipelineF32: P.int4MatmulF32Affine, rowsPerWG: 1, label: 'scalar_affine' }
+  }
   // ?vec4=1 experiment: vec4-load builds exist for the tiled and sg shapes.
   // tiled8 has no vec4 build (known-regressed tile size) and scalar can't
   // have one (64-thread WG breaks K divisibility) — those fall through
@@ -250,10 +269,14 @@ export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines, spec:
   // Per-instance vec4 gating: each matmul role passes its own K, so vec4
   // survives exactly on the instances whose K % 1024 == 0 (all of them for
   // Phi-3 — resolution unchanged there).
+  // The checkpoint's quantization decides the kernel family, not a URL flag —
+  // a spec whose weights are MLX-affine can never be served by a symmetric
+  // kernel, and the failure would be silent.
+  const affine = spec.weightFormat === 'mlx-safetensors'
   const { pipeline: matmul, pipelineF32: matmulF32, rowsPerWG: matmulRowsPerWG, label: matmulLabel } =
-    resolveMatmul(flags.matmul, P, flags.vec4, spec.d, flags.vec4Half)
-  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim, flags.vec4Half)
-  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn, flags.vec4Half)
+    resolveMatmul(flags.matmul, P, flags.vec4, spec.d, flags.vec4Half, affine)
+  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim, flags.vec4Half, affine)
+  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn, flags.vec4Half, affine)
   const attention = (flags.sgAttn && P.attentionSg) ? P.attentionSg : P.attention
   // ?splitk=N experiment: partial pass follows the sgAttn toggle (subgroup
   // reduce when available), combine is feature-free.
