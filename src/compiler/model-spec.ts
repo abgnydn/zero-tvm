@@ -642,6 +642,6 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
 export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
   ...QWEN36_35B_A3B,
   id: 'qwen36-35b-a3b-q3',
-  hfRepo: 'abgnydn/Qwen3.6-35B-A3B-MLX-q3exp',
+  hfRepo: 'abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp',
   moe: { ...QWEN36_35B_A3B.moe!, bits: 3 },
 })

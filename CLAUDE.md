@@ -162,7 +162,7 @@ Weights load via `weight-loader-mlx.ts`: byte-range fetches (never a whole
 5.3 GB shard), OPFS keyed by BUILT buffer, bf16 conversion at load. The dev
 mirror serves both checkpoints; `?model=qwen36q3` needs the locally-converted
 `.weights-local/Qwen3.6-35B-A3B-MLX-q3exp` (16.36 GB) until it is uploaded to
-`abgnydn/Qwen3.6-35B-A3B-MLX-q3exp`.
+`abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp`.
 
 ```bash
 # 4-bit: huggingface-cli download lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit \
