@@ -40,8 +40,11 @@ export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: strin
   // 2026-07-30 corrected protocol — the conservative number a user actually
   // experiences. Decode-only rates run higher (83 / 75 / 73 t/s); see BENCH.md.
   if (spec.id === QWEN36_35B_A3B_Q3.id) {
+    // ~55 t/s measured by the machine owner on a quiet 32 GB M2 Max
+    // (2026-08-05); ~11 t/s under heavy memory pressure. Quote the quiet one —
+    // the gate already states the RAM requirement.
     return { name: 'Qwen3.6-35B-A3B (3-bit experts)',
-             sizeLabel: '~16.4 GB — needs ~20 GB free RAM', rateLabel: '' }
+             sizeLabel: '~16.4 GB — needs ~20 GB free RAM', rateLabel: '~55 t/s' }
   }
   if (spec.id === QWEN36_35B_A3B.id) {
     // No rate label: correctness is verified against mlx_lm (identical argmax),

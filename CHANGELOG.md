@@ -7,6 +7,28 @@ from `0.1.0`.
 
 ## [Unreleased]
 
+### Added — Qwen3.6-35B-A3B: the first MoE, the first MLX checkpoint, and a 3-bit build
+
+- **`?model=qwen36`** — Qwen3.6-35B-A3B (30 GDN + 10 attention layers, 256
+  experts top-8 + shared) on the same hand-written engine. Every layer type is
+  validated against **mlx_lm's own modules** on the real checkpoint (GDN
+  2.26e-3, attention 7.59e-4, MoE block 1.57e-4, whole decoder layer 5.16e-4,
+  greedy argmax matches mlx). New kernels: `moe_router_logits`,
+  `moe_router_topk` (32 lanes × 8 experts in registers), `moe_combine`, and
+  `affine`/`moe` variants of the int4 matmul (MLX `w = s·q + b`, group 64,
+  expert-as-grid-z). 19.7 GB resident — needs ~24 GB free RAM.
+- **`?model=qwen36q3`** — the 32 GB-Mac build: expert stacks requantised to
+  3-bit (`scripts/convert-q3-experts.py`, 16 s), resident 15.7 GB. The MLX
+  bits=3 layout is a continuous LSB-first bitstream straddling u32 words; the
+  `q3` kernel variants walk 8-value/24-bit windows. Chosen over 2-bit by
+  measurement (block cosine 0.936 vs 0.785). ~55 t/s on a quiet 32 GB M2 Max.
+- **MLX safetensors loader** — byte-range reads (a 5.3 GB shard is never one
+  ArrayBuffer), per-BufferPlan OPFS caching of BUILT buffers, bf16→f16/f32
+  conversion with subnormal-exact rounding and hard-error on overflow; 268 KB
+  of headers maps all 19.5 GB. Repacking is byte-verified against the
+  checkpoint (`npm run test:kernels:mlx`).
+
+
 Correctness fixes, the first measured optimization promoted to default, and a
 new headline number. The engine now measures **faster than WebLLM** on the
 one machine benchmarked — and, since the 2026-07-30 corrected protocol, every

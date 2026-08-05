@@ -141,6 +141,39 @@ BENCH_QUERY="?model=qwen35" npm run bench         # same-session A/B vs WebLLM's
                                                   # prebuilt Qwen3.5-4B; never writes results.json
 ```
 
+## Qwen3.6-35B-A3B (`?model=qwen36`, `?model=qwen36q3`)
+
+Fourth model, first MoE and first MLX-format checkpoint: 40 layers (30 GDN +
+10 gated-attention, GQA 16/2), 256 experts top-8 plus a shared expert, untied
+lm_head, MLX-affine quantization (`w = s·q + b`, group 64, per-tensor biases).
+`model-select.ts` maps `?model=qwen36` → `QWEN36_35B_A3B` (4-bit, 19.7 GB
+resident, needs ~24 GB free RAM) and `?model=qwen36q3` → `QWEN36_35B_A3B_Q3`
+(3-bit expert stacks, 15.7 GB resident, ~55 t/s on a quiet 32 GB M2 Max).
+
+Engine notes: the MoE block is 7 dispatches (router_logits → router_topk →
+gate/up/silu/down → combine) with the expert index in grid `z` and the shared
+expert stacked as index E of every expert tensor (its gate is router row E) —
+no special cases anywhere. Chunked prefill is OFF for MoE (affine has no
+batched_dyn and `ids[]` has no token dimension); prefill is per-token. MoE
+specs require subgroups — there is no scalar router/expert path and
+`buildDecodeEngine` throws rather than running the dense FFN.
+
+Weights load via `weight-loader-mlx.ts`: byte-range fetches (never a whole
+5.3 GB shard), OPFS keyed by BUILT buffer, bf16 conversion at load. The dev
+mirror serves both checkpoints; `?model=qwen36q3` needs the locally-converted
+`.weights-local/Qwen3.6-35B-A3B-MLX-q3exp` (16.36 GB) until it is uploaded to
+`abgnydn/Qwen3.6-35B-A3B-MLX-q3exp`.
+
+```bash
+# 4-bit: huggingface-cli download lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit \
+#          --local-dir .weights-local/Qwen3.6-35B-A3B-MLX-4bit
+# 3-bit experts (from the 4-bit, ~16 s):
+#   cd ~/dev/ml-research && uv run python ~/dev/zero-tvm/scripts/convert-q3-experts.py
+npm run test:kernels          # includes the synthetic affine/q3 matmul tests
+npm run test:kernels:mlx      # byte-exact repack + loader replay + model budget
+npm run test:kernels:real     # kernels vs mlx_lm's own modules on real weights
+```
+
 ## Cross-site context
 
 `sites.json` is synced from `~/sites-shared/sites.ts`. Edit URLs,
