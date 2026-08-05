@@ -601,7 +601,18 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   { affine: true }, // int4_matmul_affine
   { outF32: true, affine: true }, // int4_matmul_f32_affine
   { subgroups: true, affine: true }, // int4_matmul_sg_affine
-  { subgroups: true, rowsPerWG: 4, affine: true } // int4_matmul_tiled_affine
+  { subgroups: true, rowsPerWG: 4, affine: true }, // int4_matmul_tiled_affine
+  // The f32-output siblings are not optional extras: variants.ts's resolveMatmul
+  // only returns a tiled pipeline when BOTH the f16 and the f32 sibling exist,
+  // and falls through to the scalar path otherwise. Without _f32_tiled_affine an
+  // untied lm_head lands on the scalar kernel, which is 248320 workgroups —
+  // past the 65535 per-dimension limit, so it needs the z-fold; the tiled one is
+  // 62080 and does not.
+  { outF32: true, subgroups: true, affine: true }, // int4_matmul_f32_sg_affine
+  { outF32: true, subgroups: true, rowsPerWG: 4, affine: true }, // int4_matmul_f32_tiled_affine
+  // MoE: workgroup_id.z is the SLOT and the expert row comes from ids[] at
+  // @binding(6), so one dispatch covers every selected expert.
+  { affine: true, moe: true, subgroups: true, rowsPerWG: 4 } // int4_matmul_tiled_affine_moe
 ]
 
 /** Human-auditable dump of every shipped variant. */

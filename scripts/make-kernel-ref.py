@@ -550,9 +550,59 @@ def qwen36layer(seed: int):
     }
 
 
+def qwen36embed(seed: int):
+    """Embedding rows for a handful of token ids, dequantized by MLX itself.
+
+    embedding.wgsl is hard-symmetric — `(nibble - 7) * scale` over groups of 32,
+    no bias binding. The MLX table is affine over groups of 64. Binding one to
+    the other is in bounds and error-free; it just returns wrong token vectors,
+    at the very top of the forward pass, where nothing downstream points back.
+    So the affine sibling gets its own real-weight check.
+    """
+    import mlx.core as mx
+
+    W, cfg, args = _qwen36_args()
+    key = "language_model.model.embed_tokens"
+    w = mx.load(os.path.join(W, "model-00001-of-00004.safetensors"))
+    if key + ".weight" not in w:
+        # embed_tokens lives in whichever shard the index says; find it.
+        import json as _json
+        idx = _json.load(open(os.path.join(W, "model.safetensors.index.json")))["weight_map"]
+        w = mx.load(os.path.join(W, idx[key + ".weight"]))
+
+    qz = cfg["quantization"]
+    G = qz["group_size"]
+    # Real ids plus the two ends of the table — an off-by-one in the row stride
+    # shows up at the edges first.
+    ids = np.array([0, 1, 1000, 100000, args.vocab_size - 1], dtype=np.uint32)
+    rows = mx.array(ids.astype(np.int32))
+    ref = mx.dequantize(mx.take(w[key + ".weight"], rows, axis=0),
+                        mx.take(w[key + ".scales"], rows, axis=0),
+                        mx.take(w[key + ".biases"], rows, axis=0),
+                        group_size=G, bits=qz["bits"])
+    mx.eval(ref)
+
+    return {
+        "arrays": {
+            "ids_u32": ids,
+            "weights_u32": np.array(w[key + ".weight"].astype(mx.uint32)).ravel(),
+            "scales_f16": np.array(w[key + ".scales"].astype(mx.float32)).astype(np.float16).ravel(),
+            "bias_f16": np.array(w[key + ".biases"].astype(mx.float32)).astype(np.float16).ravel(),
+            "y_ref_f32": _f32(ref),
+        },
+        "meta": {"kernel": "affine_embedding",
+                 "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
+                 "tensor": key,
+                 "reference": "mlx.core.dequantize",
+                 "hidden": int(args.hidden_size), "vocab": int(args.vocab_size),
+                 "group": G, "n_ids": int(ids.size),
+                 "note": "rows for ids [0, 1, 1000, 100000, vocab-1]; affine w = s*q + b, group 64"},
+    }
+
+
 PRODUCERS = {"qwen36moe": qwen36moe, "qwen36moe_block": qwen36moe_block,
              "qwen36gdn": qwen36gdn, "qwen36attn": qwen36attn,
-             "qwen36layer": qwen36layer}
+             "qwen36layer": qwen36layer, "qwen36embed": qwen36embed}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

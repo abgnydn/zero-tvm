@@ -73,7 +73,7 @@ async function affineMatmul(device, dir, meta) {
 }
 
 
-// ── MoE block: router + K+1 expert slots, 6 dispatches ───────────────────────
+// ── MoE block: router + K+1 expert slots, 7 dispatches ───────────────────────
 //
 // The whole block, in the layout the engine's loader is meant to build:
 // the shared expert is index E of every stacked expert tensor and its gate is
@@ -82,7 +82,7 @@ async function affineMatmul(device, dir, meta) {
 //
 //   router_logits (E+1 wg) -> router_topk (1 wg)
 //     -> gate (F/4,1,SLOTS) -> up (F/4,1,SLOTS) -> silu_mul -> down (D/4,1,SLOTS)
-//     -> combine
+//     -> combine                                              [7 dispatches]
 //
 async function moeBlock(device, dir, meta) {
   const D = meta.hidden, F = meta.moe_intermediate, K = meta.top_k
@@ -150,7 +150,7 @@ async function moeBlock(device, dir, meta) {
   const gu = device.createBuffer({ size: SLOTS * 2 * F * 2, usage: BU.STORAGE })     // [slot][gate|up]
   const h = device.createBuffer({ size: SLOTS * F * 2, usage: BU.STORAGE })
   const dOut = device.createBuffer({ size: SLOTS * D * 2, usage: BU.STORAGE })
-  const acc = device.createBuffer({ size: D * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const acc = device.createBuffer({ size: D * 2, usage: BU.STORAGE | BU.COPY_SRC })
 
   // Tiled + subgroups: 4 output rows per workgroup, subgroupAdd instead of a
   // tree reduction, so the 8 activations a thread loads are reused 4 times.
@@ -207,11 +207,11 @@ async function moeBlock(device, dir, meta) {
   pass.dispatchWorkgroups(Math.ceil(D / 256))
   pass.end()
 
-  const outBuf = device.createBuffer({ size: D * 4, usage: BU.COPY_DST | BU.MAP_READ })
-  enc.copyBufferToBuffer(acc, 0, outBuf, 0, D * 4)
+  const outBuf = device.createBuffer({ size: D * 2, usage: BU.COPY_DST | BU.MAP_READ })
+  enc.copyBufferToBuffer(acc, 0, outBuf, 0, D * 2)
   device.queue.submit([enc.finish()])
   await outBuf.mapAsync(MM.READ)
-  const got = new Float32Array(outBuf.getMappedRange().slice(0))
+  const got = Array.from(new Uint16Array(outBuf.getMappedRange().slice(0)), f16BitsToF32)
 
   // The reference runs in f32, so this tolerance is set by OUR f16 activations
   // and int4 weights rather than by the reference's own rounding. It was 0.012
@@ -222,7 +222,7 @@ async function moeBlock(device, dir, meta) {
   for (let i2 = 0; i2 < D; i2++) maxRel = Math.max(maxRel, Math.abs(got[i2] - yRef[i2]) / scale)
   return {
     pass: maxRel < 0.005 && scoreErr < 0.005,
-    detail: `router top-${K} exact, scores ${scoreErr.toExponential(2)} | full block ${maxRel.toExponential(2)} | ${SLOTS} slots in 6 dispatches`,
+    detail: `router top-${K} exact, scores ${scoreErr.toExponential(2)} | full block ${maxRel.toExponential(2)} | ${SLOTS} slots in 7 dispatches`,
   }
 }
 
@@ -516,9 +516,12 @@ async function qwen36Attn(device, dir, meta) {
  * The qwen36layer bundle owns the x they are all run on, the seeded state, and
  * post_attention_layernorm, which neither of the others carries.
  *
- * The final `y = h + m` is done on the HOST, not by add_norm: at that point the
- * layer is over and the add belongs to the NEXT layer's add_norm, which this
- * bundle has no gamma for. Everything upstream of it runs on the GPU.
+ * The closing `y = h + m` runs on the GPU through add_norm, whose `residual`
+ * output is exactly that sum. Its normalised output needs the NEXT layer's
+ * gamma, which this bundle has no reason to carry, so that output is ignored
+ * and only the residual is compared — which is the point, since it is the one
+ * seam nothing else covers: moe_combine writes f16 and add_norm reads f16, and
+ * WebGPU would silently accept an f32 buffer there.
  */
 async function qwen36Layer(device, dir, meta) {
   const gdnDir = join(REFS, 'qwen36gdn'), moeDir = join(REFS, 'qwen36moe_block')
@@ -578,7 +581,8 @@ async function qwen36Layer(device, dir, meta) {
   const r = sb(D * 2), h = sb(D * 2), n2 = sb(D * 2)
   const rLog = sb((E + 1) * 4), rIdx = sb(SLOTS * 4), rScore = sb(SLOTS * 4)
   const GU = 2 * F * 2
-  const gu = sb(SLOTS * GU), hh = sb(SLOTS * F * 2), dOut = sb(SLOTS * D * 2), moeOut = sb(D * 4)
+  const gu = sb(SLOTS * GU), hh = sb(SLOTS * F * 2), dOut = sb(SLOTS * D * 2), moeOut = sb(D * 2)
+  const y = sb(D * 2), yNorm = sb(D * 2)
   const convState = st('conv_state_f16', Uint16Array)
   const state = buffer(device, rd('recur_state_f32', Float32Array), BU.STORAGE | BU.COPY_DST | BU.COPY_SRC)
 
@@ -599,9 +603,11 @@ async function qwen36Layer(device, dir, meta) {
     [mm, [r, gnormOut, stFrom(gdnDir, 'out_s_f16', Uint16Array), stFrom(gdnDir, 'out_w_u32', Uint32Array),
           u32([VD / 8, VD / 64, D]), stFrom(gdnDir, 'out_b_f16', Uint16Array)], [D / RPW]],
     // ── residual + post-attention norm, one kernel ──
-    [addNorm, [xBuf, r, st('norm2_gamma_f16', Uint16Array), n2, h, u32([Math.ceil(D / 256)])],
-     [Math.ceil(D / 256)]],
-    // ── MoE block, 6 dispatches ──
+    // add_norm's grid is the TOKEN count (base = batch * D), not ceil(D/256):
+    // one workgroup of 256 threads walks a whole row. Dispatching D/256 of them
+    // runs seven extra workgroups whose reads fall off the end of the buffer.
+    [addNorm, [xBuf, r, st('norm2_gamma_f16', Uint16Array), n2, h, u32([1])], [1]],
+    // ── MoE block, 7 dispatches ──
     [rtL, [rLog, n2, stFrom(moeDir, 'router_w_u32', Uint32Array),
            stFrom(moeDir, 'router_s_f16', Uint16Array), stFrom(moeDir, 'router_b_f16', Uint16Array),
            u32([D, E + 1])], [E + 1]],
@@ -620,30 +626,72 @@ async function qwen36Layer(device, dir, meta) {
                            BU.UNIFORM | BU.COPY_DST)], [Math.ceil(SLOTS * F / 256)]],
     [mmMoe, bgMoe(dOut, 0, SLOTS * D * 2, hh, 'down_proj', podDown), [D / RPW, 1, SLOTS]],
     [comb, [moeOut, dOut, rScore, u32([D, SLOTS])], [Math.ceil(D / 256)]],
+    // The layer's own closing residual, on the GPU. add_norm's `residual`
+    // output IS h + m; its normalised output needs a gamma that belongs to the
+    // NEXT layer, so any gamma will do here and only the residual is compared.
+    // Running it proves the seam the MoE block feeds: moe_combine writes f16
+    // and add_norm reads f16.
+    [addNorm, [h, moeOut, st('norm2_gamma_f16', Uint16Array), yNorm, y, u32([1])], [1]],
   )
 
   const bytes = await runChain(device, steps,
-    [[r, D * 2], [h, D * 2], [n2, D * 2], [moeOut, D * 4]])
+    [[r, D * 2], [h, D * 2], [n2, D * 2], [moeOut, D * 2], [y, D * 2]])
   const hf = (b) => Array.from(new Uint16Array(b), f16BitsToF32)
-  const hArr = hf(bytes[1]), mArr = new Float32Array(bytes[3])
-  const y = hArr.map((v, i) => v + mArr[i])
   const stages = [
     ['linear_attn', hf(bytes[0]), 'r_ref_f32'],
-    ['x + r', hArr, 'h_ref_f32'],
+    ['x + r', hf(bytes[1]), 'h_ref_f32'],
     ['post_attn norm', hf(bytes[2]), 'norm2_ref_f32'],
-    ['MoE', mArr, 'moe_ref_f32'],
-    ['h + MoE', y, 'y_ref_f32'],
+    ['MoE', hf(bytes[3]), 'moe_ref_f32'],
+    ['h + MoE', hf(bytes[4]), 'y_ref_f32'],
   ].map(([name, got, ref]) => [name, relErr(got, rd(ref, Float32Array))])
 
   const worst = Math.max(...stages.map(([, e]) => e))
   return {
     pass: worst < 0.005,
-    detail: stages.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ') + ' (15 dispatches)',
+    detail: stages.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ') + ' (16 dispatches, all GPU)',
   }
 }
 
+
+/**
+ * The MLX embedding table through embedding_affine.wgsl.
+ *
+ * embedding.wgsl is hard-symmetric with no bias binding; the MLX table is
+ * affine over groups of 64. Feeding one to the other is in bounds and
+ * error-free, so this check exists to make that difference loud.
+ */
+async function affineEmbedding(device, dir, meta) {
+  const rd = (n, T) => read(dir, n, T)
+  const st = (n, T) => buffer(device, rd(n, T), BU.STORAGE | BU.COPY_DST)
+  const D = meta.hidden, N = meta.n_ids
+  const S = { ...QWEN36, d: D }
+  const pipe = pipelineFor(device,
+    withPrelude(readFileSync(join(SHADERS, 'embedding_affine.wgsl'), 'utf8'), S), 'embedding_affine')
+  const out = device.createBuffer({ size: N * D * 2, usage: BU.STORAGE | BU.COPY_SRC })
+  const wgs = Math.ceil(N * D / 256)
+  const bufs = [
+    out, st('ids_u32', Uint32Array), st('scales_f16', Uint16Array), st('weights_u32', Uint32Array),
+    buffer(device, new Int32Array([N, wgs]), BU.UNIFORM | BU.COPY_DST),
+    st('bias_f16', Uint16Array),   // binding index == array index -> @binding(5)
+  ]
+  const enc = device.createCommandEncoder()
+  const pass = enc.beginComputePass()
+  pass.setPipeline(pipe)
+  pass.setBindGroup(0, device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
+  }))
+  pass.dispatchWorkgroups(wgs)
+  pass.end()
+  device.queue.submit([enc.finish()])
+  const [bytes] = await readBack(device, [[out, N * D * 2]])
+  const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
+  const err = relErr(got, rd('y_ref_f32', Float32Array))
+  return { pass: err < 0.005, detail: `max rel err ${err.toExponential(2)} over ${N} rows (vs ${meta.reference})` }
+}
+
 const KERNELS = {
-  affine_matmul: affineMatmul, moe_block: moeBlock,
+  affine_matmul: affineMatmul, affine_embedding: affineEmbedding, moe_block: moeBlock,
   qwen36_gdn: qwen36Gdn, qwen36_attn: qwen36Attn, qwen36_layer: qwen36Layer,
 }
 
