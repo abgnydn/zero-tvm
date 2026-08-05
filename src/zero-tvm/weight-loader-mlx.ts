@@ -1,0 +1,239 @@
+/**
+ * MLX SAFETENSORS LOADER — the I/O half of the Qwen3.6 port.
+ *
+ * `mlx-weights.ts` decides WHAT each GPU buffer is made of (which records, in
+ * which order, with which dtype conversion) and is byte-verified against the
+ * checkpoint. This module is the part that has to go and get the bytes, and it
+ * differs from the MLC path in one structural way:
+ *
+ *   THE UNIT OF WORK IS A BufferPlan, NEVER A SHARD.
+ *
+ * The MLC loader fetches a shard, then slices GPU buffers out of it. That
+ * cannot work here: a Qwen3.6 shard is 5.3 GB, and both `fetchBufWithRetry`
+ * (which accumulates into one Uint8Array) and `File.arrayBuffer()` allocate a
+ * single ArrayBuffer, which V8 caps near 4.29 GB. So every read is a byte
+ * RANGE, sized by the record it serves, and what gets cached in OPFS is the
+ * BUILT buffer — after concatenation and bf16 conversion — keyed by plan name.
+ * A warm reload then skips the ranges and the conversion together.
+ *
+ * The safetensors index and the four shard headers (~90 KB each) are fetched
+ * whole; they are the only things small enough to be.
+ *
+ * Imports carry the .ts extension on purpose — like model-spec.ts and
+ * mlx-weights.ts, this module is imported directly by tests/kernels/*.mjs under
+ * Node type stripping, which does no extension searching.
+ */
+
+import type { ModelSpec } from '../compiler/model-spec.ts'
+import {
+  parseSafetensorsHeader, planLayer, planGlobal, buildBuffer, planBytes,
+  type BufferPlan, type TensorInfo,
+} from './mlx-weights.ts'
+
+/** Where a record lives: which shard, and its byte range within the file. */
+interface RecordLoc {
+  file: string
+  /** Absolute byte offset in the shard file (header already added). */
+  begin: number
+  end: number
+  info: TensorInfo
+}
+
+export interface MlxSource {
+  /** Fetch [begin, end) of a shard file. */
+  range(file: string, begin: number, end: number): Promise<Uint8Array<ArrayBuffer>>
+  /** Fetch a whole small file (index / header probe). */
+  whole(file: string): Promise<Uint8Array<ArrayBuffer>>
+}
+
+/**
+ * Resolve every record's shard and absolute byte range.
+ *
+ * Reads the index, then each shard's 8-byte header length followed by the
+ * header itself. Four ranged reads of ~90 KB against 20 GB of shards — the
+ * whole point of not fetching shards.
+ */
+export async function openMlxCheckpoint(src: MlxSource): Promise<{
+  locate: (record: string) => RecordLoc
+  records: string[]
+  shards: string[]
+}> {
+  const index = JSON.parse(new TextDecoder().decode(await src.whole('model.safetensors.index.json')))
+  const map: Record<string, string> = index.weight_map
+  const shards = [...new Set(Object.values(map))].sort()
+
+  const headers: Record<string, { tensors: Record<string, TensorInfo>; dataStart: number }> = {}
+  for (const file of shards) {
+    const lenBytes = await src.range(file, 0, 8)
+    const view = new DataView(lenBytes.buffer, lenBytes.byteOffset, 8)
+    if (view.getUint32(4, true) !== 0) throw new Error(`${file}: safetensors header longer than 4 GB`)
+    const headerLen = view.getUint32(0, true)
+    const head = await src.range(file, 0, 8 + headerLen)
+    headers[file] = parseSafetensorsHeader(head.buffer.slice(head.byteOffset, head.byteOffset + head.byteLength))
+  }
+
+  const locate = (record: string): RecordLoc => {
+    const file = map[record]
+    if (!file) throw new Error(`record not in checkpoint index: ${record}`)
+    const h = headers[file]
+    const info = h.tensors[record]
+    if (!info) throw new Error(`record in index but not in ${file}'s header: ${record}`)
+    return { file, begin: h.dataStart + info.begin, end: h.dataStart + info.end, info }
+  }
+  return { locate, records: Object.keys(map), shards }
+}
+
+/** Every buffer the model needs, in the order they should be built. */
+export function planModel(spec: ModelSpec): { plan: BufferPlan; layer: number | null }[] {
+  const out: { plan: BufferPlan; layer: number | null }[] = []
+  for (const p of planGlobal(spec)) out.push({ plan: p, layer: null })
+  for (let L = 0; L < spec.layers; L++) {
+    for (const p of planLayer(spec, L)) out.push({ plan: p, layer: L })
+  }
+  return out
+}
+
+/** Stable OPFS / GPU-label key for a plan. Layer plans repeat their names. */
+export function planKey(name: string, layer: number | null): string {
+  return layer === null ? `g.${name}` : `l${layer}.${name}`
+}
+
+export interface BuiltBuffer {
+  key: string
+  layer: number | null
+  name: string
+  data: Uint8Array
+}
+
+/**
+ * Build one plan's bytes: ranged-read each record, convert, concatenate.
+ *
+ * `readRecord` is synchronous inside `buildBuffer`, so the ranges are fetched
+ * first and handed over as a lookup — which also lets the caller run the
+ * fetches concurrently.
+ */
+export async function buildPlan(
+  plan: BufferPlan,
+  locate: (record: string) => RecordLoc,
+  src: MlxSource,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const parts = new Map<string, Uint8Array>()
+  for (const part of plan.parts) {
+    const loc = locate(part.record)
+    parts.set(part.record, await src.range(loc.file, loc.begin, loc.end))
+  }
+  const { data } = buildBuffer(plan, (n) => {
+    const d = parts.get(n)
+    if (!d) throw new Error(`internal: range for ${n} was not fetched`)
+    return d
+  })
+  return data
+}
+
+/** Total GPU bytes the model will occupy, before fetching anything. */
+export function modelBytes(spec: ModelSpec, locate: (record: string) => RecordLoc): number {
+  const src = (r: string) => { const l = locate(r); return l.end - l.begin }
+  return planModel(spec).reduce((a, { plan }) => a + planBytes(plan, src), 0)
+}
+
+// ============================================================
+// GPU assembly
+// ============================================================
+
+/** Where a plan's buffer lands in LoadedWeights. */
+type Slot = [group: 'root' | 'layer' | 'gdn' | 'moe', field: string]
+
+/**
+ * plan name -> LoadedWeights field. Exhaustive on purpose: `assembleMlx`
+ * THROWS on a plan it cannot place, so adding a buffer to planLayer without
+ * saying where it goes fails at load rather than leaving a field undefined for
+ * a bind group to trip over later.
+ */
+const SLOTS: Record<string, Slot> = {
+  embed_w: ['root', 'embdWeights'], embed_s: ['root', 'embdScales'], embed_b: ['root', 'embdBiases'],
+  lm_head_w: ['root', 'lmHeadWeights'], lm_head_s: ['root', 'lmHeadScales'], lm_head_b: ['root', 'lmHeadBiases'],
+  final_norm: ['root', 'finalNormGamma'],
+  norm1: ['layer', 'normGamma1'], norm2: ['layer', 'normGamma2'],
+  c_attn_w: ['layer', 'qkvWeights'], c_attn_s: ['layer', 'qkvScales'], c_attn_b: ['layer', 'qkvBiases'],
+  o_proj_w: ['layer', 'oProjWeights'], o_proj_s: ['layer', 'oProjScales'], o_proj_b: ['layer', 'oProjBiases'],
+  q_norm: ['layer', 'qNormGamma'], k_norm: ['layer', 'kNormGamma'],
+  gdn_proj_w: ['gdn', 'projWeights'], gdn_proj_s: ['gdn', 'projScales'], gdn_proj_b: ['gdn', 'projBiases'],
+  gdn_out_w: ['gdn', 'outWeights'], gdn_out_s: ['gdn', 'outScales'], gdn_out_b: ['gdn', 'outBiases'],
+  gdn_conv: ['gdn', 'convWeight'], gdn_norm: ['gdn', 'normGamma'],
+  gdn_a_log: ['gdn', 'aLog'], gdn_dt_bias: ['gdn', 'dtBias'],
+  moe_gate_proj_w: ['moe', 'gateWeights'], moe_gate_proj_s: ['moe', 'gateScales'], moe_gate_proj_b: ['moe', 'gateBiases'],
+  moe_up_proj_w: ['moe', 'upWeights'], moe_up_proj_s: ['moe', 'upScales'], moe_up_proj_b: ['moe', 'upBiases'],
+  moe_down_proj_w: ['moe', 'downWeights'], moe_down_proj_s: ['moe', 'downScales'], moe_down_proj_b: ['moe', 'downBiases'],
+  router_w: ['moe', 'routerWeights'], router_s: ['moe', 'routerScales'], router_b: ['moe', 'routerBiases'],
+  ffn_w: ['layer', 'ffnWeights'], ffn_s: ['layer', 'ffnScales'], ffn_b: ['layer', 'ffnWeights'],
+  ffn_down_w: ['layer', 'ffnDownWeights'], ffn_down_s: ['layer', 'ffnDownScales'], ffn_down_b: ['layer', 'ffnDownScales'],
+}
+
+export interface MlxLoadHooks {
+  /** Cached BUILT buffer for a plan key, or null. Skips the ranges AND the
+   *  bf16 conversion, which is why the cache is keyed by plan and not shard. */
+  cacheRead?: (key: string) => Promise<ArrayBuffer | null>
+  cacheWrite?: (key: string, data: ArrayBuffer) => void
+  onProgress?: (msg: string) => void
+  onBuffer?: (done: number, total: number, bytes: number) => void
+}
+
+/**
+ * Fetch, convert and upload every buffer, then assemble LoadedWeights.
+ *
+ * Buffers are uploaded one at a time and the host copy dropped immediately:
+ * peak host memory is ONE plan (242 MB for the embedding table), not the model.
+ * There is no concurrency here on purpose — 19.5 GB of GPU allocation is the
+ * scarce resource, not request parallelism, and overlapping fetches would hold
+ * several host copies alive at once.
+ */
+export async function assembleMlx(
+  device: GPUDevice,
+  spec: ModelSpec,
+  src: MlxSource,
+  locate: (record: string) => RecordLoc,
+  usage: number,
+  hooks: MlxLoadHooks = {},
+): Promise<Record<string, unknown>> {
+  const plans = planModel(spec)
+  const root: Record<string, unknown> = { device }
+  const layers: Record<string, unknown>[] = Array.from({ length: spec.layers }, () => ({}))
+  let done = 0
+  let bytes = 0
+
+  for (const { plan, layer } of plans) {
+    const slot = SLOTS[plan.name]
+    if (!slot) throw new Error(`assembleMlx: no LoadedWeights slot for plan '${plan.name}'`)
+    const key = planKey(plan.name, layer)
+
+    let data: Uint8Array<ArrayBuffer>
+    const cached = await hooks.cacheRead?.(key)
+    if (cached) {
+      data = new Uint8Array(cached) as Uint8Array<ArrayBuffer>
+    } else {
+      data = await buildPlan(plan, locate, src)
+      hooks.cacheWrite?.(key, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))
+    }
+
+    const buf = device.createBuffer({ size: data.byteLength, usage, label: key })
+    device.queue.writeBuffer(buf, 0, data)
+    bytes += data.byteLength
+    done++
+    hooks.onBuffer?.(done, plans.length, bytes)
+
+    const [group, field] = slot
+    if (group === 'root') root[field] = buf
+    else if (layer === null) throw new Error(`assembleMlx: '${plan.name}' is a layer plan with no layer`)
+    else if (group === 'layer') layers[layer][field] = buf
+    else {
+      const sub = (layers[layer][group] ??= {}) as Record<string, unknown>
+      sub[field] = buf
+    }
+  }
+
+  root.layers = layers
+  // The MLC path exposes layer 0's input_layernorm separately; the engine reads
+  // it before the layer loop.
+  root.initNormGamma = layers[0].normGamma1
+  return root
+}

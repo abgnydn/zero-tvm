@@ -15,7 +15,11 @@
 // generated (see shaders/int4_matmul.gen.ts). Every source is piped through
 // withPrelude() so model-shape constants come from one place (shader-prelude.ts).
 import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
-import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
+import { int4MatmulWGSL, int4MatmulEntry } from './shaders/int4_matmul.gen'
+import embeddingAffineSrc from './shaders/embedding_affine.wgsl?raw'
+import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
+import moeRouterTopkSrc from './shaders/moe_router_topk.wgsl?raw'
+import moeCombineSrc from './shaders/moe_combine.wgsl?raw'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
@@ -70,6 +74,10 @@ export type { ModelSpec } from './shader-prelude'
 
 export interface Pipelines {
   embedding: GPUComputePipeline
+  /** MLX-affine embedding table (w = s·q + b, group 64). embedding.wgsl is
+   *  hard-symmetric with no bias binding, and binding an affine table to it is
+   *  in-bounds and error-free — just wrong. */
+  embeddingAffine: GPUComputePipeline
   rmsNorm: GPUComputePipeline
   qkvMatmul: GPUComputePipeline      // int4 matmul, K=3072→9216
   int4Matmul: GPUComputePipeline     // alias to the scalar int4_matmul (shared across QKV/O/FFN-down)
@@ -137,6 +145,27 @@ export interface Pipelines {
   lmHead: GPUComputePipeline          // int4 matmul f32 output
   argmax: GPUComputePipeline
   argmaxSg: GPUComputePipeline | null // subgroup variant; null if `subgroups` feature absent
+  // ── MLX affine dense family (Qwen3.6). Same bindings as the symmetric
+  // siblings plus a per-group bias at @binding(5); SCALES_PER_ROW is K/64.
+  int4MatmulAffine: GPUComputePipeline
+  int4MatmulF32Affine: GPUComputePipeline
+  int4MatmulSgAffine: GPUComputePipeline | null
+  int4MatmulTiledAffine: GPUComputePipeline | null
+  int4MatmulF32SgAffine: GPUComputePipeline | null
+  int4MatmulF32TiledAffine: GPUComputePipeline | null
+  // ── Sparse MoE block (Qwen3.6). Seven dispatches: router logits, top-k,
+  // gate, up, silu_mul, down, combine. moeMatmul folds the expert into grid z.
+  moeRouterLogits: GPUComputePipeline
+  /** null without subgroups — moe_router_topk.wgsl declares `enable subgroups`,
+   *  so the shader module itself fails to create. There is no scalar fallback:
+   *  the engine throws for a MoE spec without subgroups rather than silently
+   *  running the dense FFN. */
+  moeRouterTopk: GPUComputePipeline | null
+  moeMatmul: GPUComputePipeline | null
+  /** 3-bit sibling of moeMatmul (MLX bits=3 bitstream) — used when the spec's
+   *  MoeDims.bits is 3. Same bindings, different unpack. */
+  moeMatmulQ3: GPUComputePipeline | null
+  moeCombine: GPUComputePipeline
 }
 
 /** Per-layer weight buffers */
@@ -188,9 +217,14 @@ export function compile(
   // Bind createPipeline to this spec so the big literal below stays readable.
   const createPipeline = (device: GPUDevice, src: string, entry: string) =>
     createPipelineFor(device, src, entry, spec)
+  // Same, for generated int4 variants: the entry name is derived from the opts
+  // rather than repeated as a literal.
+  const mm = (o: Parameters<typeof int4MatmulWGSL>[0]) =>
+    createPipelineFor(device, int4MatmulWGSL(o), int4MatmulEntry(o), spec)
 
   const pipelines: Pipelines = {
     embedding: createPipeline(device, embeddingSrc, 'embedding'),
+    embeddingAffine: createPipeline(device, embeddingAffineSrc, 'embedding_affine'),
     rmsNorm: createPipeline(device, rmsNormSrc, 'rms_norm'),
     qkvMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
     int4Matmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
@@ -248,6 +282,20 @@ export function compile(
     lmHead: createPipeline(device, int4MatmulWGSL({ outF32: true }), 'int4_matmul_f32'),
     argmax: createPipeline(device, argmaxSrc, 'argmax_kernel'),
     argmaxSg: subgroups ? createPipeline(device, argmaxSgSrc, 'argmax_sg') : null,
+    // Entry names come from int4MatmulEntry(opts), not literals: these differ
+    // from their symmetric siblings by one suffix, and compile() runs on EVERY
+    // model's boot path, so a typo here breaks Phi-3 too.
+    int4MatmulAffine: mm({ affine: true }),
+    int4MatmulF32Affine: mm({ outF32: true, affine: true }),
+    int4MatmulSgAffine: subgroups ? mm({ subgroups: true, affine: true }) : null,
+    int4MatmulTiledAffine: subgroups ? mm({ subgroups: true, rowsPerWG: 4, affine: true }) : null,
+    int4MatmulF32SgAffine: subgroups ? mm({ outF32: true, subgroups: true, affine: true }) : null,
+    int4MatmulF32TiledAffine: subgroups ? mm({ outF32: true, subgroups: true, rowsPerWG: 4, affine: true }) : null,
+    moeRouterLogits: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits'),
+    moeRouterTopk: subgroups ? createPipeline(device, moeRouterTopkSrc, 'moe_router_topk') : null,
+    moeMatmul: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4 }) : null,
+    moeMatmulQ3: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: true }) : null,
+    moeCombine: createPipeline(device, moeCombineSrc, 'moe_combine'),
   }
 
   console.log(`[compiler] Done: ${Object.keys(pipelines).length} pipelines`)

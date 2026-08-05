@@ -64,6 +64,30 @@ export interface ParamNaming {
   lmHeadScale: string[]
   finalNorm: string[]
   layer: (L: number) => LayerParamNames
+  /**
+   * Affine (MLX) checkpoints carry a per-group BIAS next to every scale —
+   * `w = scale·q + bias` — which the symmetric MLC layout has no analogue for.
+   * Given a weight record name this returns its bias record.
+   *
+   * One function rather than a `*Bias` list beside every `*Weight`/`*Scale`
+   * pair: MLX names are exactly `<base>.weight` / `.scales` / `.biases`, so
+   * fourteen more fields would carry no information the suffix does not.
+   * Absent = symmetric weights, no bias tensor.
+   */
+  biasFor?: (weightRecord: string) => string
+}
+
+/** Sparse-MoE FFN (Qwen3.6). Absent = the dense gate_up/down FFN. */
+export interface MoeDims {
+  experts: number             // routed experts (num_experts)
+  topK: number                // experts per token (num_experts_per_tok)
+  sharedIntermediate: number  // shared_expert_intermediate_size
+  normTopkProb: boolean       // renormalise the top-K probabilities to sum to 1
+  routerBits: 4 | 8           // the router ships at 8 bits while the FFN is 4
+  /** Expert-stack precision. 3 selects the q3 bitstream kernels and a
+   *  checkpoint whose switch_mlp/shared_expert were requantised to 3 bits
+   *  (scripts/convert-q3-experts.py). Default 4. */
+  bits?: 3 | 4
 }
 
 // ============================================================
@@ -130,6 +154,17 @@ export interface ModelSpecBase {
    *  [Q|gate] pairs before K and V — cAttnDim = 2*qDim + 2*kvDim — and
    *  sigmoid(gate) multiplies the attention output before o_proj. */
   attnGate?: boolean
+  /** Sparse-MoE FFN (Qwen3.6). When set, `ffn` is moe_intermediate_size — the
+   *  per-expert width — and every layer runs the MoE block instead of the dense
+   *  gate_up/down pair. */
+  moe?: MoeDims
+  /**
+   * On-disk weight layout. 'mlc' is the ndarray/tensor-cache shard format with
+   * symmetric q4f16_1 (group 32); 'mlx-safetensors' is a HuggingFace
+   * safetensors checkpoint quantised MLX-affine (group 64, with biases).
+   * Default 'mlc'.
+   */
+  weightFormat?: 'mlc' | 'mlx-safetensors'
 }
 
 export interface ModelSpec extends ModelSpecBase {
@@ -188,6 +223,16 @@ export interface ModelSpec extends ModelSpecBase {
    *  downstream kernels read the regions at fixed offsets
    *  (z at gdnQkvDim, a at gdnQkvDim+gdnVDim, b right after a). */
   gdnProjRows: number
+  // ── MoE derivations (1 / 0 / -1 for dense specs, so consumers can branch on
+  // `spec.moe` and still read these unconditionally)
+  /** Expert slots one token runs: the top-K routed experts PLUS the shared
+   *  expert, which the loader stacks as expert index `sharedExpertIndex` so it
+   *  is not a special case in any kernel. */
+  moeSlots: number
+  /** Index of the shared expert within every stacked expert tensor, and of its
+   *  gate within the router — both are appended at the end, so both are
+   *  `moe.experts`. -1 for dense specs. */
+  sharedExpertIndex: number
 }
 
 export function makeModelSpec(base: ModelSpecBase): ModelSpec {
@@ -258,6 +303,8 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
     kvScalesPerSlot: 2,
     kvScalesPerHead: base.pageSize * 2,
     kvScalesPerPage: base.kvHeads * base.pageSize * 2,
+    moeSlots: base.moe ? base.moe.topK + 1 : 1,
+    sharedExpertIndex: base.moe ? base.moe.experts : -1,
   })
 }
 
@@ -471,4 +518,130 @@ export const QWEN35_4B: ModelSpec = makeModelSpec({
       }
     },
   },
+})
+
+
+// ============================================================
+// Qwen3.6-35B-A3B — the first MoE spec, and the first MLX-affine checkpoint
+// ============================================================
+
+/**
+ * Same architecture as Qwen3.5, scaled: 40 layers instead of 32, a sparse MoE
+ * FFN instead of a dense one, and an untied lm_head. The GDN dims are
+ * IDENTICAL (kHeads 16, vHeads 32, headK/V 128, convK 4), which is why every
+ * gdn_* kernel runs unchanged — verified against mlx_lm's own modules on the
+ * real checkpoint by tests/kernels/real-weights.mjs.
+ *
+ * `ffn` is moe_intermediate_size (512), the PER-EXPERT width, not a dense FFN
+ * width: it is what silu_mul strides by between slots.
+ *
+ * maxPages: one position costs 2 (K+V) × 2 kvHeads × 256 headDim × 2 B × 10
+ * attention layers = 20 KiB. 384 pages = 6144 tokens on a 126 MiB KV budget —
+ * deliberately small, because the MODEL is 19.5 GiB resident and decode dies
+ * the moment the total working set exceeds physical RAM (measured 2026-08-05:
+ * the GPU process is killed mid-prefill at 0.1 GB free; every hundred MiB of
+ * headroom is worth more than context length here). maxSeq is 262144; even
+ * the old 3072-page budget (49k tokens, 960 MiB) was 1/5th of that.
+ *
+ * The checkpoint is MULTIMODAL — every text record sits under
+ * `language_model.`, and `vision_tower.*` (0.89 GB) is never read for text.
+ */
+export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
+  id: 'qwen36-35b-a3b',
+  d: 2048,
+  layers: 40,
+  heads: 16,
+  kvHeads: 2,      // GQA 8:1 on the 10 attention layers
+  headDim: 256,
+  ffn: 512,        // moe_intermediate_size — per-expert, not a dense FFN width
+  vocab: 248320,
+  pageSize: 16,
+  maxPages: 384,
+  maxSeq: 262144,
+  ropeTheta: 1e7,
+  rmsEps: 1e-6,
+  tiedEmbeddings: false,   // lm_head is its own 248320 x 2048 tensor (0.29 GB int4)
+  qkNorm: true,
+  // Same ids as Qwen3.5 — confirmed against THIS repo's tokenizer.json
+  // added_tokens, not assumed from the shared 248320 vocab size.
+  stops: [248046, 248044],   // <|im_end|>, <|endoftext|>
+  chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  fullAttnInterval: 4,       // layers 3, 7, ... 39 are full attention (10 of 40)
+  gdn: { kHeads: 16, vHeads: 32, headK: 128, headV: 128, convK: 4 },
+  partialRotaryFactor: 0.25, // rotary_dim = 64 of 256 dims per head
+  attnGate: true,
+  moe: { experts: 256, topK: 8, sharedIntermediate: 512, normTopkProb: true, routerBits: 8 },
+  // MLX names every quantized tensor <base>.weight / .scales / .biases, and
+  // ships the projections UNFUSED — src/zero-tvm/mlx-weights.ts holds the
+  // concatenation plan (c_attn = q++k++v, gdn proj = qkv++z++a++b, expert
+  // stacks with the shared expert appended). These entries name the records
+  // the rest of the engine binds by; the unfused parts are the loader's
+  // business, not the spec's.
+  paramNaming: {
+    embedWeight: ['language_model.model.embed_tokens.weight'],
+    embedScale: ['language_model.model.embed_tokens.scales'],
+    lmHeadWeight: ['language_model.lm_head.weight'],   // NOT tied — its own tensor
+    lmHeadScale: ['language_model.lm_head.scales'],
+    finalNorm: ['language_model.model.norm.weight'],
+    biasFor: (w: string) => w.replace(/\.weight$/, '.biases'),
+    layer: (L: number) => {
+      const p = `language_model.model.layers.${L}`
+      const g = `${p}.linear_attn`
+      return {
+        qkvWeight: [`${p}.self_attn.q_proj.weight`],   // ++ k_proj ++ v_proj (see mlx-weights.ts)
+        qkvScale: [`${p}.self_attn.q_proj.scales`],
+        oProjWeight: [`${p}.self_attn.o_proj.weight`],
+        oProjScale: [`${p}.self_attn.o_proj.scales`],
+        norm1: [`${p}.input_layernorm.weight`],
+        norm2: [`${p}.post_attention_layernorm.weight`],
+        ffnWeight: [`${p}.mlp.switch_mlp.gate_proj.weight`],
+        ffnScale: [`${p}.mlp.switch_mlp.gate_proj.scales`],
+        ffnDownWeight: [`${p}.mlp.switch_mlp.down_proj.weight`],
+        ffnDownScale: [`${p}.mlp.switch_mlp.down_proj.scales`],
+        qNorm: [`${p}.self_attn.q_norm.weight`],
+        kNorm: [`${p}.self_attn.k_norm.weight`],
+        gdnQkvWeight: [`${g}.in_proj_qkv.weight`],
+        gdnQkvScale: [`${g}.in_proj_qkv.scales`],
+        gdnZWeight: [`${g}.in_proj_z.weight`],
+        gdnZScale: [`${g}.in_proj_z.scales`],
+        gdnAWeight: [`${g}.in_proj_a.weight`],
+        gdnAScale: [`${g}.in_proj_a.scales`],
+        gdnBWeight: [`${g}.in_proj_b.weight`],
+        gdnBScale: [`${g}.in_proj_b.scales`],
+        gdnALog: [`${g}.A_log`],
+        gdnDtBias: [`${g}.dt_bias`],
+        gdnConvWeight: [`${g}.conv1d.weight`],
+        gdnNormWeight: [`${g}.norm.weight`],
+        gdnOutWeight: [`${g}.out_proj.weight`],
+        gdnOutScale: [`${g}.out_proj.scales`],
+      }
+    },
+  },
+})
+
+/**
+ * The 3-bit-expert build of QWEN36_35B_A3B — same architecture, same router,
+ * same attention/GDN/lm_head precision; only the expert stacks (and the shared
+ * expert inside them) are 3-bit.
+ *
+ * WHY IT EXISTS: the 4-bit build is 19.7 GB resident and a 32 GB Mac kills the
+ * GPU process the moment the working set exceeds physical RAM (measured
+ * 2026-08-05, mid-prefill, 0.1 GB free). 3-bit experts bring resident to
+ * ~15.7 GB — real headroom. The cost is measured, not guessed: block-output
+ * cosine 0.936 vs the 4-bit block (2-bit measured 0.79 and is not offered).
+ *
+ * The checkpoint is produced locally by scripts/convert-q3-experts.py; the
+ * hfRepo below is where an upload WOULD live and what names the dev-mirror
+ * directory — until it is uploaded, this spec only works where the converted
+ * checkpoint exists on disk.
+ */
+export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
+  ...QWEN36_35B_A3B,
+  id: 'qwen36-35b-a3b-q3',
+  hfRepo: 'abgnydn/Qwen3.6-35B-A3B-MLX-q3exp',
+  moe: { ...QWEN36_35B_A3B.moe!, bits: 3 },
 })

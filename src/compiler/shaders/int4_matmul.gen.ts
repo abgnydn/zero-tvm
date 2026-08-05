@@ -68,11 +68,73 @@ export interface Int4MatmulOpts {
    * Requires subgroups + rowsPerWG=4.
    */
   mDyn?: boolean
+  /**
+   * Affine (MLX-style) quantization instead of the symmetric MLC scheme:
+   * `w = scale·q + bias` over groups of 64, rather than `w = (nibble−7)·scale`
+   * over groups of 32. Adds a per-group bias tensor at `@binding(5)`.
+   *
+   * The nibbles are read unchanged — only the metadata differs — via
+   *
+   *   Σ xᵢwᵢ = s·Σ xᵢqᵢ + b·Σ xᵢ
+   *
+   * `Σ xᵢ` is accumulated per thread over exactly the 8 values that thread
+   * already loaded, and multiplied by that thread's own group bias — summing
+   * across threads then lands each group's bias term exactly once. (Adding a
+   * whole-group Σx per thread would double-count it 8×, since 8 consecutive
+   * threads share one group-64 scale.)
+   *
+   * The symmetric path's `−7` per nibble is NOT applied here. It exists only
+   * because MLC stores `w = (nibble−7)·scale`; folding it in as
+   * `s·Σx(q−7) + (7s+b)·Σx` is algebraically identical and was how this variant
+   * first shipped. Dropping it is NOT a speed win — an A/B of the two shaders in
+   * one session, 9 paired runs on the Qwen3.6 gate projection, measured 27.00 µs
+   * both ways (0.0%); the subtract folds into the multiply-add. It is kept out
+   * because the caller then hands MLX's bias straight through instead of
+   * materialising a derived `7·scale + bias` tensor at load time.
+   *
+   * `SCALES_PER_ROW` means K/64 for this variant, not K/32.
+   */
+  affine?: boolean
+  /**
+   * MoE indirection: `workgroup_id.z` is a SLOT (0..top_k-1), and the expert row
+   * for that slot is read from an `ids` buffer at `@binding(6)`, so one dispatch
+   * covers every selected expert instead of one dispatch each. Measured: 960
+   * per-expert dispatches cost 7.6 ms/token against 1.0 ms when the expert is a
+   * grid dimension, at 7.9 µs of launch overhead apiece.
+   *
+   * Note this changes what `z` means. Every other variant flattens the grid as
+   * `(z * gridDim.x + x)`; here `z` is the slot and the row comes from `x` alone.
+   *
+   * Slot striding for the activation and output buffers comes from PODArgs, so
+   * one kernel serves gate/up (input shared across slots, output strided) and
+   * down (both strided). Requires `affine`.
+   */
+  moe?: boolean
+  /**
+   * 3-bit weights (MLX bits=3) instead of 4-bit nibbles. The values are a
+   * CONTINUOUS LSB-first bitstream per row — value i occupies bits
+   * [3i, 3i+3), crossing u32 boundaries freely (discovered empirically:
+   * 10 values in a word's low 30 bits, the 11th straddling into the next).
+   *
+   * The kernel walks 8-VALUE BLOCKS: one block is 24 bits starting at
+   * bit w_offset*24, so the in-word shift cycles {0,8,16,24} and a block
+   * spans at most two words — and never past the row's final word, because
+   * rows are 3K/32 words and the sh=24 case cannot fall on the last block
+   * (K % 64 == 0 makes the row's bit length a multiple of 192).
+   *
+   * Group-64 boundaries stay word-aligned (192 bits = 6 words), so
+   * SCALES_PER_ROW keeps meaning K/64 and sc_idx keeps being
+   * blockIndex >> 3. PODArgs.K_PACKED becomes 3K/32 (words per row) —
+   * the LOOP bound is derived from SCALES_PER_ROW instead, since K_PACKED
+   * no longer counts 8-value blocks. Requires `affine` (the q3 experts are
+   * MLX-affine); K % 256 == 0 for the 32-thread variants.
+   */
+  q3?: boolean
 }
 
 /** Entry-point name for a variant (same names the old .wgsl files used). */
 export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false, q3 = false } = opts
   if (mDyn) return 'int4_matmul_batched_dyn'
   if (m === 4) return 'int4_matmul_batched_m4'
   let name = 'int4_matmul'
@@ -82,15 +144,21 @@ export function int4MatmulEntry(opts: Int4MatmulOpts = {}): string {
   else if (subgroups) name += '_sg'
   if (vec4) name += '_vec4'
   else if (vec4Half) name += '_vec4h'
+  if (affine) name += '_affine'
+  if (q3) name += '_q3'
+  if (moe) name += '_moe'
   return name
 }
 
-// Σ xᵢ·(nibble(p, i) - 7), scale factored out by the caller.
-function dequantDot(p: string, x: (i: number) => string, indent: string): string {
+// Σ xᵢ·(nibble(p, i) - 7), scale factored out by the caller. With
+// `offset = false` the -7 is dropped: affine (MLX) weights are `s·q + b`, so
+// the nibble is used raw and the bias rides along in its own term.
+function dequantDot(p: string, x: (i: number) => string, indent: string, offset = true): string {
   const terms: string[] = []
   for (let i = 0; i < 8; i++) {
     const shift = String(i * 4).padStart(2)
-    terms.push(`${x(i)} * (f32((${p} >> ${shift}u) & 15u) - 7.0)`)
+    const q = `f32((${p} >> ${shift}u) & 15u)`
+    terms.push(offset ? `${x(i)} * (${q} - 7.0)` : `${x(i)} * ${q}`)
   }
   const pairs: string[] = []
   for (let i = 0; i < 8; i += 2) pairs.push(`${terms[i]} + ${terms[i + 1]}`)
@@ -99,7 +167,11 @@ function dequantDot(p: string, x: (i: number) => string, indent: string): string
 
 /** Render the WGSL for one variant. */
 export function int4MatmulWGSL(opts: Int4MatmulOpts = {}): string {
-  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false } = opts
+  const { outF32 = false, rowsPerWG = 1, subgroups = false, m = 1, vec4 = false, vec4Half = false, mDyn = false, affine = false, moe = false, q3 = false } = opts
+  if (moe && !affine) throw new Error('moe requires affine (the MoE weights are MLX affine-quantised)')
+  if (q3 && !affine) throw new Error('q3 requires affine (3-bit ships only in the MLX-affine layout)')
+  if (affine && (m !== 1 || vec4 || vec4Half || mDyn))
+    throw new Error('affine is implemented for the scalar path only (m=1, no vec4/vec4Half/mDyn)')
   if (rowsPerWG !== 1 && !subgroups) throw new Error('rowsPerWG > 1 requires subgroups')
   if (m === 4 && (!subgroups || rowsPerWG !== 4)) throw new Error('m=4 requires subgroups + rowsPerWG=4')
   if (vec4 && !subgroups) throw new Error('vec4 requires subgroups (32-thread WG keeps K=3072 divisible)')
@@ -128,11 +200,13 @@ ${subgroups ? 'enable subgroups;\n' : ''}
 @group(0) @binding(1) var<storage, read> input_buf : array<${vec4 || vec4Half ? 'vec4<u32>' : 'f16'}>;
 @group(0) @binding(2) var<storage, read> scales : array<f16>;
 @group(0) @binding(3) var<storage, read> weights : array<${vec4 ? 'vec4<u32>' : vec4Half ? 'vec2<u32>' : 'u32'}>;
-
+${affine ? '@group(0) @binding(5) var<storage, read> biases : array<f16>;   // MLX bias, verbatim\n' : ''}${moe ? '@group(0) @binding(6) var<storage, read> ids : array<u32>;       // expert row per slot\n' : ''}
 struct PODArgs {
   K_PACKED: u32,        // K / 8  (u32 words per weight row)
-  SCALES_PER_ROW: u32,  // K / 32 (int4 group scales per weight row)
-  packGridDimX: u32     // N (number of output ${m > 1 ? 'columns' : 'elements'})
+  SCALES_PER_ROW: u32,  // K / ${affine ? '64' : '32'} (int4 group scales per weight row)
+  packGridDimX: u32${moe ? ',' : ''}     // N (number of output ${m > 1 ? 'columns' : 'elements'})${moe ? `
+  IN_SLOT_STRIDE: u32,  // activation elements per slot (0 = all slots share one input)
+  OUT_SLOT_STRIDE: u32  // output elements per slot` : ''}
 }
 @group(0) @binding(4) var<uniform> podArgs : PODArgs;
 `
@@ -144,13 +218,20 @@ fn ${entry}(
   @builtin(num_workgroups) gridDim : vec3<u32>,
   @builtin(local_invocation_id) threadIdx : vec3<u32>
 ) {
-  let row_base : u32 = (blockIdx.z * gridDim.x + blockIdx.x) * ${rowsPerWG}u;
+${moe ? `  // z is the SLOT here, not part of the row flattening the other variants use.
+  let slot : u32 = blockIdx.z;
+  let row_base : u32 = blockIdx.x * ${rowsPerWG}u;` : `  let row_base : u32 = (blockIdx.z * gridDim.x + blockIdx.x) * ${rowsPerWG}u;`}
   if (row_base >= podArgs.packGridDimX) { return; }
 
   let K_PACKED : u32 = podArgs.K_PACKED;
   let SCALES_PER_ROW : u32 = podArgs.SCALES_PER_ROW;
   let tid : u32 = threadIdx.x;
-`
+${moe ? `  let expert : u32 = ids[slot];
+  let wBase : u32 = expert * podArgs.packGridDimX * K_PACKED;
+  let sBase : u32 = expert * podArgs.packGridDimX * SCALES_PER_ROW;
+  let inBase : u32 = slot * podArgs.IN_SLOT_STRIDE;
+  let outBase : u32 = slot * podArgs.OUT_SLOT_STRIDE;
+` : ''}`
 
   // Per-thread K-chunk loop. Each thread strides by the workgroup width.
   const rowDecl = rows.map((r) => `  let r${r} = row_base${r ? ` + ${r}u` : ''};`).join('\n')
@@ -271,26 +352,65 @@ ${rowBlocks}
             .join('\n')
     const rowBlocks = rows
       .map(
-        (r) => `    { // row r${r}: one (packed, scale) load, scale factored out of the 8 terms
-      let p = weights[r${r} * K_PACKED + w_offset];
-      let s = f32(scales[r${r} * SCALES_PER_ROW + sc_idx]);
-      acc${r} = acc${r} + s * (
-          ${dequantDot('p', (i) => `i${i}`, '        ')});
+        (r) => `    { // row r${r}: one (packed, scale${affine ? ', bias' : ''}) load, scale factored out of the 8 terms
+      let p = weights[${moe ? 'wBase + ' : ''}r${r} * K_PACKED + w_offset];
+      let s = f32(scales[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);
+${affine ? `      let b = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);\n` : ''}      acc${r} = acc${r} + s * (
+          ${dequantDot('p', (i) => `i${i}`, '        ', !affine)})${affine ? ' + b * xs' : ''};
     }`,
       )
       .join('\n')
-    body = `
+    const rowBlocksQ3 = rows
+      .map(
+        (r) => `    { // row r${r}: 24-bit window from the row's bitstream, one (scale, bias) load
+      let wi${r} : u32 = ${moe ? 'wBase + ' : ''}r${r} * K_PACKED + (bit >> 5u);
+      var win${r} : u32 = weights[wi${r}] >> sh;
+      if (sh > 8u) { win${r} = win${r} | (weights[wi${r} + 1u] << (32u - sh)); }
+      let s${r} = f32(scales[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);
+      let b${r} = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + sc_idx]);
+      acc${r} = acc${r} + s${r} * (
+          i0 * f32(win${r} & 7u)          + i1 * f32((win${r} >>  3u) & 7u)
+        + i2 * f32((win${r} >>  6u) & 7u) + i3 * f32((win${r} >>  9u) & 7u)
+        + i4 * f32((win${r} >> 12u) & 7u) + i5 * f32((win${r} >> 15u) & 7u)
+        + i6 * f32((win${r} >> 18u) & 7u) + i7 * f32((win${r} >> 21u) & 7u)) + b${r} * xs;
+    }`,
+      )
+      .join('\n')
+    body = q3
+      ? `
+${accDecl}
+
+${rowDecl}
+
+  // 8-value blocks; K_PACKED is 3K/32 here, so the loop bound comes from
+  // SCALES_PER_ROW (= K/64): blocks per thread pass = K/8 / ${wgSize}.
+  for (var chunk : u32 = 0u; chunk < SCALES_PER_ROW * 8u / ${wgSize}u; chunk = chunk + 1u) {
+    let w_offset : u32 = tid + chunk * ${wgSize}u;   // 8-value block index
+    let base : u32 = ${moe ? 'inBase + ' : ''}w_offset * 8u;
+    let sc_idx : u32 = w_offset >> 3u;
+    let bit : u32 = w_offset * 24u;
+    let sh : u32 = bit & 31u;   // cycles 0,24,16,8
+
+${loads}
+
+    // Σx over exactly this thread's 8 values — see the affine note above.
+    let xs : f32 = i0 + i1 + i2 + i3 + i4 + i5 + i6 + i7;
+
+${rowBlocksQ3}
+  }
+`
+      : `
 ${accDecl}
 
 ${rowDecl}
 
   for (var chunk : u32 = 0u; chunk < K_PACKED / ${wgSize}u; chunk = chunk + 1u) {
     let w_offset : u32 = tid + chunk * ${wgSize}u;
-    let base : u32 = w_offset * 8u;
-    let sc_idx : u32 = w_offset >> 2u;
+    let base : u32 = ${moe ? 'inBase + ' : ''}w_offset * 8u;
+    let sc_idx : u32 = w_offset >> ${affine ? '3' : '2'}u;
 
 ${loads}
-
+${affine ? '\n    // Σx over exactly this thread\'s 8 values — paired with this thread\'s own\n    // group bias, so the group term is counted once across the 8 threads.\n    let xs : f32 = i0 + i1 + i2 + i3 + i4 + i5 + i6 + i7;\n' : ''}
 ${rowBlocks}
   }
 `
@@ -356,7 +476,7 @@ ${rowBlocks}
             .join('\n')
     const writes =
       m === 1
-        ? rows.map((r) => `    output_buf[r${r}] = ${cast(`sum${r}`)};`).join('\n')
+        ? rows.map((r) => `    output_buf[${moe ? 'outBase + ' : ''}r${r}] = ${cast(`sum${r}`)};`).join('\n')
         : `    let N = podArgs.packGridDimX;\n` +
           batches
             .map((b) =>
@@ -391,7 +511,7 @@ ${writes}
   workgroupBarrier();
 
   if (tid == 0u) {
-    output_buf[r0] = ${cast('red_buf[0]')};
+    output_buf[${moe ? 'outBase + ' : ''}r0] = ${cast('red_buf[0]')};
   }
 }
 `
@@ -527,7 +647,7 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   { outF32: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_f32_tiled
   { outF32: true, subgroups: true, rowsPerWG: 8 }, // int4_matmul_f32_tiled8
   { subgroups: true, rowsPerWG: 4, m: 4 },       // int4_matmul_batched_m4
-  { subgroups: true, rowsPerWG: 4, mDyn: true }, // int4_matmul_batched_dyn (chunked prefill, runtime M)
+  { subgroups: true, rowsPerWG: 4, mDyn: true }, // int4_matmul_batched_dyn (chunked prefill, runtime M),
   { subgroups: true, vec4: true },                            // int4_matmul_sg_vec4
   { subgroups: true, rowsPerWG: 4, vec4: true },              // int4_matmul_tiled_vec4
   { outF32: true, subgroups: true, vec4: true },              // int4_matmul_f32_sg_vec4
@@ -537,7 +657,27 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   { subgroups: true, vec4Half: true },                            // int4_matmul_sg_vec4h
   { subgroups: true, rowsPerWG: 4, vec4Half: true },              // int4_matmul_tiled_vec4h
   { outF32: true, subgroups: true, vec4Half: true },              // int4_matmul_f32_sg_vec4h
-  { outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true } // int4_matmul_f32_tiled_vec4h
+  { outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true }, // int4_matmul_f32_tiled_vec4h
+  // MLX affine (w = scale·q + bias, group 64) — second per-group tensor at @binding(5).
+  { affine: true }, // int4_matmul_affine
+  { outF32: true, affine: true }, // int4_matmul_f32_affine
+  { subgroups: true, affine: true }, // int4_matmul_sg_affine
+  { subgroups: true, rowsPerWG: 4, affine: true }, // int4_matmul_tiled_affine
+  // The f32-output siblings are not optional extras: variants.ts's resolveMatmul
+  // only returns a tiled pipeline when BOTH the f16 and the f32 sibling exist,
+  // and falls through to the scalar path otherwise. Without _f32_tiled_affine an
+  // untied lm_head lands on the scalar kernel, which is 248320 workgroups —
+  // past the 65535 per-dimension limit, so it needs the z-fold; the tiled one is
+  // 62080 and does not.
+  { outF32: true, subgroups: true, affine: true }, // int4_matmul_f32_sg_affine
+  { outF32: true, subgroups: true, rowsPerWG: 4, affine: true }, // int4_matmul_f32_tiled_affine
+  // MoE: workgroup_id.z is the SLOT and the expert row comes from ids[] at
+  // @binding(6), so one dispatch covers every selected expert.
+  { affine: true, moe: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_tiled_affine_moe
+  // 3-bit experts (MLX bits=3, continuous bitstream — see the q3 option note).
+  { affine: true, q3: true }, // int4_matmul_affine_q3
+  { affine: true, q3: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_tiled_affine_q3
+  { affine: true, q3: true, moe: true, subgroups: true, rowsPerWG: 4 } // int4_matmul_tiled_affine_q3_moe
 ]
 
 /** Human-auditable dump of every shipped variant. */

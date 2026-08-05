@@ -1,0 +1,63 @@
+{
+ "model": "Qwen3.5-4B",
+ "engine": "zero-tvm",
+ "date": "2026-07-31",
+ "hardware": "Apple M2 Max",
+ "quant": "MLC q4f16_1",
+ "result": {
+  "mode": "ttft-sweep",
+  "engine": "zero-tvm",
+  "runsPerPoint": 3,
+  "genTokensPerPoint": 8,
+  "points": [
+   {
+    "targetTokens": 64,
+    "promptTokens": 60,
+    "ttftMsRuns": [
+     320,
+     356.10000002384186,
+     394.10000002384186
+    ],
+    "ttftMs": 356.10000002384186,
+    "decodeTokPerS": 55.64387918120024,
+    "chunks": 1
+   },
+   {
+    "targetTokens": 256,
+    "promptTokens": 252,
+    "ttftMsRuns": [
+     2453.5,
+     2097.199999988079,
+     2077.2000000178814
+    ],
+    "ttftMs": 2097.199999988079,
+    "decodeTokPerS": 42.44996968473066,
+    "chunks": 4
+   },
+   {
+    "targetTokens": 1024,
+    "promptTokens": 1025,
+    "ttftMsRuns": [
+     8007.200000017881,
+     8087.0999999940395,
+     7977.100000023842
+    ],
+    "ttftMs": 8007.200000017881,
+    "decodeTokPerS": 37.01745108524929,
+    "chunks": 16
+   },
+   {
+    "targetTokens": 2048,
+    "promptTokens": 2044,
+    "ttftMsRuns": [
+     16386.20000001788,
+     20495.29999998212,
+     21676.600000023842
+    ],
+    "ttftMs": 20495.29999998212,
+    "decodeTokPerS": 4.712535344090719,
+    "chunks": 32
+   }
+  ]
+ }
+}

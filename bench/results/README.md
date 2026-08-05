@@ -3,12 +3,25 @@
 `bench/results.json` (one level up) is the auto-written artifact of the plain
 `npm run bench` flow, and it covers the **Phi-3 pair only**. Cross-engine A/B
 mode (`BENCH_QUERY="?model=qwen3" npm run bench`) deliberately never writes it,
-so the Qwen pairs had no machine-readable home. These files are that home.
+so the Qwen pairs had no machine-readable home. `BENCH_BASELINE=wllama` never
+writes it either — its `webllmDecode` field feeds `sync-docs.mjs` and the
+published headline, and a GGUF number landing there unlabelled would be
+mislabelled by construction. These files are the home for both.
 
-One file per model, hand-written from the run logs of the 2026-07-30 corrected
-protocol (BENCH.md § "Corrected protocol (2026-07-30)"). `sync-docs.mjs` does
-**not** read them — the BENCH.md table is their rendering, and these are the
-falsifiable artifact behind it.
+One file per model per baseline, hand-written from the run logs.
+`sync-docs.mjs` does **not** read them — the BENCH.md tables are their
+rendering, and these are the falsifiable artifact behind them.
+
+- `phi3-mini.json`, `qwen3-4b.json`, `qwen35-4b.json` — the **WebLLM/MLC**
+  pairs from the 2026-07-30 corrected protocol (BENCH.md § "Corrected
+  protocol (2026-07-30)"). Both engines load **byte-identical q4f16_1
+  weights**, so these isolate the runtime.
+- `*-wllama.json` — the **llama.cpp via wllama (WebGPU)** pairs, same day
+  (BENCH.md § "Third baseline"). These are **not** same-bytes: wllama reads
+  GGUF (Q4_K_M / Q4) against Zero-TVM's MLC q4f16_1, so they compare a runtime
+  *and* a quantization together. Each carries `"sameBytes": false` and a
+  `quantizationCaveat` string for exactly this reason — do not merge them into
+  the WebLLM table or quote them without the caveat.
 
 Every pair carries both metrics, because reporting one alone is
 cherry-picking:

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>wllama Bench — llama.cpp WebGPU baseline vs Zero-TVM</title>
+  <meta name="description" content="Third benchmark baseline: wllama (llama.cpp WASM + WebGPU backend) on GGUF Q4_K_M vs Zero-TVM on MLC q4f16_1. NOT a same-bytes comparison — the quantizations differ, so this measures runtime AND quantization.">
+  <meta name="theme-color" content="#0a0a0c">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <a href="/" class="back-link">← zerotvm.com</a>
+      <h1>wllama (llama.cpp WebGPU) Baseline</h1>
+      <span id="badge" class="badge loading">Loading...</span>
+      <span id="stats" class="stats"></span>
+    </header>
+    <p style="max-width:70ch;line-height:1.5">
+      <strong>Not a same-bytes comparison.</strong> wllama reads GGUF
+      (Q4_K_M / Q4); Zero-TVM and the WebLLM baseline read MLC
+      <code>q4f16_1</code>. Same base model, <em>different quantization</em>.
+      Every number on this page is therefore a <strong>runtime +
+      quantization</strong> result, not the clean runtime-only A/B that
+      <a href="/webllm-bench.html">webllm-bench</a> is. A true same-bytes race
+      against llama.cpp needs GGUF support in Zero-TVM.
+    </p>
+    <pre id="log" class="log"></pre>
+  </div>
+  <footer>wllama v3.5.1 (llama.cpp WASM + WebGPU backend) measured against Zero-TVM — different quantization, read the caveat above.</footer>
+  <script type="module" src="/src/wllama-bench/main.ts"></script>
+</body>
+</html>

@@ -18,6 +18,7 @@ import { loadWeights, formatEta, LoadedWeights } from './weight-loader.js'
 import { Tokenizer } from './tokenizer.js'
 import { loadTokenizerFor, buildChatPromptFor } from './model-select.js'
 import { allocKVPages, buildDecodeEngine, type DecodeEngine } from './engine-core.js'
+import { SCALAR_VARIANTS } from './variants.js'
 import { PHI3, type ModelSpec } from '../compiler/compiler.js'
 
 // ============================================================
@@ -144,7 +145,7 @@ export interface BootEngineOptions {
    * buildDecodeEngine defaults (unfused reference path, scalar shaders). */
   buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean; spec: ModelSpec }) => DecodeEngine
   /** Warm the lazily-JIT'd pipelines. Default: one forwardLogits pass. */
-  warmup?: (engine: DecodeEngine, tokenizer: Tokenizer) => Promise<void>
+  warmup?: (engine: DecodeEngine, tokenizer: Tokenizer, log?: (msg: string) => void) => Promise<void>
 }
 
 /**
@@ -209,7 +210,9 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   })
 
   let sgSizeOk = false
-  if (opts.probeSubgroups) {
+  // MoE specs force the probe: moe_router_topk and the expert matmul are
+  // subgroup-only, so without it the default boot below cannot build at all.
+  if (opts.probeSubgroups || spec.moe) {
     if ((device.features as ReadonlySet<string>).has('subgroups')) {
       setProgress(3, 'Probing GPU subgroups...')
       sgSizeOk = await probeSubgroupSize(device)
@@ -266,7 +269,14 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     const kvPages = allocKVPages(device, spec)
     setProgress(96, 'Compiling shaders...')
     log('Compiling 55 WGSL kernels (10 roles; 37 files + 18 generated)')
-    engine = buildDecodeEngine(device, weights, kvPages, { spec })
+    // A MoE spec has no scalar path — moe_router_topk and the grid-z expert
+    // matmul are subgroup-only — so the default boot picks the subgroup
+    // variants when the probe passed. If it did not, buildDecodeEngine's
+    // guard throws, which is the correct answer on such a device.
+    const variants = spec.moe && sgSizeOk
+      ? { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled' as const }
+      : undefined
+    engine = buildDecodeEngine(device, weights, kvPages, { spec, variants })
   }
 
   // Pipeline warmup. createComputePipeline only registers shaders — Chrome's
@@ -277,7 +287,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   setProgress(98, 'Warming up GPU pipelines...')
   const warmupT0 = performance.now()
   if (opts.warmup) {
-    await opts.warmup(engine, tokenizer)
+    await opts.warmup(engine, tokenizer, log)
   } else {
     const warmupIds = buildChatPromptFor(
       spec,

@@ -16,8 +16,8 @@
  *   - display copy (model name + approximate download size) for gate/header UI
  */
 
-import { PHI3, QWEN3_4B, QWEN35_4B, type ModelSpec } from '../compiler/model-spec.js'
-import { modelBaseUrl } from './weight-loader.js'
+import { PHI3, QWEN3_4B, QWEN35_4B, QWEN36_35B_A3B, QWEN36_35B_A3B_Q3, type ModelSpec } from '../compiler/model-spec.js'
+import { resolveModelBase } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
 import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt } from './tokenizer-bpe.js'
 
@@ -27,6 +27,8 @@ export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: stri
  *  default (and anything else) is PHI3. */
 export function specFromSearch(search: string): ModelSpec {
   const model = new URLSearchParams(search).get('model')
+  if (model === 'qwen36q3') return QWEN36_35B_A3B_Q3
+  if (model === 'qwen36') return QWEN36_35B_A3B
   if (model === 'qwen35') return QWEN35_4B
   if (model === 'qwen3') return QWEN3_4B
   return PHI3
@@ -37,6 +39,22 @@ export function modelBranding(spec: ModelSpec): { name: string; sizeLabel: strin
   // rateLabel is the TOTAL wall-clock median (prefill + decode) from the
   // 2026-07-30 corrected protocol — the conservative number a user actually
   // experiences. Decode-only rates run higher (83 / 75 / 73 t/s); see BENCH.md.
+  if (spec.id === QWEN36_35B_A3B_Q3.id) {
+    // ~55 t/s measured by the machine owner on a quiet 32 GB M2 Max
+    // (2026-08-05); ~11 t/s under heavy memory pressure. Quote the quiet one —
+    // the gate already states the RAM requirement.
+    return { name: 'Qwen3.6-35B-A3B (3-bit experts)',
+             sizeLabel: '~16.4 GB — needs ~20 GB free RAM', rateLabel: '~55 t/s' }
+  }
+  if (spec.id === QWEN36_35B_A3B.id) {
+    // No rate label: correctness is verified against mlx_lm (identical argmax),
+    // but decode speed is set by whether ~21 GB fits in PHYSICAL RAM. On a
+    // 32 GB Mac running a normal desktop it does not — measured 2026-08-05:
+    // ~30 s/token with 167 GB/3-tokens of memory-compressor churn. On 64 GB
+    // the kernel benchmarks project ~50-60 t/s. Printing either number as
+    // "the" rate would be wrong for half the audience.
+    return { name: 'Qwen3.6-35B-A3B', sizeLabel: '~19.5 GB — needs ~24 GB free RAM (64 GB Mac recommended)', rateLabel: '' }
+  }
   if (spec.id === QWEN35_4B.id) {
     return { name: 'Qwen3.5-4B', sizeLabel: '~2.6 GB', rateLabel: '~65 t/s' }  // 65.28 total, M2 Max (BENCH.md 2026-07-30)
   }
@@ -55,7 +73,7 @@ export async function loadTokenizerFor(
   spec: ModelSpec,
   onProgress?: (msg: string) => void,
 ): Promise<Tokenizer> {
-  const base = modelBaseUrl(spec)
+  const base = await resolveModelBase(spec)
   return spec.tokenizerKind === 'byteLevel'
     ? loadByteLevelTokenizer(onProgress, base)
     : loadTokenizer(onProgress, base)

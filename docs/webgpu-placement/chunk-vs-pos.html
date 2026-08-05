@@ -1,0 +1,35 @@
+<!doctype html><meta charset="utf-8"><title>chunk Scan vs per-position Scan</title>
+<body><pre id="log">…</pre>
+<script type="module">
+import * as ort from '/ort-dist126/ort.webgpu.bundle.min.mjs';
+const L=[];const say=(...a)=>{L.push(a.join(' '));document.getElementById('log').textContent=L.join('\n');console.log('[T]',a.join(' '))};
+window.__done=false;
+ort.env.wasm.wasmPaths='/ort-dist126/'; ort.env.wasm.numThreads=1; ort.env.logLevel='error';
+const H=32,DK=128,DV=128,C=64,S=256,NC=S/C;
+const f=(d)=>new ort.Tensor('float32',new Float32Array(d.reduce((a,b)=>a*b,1)).fill(0.01),d);
+const med=(x)=>{x=[...x].sort((a,b)=>a-b);return x[Math.floor(x.length/2)]};
+async function timeIt(sess,feeds,label){
+  await sess.run(feeds);
+  const t=[];for(let r=0;r<5;r++){const a=performance.now();await sess.run(feeds);t.push(performance.now()-a)}
+  const m=med(t);
+  say(`${label.padEnd(26)} ${m.toFixed(0).padStart(6)} ms   (${t.map(x=>x.toFixed(0)).join('/')})`);
+  return m;
+}
+try{
+  // per-position Scan (what ships today), same dims, S=256
+  const posS=await ort.InferenceSession.create('/real_scan.onnx',{executionProviders:['webgpu']});
+  const posT=await timeIt(posS,{state0:f([1,H,DK,DV]),q:f([1,H,S,DK]),k:f([1,H,S,DK]),
+                                v:f([1,H,S,DV]),beta:f([1,H,S]),g:f([1,H,S])},
+                          `per-position (${S} iters)`);
+  // chunk-level Scan built from HF's own chunked math
+  const chS=await ort.InferenceSession.create('/real_chunked_scan.onnx',{executionProviders:['webgpu']});
+  const chT=await timeIt(chS,{state0:f([1,H,DK,DV]),qc:f([1,NC,C,H,DK]),kc:f([1,NC,C,H,DK]),
+                              vc:f([1,NC,C,H,DV]),gc:f([1,NC,C,H]),bc:f([1,NC,C,H])},
+                         `chunk-64 (${NC} iters)`);
+  say('');
+  say(`speed-up, one layer      : ${(posT/chT).toFixed(1)}x`);
+  say(`x24 layers, ${S}-tok prompt: ${(posT*24/1000).toFixed(2)} s  ->  ${(chT*24/1000).toFixed(2)} s`);
+  say(`RESULT pos=${posT.toFixed(0)} chunk=${chT.toFixed(0)} speedup=${(posT/chT).toFixed(2)}`);
+}catch(e){say('ERROR:',e&&e.message?e.message:String(e))}
+window.__done=true;
+</script>

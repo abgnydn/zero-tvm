@@ -1,0 +1,54 @@
+<!doctype html><meta charset="utf-8"><title>clean share measurement</title>
+<body><pre id="log">…</pre>
+<script type="module">
+import * as ort from '/ort-dist126/ort.webgpu.bundle.min.mjs';
+const L=[];const say=(...a)=>{L.push(a.join(' '));document.getElementById('log').textContent=L.join('\n');console.log('[T]',a.join(' '))};
+window.__done=false;
+ort.env.wasm.wasmPaths='/ort-dist126/'; ort.env.wasm.numThreads=1; ort.env.logLevel='error';
+const N=parseInt(new URLSearchParams(location.search).get('s')||'252');
+const H=32,DK=128,DV=128,HID=2560;
+const f32=(d)=>new ort.Tensor('float32',new Float32Array(d.reduce((a,b)=>a*b,1)).fill(0.02),d);
+const f16=(d)=>new ort.Tensor('float16',new Uint16Array(d.reduce((a,b)=>a*b,1)),d);
+const i64=(d,p)=>{const n=d.reduce((a,b)=>a*b,1),a=new BigInt64Array(n);
+  if(p){const s=d[d.length-1];for(let i=0;i<n;i++)a[i]=BigInt(i%s)}else a.fill(1n);return new ort.Tensor('int64',a,d)};
+const med=(xs)=>{xs=[...xs].sort((a,b)=>a-b);return xs[Math.floor(xs.length/2)]};
+try{
+  const sc=await ort.InferenceSession.create('/real_scan.onnx',{executionProviders:['webgpu']});
+  const sf={state0:f32([1,H,DK,DV]),q:f32([1,H,N,DK]),k:f32([1,H,N,DK]),v:f32([1,H,N,DV]),beta:f32([1,H,N]),g:f32([1,H,N])};
+  const scan=async()=>{await sc.run(sf);const t=[];for(let r=0;r<3;r++){const a=performance.now();await sc.run(sf);t.push(performance.now()-a)}return med(t)};
+
+  const A1=await scan();                       // control: before
+  say(`A1 isolated Scan (before) : ${A1.toFixed(0)} ms  -> x24 = ${(A1*24/1000).toFixed(2)} s`);
+
+  const t0=performance.now();
+  const sess=await ort.InferenceSession.create('/weights/decoder_model_merged_q4f16.onnx',{
+    executionProviders:['webgpu'],
+    externalData:[{path:'decoder_model_merged_q4f16.onnx_data',data:'/weights/decoder_model_merged_q4f16.onnx_data'},
+                  {path:'decoder_model_merged_q4f16.onnx_data_1',data:'/weights/decoder_model_merged_q4f16.onnx_data_1'}]});
+  const loadS=(performance.now()-t0)/1000;
+  say(`   full model loaded in ${loadS.toFixed(1)} s  ${loadS>10?'<-- SLOW: machine busy':''}`);
+
+  const fd={inputs_embeds:f32([1,N,HID]),attention_mask:i64([1,N]),position_ids:i64([3,1,N],1)};
+  for(const n of sess.inputNames){
+    if(n.startsWith('past_conv')) fd[n]=f16([1,8192,4]);
+    else if(n.startsWith('past_recurrent')) fd[n]=f16([1,H,DK,DV]);
+    else if(n.startsWith('past_key_values')) fd[n]=f16([1,4,0,256]);
+  }
+  const chk=await sess.run(fd);
+  say(`   sanity: logits ${JSON.stringify(chk.logits.dims)}`);
+  const ft=[];for(let r=0;r<3;r++){const a=performance.now();await sess.run(fd);ft.push(performance.now()-a)}
+  const full=med(ft);
+  say(`B  FULL prefill S=${N}       : ${(full/1000).toFixed(2)} s  (${ft.map(x=>(x/1000).toFixed(2)).join(', ')})`);
+
+  const A2=await scan();                       // control: after
+  say(`A2 isolated Scan (after)  : ${A2.toFixed(0)} ms  -> x24 = ${(A2*24/1000).toFixed(2)} s`);
+
+  const drift=Math.abs(A2-A1)/Math.min(A1,A2)*100;
+  const scanAvg=(A1+A2)/2*24;
+  say('');
+  say(`drift between controls    : ${drift.toFixed(0)} %  ${drift<15?'OK — conditions stable':'<-- UNSTABLE, discard'}`);
+  say(`SHARE = Scan x24 / full   : ${(100*scanAvg/full).toFixed(0)} %`);
+  say(`RESULT s=${N} A1=${A1.toFixed(0)} A2=${A2.toFixed(0)} full=${full.toFixed(0)} drift=${drift.toFixed(0)} share=${(100*scanAvg/full).toFixed(0)}`);
+}catch(e){say('ERROR:',e&&e.message?e.message:String(e))}
+window.__done=true;
+</script>

@@ -271,9 +271,12 @@ async function hasWeightsCached(): Promise<boolean> {
   try {
     const root = await navigator.storage.getDirectory()
     const dir = await root.getDirectoryHandle(opfsDirFor(SPEC))
-    // ndarray-cache.json is the smallest sentinel — its presence means at
-    // least the manifest has been fetched (and shards followed in-session).
-    await dir.getFileHandle('ndarray-cache.json')
+    // The sentinel is the SPEC's own manifest, not a hardcoded name. It was
+    // 'ndarray-cache.json' — already wrong for Qwen3.5, whose manifest MLC
+    // renamed to tensor-cache.json, so that model re-showed the download gate
+    // on every visit no matter what was cached. An MLX checkpoint has no
+    // manifest of that shape at all; its index is the safetensors index.
+    await dir.getFileHandle(SPEC.manifestName ?? 'ndarray-cache.json')
     return true
   } catch {
     return false
@@ -387,9 +390,18 @@ async function main(): Promise<void> {
     // progress bar so the first chat message streams at steady-state speed.
     // The KV slots it writes are overwritten by the first real turn's
     // prefill (chat always prefills from 0).
-    warmup: async (engine, tokenizer) => {
-      const warmupIds = buildChatPromptFor(SPEC, [{ role: 'user', content: 'Hi.' }], tokenizer)
+    warmup: async (engine, tokenizer, log) => {
+      // One forward pass warms every pipeline — all 40 layers dispatch the same
+      // ones. The full-prompt warmup is a POLISH step (first message streams at
+      // steady state) and it costs promptLen per-token passes, because chunked
+      // prefill is off for MoE. On a big model that polish is minutes of dead
+      // screen; the first message can pay its own warm cost instead.
+      const full = buildChatPromptFor(SPEC, [{ role: 'user', content: 'Hi.' }], tokenizer)
+      const warmupIds = SPEC.moe ? full.slice(0, 1) : full
+      const t0 = performance.now()
+      log?.(`Warming up pipeline — ${warmupIds.length} token(s)${SPEC.moe ? ' (single-pass: MoE)' : ''}…`)
       await engine.generatePipelined(warmupIds, 1, () => {})
+      log?.(`Warmup done in ${((performance.now() - t0) / 1000).toFixed(1)}s`)
     },
   })
   if (!boot.ok) {

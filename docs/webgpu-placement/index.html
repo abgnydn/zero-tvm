@@ -1,0 +1,46 @@
+<!doctype html><meta charset="utf-8"><title>ORT-web Scan placement</title>
+<body><pre id="log">running…</pre>
+<script type="module">
+import * as ort from './ort-dist/ort.webgpu.bundle.min.mjs';
+
+const L = [];
+const say = (...a) => { const s = a.join(' '); L.push(s); console.log('[T]', s);
+                        document.getElementById('log').textContent = L.join('\n'); };
+window.__done = false; window.__log = L;
+
+// capture ORT's own verbose logging (node placement is emitted here)
+ort.env.wasm.wasmPaths = '/ort-dist/';
+ort.env.wasm.numThreads = 1;            // avoids needing cross-origin isolation
+ort.env.logLevel = 'verbose';
+ort.env.debug = true;
+
+try {
+  if (!navigator.gpu) { say('NO_WEBGPU'); window.__done = true; }
+  else {
+    const adapter = await navigator.gpu.requestAdapter();
+    say('adapter:', adapter ? 'ok' : 'null');
+
+    const sess = await ort.InferenceSession.create('/toy_scan.onnx', {
+      executionProviders: ['webgpu'],
+      logSeverityLevel: 0,     // VERBOSE -> emits node placement
+      logVerbosityLevel: 0,
+      graphOptimizationLevel: 'all',
+    });
+    say('session created. inputs:', sess.inputNames.join(','));
+
+    const SEQ = 4, D = 8;
+    const f = (n) => new ort.Tensor('float32', Float32Array.from({length:n}, (_,i)=>0.01*(i%7)), arguments);
+    const mk = (dims) => new ort.Tensor('float32',
+        Float32Array.from({length: dims.reduce((a,b)=>a*b,1)}, (_,i)=>0.01*((i%7)+1)), dims);
+    const feeds = {
+      state0: mk([1,D]), q: mk([1,SEQ,D]), k: mk([1,SEQ,D]),
+      v: mk([1,SEQ,D]), g: mk([1,SEQ,D]),
+    };
+    const out = await sess.run(feeds);
+    say('RAN OK. out dims:', JSON.stringify(out.out.dims));
+  }
+} catch (e) {
+  say('ERROR:', e && e.message ? e.message : String(e));
+}
+window.__done = true;
+</script>

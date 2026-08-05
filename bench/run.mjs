@@ -38,6 +38,29 @@ const N_RUNS = Number(process.env.BENCH_RUNS ?? 5)
 // in bench/results/*.json and BENCH.md's Qwen sections).
 const QUERY = process.env.BENCH_QUERY ?? ''
 const AB_MODEL = QUERY ? new URLSearchParams(QUERY.replace(/^\?/, '')).get('model') : null
+// BENCH_BASELINE picks which engine runs as the second half.
+//   webllm (default) — @mlc-ai/web-llm on the SAME q4f16_1 bytes we load.
+//                      A true runtime-only A/B. Unchanged behaviour.
+//   wllama           — llama.cpp WASM+WebGPU on GGUF Q4_K_M. NOT the same
+//                      bytes: different quantization of the same base model,
+//                      so the gap it prints is runtime + quantization. Never
+//                      writes results.json (that file's `webllmDecode` field
+//                      feeds bench/sync-docs.mjs into the published numbers,
+//                      and a wllama figure must not land there unlabelled).
+//   tjs              — @huggingface/transformers (ONNX Runtime Web, WebGPU EP)
+//                      on ONNX q4f16. Also NOT the same bytes, though the
+//                      confound is smaller than GGUF's: same 4-bit width and
+//                      same fp16 activations, different block layout. Same
+//                      results.json embargo as wllama, for the same reason.
+const BASELINES = {
+  webllm: { page: '/webllm-bench.html', name: 'WebLLM', global: 'webllmResult', label: 'wl' },
+  wllama: { page: '/wllama-bench.html', name: 'wllama (llama.cpp WebGPU, GGUF)', global: 'wllamaResult', label: 'wllama' },
+  tjs:    { page: '/tjs-bench.html',    name: 'transformers.js (ORT Web WebGPU, ONNX q4f16)', global: 'tjsResult', label: 'tjs' },
+}
+const BASELINE = BASELINES[process.env.BENCH_BASELINE] ? process.env.BENCH_BASELINE : 'webllm'
+const BASE_PAGE = BASELINES[BASELINE].page
+const BASE_NAME = BASELINES[BASELINE].name
+const BASE_GLOBAL = BASELINES[BASELINE].global
 const HARDWARE = process.env.BENCH_HW ?? 'unknown GPU'
 const READY_MS = 12 * 60 * 1000 // first run downloads ~2 GB
 // headless:false matches the e2e harness (most reliable on a desktop GPU under
@@ -128,6 +151,45 @@ async function bootReady(page, path) {
   throw new Error(`boot timed out — last badge="${last}"`)
 }
 
+/** Boot the selected baseline page and read its window.<engine>Result. */
+async function runBaseline(browser, query) {
+  const page = await browser.newPage()
+  attachDiagnostics(page, BASELINES[BASELINE].label)
+  await bootReady(page, `${BASE_PAGE}${query}`)
+  const res = await page
+    .waitForFunction((k) => window[k], { timeout: READY_MS, polling: 1000 }, BASE_GLOBAL)
+    .then((h) => h.jsonValue())
+  if (BASELINE === 'tjs') {
+    // Same class of check as the wllama half. `device: 'webgpu'` is a request,
+    // not a guarantee — ORT Web falls back to the WASM EP silently, and the
+    // only symptom is a slow number. The page proves it by counting GPU queue
+    // submits during a real generation, not by reading navigator.gpu.
+    console.log(`[tjs] transformers.js=${res.transformersJs} backend=${res.backend} dtype=${res.dtype} adapter=${res.adapterInfo ?? 'none'}`)
+    console.log(`[tjs] gpu: devices=${res.gpuCounters?.requestDeviceCalls} pipelines=${res.gpuCounters?.computePipelines} submits=${res.gpuCounters?.queueSubmits} · weights=${res.weightsFrom} · repo=${res.repo}`)
+    if (!res.webgpuProven) console.log('[tjs] *** WEBGPU NOT PROVEN — do not publish this as a WebGPU baseline ***')
+    if (res.mode === 'ttft-sweep') {
+      // Sweep mode has no median; it produces the curve instead.
+      for (const p of res.points ?? [])
+        console.log(`[tjs:ttft] prompt=${p.promptTokens} ttft=${p.ttftMs.toFixed(0)}ms (${p.ttftMsRuns.map((x) => x.toFixed(0)).join(', ')}) decode=${p.decodeTokPerS.toFixed(2)} tok/s`)
+      return res
+    }
+    if (!res.contentAccountingOk)
+      console.log(`[tjs] *** TOKEN ACCOUNTING BROKEN — runs: ${res.runs?.map((r) => `${r.tokens}tok`).join(', ')} — median is meaningless, do not publish it ***`)
+  }
+  if (BASELINE === 'wllama') {
+    // A wllama run that silently fell back to CPU/WASM is not a baseline at
+    // all — say so loudly rather than letting the pair get quoted.
+    console.log(`[wllama] backend=${res.backend} layers_on_gpu=${res.layersOnGpu}/${res.layersTotal} adapter=${res.adapterInfo ?? 'none'}`)
+    console.log(`[wllama] threads=${res.nThreads} multithread=${res.multithread} gguf=${res.gguf} (${res.quant})`)
+    if (!res.webgpuProven) console.log('[wllama] *** WEBGPU NOT PROVEN — this is a CPU/WASM number, do not publish it ***')
+    // A run that counted 0 content tokens (thinking-mode tokens arriving as
+    // reasoning_content) still yields a numeric median, so check explicitly.
+    if (!res.contentAccountingOk)
+      console.log(`[wllama] *** TOKEN ACCOUNTING BROKEN — runs: ${res.runs?.map((r) => `${r.tokens}tok/${r.reasoningChunks}reasoning`).join(', ')} — median is meaningless, do not publish it ***`)
+  }
+  return res
+}
+
 let viteLog = ''
 const vite = spawn(
   resolve(ROOT, 'node_modules/.bin/vite'),
@@ -173,50 +235,55 @@ try {
   console.log(`→ Zero-TVM median: ${zt.median.toFixed(2)} tok/s${QUERY ? `  (${QUERY})` : ''}`)
 
   if (QUERY && AB_MODEL) {
-    // Cross-engine A/B (?model=…): run the WebLLM half too, same model, same
+    // Cross-engine A/B (?model=…): run the baseline half too, same model, same
     // session — but never write results.json (Phi-3 headline artifact).
     console.log(`[a/b] zt runs: ${zt.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
-    const wlPage = await browser.newPage()
-    attachDiagnostics(wlPage, 'wl')
-    await bootReady(wlPage, `/webllm-bench.html?model=${AB_MODEL}`)
-    const wl = await wlPage
-      .waitForFunction(() => window.webllmResult, { timeout: READY_MS, polling: 1000 })
-      .then((h) => h.jsonValue())
-    console.log(`→ WebLLM median: ${wl.median.toFixed(2)} tok/s  (model=${AB_MODEL})`)
-    console.log(`[a/b] wl runs: ${wl.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
+    const wl = await runBaseline(browser, `?model=${AB_MODEL}`)
+    console.log(`→ ${BASE_NAME} median: ${wl.median.toFixed(2)} tok/s  (model=${AB_MODEL})`)
+    console.log(`[a/b] ${BASELINES[BASELINE].label} runs: ${wl.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
     const gap = ((zt.median - wl.median) / wl.median) * 100
     console.log(
       `\n[a/b] model=${AB_MODEL} same-session pair: ` +
-      `Zero-TVM ${zt.median.toFixed(2)} vs WebLLM ${wl.median.toFixed(2)} tok/s — ` +
-      `Zero-TVM is ${gap >= 0 ? '+' : ''}${gap.toFixed(1)}% vs WebLLM ` +
+      `Zero-TVM ${zt.median.toFixed(2)} vs ${BASE_NAME} ${wl.median.toFixed(2)} tok/s — ` +
+      `Zero-TVM is ${gap >= 0 ? '+' : ''}${gap.toFixed(1)}% vs ${BASE_NAME} ` +
       `(results.json NOT written)`,
     )
+    if (wl.caveat) console.log(`[a/b] CAVEAT: ${wl.caveat}`)
     ok = true
   } else if (QUERY) {
     // A/B mode: one engine config, no WebLLM half, no results.json.
     console.log(`[a/b] runs: ${zt.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
     ok = true
   } else {
-    // 2) WebLLM decode median — webllm-bench.html runs on start and sets window.webllmResult.
-    const wlPage = await browser.newPage()
-    attachDiagnostics(wlPage, 'wl')
-    await bootReady(wlPage, '/webllm-bench.html')
-    const wl = await wlPage
-      .waitForFunction(() => window.webllmResult, { timeout: READY_MS, polling: 1000 })
-      .then((h) => h.jsonValue())
-    console.log(`→ WebLLM median: ${wl.median.toFixed(2)} tok/s`)
+    // 2) Baseline decode median — the page runs on start and sets its own global.
+    const wl = await runBaseline(browser, '')
+    console.log(`→ ${BASE_NAME} median: ${wl.median.toFixed(2)} tok/s`)
 
-    const results = {
-      ztDecode: +zt.median.toFixed(2),
-      ztRuns: zt.runs?.map((x) => +x.tokPerS.toFixed(2)),
-      webllmDecode: +wl.median.toFixed(2),
-      hardware: HARDWARE,
-      date: new Date().toISOString().slice(0, 10),
-      nTokens: N_TOKENS,
-      nRuns: N_RUNS,
+    if (BASELINE !== 'webllm') {
+      // Phi-3 headline pair, but against a different-quantization baseline:
+      // print it and stop. results.json is the same-bytes WebLLM artifact that
+      // sync-docs.mjs publishes; a different-quantization number cannot go in
+      // it. Applies to wllama (GGUF) and tjs (ONNX q4f16) alike.
+      const gap = ((zt.median - wl.median) / wl.median) * 100
+      console.log(
+        `\n[pair] same-session: Zero-TVM ${zt.median.toFixed(2)} vs ${BASE_NAME} ` +
+        `${wl.median.toFixed(2)} tok/s — Zero-TVM is ${gap >= 0 ? '+' : ''}${gap.toFixed(1)}% ` +
+        `(results.json NOT written — BENCH_BASELINE=${BASELINE})`,
+      )
+      console.log(`[pair] CAVEAT: ${wl.caveat}`)
+    } else {
+      const results = {
+        ztDecode: +zt.median.toFixed(2),
+        ztRuns: zt.runs?.map((x) => +x.tokPerS.toFixed(2)),
+        webllmDecode: +wl.median.toFixed(2),
+        hardware: HARDWARE,
+        date: new Date().toISOString().slice(0, 10),
+        nTokens: N_TOKENS,
+        nRuns: N_RUNS,
+      }
+      writeFileSync(resolve(ROOT, 'bench/results.json'), JSON.stringify(results, null, 2) + '\n')
+      console.log('\nwrote bench/results.json')
     }
-    writeFileSync(resolve(ROOT, 'bench/results.json'), JSON.stringify(results, null, 2) + '\n')
-    console.log('\nwrote bench/results.json')
     ok = true
   }
 } finally {
@@ -224,4 +291,6 @@ try {
   vite.kill('SIGTERM')
 }
 
-if (ok && !QUERY) spawnSync('node', [resolve(ROOT, 'bench/sync-docs.mjs'), '--write'], { cwd: ROOT, stdio: 'inherit' })
+// Docs sync reads bench/results.json, which only the same-bytes WebLLM run writes.
+if (ok && !QUERY && BASELINE === 'webllm')
+  spawnSync('node', [resolve(ROOT, 'bench/sync-docs.mjs'), '--write'], { cwd: ROOT, stdio: 'inherit' })

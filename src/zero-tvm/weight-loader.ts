@@ -12,6 +12,7 @@
  */
 
 import { PHI3, type ModelSpec } from '../compiler/model-spec.js'
+import { openMlxCheckpoint, assembleMlx, planModel, type MlxSource } from './weight-loader-mlx.js'
 import { mapLimited, backoffMs } from './map-limited.js'
 
 // ============================================================
@@ -305,6 +306,24 @@ function localMirrorBase(spec: ModelSpec): string | null {
   return DEV ? `/local-weights/${spec.hfRepo.split('/')[1]}/` : null
 }
 
+/**
+ * Base URL for a spec's SMALL files (tokenizer, templates): the dev mirror when
+ * it is primed, the HF repo otherwise. Exists because the tokenizer went
+ * straight to HF, which works only when the repo is PUBLISHED — a
+ * locally-converted checkpoint (the Qwen3.6 q3-expert build) has no HF repo,
+ * and its boot died on a 401 for tokenizer.json. Probes with HEAD so an 11 MB
+ * tokenizer is not downloaded twice.
+ */
+export async function resolveModelBase(spec: ModelSpec, probeFile = 'tokenizer.json'): Promise<string> {
+  const mirror = localMirrorBase(spec)
+  if (mirror) {
+    try {
+      if ((await fetch(mirror + probeFile, { method: 'HEAD' })).ok) return mirror
+    } catch { /* mirror down — fall through to HF */ }
+  }
+  return modelBaseUrl(spec)
+}
+
 async function fetchShard(
   url: string,
   dataPath: string,
@@ -357,6 +376,57 @@ async function fetchShard(
   const buf = await fetchBufWithRetry(url, signal, onProgress)
   cache(buf)
   return buf
+}
+
+/**
+ * Ranged reads over the checkpoint's shards, with the same retry/backoff the
+ * shard fetcher uses.
+ *
+ * The Cache API tier is skipped deliberately: it is populated by WebLLM's
+ * tvmjs for MLC repos and is a guaranteed miss for a safetensors checkpoint,
+ * so probing it 2841 times would only cost time. OPFS caching happens a level
+ * up, keyed by BUILT buffer rather than by shard.
+ */
+function mlxSource(
+  baseUrl: string,
+  mirrorBase: string | null,
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
+): MlxSource {
+  const url = (file: string) => (mirrorBase ?? baseUrl) + file
+  return {
+    whole: async (file) => new Uint8Array(await fetchBufWithRetry(url(file), signal, onProgress)),
+    range: async (file, begin, end) => {
+      let lastErr: unknown
+      for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
+        if (attempt > 0) await new Promise((r) => setTimeout(r, backoffMs(attempt - 1)))
+        try {
+          const resp = await fetch(url(file), {
+            credentials: 'omit',
+            signal,
+            headers: { Range: `bytes=${begin}-${end - 1}` },
+          })
+          // A server that ignores Range answers 200 with the WHOLE file — which
+          // for a 5.3 GB shard is exactly the allocation this design exists to
+          // avoid. Refuse rather than OOM.
+          if (resp.status === 200) {
+            throw new Error(`${file}: server ignored Range (200, not 206) — cannot stream a multi-GB shard`)
+          }
+          if (!resp.ok) throw new Error(`${file}: HTTP ${resp.status}`)
+          const buf = new Uint8Array(await resp.arrayBuffer())
+          if (buf.byteLength !== end - begin) {
+            throw new Error(`${file}: asked for ${end - begin} bytes, got ${buf.byteLength}`)
+          }
+          return buf
+        } catch (e) {
+          if (signal?.aborted) throw e
+          lastErr = e
+          onProgress?.(`[retry ${attempt + 1}/${FETCH_RETRIES}] ${file} ${begin}-${end} (${e})`)
+        }
+      }
+      throw new Error(`range fetch failed after ${FETCH_RETRIES} retries: ${lastErr}`)
+    },
+  }
 }
 
 async function openAllCacheStores(): Promise<Cache[]> {
@@ -468,6 +538,47 @@ export async function loadWeights(
   // Tracks fire-and-forget OPFS writes so loadWeights doesn't resolve while
   // shards are still being persisted (would leave a torn cache on tab close).
   const pendingWrites: Promise<void>[] = []
+
+  // ── MLX safetensors path ─────────────────────────────────────────────────
+  // Branches HERE, after the OPFS/Cache setup above (which is format-agnostic
+  // and stays single-sourced) and before the manifest read below, which is
+  // MLC-shaped. The unit of work is a BufferPlan, never a shard — see
+  // weight-loader-mlx.ts for why a 5.3 GB shard cannot be one ArrayBuffer.
+  if (spec.weightFormat === 'mlx-safetensors') {
+    const src = mlxSource(baseUrl, mirrorBase, onProgress)
+    onProgress?.('Reading safetensors headers…')
+    const { locate, shards } = await openMlxCheckpoint(src)
+    const total = planModel(spec).length
+    onProgress?.(`${shards.length} shards, ${total} buffers to build`)
+    const t0 = performance.now()
+    const lw = await assembleMlx(device, spec, src, locate, USAGE, {
+      onProgress,
+      cacheRead: (key) => opfsRead(opfs, key),
+      // Not when serving from the dev mirror: the bytes are already on local
+      // disk and OPFS-caching them would write a second 19.5 GB copy.
+      cacheWrite: mirrorBase ? undefined
+        : (key, data) => { pendingWrites.push(opfsWrite(opfs, key, data)) },
+      onBuffer: (done, n, bytes) => {
+        // Every 25th, so a 947-buffer load does not spend its time on strings.
+        if (done % 25 !== 0 && done !== n) return
+        const el = (performance.now() - t0) / 1000
+        // Buffers stand in for shards here — same progress semantics, different
+        // unit, because a plan is what this loader actually completes.
+        const est = bytes / (done / n)
+        onProgress?.(`${done}/${n} buffers — ${(bytes / 1e9).toFixed(2)} GB in ${el.toFixed(0)}s`)
+        onStats?.({
+          shardsLoaded: done, totalShards: n,
+          bytesLoaded: bytes, totalBytes: Math.round(est),
+          mbPerSec: el > 0 ? bytes / 1e6 / el : 0,
+          etaSec: done > 0 ? (el / done) * (n - done) : 0,
+          persisted,
+        })
+      },
+    })
+    await Promise.all(pendingWrites)
+    onProgress?.(`Weights ready (${((performance.now() - t0) / 1000).toFixed(0)}s)`)
+    return lw as unknown as LoadedWeights
+  }
 
   const manifestBytes = await fetchShard(
     baseUrl + manifestName,
@@ -661,12 +772,21 @@ export async function loadWeights(
   }
 }
 
+/**
+ * AFFINE CHECKPOINTS carry a per-group bias beside every scale (`w = s·q + b`),
+ * which the symmetric MLC layout has no analogue for. Every `*Biases` field
+ * below is present exactly when `spec.weightFormat === 'mlx-safetensors'` and
+ * absent otherwise, and every affine bind group binds it at @binding(5) — so a
+ * missing one is a bind-group validation error, not a wrong number.
+ */
 export interface LoadedWeights {
   device: GPUDevice
   embdWeights: GPUBuffer
   embdScales: GPUBuffer
+  embdBiases?: GPUBuffer
   lmHeadWeights: GPUBuffer
   lmHeadScales: GPUBuffer
+  lmHeadBiases?: GPUBuffer
   initNormGamma: GPUBuffer     // layer 0 input_layernorm
   finalNormGamma: GPUBuffer    // model.norm (after all layers)
   layers: Array<{
@@ -674,14 +794,17 @@ export interface LoadedWeights {
     // (always, for pure-attention specs like Phi-3/Qwen3).
     qkvWeights?: GPUBuffer
     qkvScales?: GPUBuffer
+    qkvBiases?: GPUBuffer
     oProjWeights?: GPUBuffer
     oProjScales?: GPUBuffer
+    oProjBiases?: GPUBuffer
     normGamma1: GPUBuffer    // input_layernorm (pre-attention)
     normGamma2: GPUBuffer    // post_attention_layernorm (pre-FFN)
-    ffnWeights: GPUBuffer
-    ffnScales: GPUBuffer
-    ffnDownWeights: GPUBuffer
-    ffnDownScales: GPUBuffer
+    // Dense FFN — absent on a MoE spec, which has `moe` below instead.
+    ffnWeights?: GPUBuffer
+    ffnScales?: GPUBuffer
+    ffnDownWeights?: GPUBuffer
+    ffnDownScales?: GPUBuffer
     qNormGamma?: GPUBuffer   // per-head q RMSNorm over head_dim (Qwen3 only)
     kNormGamma?: GPUBuffer   // per-head k RMSNorm over head_dim (Qwen3 only)
     // GatedDeltaNet records — present iff spec.layerKinds[L] === 'gdn' (Qwen3.5).
@@ -691,12 +814,31 @@ export interface LoadedWeights {
        *  loader so the engine runs ONE matmul dispatch per GDN layer. */
       projWeights: GPUBuffer
       projScales: GPUBuffer
+      projBiases?: GPUBuffer
       aLog: GPUBuffer        // A_log f32 [gdnVHeads]
       dtBias: GPUBuffer      // dt_bias f32 [gdnVHeads]
       convWeight: GPUBuffer  // conv1d_weight f16 [gdnQkvDim * gdnConvK]
       normGamma: GPUBuffer   // gated-RMSNorm gamma f16 [gdnHeadV]
       outWeights: GPUBuffer  // out_proj int4 [d, gdnVDim]
       outScales: GPUBuffer
+      outBiases?: GPUBuffer
+    }
+    /** Sparse-MoE FFN — present iff spec.moe. Every stacked tensor carries the
+     *  SHARED expert at index spec.sharedExpertIndex, and the router carries
+     *  its gate as row E, so the block has no special case for it. */
+    moe?: {
+      routerWeights: GPUBuffer   // int8 affine [experts+1, d]
+      routerScales: GPUBuffer
+      routerBiases: GPUBuffer
+      gateWeights: GPUBuffer     // int4 affine [experts+1, moeIntermediate, d]
+      gateScales: GPUBuffer
+      gateBiases: GPUBuffer
+      upWeights: GPUBuffer
+      upScales: GPUBuffer
+      upBiases: GPUBuffer
+      downWeights: GPUBuffer     // int4 affine [experts+1, d, moeIntermediate]
+      downScales: GPUBuffer
+      downBiases: GPUBuffer
     }
   }>
 }

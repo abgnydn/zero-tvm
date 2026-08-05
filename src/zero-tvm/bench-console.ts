@@ -1,15 +1,17 @@
 /**
  * DEVTOOLS BENCH HARNESSES (chat page)
  *
- * Wires window.bench / window.benchBatched / window.specSim so the chat page
- * can be benchmarked from the console (or preview_eval) without touching the
- * chat UI. Imported by chat.ts for its side effects via installBenchConsole().
+ * Wires window.bench / window.benchTtft / window.benchBatched / window.specSim
+ * so the chat page can be benchmarked from the console (or preview_eval)
+ * without touching the chat UI. Imported by chat.ts for its side effects via
+ * installBenchConsole().
  */
 
 import { Tokenizer } from './tokenizer.js'
 import { buildChatPromptFor } from './model-select.js'
 import { summarize as summarizePLD } from './spec-sim.js'
 import type { DecodeEngine } from './engine-core.js'
+import { buildPromptOfLength, TTFT_PROMPT_LENGTHS } from '../bench-prompts.js'
 
 export interface BenchConsoleCtx {
   engine: DecodeEngine
@@ -99,6 +101,113 @@ export function installBenchConsole(ctx: BenchConsoleCtx): void {
           ` · decode=${medianDecode.toFixed(2)} tok/s · ttft=${medianTtftMs.toFixed(0)}ms`
         )
         return summary
+      } finally {
+        ctx.setBusy(false)
+        ctx.onIdle()
+      }
+    }
+
+  // TTFT as a function of prompt length: `await window.benchTtft()`.
+  //
+  // The counterpart of src/tjs-bench/main.ts's ?ttft=1 sweep, sharing its
+  // prompt construction (src/bench-prompts.ts) so both engines prefill the
+  // same text at the same measured length. Exists to answer a specific
+  // question — huggingface/transformers.js#1599 reports a 16-second TTFT on
+  // Qwen3.5-4B, and a single prompt length cannot separate "prefill has a
+  // large constant cost" from "prefill scales badly with length".
+  //
+  // Only 8 tokens are generated per point; everything past the first token is
+  // decode, which window.bench() already measures. `chunks` comes from the
+  // engine's own getLastPrefill() and is the chunked-prefill evidence: it
+  // should rise with prompt length while ms/prompt-token stays flat.
+  ;(window as Window & typeof globalThis & { benchTtft?: unknown }).benchTtft =
+    async (
+      targets: number[] = TTFT_PROMPT_LENGTHS,
+      nGen: number = 8,
+      nRuns: number = 3,
+    ): Promise<unknown> => {
+      if (ctx.isBusy()) { console.warn('[ttft] decode already in flight — skipping'); return null }
+      ctx.setBusy(true)
+      try {
+        const medianOf = (xs: number[]) => xs.slice().sort((a, b) => a - b)[Math.floor(xs.length / 2)]
+        const encodeTemplated = (userMessage: string) =>
+          buildChatPromptFor(engine.spec, [
+            { role: 'system', content: 'You are a helpful assistant.' },
+            { role: 'user', content: userMessage },
+          ], tokenizer)
+
+        const points: {
+          targetTokens: number
+          promptTokens: number
+          ttftMsRuns: number[]
+          ttftMs: number
+          decodeTokPerS: number
+          chunks: number
+        }[] = []
+
+        for (const target of targets) {
+          const built = buildPromptOfLength(target, encodeTemplated)
+          const promptIds = encodeTemplated(built.userMessage)
+          if (promptIds.length > engine.maxContext) {
+            console.warn(`[ttft] target ${target}: ${promptIds.length} tok exceeds maxContext ${engine.maxContext} — skipped`)
+            continue
+          }
+          const ttfts: number[] = []
+          const decodes: number[] = []
+          let chunks = 0
+          // One unmeasured run at this length first, mirroring the
+          // transformers.js half (a new sequence length can trigger fresh
+          // pipeline specialisation, which is not the prefill cost).
+          engine.resetKVTracking()
+          await engine.generatePipelined(promptIds, nGen, () => {})
+          for (let r = 0; r < nRuns; r++) {
+            // Every run pays a FULL prefill — without this, cross-turn prefix
+            // reuse makes runs 2..N prefill a single token and the whole
+            // experiment measures nothing.
+            engine.resetKVTracking()
+            const t0 = performance.now()
+            let count = 0
+            let tFirst = 0
+            await engine.generatePipelined(promptIds, nGen, () => {
+              if (count === 0) tFirst = performance.now()
+              count++
+            })
+            const tEnd = performance.now()
+            const seconds = (tEnd - t0) / 1000
+            const ttftMs = tFirst ? tFirst - t0 : seconds * 1000
+            const decodeTokPerS = count > 1 && tFirst ? (count - 1) / ((tEnd - tFirst) / 1000) : count / seconds
+            const pf = engine.getLastPrefill()
+            if (pf) chunks = pf.chunks
+            ttfts.push(ttftMs)
+            decodes.push(decodeTokPerS)
+            console.log(
+              `[ttft] prompt=${promptIds.length} tok (target ${target}) run${r + 1}: ` +
+              `ttft ${ttftMs.toFixed(0)}ms · ${count} gen tok · decode ${decodeTokPerS.toFixed(2)} tok/s` +
+              (pf ? ` · prefill chunks ${pf.chunks} (reused ${pf.reused})` : ''),
+            )
+          }
+          points.push({
+            targetTokens: target,
+            promptTokens: promptIds.length,
+            ttftMsRuns: ttfts,
+            ttftMs: medianOf(ttfts),
+            decodeTokPerS: medianOf(decodes),
+            chunks,
+          })
+        }
+
+        console.log('')
+        console.log('  prompt tok |  TTFT ms |  ms/prompt-token |  vs shortest | chunks')
+        console.log('  -----------+----------+------------------+--------------+-------')
+        const base = points[0]
+        for (const p of points) {
+          console.log(
+            `  ${String(p.promptTokens).padStart(10)} | ${p.ttftMs.toFixed(0).padStart(8)} | ` +
+            `${(p.ttftMs / p.promptTokens).toFixed(3).padStart(16)} | ` +
+            `${(p.ttftMs / base.ttftMs).toFixed(2).padStart(12)}x | ${String(p.chunks).padStart(6)}`,
+          )
+        }
+        return { mode: 'ttft-sweep', engine: 'zero-tvm', runsPerPoint: nRuns, genTokensPerPoint: nGen, points }
       } finally {
         ctx.setBusy(false)
         ctx.onIdle()

@@ -1,0 +1,48 @@
+<!doctype html><meta charset="utf-8"><title>ablation: full vs Scan-free</title>
+<body><pre id="log">…</pre>
+<script type="module">
+import * as ort from '/ort-dist126/ort.webgpu.bundle.min.mjs';
+const L=[];const say=(...a)=>{L.push(a.join(' '));document.getElementById('log').textContent=L.join('\n');console.log('[T]',a.join(' '))};
+window.__done=false;
+ort.env.wasm.wasmPaths='/ort-dist126/'; ort.env.wasm.numThreads=1; ort.env.logLevel='error';
+const N=parseInt(new URLSearchParams(location.search).get('s')||'252');
+const H=32,DK=128,DV=128,HID=2560;
+const f32=(d)=>new ort.Tensor('float32',new Float32Array(d.reduce((a,b)=>a*b,1)).fill(0.02),d);
+const f16=(d)=>new ort.Tensor('float16',new Uint16Array(d.reduce((a,b)=>a*b,1)),d);
+const i64=(d,p)=>{const n=d.reduce((a,b)=>a*b,1),a=new BigInt64Array(n);
+  if(p){const s=d[d.length-1];for(let i=0;i<n;i++)a[i]=BigInt(i%s)}else a.fill(1n);return new ort.Tensor('int64',a,d)};
+const med=(x)=>{x=[...x].sort((a,b)=>a-b);return x[Math.floor(x.length/2)]};
+const EXT=[{path:'decoder_model_merged_q4f16.onnx_data',data:'/weights/decoder_model_merged_q4f16.onnx_data'},
+           {path:'decoder_model_merged_q4f16.onnx_data_1',data:'/weights/decoder_model_merged_q4f16.onnx_data_1'}];
+
+async function bench(file,label){
+  const t0=performance.now();
+  const sess=await ort.InferenceSession.create('/weights/'+file,{executionProviders:['webgpu'],externalData:EXT});
+  const load=(performance.now()-t0)/1000;
+  const fd={inputs_embeds:f32([1,N,HID]),attention_mask:i64([1,N]),position_ids:i64([3,1,N],1)};
+  for(const n of sess.inputNames){
+    if(n.startsWith('past_conv')) fd[n]=f16([1,8192,4]);
+    else if(n.startsWith('past_recurrent')) fd[n]=f16([1,H,DK,DV]);
+    else if(n.startsWith('past_key_values')) fd[n]=f16([1,4,0,256]);
+  }
+  const chk=await sess.run(fd);                       // warm-up + sanity
+  const ts=[];for(let r=0;r<3;r++){const a=performance.now();await sess.run(fd);ts.push(performance.now()-a)}
+  const t=med(ts);
+  say(`${label.padEnd(22)} ${(t/1000).toFixed(2)} s   (load ${load.toFixed(1)}s, logits ${JSON.stringify(chk.logits.dims)}, runs ${ts.map(x=>(x/1000).toFixed(2)).join('/')})`);
+  try{ await sess.release() }catch(e){}
+  return t;
+}
+try{
+  const full1=await bench('decoder_model_merged_q4f16.onnx','A  full (with Scan)');
+  const abl  =await bench('decoder_ablated_q4f16.onnx',     'B  ablated (no Scan)');
+  const full2=await bench('decoder_model_merged_q4f16.onnx','A2 full again (control)');
+  const drift=Math.abs(full2-full1)/Math.min(full1,full2)*100;
+  const full=(full1+full2)/2;
+  say('');
+  say(`control drift on full : ${drift.toFixed(0)} %  ${drift<10?'OK — conditions stable':'<-- UNSTABLE, discard'}`);
+  say(`Scan cost in situ     : ${((full-abl)/1000).toFixed(2)} s   (full ${(full/1000).toFixed(2)} - ablated ${(abl/1000).toFixed(2)})`);
+  say(`>> SCAN SHARE         : ${(100*(full-abl)/full).toFixed(1)} %`);
+  say(`RESULT s=${N} full1=${full1.toFixed(0)} abl=${abl.toFixed(0)} full2=${full2.toFixed(0)} drift=${drift.toFixed(0)} share=${(100*(full-abl)/full).toFixed(1)}`);
+}catch(e){say('ERROR:',e&&e.message?e.message:String(e))}
+window.__done=true;
+</script>
