@@ -1,6 +1,6 @@
 // INT8_AFFINE_MATVEC — GEMV over MLX-style 8-bit affine weights.
 //
-// Same scheme as moe_router's inner loop, but exposed as a plain matvec with no
+// Same scheme as moe_router_logits' inner loop, but exposed as a plain matvec with no
 // softmax or top-k: out[r] = Σ xᵢ·wᵢ with w = scale*q + bias over groups of 64,
 // q an unsigned byte, 4 per u32 word.
 //

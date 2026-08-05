@@ -139,21 +139,38 @@ def qwen36moe_block(seed: int):
         "topk_idx_u32": np.array(inds).astype(np.uint32).ravel(),
         "topk_score_f32": np.array(sc).astype(np.float32).ravel(),
     }
-    # Expert + shared weights, exactly as stored (nibbles untouched); bias2 = 7s+b.
-    for proj in ("gate_proj", "up_proj", "down_proj"):
-        for who, key in (("exp", f"switch_mlp.{proj}"), ("shd", f"shared_expert.{proj}")):
-            Wq = np.array(w[PRE + key + ".weight"].astype(mx.uint32))
-            S = np.array(w[PRE + key + ".scales"].astype(mx.float32))
-            B = np.array(w[PRE + key + ".biases"].astype(mx.float32))
-            arrays[f"{who}_{proj}_w_u32"] = Wq.ravel()
-            arrays[f"{who}_{proj}_s_f16"] = S.astype(np.float16).ravel()
-            arrays[f"{who}_{proj}_b2_f16"] = (7.0 * S + B).astype(np.float16).ravel()
+    # LAYOUT: the shared expert is appended to the stacked expert tensors as
+    # index E, and its gate as row E of the router. It is then not a special
+    # case at all — one kernel, one dispatch, K+1 slots, and `moe_combine`
+    # becomes a plain weighted sum. Costs one expert's worth of memory (0.4%)
+    # and removes an entire second matmul path. This is the layout the engine's
+    # loader should build, so the harness validates the kernels as they'll run.
+    # Nibbles are untouched; bias2 = 7s+b (see the note in qwen36moe).
+    def stack(key_e, key_s):
+        """[E, ...] ++ shared -> [E+1, ...], for weight/scales/biases alike."""
+        out = []
+        for part in ("weight", "scales", "biases"):
+            dt = mx.uint32 if part == "weight" else mx.float32
+            e = np.array(w[f"{PRE}{key_e}.{part}"].astype(dt))
+            s = np.array(w[f"{PRE}{key_s}.{part}"].astype(dt))
+            if s.ndim == e.ndim - 1:
+                s = s[None]                   # switch_mlp is [E, N, ..]; shared_expert is [N, ..]
+            assert e.shape[1:] == s.shape[1:], f"{key_s}.{part} {s.shape} cannot append to {e.shape}"
+            out.append(np.concatenate([e, s]))
+        return out
 
-    # Router + shared gate ship at 8 bits, group 64 — a different kernel path.
-    for who, key in (("router", "gate"), ("shdgate", "shared_expert_gate")):
-        arrays[f"{who}_w_u32"] = np.array(w[PRE + key + ".weight"].astype(mx.uint32)).ravel()
-        arrays[f"{who}_s_f16"] = np.array(w[PRE + key + ".scales"].astype(mx.float32)).astype(np.float16).ravel()
-        arrays[f"{who}_b_f16"] = np.array(w[PRE + key + ".biases"].astype(mx.float32)).astype(np.float16).ravel()
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        Wq, S, B = stack(f"switch_mlp.{proj}", f"shared_expert.{proj}")
+        arrays[f"exp_{proj}_w_u32"] = Wq.ravel()
+        arrays[f"exp_{proj}_s_f16"] = S.astype(np.float16).ravel()
+        arrays[f"exp_{proj}_b2_f16"] = (7.0 * S + B).astype(np.float16).ravel()
+
+    # Router ships at 8 bits, group 64 — a different kernel path. Row E is the
+    # shared-expert gate, so one dispatch produces every logit the block needs.
+    Wq, S, B = stack("gate", "shared_expert_gate")
+    arrays["router_w_u32"] = Wq.ravel()
+    arrays["router_s_f16"] = S.astype(np.float16).ravel()
+    arrays["router_b_f16"] = B.astype(np.float16).ravel()
 
     shp = lambda k_: list(np.array(w[PRE + k_ + ".weight"]).shape)
     return {
@@ -167,10 +184,13 @@ def qwen36moe_block(seed: int):
                  "shared_intermediate": int(args.shared_expert_intermediate_size),
                  "norm_topk_prob": bool(args.norm_topk_prob),
                  "group": qz["group_size"],
+                 "shared_expert_index": int(args.num_experts),
                  "exp_shapes": {p: shp(f"switch_mlp.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
                  "shd_shapes": {p: shp(f"shared_expert.{p}") for p in ("gate_proj", "up_proj", "down_proj")},
                  "router_bits": int(g8["bits"]) if g8 else int(qz["bits"]),
-                 "note": "routed y = sum_k score_k * down(silu(gate)*up); shared added with sigmoid gate"},
+                 "note": "every stacked tensor carries the shared expert at index shared_expert_index; "
+                         "y = sum over K+1 slots of score_slot * down(silu(gate)*up), "
+                         "with score_K = sigmoid(router logit E)"},
     }
 
 
