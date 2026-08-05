@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zero-TVM Chat — Phi-3-mini on 10 kernels across 37 WGSL files</title>
-  <meta name="description" content="Live browser chat with Phi-3-mini decoding at 60+ tok/s on raw WebGPU. No WebLLM, no TVM, no WASM — 10 kernel roles across 37 WGSL files.">
+  <title>Zero-TVM Chat — Phi-3 &amp; Qwen3 on 10 kernels across 37 WGSL files</title>
+  <meta name="description" content="Live browser chat with Phi-3-mini, Qwen3-4B or Qwen3.5-4B decoding at 60+ tok/s on raw WebGPU. No WebLLM, no TVM, no WASM — 10 kernel roles across 37 WGSL files.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zerotvm.com/zero-tvm.html">
-  <meta property="og:title" content="Zero-TVM Chat — Phi-3-mini on 10 kernels across 37 WGSL files">
-  <meta property="og:description" content="Live browser chat with Phi-3-mini decoding at 60+ tok/s on raw WebGPU. No WebLLM, no TVM, no WASM — 10 kernel roles across 37 WGSL files.">
+  <meta property="og:title" content="Zero-TVM Chat — Phi-3 &amp; Qwen3 on 10 kernels across 37 WGSL files">
+  <meta property="og:description" content="Live browser chat with Phi-3-mini, Qwen3-4B or Qwen3.5-4B decoding at 60+ tok/s on raw WebGPU. No WebLLM, no TVM, no WASM — 10 kernel roles across 37 WGSL files.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Zero-TVM Chat — Phi-3-mini on 10 kernels across 37 WGSL files">
-  <meta name="twitter:description" content="Live browser chat with Phi-3-mini decoding at 60+ tok/s on raw WebGPU. No WebLLM, no TVM, no WASM — 10 kernel roles across 37 WGSL files.">
+  <meta name="twitter:title" content="Zero-TVM Chat — Phi-3 &amp; Qwen3 on 10 kernels across 37 WGSL files">
+  <meta name="twitter:description" content="Live browser chat with Phi-3-mini, Qwen3-4B or Qwen3.5-4B decoding at 60+ tok/s on raw WebGPU. No WebLLM, no TVM, no WASM — 10 kernel roles across 37 WGSL files.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <style>
     :root {
@@ -88,7 +88,35 @@
       transition: background 0.15s, color 0.15s;
     }
     .back-link:hover { background: var(--panel-2); color: var(--text); }
-    .model-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .model-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; position: relative; }
+    .model-switch {
+      display: flex; align-items: center; gap: 4px; background: none; border: 0;
+      padding: 0; margin: 0; cursor: pointer; color: inherit; font: inherit;
+      border-radius: 5px; align-self: flex-start;
+    }
+    .model-switch:hover .chev { opacity: 1; }
+    .model-switch .chev {
+      width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor;
+      stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round;
+      opacity: 0.45; transition: opacity .15s, transform .15s;
+    }
+    .model-switch[aria-expanded="true"] .chev { opacity: 1; transform: rotate(180deg); }
+    .model-menu {
+      position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
+      min-width: 258px; padding: 5px;
+      background: #14161b; border: 1px solid #2a2e37; border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.55);
+    }
+    .model-menu button {
+      display: flex; width: 100%; align-items: baseline; gap: 8px;
+      background: none; border: 0; color: #e6e8ec; cursor: pointer;
+      padding: 8px 10px; border-radius: 7px; text-align: left; font: inherit;
+    }
+    .model-menu button:hover { background: #1e222b; }
+    .model-menu button[aria-selected="true"] { background: #1a2b22; }
+    .model-menu .mm-name { font-weight: 600; font-size: 0.86rem; }
+    .model-menu .mm-meta { font-size: 0.7rem; color: #8b93a1; margin-left: auto; white-space: nowrap; }
+    .model-menu .mm-cached { color: #5fc796; }
     .model-info h1 {
       font-size: 0.95rem;
       font-weight: 600;
@@ -632,6 +660,25 @@
       max-height: calc(100vh - 2rem);
       box-shadow: 0 20px 60px rgba(0,0,0,0.5);
     }
+    .dialog-models { padding: 0.85rem 1.25rem; border-top: 1px solid var(--border); }
+    .dialog-models .dm-label {
+      font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.07em;
+      color: var(--muted); margin-bottom: 0.5rem;
+    }
+    .dialog-models .dm-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .dialog-models .dm-chip {
+      display: flex; flex-direction: column; gap: 1px; flex: 1 1 0; min-width: 96px;
+      padding: 7px 10px; border-radius: 8px; text-align: left; cursor: pointer;
+      background: var(--panel-2); border: 1px solid var(--border);
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .dialog-models .dm-chip:hover { border-color: var(--border-2); background: #1b1b22; }
+    .dialog-models .dm-chip[aria-pressed="true"] {
+      border-color: rgba(16, 185, 129, 0.45); background: var(--accent-tint);
+    }
+    .dialog-models .dm-chip .n { font-size: 0.78rem; font-weight: 600; color: var(--text); }
+    .dialog-models .dm-chip .s { font-size: 0.66rem; color: var(--muted); }
+    .dialog-models .dm-chip[aria-pressed="true"] .s { color: var(--accent); }
     dialog#start-dialog::backdrop {
       background: rgba(8, 8, 10, 0.82);
       backdrop-filter: blur(10px);
@@ -842,6 +889,10 @@
       <div class="dstat"><div class="val">60+ t/s</div><div class="lab">M2 Max</div></div>
       <div class="dstat"><div class="val">f16</div><div class="lab">WebGPU</div></div>
     </div>
+    <div class="dialog-models">
+      <div class="dm-label">Model</div>
+      <div class="dm-chips" id="dialog-models"></div>
+    </div>
     <div class="dialog-notes">
       <ul>
         <li>Cached after first load — next visit starts in seconds</li>
@@ -880,8 +931,12 @@
         <svg class="icon" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
       </a>
       <div class="model-info">
-        <h1>Phi-3-mini</h1>
-        <div class="model-sub">10 WGSL kernels · paged KV · WebGPU</div>
+        <button class="model-switch" id="model-switch" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <h1 id="model-name">Phi-3-mini</h1>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="model-sub" id="model-sub">hand-written WGSL · paged KV · WebGPU</div>
+        <div class="model-menu" id="model-menu" role="listbox" hidden></div>
       </div>
       <div class="header-spacer"></div>
       <span class="stats" id="stats"></span>

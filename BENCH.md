@@ -19,6 +19,29 @@ weight files, so it isolates the runtime. **llama.cpp via wllama** is *not*
 same-bytes — it reads GGUF — so it measures runtime and quantization together.
 The two are reported separately and must not be merged into one table.
 
+## Qwen3.6-35B-A3B MoE (2026-08-05) — no baseline exists
+
+**This model has no A/B column.** WebLLM ships zero Qwen3.6 builds, so the
+same-bytes protocol that governs every other section cannot be run. What can
+be stated is what was measured, on the usual machine (Apple M2 Max 32 GB,
+Chrome, dev mirror weights):
+
+| build | resident | condition | decode |
+|---|---|---|---|
+| `?model=qwen36q3` (3-bit experts) | 15.7 GB | quiet machine (owner-run) | **~50–60 tok/s** |
+| `?model=qwen36q3` | 15.7 GB | heavily loaded machine (0.2 GB free RAM) | 11.4 tok/s (23-token sample) |
+| `?model=qwen36` (full 4-bit) | 19.7 GB | loaded machine | unusable — GPU process killed mid-prefill |
+
+Correctness is anchored elsewhere, not by eyeballing chat: every layer type is
+validated against mlx_lm's own modules on the real checkpoint
+(`npm run test:kernels:real` — MoE block 3.35e-4, whole decoder layer 5.16e-4,
+greedy argmax identical to mlx_lm on the tested prompt). The quiet-machine
+number is a single owner-run session, not a median-of-N protocol run; treat it
+as indicative until a proper protocol round is recorded. The memory-pressure
+row is the honest caveat: this model's floor is RAM, not kernels — the same
+kernels do 16 ms/token (62 tok/s) in the isolated 40-layer benchmark with a
+480 MB working set.
+
 ## Third baseline: llama.cpp via wllama (WebGPU) (2026-07-30, Apple M2 Max)
 
 **This is not a same-bytes comparison.** wllama reads GGUF — `Q4_K_M` for the

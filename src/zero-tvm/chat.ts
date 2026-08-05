@@ -13,6 +13,7 @@
 
 import { opfsDirFor } from './weight-loader.js'
 import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
+import { initModelSwitcher } from './model-switcher.js'
 import {
   allocKVPages,
   allocKVPagesInt8,
@@ -720,6 +721,7 @@ function applyModelBranding(): void {
 
 async function boot(): Promise<void> {
   applyModelBranding()
+  initModelSwitcher(SPEC)
   // Register the weight-cache SW first so it intercepts the very first
   // network fetch (from bootEngine's loadWeights call) — and any future
   // fetch from WebLLM in compiler-chat / webllm-bench.

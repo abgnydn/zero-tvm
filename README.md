@@ -196,6 +196,36 @@ machine-readable pair in
 Weights: `node scripts/download-weights.mjs --model qwen35` primes the local
 dev mirror (~2.6 GB); without it the page streams from HuggingFace.
 
+**Qwen3.6-35B-A3B (MLX, sparse MoE) — `?model=qwen36q3` (3-bit experts) and
+`?model=qwen36` (full 4-bit).** The fourth model, and three firsts at once: the
+first MoE, the first MLX-format checkpoint (affine `w = s·q + b`, group 64,
+per-tensor biases), and the first model here that **WebLLM ships no build of at
+all** — so there is no same-bytes A/B, and the comparison column for this row
+is simply "does not run it". What it adds:
+
+- **256-expert sparse MoE FFN** (top-8 + a shared expert) on every layer:
+  7 dispatches per block — router logits, a 32-lane register top-k, then
+  gate/up/silu/down/combine with the expert index riding in grid `z`. The
+  shared expert is stacked as expert index E and its gate as router row E, so
+  no kernel has a special case for it
+- **MLX affine int4/int3 matmul variants** — and for the 3-bit build, a
+  continuous LSB-first bitstream unpack (values straddle u32 word boundaries)
+- **byte-range weight loading**: a 5.3 GB safetensors shard is never one
+  ArrayBuffer; 268 KB of headers maps all 16–19.5 GB, OPFS caches built
+  buffers, bf16→f16 conversion happens at load with subnormal-exact rounding
+- **validated against mlx_lm's own modules** on the real checkpoint, layer by
+  layer: GDN 2.26e-3, attention 7.59e-4, MoE block 3.35e-4, whole decoder
+  layer 5.16e-4, greedy argmax identical
+
+The 3-bit expert build ([abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp](https://huggingface.co/abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp),
+16.36 GB, produced by `scripts/convert-q3-experts.py`) exists because the
+4-bit build's 19.7 GB resident set does not survive next to a browser on a
+32 GB Mac — measured, not assumed: the GPU process is killed mid-prefill. The
+3-vs-2-bit choice is also measured: block-output cosine 0.936 vs 0.785 against
+the 4-bit block; plain-RTN 2-bit is not usable. Decode measures **~55 tok/s on
+a quiet 32 GB M2 Max** (owner-measured, 2026-08-05); ~11 tok/s under heavy
+memory pressure. Needs ~20 GB free RAM (3-bit) / ~24 GB (4-bit).
+
 ## The repository as an argument
 
 The directory layout is the narrative arc of the project. Each page is a milestone.
