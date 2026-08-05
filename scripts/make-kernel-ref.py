@@ -462,8 +462,97 @@ def qwen36attn(seed: int):
     }
 
 
+def qwen36layer(seed: int):
+    """A WHOLE decoder layer: norm1 -> linear_attn -> +x -> norm2 -> MoE -> +h.
+
+    The three sub-block bundles each prove one piece against mlx_lm. This proves
+    they COMPOSE, which is what engine-core will do: the residual adds, the
+    post-attention norm, and — the part worth checking — that the GDN block's
+    f16 output is the right dtype and layout for the MoE block's input.
+
+    Carries ONLY reference vectors and the seeded state. The weights are layer
+    0's, which qwen36gdn and qwen36moe_block already hold, so duplicating them
+    would cost 450 MB to say nothing new; the test reads them from there and
+    this bundle defines the x they must all be run on.
+    """
+    import mlx.core as mx, mlx.nn as nn
+    from mlx_lm.models.qwen3_5 import DecoderLayer
+    from mlx_lm.models.cache import ArraysCache
+
+    W, cfg, args = _qwen36_args()
+    qz = cfg["quantization"]
+    layer = DecoderLayer(args, 0)
+    nn.quantize(layer, group_size=qz["group_size"], bits=qz["bits"])
+    PRE = "language_model.model.layers.0."
+    g8 = qz.get(PRE + "mlp.gate")            # router + shared gate ship at 8 bits
+    if g8:
+        layer.mlp.gate = nn.QuantizedLinear(args.hidden_size, args.num_experts, bias=False,
+                                            group_size=g8["group_size"], bits=g8["bits"])
+        layer.mlp.shared_expert_gate = nn.QuantizedLinear(args.hidden_size, 1, bias=False,
+                                                          group_size=g8["group_size"], bits=g8["bits"])
+    w = mx.load(os.path.join(W, "model-00001-of-00004.safetensors"))
+    layer.load_weights([(k[len(PRE):], v) for k, v in w.items() if k.startswith(PRE)])
+    layer.set_dtype(mx.float32)              # f32 reference — see qwen36gdn
+    mx.eval(layer.parameters())
+
+    rng = np.random.default_rng(seed)
+    D, PREFILL = args.hidden_size, 3
+    hs = mx.array(rng.standard_normal((1, PREFILL + 1, D)).astype(np.float32))
+
+    cache = ArraysCache(2)
+    layer(hs[:, :PREFILL], cache=cache)
+    mx.eval(cache[0], cache[1])
+    conv_state, recur_state = cache[0], cache[1]
+
+    x = hs[:, PREFILL:]
+    y = layer(x, cache=cache)                # the module's own answer
+
+    # Same thing stage by stage, from a cache restored to the snapshot, so a GPU
+    # mismatch localises instead of just saying "the layer is wrong".
+    c2 = ArraysCache(2)
+    c2[0], c2[1] = conv_state, recur_state
+    r = layer.linear_attn(layer.input_layernorm(x), None, c2)
+    h = x + r
+    n2 = layer.post_attention_layernorm(h)
+    m = layer.mlp(n2)
+    y_mine = h + m
+    mx.eval(y, r, h, n2, m, y_mine)
+    rel = float(mx.abs(y_mine - y).max() / (mx.abs(y).max() + 1e-9))
+    if rel > 1e-5:
+        sys.exit(f"stage-by-stage transcription disagrees with the module (rel {rel:.2e}) "
+                 "— refusing to write")
+
+    return {
+        "arrays": {
+            "x_f16": _f16(x),
+            "r_ref_f32": _f32(r), "h_ref_f32": _f32(h), "norm2_ref_f32": _f32(n2),
+            "moe_ref_f32": _f32(m), "y_ref_f32": _f32(y),
+            "conv_state_f16": _f16(conv_state),
+            # transposed for gdn_recur's S[h][dk][dv] — see qwen36gdn
+            "recur_state_f32": _f32(mx.swapaxes(recur_state, -1, -2)),
+            # the one weight the other two bundles do not carry
+            "norm2_gamma_f16": _f16(w[PRE + "post_attention_layernorm.weight"]),
+        },
+        "meta": {"kernel": "qwen36_layer",
+                 "model": "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit",
+                 "tensor": "layers.0 (whole DecoderLayer), decode step 3",
+                 "reference": "mlx_lm qwen3_5.DecoderLayer",
+                 "hidden": int(args.hidden_size), "num_experts": int(args.num_experts),
+                 "top_k": int(args.num_experts_per_tok),
+                 "moe_intermediate": int(args.moe_intermediate_size),
+                 "norm_topk_prob": bool(args.norm_topk_prob),
+                 "prefill": PREFILL, "group": qz["group_size"],
+                 "weights_from": ["qwen36gdn", "qwen36moe_block"],
+                 "note": "y = h + mlp(post_attention_layernorm(h)) where h = x + "
+                         "linear_attn(input_layernorm(x)); weights live in the bundles "
+                         "named by weights_from — this one carries references plus "
+                         "post_attention_layernorm, which neither of those has"},
+    }
+
+
 PRODUCERS = {"qwen36moe": qwen36moe, "qwen36moe_block": qwen36moe_block,
-             "qwen36gdn": qwen36gdn, "qwen36attn": qwen36attn}
+             "qwen36gdn": qwen36gdn, "qwen36attn": qwen36attn,
+             "qwen36layer": qwen36layer}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

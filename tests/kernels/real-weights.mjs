@@ -500,9 +500,151 @@ async function qwen36Attn(device, dir, meta) {
   }
 }
 
+
+/**
+ * A WHOLE decoder layer against mlx_lm's DecoderLayer:
+ *
+ *   r = linear_attn(input_layernorm(x));  h = x + r
+ *   y = h + mlp(post_attention_layernorm(h))
+ *
+ * The other three bundles each prove one sub-block. This proves they COMPOSE,
+ * which is what engine-core will do — in particular that the GDN block's f16
+ * output is the dtype and layout the MoE block reads.
+ *
+ * Weights come from the qwen36gdn and qwen36moe_block bundles: all three are
+ * layer 0, so duplicating 450 MB into a fourth bundle would say nothing new.
+ * The qwen36layer bundle owns the x they are all run on, the seeded state, and
+ * post_attention_layernorm, which neither of the others carries.
+ *
+ * The final `y = h + m` is done on the HOST, not by add_norm: at that point the
+ * layer is over and the add belongs to the NEXT layer's add_norm, which this
+ * bundle has no gamma for. Everything upstream of it runs on the GPU.
+ */
+async function qwen36Layer(device, dir, meta) {
+  const gdnDir = join(REFS, 'qwen36gdn'), moeDir = join(REFS, 'qwen36moe_block')
+  if (!existsSync(gdnDir) || !existsSync(moeDir)) {
+    return { pass: null, detail: 'needs the qwen36gdn and qwen36moe_block bundles (same layer 0 weights)' }
+  }
+  const S = QWEN36
+  const rd = (n, T) => read(dir, n, T)
+  const stFrom = (d, n, T) => buffer(device, read(d, n, T), BU.STORAGE | BU.COPY_DST)
+  const st = (n, T) => stFrom(dir, n, T)
+  const shader = (f, e) => pipelineFor(device, withPrelude(readFileSync(join(SHADERS, f), 'utf8'), S), e)
+  const D = S.d, F = meta.moe_intermediate, K = meta.top_k, SLOTS = K + 1, E = meta.num_experts
+  const QKV = S.gdnQkvDim, VD = S.gdnVDim, ROWS = S.gdnProjRows, VH = S.gdnVHeads
+
+  const cat = (d, names, T) => {
+    const parts = names.map((n) => read(d, n, T))
+    const out = new T(parts.reduce((a, p) => a + p.length, 0))
+    let o = 0
+    for (const p of parts) { out.set(p, o); o += p.length }
+    return buffer(device, out, BU.STORAGE | BU.COPY_DST)
+  }
+  const P = ['qkv', 'z', 'a', 'b']
+  const projW = cat(gdnDir, P.map((n) => `${n}_w_u32`), Uint32Array)
+  const projS = cat(gdnDir, P.map((n) => `${n}_s_f16`), Uint16Array)
+  const projB = cat(gdnDir, P.map((n) => `${n}_b_f16`), Uint16Array)
+  const W = {}
+  for (const proj of ['gate_proj', 'up_proj', 'down_proj']) {
+    W[`${proj}_w`] = stFrom(moeDir, `exp_${proj}_w_u32`, Uint32Array)
+    W[`${proj}_s`] = stFrom(moeDir, `exp_${proj}_s_f16`, Uint16Array)
+    W[`${proj}_b`] = stFrom(moeDir, `exp_${proj}_b_f16`, Uint16Array)
+  }
+
+  const MM = { affine: true, subgroups: true, rowsPerWG: 4 }
+  const MOE = { ...MM, moe: true }
+  const mm = pipelineFor(device, withPrelude(int4MatmulWGSL(MM), S), int4MatmulEntry(MM))
+  const mmMoe = pipelineFor(device, withPrelude(int4MatmulWGSL(MOE), S), int4MatmulEntry(MOE))
+  const RPW = 4
+  const norm = shader('rms_norm.wgsl', 'rms_norm')
+  const conv = shader('gdn_conv.wgsl', 'gdn_conv')
+  const gates = shader('gdn_gates.wgsl', 'gdn_gates')
+  const recur = shader('gdn_recur.wgsl', 'gdn_recur')
+  const gnorm = shader('gdn_norm_out.wgsl', 'gdn_norm_out')
+  const addNorm = shader('add_norm.wgsl', 'add_norm')
+  const rtL = shader('moe_router_logits.wgsl', 'moe_router_logits')
+  const rtK = shader('moe_router_topk.wgsl', 'moe_router_topk')
+  const silu = pipelineFor(device, withPrelude(readFileSync(join(SHADERS, 'silu_mul.wgsl'), 'utf8'),
+                                               { ...S, ffn: F }), 'silu_mul')
+  const comb = shader('moe_combine.wgsl', 'moe_combine')
+
+  const u32 = (a) => buffer(device, new Uint32Array(a), BU.UNIFORM | BU.COPY_DST)
+  const i32 = (a) => buffer(device, new Int32Array(a), BU.UNIFORM | BU.COPY_DST)
+  const sb = (n) => device.createBuffer({ size: n, usage: BU.STORAGE | BU.COPY_SRC })
+
+  const xBuf = st('x_f16', Uint16Array)
+  const xn = sb(D * 2), proj = sb(ROWS * 2), convOut = sb(QKV * 2)
+  const gateBuf = sb(2 * VH * 4), recurOut = sb(VD * 4), gnormOut = sb(VD * 2)
+  const r = sb(D * 2), h = sb(D * 2), n2 = sb(D * 2)
+  const rLog = sb((E + 1) * 4), rIdx = sb(SLOTS * 4), rScore = sb(SLOTS * 4)
+  const GU = 2 * F * 2
+  const gu = sb(SLOTS * GU), hh = sb(SLOTS * F * 2), dOut = sb(SLOTS * D * 2), moeOut = sb(D * 4)
+  const convState = st('conv_state_f16', Uint16Array)
+  const state = buffer(device, rd('recur_state_f32', Float32Array), BU.STORAGE | BU.COPY_DST | BU.COPY_SRC)
+
+  const zOff = QKV * 2, abOff = (QKV + VD) * 2
+  const steps = [
+    // ── GDN sub-block ──
+    [norm, [xn, xBuf, stFrom(gdnDir, 'norm1_gamma_f16', Uint16Array), u32([D])], [1]],
+    [mm, [proj, xn, projS, projW, u32([D / 8, D / 64, ROWS]), projB], [ROWS / RPW]],
+    [conv, [convOut, { buffer: proj, offset: 0, size: QKV * 2 }, convState,
+            stFrom(gdnDir, 'conv1d_f16', Uint16Array), i32([meta.prefill, Math.ceil(QKV / 256)])],
+     [Math.ceil(QKV / 256)]],
+    [gates, [gateBuf, { buffer: proj, offset: abOff, size: ROWS * 2 - abOff },
+             stFrom(gdnDir, 'A_log_f32', Float32Array), stFrom(gdnDir, 'dt_bias_f32', Float32Array),
+             i32([1, ROWS, 1])], [1]],
+    [recur, [recurOut, convOut, gateBuf, state, i32([1, VH])], [VH]],
+    [gnorm, [gnormOut, recurOut, stFrom(gdnDir, 'gnorm_gamma_f16', Uint16Array),
+             { buffer: proj, offset: zOff, size: ROWS * 2 - zOff }, i32([1, ROWS, VH])], [VH]],
+    [mm, [r, gnormOut, stFrom(gdnDir, 'out_s_f16', Uint16Array), stFrom(gdnDir, 'out_w_u32', Uint32Array),
+          u32([VD / 8, VD / 64, D]), stFrom(gdnDir, 'out_b_f16', Uint16Array)], [D / RPW]],
+    // ── residual + post-attention norm, one kernel ──
+    [addNorm, [xBuf, r, st('norm2_gamma_f16', Uint16Array), n2, h, u32([Math.ceil(D / 256)])],
+     [Math.ceil(D / 256)]],
+    // ── MoE block, 6 dispatches ──
+    [rtL, [rLog, n2, stFrom(moeDir, 'router_w_u32', Uint32Array),
+           stFrom(moeDir, 'router_s_f16', Uint16Array), stFrom(moeDir, 'router_b_f16', Uint16Array),
+           u32([D, E + 1])], [E + 1]],
+    [rtK, [rIdx, rScore, rLog, u32([E, K, meta.norm_topk_prob ? 1 : 0])], [1]],
+  ]
+  const bgMoe = (out, outOff, outSize, inp, proj2, pod) => [
+    { buffer: out, offset: outOff, size: outSize }, inp, W[`${proj2}_s`], W[`${proj2}_w`], pod,
+    W[`${proj2}_b`], rIdx,
+  ]
+  const podGate = u32([D / 8, D / 64, F, 0, 2 * F])
+  const podDown = u32([F / 8, F / 64, D, F, D])
+  steps.push(
+    [mmMoe, bgMoe(gu, 0, SLOTS * GU, n2, 'gate_proj', podGate), [F / RPW, 1, SLOTS]],
+    [mmMoe, bgMoe(gu, F * 2, SLOTS * GU - F * 2, n2, 'up_proj', podGate), [F / RPW, 1, SLOTS]],
+    [silu, [hh, gu, buffer(device, new Int32Array([SLOTS, Math.ceil(SLOTS * F / 256)]),
+                           BU.UNIFORM | BU.COPY_DST)], [Math.ceil(SLOTS * F / 256)]],
+    [mmMoe, bgMoe(dOut, 0, SLOTS * D * 2, hh, 'down_proj', podDown), [D / RPW, 1, SLOTS]],
+    [comb, [moeOut, dOut, rScore, u32([D, SLOTS])], [Math.ceil(D / 256)]],
+  )
+
+  const bytes = await runChain(device, steps,
+    [[r, D * 2], [h, D * 2], [n2, D * 2], [moeOut, D * 4]])
+  const hf = (b) => Array.from(new Uint16Array(b), f16BitsToF32)
+  const hArr = hf(bytes[1]), mArr = new Float32Array(bytes[3])
+  const y = hArr.map((v, i) => v + mArr[i])
+  const stages = [
+    ['linear_attn', hf(bytes[0]), 'r_ref_f32'],
+    ['x + r', hArr, 'h_ref_f32'],
+    ['post_attn norm', hf(bytes[2]), 'norm2_ref_f32'],
+    ['MoE', mArr, 'moe_ref_f32'],
+    ['h + MoE', y, 'y_ref_f32'],
+  ].map(([name, got, ref]) => [name, relErr(got, rd(ref, Float32Array))])
+
+  const worst = Math.max(...stages.map(([, e]) => e))
+  return {
+    pass: worst < 0.005,
+    detail: stages.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ') + ' (15 dispatches)',
+  }
+}
+
 const KERNELS = {
   affine_matmul: affineMatmul, moe_block: moeBlock,
-  qwen36_gdn: qwen36Gdn, qwen36_attn: qwen36Attn,
+  qwen36_gdn: qwen36Gdn, qwen36_attn: qwen36Attn, qwen36_layer: qwen36Layer,
 }
 
 async function main() {
