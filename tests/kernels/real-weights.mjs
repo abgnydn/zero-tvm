@@ -22,7 +22,7 @@ import { getDevice, pipelineFor, buffer, runCompute, BU, MM } from './gpu.mjs'
 import { f16Array, f16BitsToF32 } from './half.mjs'
 import { int4MatmulWGSL, int4MatmulEntry } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import { withPrelude } from '../../src/compiler/shader-prelude.ts'
-import { QWEN35_4B, makeModelSpec } from '../../src/compiler/model-spec.ts'
+import { QWEN35_4B, QWEN36_35B_A3B } from '../../src/compiler/model-spec.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const REFS = join(ROOT, '.weights-local/kernel-refs')
@@ -227,24 +227,9 @@ async function moeBlock(device, dir, meta) {
 }
 
 
-// ── Qwen3.6-35B-A3B shape ────────────────────────────────────────────────────
-//
-// Derived here rather than added to model-spec.ts: a shipped spec also has to
-// carry `paramNaming`, and Qwen3.6 loads from MLX safetensors (weight/scales/
-// BIASES triples) rather than the MLC records every existing spec names — that
-// interface change belongs with the loader, not ahead of it. Only the shape
-// fields matter to the shader prelude, and they are what these tests exercise.
-// GDN dims are IDENTICAL to Qwen3.5's, which is why its kernels carry over.
-const QWEN36 = makeModelSpec({
-  ...QWEN35_4B,
-  id: 'qwen36-35b-a3b',
-  d: 2048,
-  layers: 40,
-  kvHeads: 2,
-  ffn: 512,                 // moe_intermediate_size — silu_mul's per-slot stride
-  tiedEmbeddings: false,    // lm_head is its own 248320 x 2048 tensor
-  hfRepo: 'lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit',
-})
+// The shipped spec, so these tests exercise what the engine will actually use
+// rather than a shape derived beside it.
+const QWEN36 = QWEN36_35B_A3B
 
 /** Chain kernels in one pass, then read the requested buffers back. */
 async function runChain(device, steps, reads) {
