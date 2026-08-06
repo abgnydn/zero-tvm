@@ -12,14 +12,14 @@ same file as this table's source, so they cannot drift far.
 |---|---|---|---|
 | Weight format | MLC q4f16_1 shards (group 32, symmetric); MLX safetensors (group 64, affine, 4-bit; 8-bit router; 3-bit expert stacks via convert-q3-experts) | f16/bf16 unquantised, GPTQ/AWQ, other group sizes | new dequant paths in int4_matmul.gen.ts |
 | Attention | MHA and GQA, headDim %32 ≤256, full RoPE or partial (rotary fraction), qk-norm optional, gated attention (Qwen3.5/3.6), paged f16 KV; int8 KV for headDim ≤128 | sliding window, MLA, ALiBi, softcap, attention biases | windowed/MLA variants of attention.wgsl; bias epilogue in matmuls |
-| RoPE | plain theta (any base), partial rotary factor | llama3 / yarn / longrope frequency scaling | precomputed frequency-table binding in rope.wgsl |
+| RoPE | plain theta (any base), partial rotary factor, llama3 frequency scaling (precomputed inv_freq table) | yarn / longrope frequency scaling | a frequency formula in model-spec.ts ropeInvFreqTable() — rope.wgsl already reads the table |
 | FFN | SwiGLU dense (fused kernel for MLC, matmul+silu_mul chain for MLX-affine) | GeGLU / ReLU / non-gated FFN, FFN biases | activation-parameterised fused_ffn.wgsl + silu_mul.wgsl |
 | Norm | RMSNorm with plain gamma | LayerNorm (beta), Gemma-style (1+gamma), post-norm sandwiches | variants of rms_norm/add_norm.wgsl |
 | MoE | ≤256 routed experts, top-K ≤32, stacked shared expert (width == moe_intermediate), 8-bit router, norm_topk_prob; subgroups required | MoE without shared expert (Mixtral, Qwen3-MoE), grouped/expert-parallel routing | optional-shared-slot layout in loader + moe_router_topk.wgsl |
-| Linear attention | GatedDeltaNet (Qwen3.5/3.6): GVA, headV %32 ≤256, conv width 4 | Mamba/S4, RWKV, other conv widths | new recurrence kernels |
+| Linear attention | GatedDeltaNet (Qwen3.5/3.6): GVA, headV %32 ≤256, conv width 4 | Mamba/S4, RWKV, conv hybrids (LFM2 layer_types 'conv'), other conv widths | new recurrence kernels |
 | Embedding / head | quantised embedding (symmetric or affine), tied or untied lm_head, vocab %4 | unquantised embedding tables | f16 gather path |
 | Tokenizer | SentencePiece (Phi-3), byte-level BPE (Qwen/Llama-style tokenizer.json) | tekken, WordPiece, custom pipelines | new pipeline beside tokenizer-bpe.ts |
-| Chat template | Phi-3, ChatML (non-thinking) | Llama-3 header template, Gemma turns, thinking-mode rendering | renderer branch in model-select.ts |
+| Chat template | Phi-3, ChatML (non-thinking), Llama-3 header template | Gemma turns, thinking-mode rendering | renderer branch in model-select.ts |
 | Decoding | greedy argmax, streaming, cross-turn prefix reuse | sampling (temperature/top-p), batch > 1 | sampling kernel after logits |
 
 Dimension rules (all enforced by the checker): heads divisible by kvHeads;

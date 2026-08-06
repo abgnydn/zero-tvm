@@ -90,6 +90,10 @@ async function json(file) {
   try { return JSON.parse(new TextDecoder().decode(await whole(file))) }
   catch { return null }
 }
+async function text(file) {
+  try { return new TextDecoder().decode(await whole(file)) }
+  catch { return null }
+}
 
 console.log(`probing ${localDir ?? repo} …`)
 const cfg = await json('config.json')
@@ -129,11 +133,16 @@ if (quantCfg) {
   }
 }
 
-// Chat template — from tokenizer_config (string, or a named list on newer repos).
+// Chat template — from tokenizer_config (string, or a named list on newer
+// repos), else the standalone chat_template.jinja file the current HF
+// convention ships (e.g. Qwen3-4B-Instruct-2507: no tokenizer_config
+// template at all — skipping the jinja file made real ChatML repos red).
 const templates = typeof tokCfg.chat_template === 'string' ? [tokCfg.chat_template]
   : Array.isArray(tokCfg.chat_template) ? tokCfg.chat_template.map((t) => t.template ?? '') : []
-const templateText = templates.join('\n')
+let templateText = templates.join('\n')
+if (!templateText) templateText = (await text('chat_template.jinja')) ?? ''
 const chatTemplate = templateText.includes('<|im_start|>') ? 'chatml'
+  : templateText.includes('<|start_header_id|>') ? 'llama3'
   : templateText.includes('<|user|>') && templateText.includes('<|end|>') ? 'phi3'
   : 'unknown'
 
@@ -151,6 +160,8 @@ const addedId = (content) => tok?.added_tokens?.find((t) => t.content === conten
 const eosIds = [tc.eos_token_id].flat().filter((v) => typeof v === 'number')
 const stops = chatTemplate === 'chatml'
   ? [addedId('<|im_end|>'), addedId('<|endoftext|>')].filter((v) => v !== null)
+  : chatTemplate === 'llama3'
+  ? [addedId('<|eot_id|>'), addedId('<|end_of_text|>')].filter((v) => v !== null)
   : eosIds
 if (!stops.length) stops.push(...eosIds)
 
@@ -167,6 +178,14 @@ const detected = {
   vocab: num(tc.vocab_size),
   ropeTheta: num(tc.rope_theta),
   ropeScalingType: tc.rope_scaling ? (tc.rope_scaling.rope_type ?? tc.rope_scaling.type ?? 'unknown') : null,
+  // llama3 remapping params for ropeInvFreqTable() (checked complete by the
+  // rope rule); other scaling types carry no params — they are red anyway.
+  ropeScaling: (tc.rope_scaling?.rope_type ?? tc.rope_scaling?.type) === 'llama3' ? {
+    factor: num(tc.rope_scaling.factor),
+    lowFreqFactor: num(tc.rope_scaling.low_freq_factor),
+    highFreqFactor: num(tc.rope_scaling.high_freq_factor),
+    originalMaxPositionEmbeddings: num(tc.rope_scaling.original_max_position_embeddings),
+  } : null,
   rmsEps: num(tc.rms_norm_eps),
   maxSeq: num(tc.max_position_embeddings),
   tied: tc.tie_word_embeddings === true
@@ -193,6 +212,9 @@ const detected = {
   } : null,
   attnGate: isGdn,   // both shipped GDN families (Qwen3.5/3.6) gate attention
   partialRotaryFactor: num(tc.partial_rotary_factor),
+  // Verbatim per-layer block claim — the checker refuses unknown kinds (LFM2's
+  // 'conv' would otherwise detect as plain attention and fake-green).
+  layerTypes: Array.isArray(tc.layer_types) ? tc.layer_types : null,
   hasIndex: !!checkpoint,
   tokenizer: tokKind,
   chatTemplate,
@@ -266,6 +288,10 @@ const lines = [
   `  maxPages: ${maxPages},`,
   `  maxSeq: ${detected.maxSeq},`,
   `  ropeTheta: ${detected.ropeTheta},`,
+  ...(detected.ropeScaling ? [
+    `  // llama3 frequency remapping — ropeInvFreqTable() precomputes the table.`,
+    `  ropeScaling: { ropeType: 'llama3', factor: ${detected.ropeScaling.factor}, lowFreqFactor: ${detected.ropeScaling.lowFreqFactor}, highFreqFactor: ${detected.ropeScaling.highFreqFactor}, originalMaxPositionEmbeddings: ${detected.ropeScaling.originalMaxPositionEmbeddings} },`,
+  ] : []),
   `  rmsEps: ${detected.rmsEps},`,
   `  tiedEmbeddings: ${detected.tied},`,
   `  qkNorm: ${detected.qkNorm},`,
@@ -298,6 +324,7 @@ const spec = makeModelSpec({
   id, d: detected.d, layers: detected.layers, heads: detected.heads, kvHeads: detected.kvHeads,
   headDim: detected.headDim, ffn: detected.ffn, vocab: detected.vocab, pageSize: 16, maxPages,
   maxSeq: detected.maxSeq, ropeTheta: detected.ropeTheta, rmsEps: detected.rmsEps,
+  ...(detected.ropeScaling ? { ropeScaling: { ropeType: 'llama3', ...detected.ropeScaling } } : {}),
   tiedEmbeddings: detected.tied, qkNorm: detected.qkNorm, stops, chatTemplateId: chatTemplate,
   tokenizerKind: tokKind, hfRepo: repo, manifestName: 'model.safetensors.index.json',
   weightFormat: 'mlx-safetensors', mlxPrefix,

@@ -64,6 +64,15 @@ export interface DetectedModel {
   vocab: number | null
   ropeTheta: number | null
   ropeScalingType: string | null   // rope_scaling.rope_type, null = plain RoPE
+  /** The llama3 remapping parameters, when ropeScalingType is 'llama3' —
+   *  everything ropeInvFreqTable() needs. Other scaling types stay null
+   *  (and red below). */
+  ropeScaling: {
+    factor: number | null
+    lowFreqFactor: number | null
+    highFreqFactor: number | null
+    originalMaxPositionEmbeddings: number | null
+  } | null
   rmsEps: number | null
   maxSeq: number | null
   tied: boolean
@@ -76,9 +85,12 @@ export interface DetectedModel {
   gdn: DetectedGdn | null
   attnGate: boolean           // gated attention (per-head [Q|gate] in q_proj)
   partialRotaryFactor: number | null
+  /** config `layer_types`, verbatim — a POSITIVE per-layer block claim.
+   *  null when the config has none (uniform attention assumed). */
+  layerTypes: string[] | null
   hasIndex: boolean           // model.safetensors.index.json exists
   tokenizer: 'byteLevel' | 'spm' | 'unknown'
-  chatTemplate: 'chatml' | 'phi3' | 'unknown'
+  chatTemplate: 'chatml' | 'phi3' | 'llama3' | 'unknown'
 }
 
 export interface Failure {
@@ -140,9 +152,21 @@ export function checkModel(m: DetectedModel): CheckResult {
     fail('activation', `hidden_act is '${m.hiddenAct}'`,
       'silu_mul.wgsl and fused_ffn.wgsl hardcode SiLU — a GeGLU/other-activation variant of both')
   }
-  if (m.ropeScalingType !== null) {
-    fail('rope', `rope_scaling '${m.ropeScalingType}' (llama3/yarn-style frequency remapping)`,
-      'rope.wgsl computes theta^(-2i/d) inline — scaled RoPE needs a precomputed frequency table binding')
+  // llama3 scaling is green: rope.wgsl binds a precomputed inv_freq table and
+  // ropeInvFreqTable() implements the llama3 piecewise remapping. yarn /
+  // longrope are DIFFERENT formulas and stay red until someone writes them.
+  if (m.ropeScalingType !== null && m.ropeScalingType !== 'llama3') {
+    fail('rope', `rope_scaling '${m.ropeScalingType}' (yarn/longrope-style frequency remapping)`,
+      'a frequency formula in model-spec.ts ropeInvFreqTable() — rope.wgsl already reads the table')
+  }
+  if (m.ropeScalingType === 'llama3') {
+    const rs = m.ropeScaling
+    const missing = !rs || [rs.factor, rs.lowFreqFactor, rs.highFreqFactor, rs.originalMaxPositionEmbeddings]
+      .some((v) => typeof v !== 'number')
+    if (missing) {
+      fail('rope', 'rope_scaling llama3 without factor/low_freq_factor/high_freq_factor/original_max_position_embeddings',
+        'the full parameter set in config.json — ropeInvFreqTable() cannot remap without it')
+    }
   }
   if (m.attnBias) {
     fail('bias', 'linear-layer biases (attention_bias / *.bias records)',
@@ -151,6 +175,20 @@ export function checkModel(m: DetectedModel): CheckResult {
   if (m.slidingWindow) {
     fail('attention', 'sliding-window attention',
       'attention.wgsl walks every KV page unconditionally — windowed variants plus page eviction')
+  }
+  // layer_types is a POSITIVE per-layer block claim, and the checker must
+  // refuse what it does not recognise: LFM2's 'conv' blocks would otherwise
+  // detect as plain attention (nothing above knows conv exists) and pass every
+  // dimension rule — a fake green that only dies at logits time.
+  // 'linear_attention' is known only when the GDN dims resolved; the same
+  // string on a non-GDN family would run a kernel chain that does not match.
+  if (m.layerTypes) {
+    const known = new Set(['full_attention', 'attention'])
+    if (m.gdn) known.add('linear_attention')
+    for (const t of new Set(m.layerTypes.filter((t) => !known.has(t)))) {
+      fail('blocks', `layer_types contains unknown block type '${t}'`,
+        `a kernel family for '${t}' blocks — only full attention and GatedDeltaNet linear attention exist here`)
+    }
   }
 
   // ── dimensions ─────────────────────────────────────────────
@@ -212,8 +250,8 @@ export function checkModel(m: DetectedModel): CheckResult {
       'a third tokenizer pipeline in src/zero-tvm/ (tokenizer.ts covers SPM, tokenizer-bpe.ts byte-level BPE)')
   }
   if (m.chatTemplate === 'unknown') {
-    fail('template', 'chat template is neither Phi-3 nor ChatML',
-      'a renderer branch in model-select.ts buildChatPromptFor (only phi3 and chatml non-thinking exist)')
+    fail('template', 'chat template is neither Phi-3, ChatML, nor Llama-3',
+      'a renderer branch in model-select.ts buildChatPromptFor (phi3, chatml non-thinking, and llama3 exist)')
   }
 
   // ── notes that gate flags, not support ─────────────────────
@@ -238,13 +276,13 @@ export interface MatrixRow {
 export const SUPPORT_MATRIX: MatrixRow[] = [
   { area: 'Weight format', supported: 'MLC q4f16_1 shards (group 32, symmetric); MLX safetensors (group 64, affine, 4-bit; 8-bit router; 3-bit expert stacks via convert-q3-experts)', not: 'f16/bf16 unquantised, GPTQ/AWQ, other group sizes', needs: 'new dequant paths in int4_matmul.gen.ts' },
   { area: 'Attention', supported: 'MHA and GQA, headDim %32 ≤256, full RoPE or partial (rotary fraction), qk-norm optional, gated attention (Qwen3.5/3.6), paged f16 KV; int8 KV for headDim ≤128', not: 'sliding window, MLA, ALiBi, softcap, attention biases', needs: 'windowed/MLA variants of attention.wgsl; bias epilogue in matmuls' },
-  { area: 'RoPE', supported: 'plain theta (any base), partial rotary factor', not: 'llama3 / yarn / longrope frequency scaling', needs: 'precomputed frequency-table binding in rope.wgsl' },
+  { area: 'RoPE', supported: 'plain theta (any base), partial rotary factor, llama3 frequency scaling (precomputed inv_freq table)', not: 'yarn / longrope frequency scaling', needs: 'a frequency formula in model-spec.ts ropeInvFreqTable() — rope.wgsl already reads the table' },
   { area: 'FFN', supported: 'SwiGLU dense (fused kernel for MLC, matmul+silu_mul chain for MLX-affine)', not: 'GeGLU / ReLU / non-gated FFN, FFN biases', needs: 'activation-parameterised fused_ffn.wgsl + silu_mul.wgsl' },
   { area: 'Norm', supported: 'RMSNorm with plain gamma', not: 'LayerNorm (beta), Gemma-style (1+gamma), post-norm sandwiches', needs: 'variants of rms_norm/add_norm.wgsl' },
   { area: 'MoE', supported: '≤256 routed experts, top-K ≤32, stacked shared expert (width == moe_intermediate), 8-bit router, norm_topk_prob; subgroups required', not: 'MoE without shared expert (Mixtral, Qwen3-MoE), grouped/expert-parallel routing', needs: 'optional-shared-slot layout in loader + moe_router_topk.wgsl' },
-  { area: 'Linear attention', supported: 'GatedDeltaNet (Qwen3.5/3.6): GVA, headV %32 ≤256, conv width 4', not: 'Mamba/S4, RWKV, other conv widths', needs: 'new recurrence kernels' },
+  { area: 'Linear attention', supported: 'GatedDeltaNet (Qwen3.5/3.6): GVA, headV %32 ≤256, conv width 4', not: 'Mamba/S4, RWKV, conv hybrids (LFM2 layer_types \'conv\'), other conv widths', needs: 'new recurrence kernels' },
   { area: 'Embedding / head', supported: 'quantised embedding (symmetric or affine), tied or untied lm_head, vocab %4', not: 'unquantised embedding tables', needs: 'f16 gather path' },
   { area: 'Tokenizer', supported: 'SentencePiece (Phi-3), byte-level BPE (Qwen/Llama-style tokenizer.json)', not: 'tekken, WordPiece, custom pipelines', needs: 'new pipeline beside tokenizer-bpe.ts' },
-  { area: 'Chat template', supported: 'Phi-3, ChatML (non-thinking)', not: 'Llama-3 header template, Gemma turns, thinking-mode rendering', needs: 'renderer branch in model-select.ts' },
+  { area: 'Chat template', supported: 'Phi-3, ChatML (non-thinking), Llama-3 header template', not: 'Gemma turns, thinking-mode rendering', needs: 'renderer branch in model-select.ts' },
   { area: 'Decoding', supported: 'greedy argmax, streaming, cross-turn prefix reuse', not: 'sampling (temperature/top-p), batch > 1', needs: 'sampling kernel after logits' },
 ]
