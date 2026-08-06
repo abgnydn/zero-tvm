@@ -5,9 +5,11 @@
  * Two modes, decided by the URL fragment:
  *   share.html?model=qwen36q3      HOST — boots the engine (same composition
  *                                  as chat.ts), opens a room, serves requests
- *   share.html#<roomId>            GUEST — thin chat client; needs no WebGPU,
- *                                  downloads nothing, learns the model's name
- *                                  over the channel
+ *   share.html#<roomId>            GUEST — the chat page's own conversational
+ *                                  surface (chat-ui.ts + chat-ui.css) over a
+ *                                  DataChannel; needs no WebGPU, downloads
+ *                                  nothing, learns the model's identity over
+ *                                  the channel
  *
  * Privacy model: the signaling worker (workers/share-signal) relays only
  * SDP/ICE JSON; prompts and tokens travel the DataChannel, which WebRTC
@@ -30,12 +32,14 @@
  * boundary bugs is worth far more than the bytes.
  */
 
-import { renderMarkdown } from './markdown.js'
+import {
+  setChatIdentity, quantTagFor, autoGrow, wireScrollFab,
+  addUserMsg, addAiMsg, type AiMsgHandle,
+} from './chat-ui.js'
 
 // Signaling endpoint. Dev: `npx wrangler dev --port 8787` in
-// workers/share-signal (what scripts/share-e2e.mjs spawns). The production
-// URL is stamped here at first deploy of the worker. (Same import.meta cast
-// as weight-loader.ts — the repo has no vite/client types.)
+// workers/share-signal (what scripts/share-e2e.mjs spawns). (Same import.meta
+// cast as weight-loader.ts — the repo has no vite/client types.)
 const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
 const SIGNAL_BASE = DEV
   ? 'ws://localhost:8787'
@@ -53,7 +57,7 @@ interface ChatReq { type: 'chat'; id: number; messages: { role: 'system' | 'user
 interface StopReq { type: 'stop'; id: number }
 type GuestMsg = ChatReq | StopReq
 type HostMsg =
-  | { type: 'info'; name: string; params: string; rateLabel: string }
+  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string }
   | { type: 'text'; id: number; full: string }
   | { type: 'done'; id: number; tokens: number; tps: number }
   | { type: 'busy'; id: number; pos: number }
@@ -90,6 +94,38 @@ async function runHost(): Promise<void> {
   const spec = specFromSearch(location.search)
   const brand = modelBranding(spec)
   $('page-title').textContent = `Sharing ${brand.name}`
+
+  // ── keep-awake: screen wake-lock + a silent audio track. The wake lock
+  // stops the machine sleeping; the audio track is the standard exemption
+  // from background-tab throttling (measured: a backgrounded host generated
+  // at ~23 tok/s where the focused tab does ~65). Both are user-toggled and
+  // honestly labeled — the browser shows its audio indicator on the tab.
+  const awake = $('awake') as HTMLInputElement
+  let wakeLock: WakeLockSentinel | null = null
+  let audioCtx: AudioContext | null = null
+  async function applyAwake(on: boolean): Promise<void> {
+    if (on) {
+      try { wakeLock = await navigator.wakeLock.request('screen') } catch { /* unsupported / not visible */ }
+      if (!audioCtx) {
+        audioCtx = new AudioContext()
+        const osc = audioCtx.createOscillator()
+        const gain = audioCtx.createGain()
+        gain.gain.value = 0.0001   // inaudible, but "playing" as far as the scheduler cares
+        osc.connect(gain).connect(audioCtx.destination)
+        osc.start()
+      }
+      void audioCtx.resume()
+    } else {
+      void wakeLock?.release().catch(() => {})
+      wakeLock = null
+      void audioCtx?.suspend()
+    }
+  }
+  awake.addEventListener('change', () => void applyAwake(awake.checked))
+  document.addEventListener('visibilitychange', () => {
+    // The UA releases wake locks on hide; re-acquire when we come back.
+    if (awake.checked && document.visibilityState === 'visible') void applyAwake(true)
+  })
 
   // Same engine composition as chat.ts — this is the throughput path, not the
   // scalar validation path.
@@ -206,7 +242,10 @@ async function runHost(): Promise<void> {
     peers.set(guest, entry)
     const dc = pc.createDataChannel('chat', { ordered: true })
     entry.dc = dc
-    dc.onopen = () => send(guest, { type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel })
+    dc.onopen = () => send(guest, {
+      type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel,
+      tag: quantTagFor(spec),
+    })
     dc.onmessage = (e) => onGuestMessage(guest, String(e.data))
     pc.onicecandidate = (e) => {
       if (e.candidate) ws.send(JSON.stringify({ to: guest, type: 'ice', candidate: e.candidate }))
@@ -235,18 +274,18 @@ async function runHost(): Promise<void> {
 }
 
 // ============================================================
-// GUEST
+// GUEST — chat-ui.ts's surface over a DataChannel
 // ============================================================
 
 async function runGuest(roomId: string): Promise<void> {
   $('guest-view').classList.remove('hidden')
-  $('page-title').textContent = 'Remote model'
   const setStatus = (t: string) => { $('guest-status').textContent = t }
   const setBadge = (t: string, cls: 'loading' | 'ready' | 'error') => {
-    $('badge').className = `badge ${cls}`
-    $('badge-text').textContent = t
+    $('guest-badge').className = `badge ${cls}`
+    $('guest-badge-text').textContent = t
   }
   setBadge('Connecting', 'loading')
+  wireScrollFab()
 
   const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
   const pc = new RTCPeerConnection(ICE)
@@ -254,52 +293,46 @@ async function runGuest(roomId: string): Promise<void> {
 
   const history: ChatReq['messages'] = []
   let reqId = 0
-  let liveBody: HTMLElement | null = null
-  let liveMeta: HTMLElement | null = null
+  let live: AiMsgHandle | null = null
+  let liveFull = ''
 
   const inp = $('inp') as HTMLTextAreaElement
-  const sendBtn = $('send') as HTMLButtonElement
+  const sendBtn = $('btn') as HTMLButtonElement
+  const stopBtn = $('stop-btn') as HTMLButtonElement
+  const setGenerating = (on: boolean): void => {
+    sendBtn.hidden = on
+    stopBtn.hidden = !on
+    sendBtn.disabled = on
+  }
 
-  const addMsg = (cls: 'user' | 'ai', text: string): HTMLElement => {
-    const div = document.createElement('div')
-    div.className = `msg ${cls}`
-    const body = document.createElement('div')
-    body.textContent = text
-    div.appendChild(body)
-    if (cls === 'ai') {
-      const meta = document.createElement('div')
-      meta.className = 'meta'
-      div.appendChild(meta)
-      liveMeta = meta
-    }
-    $('messages').appendChild(div)
-    div.scrollIntoView({ block: 'end' })
-    return body
+  const settle = (): void => {
+    live = null
+    setGenerating(false)
   }
 
   const onHostMsg = (msg: HostMsg): void => {
     if (msg.type === 'info') {
-      $('guest-model').textContent = `${msg.name} — ${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''}`
-      setStatus('Connected. The model runs on the host machine; this page holds only the conversation.')
+      setChatIdentity(msg.name, msg.tag)
+      $('guest-model').textContent = `${msg.name} — remote`
+      setStatus(`${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''} · runs on the host machine; this page holds only the conversation.`)
       setBadge('Ready', 'ready')
       inp.disabled = false
+      inp.placeholder = 'Message the remote model…'
       sendBtn.disabled = false
     } else if (msg.type === 'text') {
-      if (liveBody) {
-        liveBody.replaceChildren(renderMarkdown(msg.full))
-        liveBody.parentElement?.scrollIntoView({ block: 'end' })
-      }
+      liveFull = msg.full
+      live?.render(liveFull)
     } else if (msg.type === 'done') {
-      if (liveMeta) liveMeta.textContent = `${msg.tokens} tok · ${msg.tps.toFixed(1)} tok/s`
-      if (liveBody) history.push({ role: 'assistant', content: liveBody.textContent ?? '' })
-      liveBody = null
-      sendBtn.disabled = false
+      if (live) {
+        live.finish({ fullText: liveFull, tokens: msg.tokens, tokPerS: msg.tps })
+        history.push({ role: 'assistant', content: liveFull })
+      }
+      settle()
     } else if (msg.type === 'busy') {
       setStatus(`Host is generating for someone else — queue position ${msg.pos}.`)
     } else if (msg.type === 'error') {
-      if (liveBody) liveBody.textContent = `⚠ ${msg.message}`
-      liveBody = null
-      sendBtn.disabled = false
+      if (live) live.body.textContent = `⚠ ${msg.message}`
+      settle()
     }
   }
 
@@ -333,15 +366,22 @@ async function runGuest(roomId: string): Promise<void> {
 
   const submit = (): void => {
     const text = inp.value.trim()
-    if (!text || !dc || dc.readyState !== 'open') return
+    if (!text || live || !dc || dc.readyState !== 'open') return
     inp.value = ''
-    sendBtn.disabled = true
+    autoGrow(inp)
     history.push({ role: 'user', content: text })
-    addMsg('user', text)
-    liveBody = addMsg('ai', '…')
+    addUserMsg(text)
+    live = addAiMsg()
+    live.showThinking()
+    liveFull = ''
+    setGenerating(true)
     dc.send(JSON.stringify({ type: 'chat', id: ++reqId, messages: [...history] } satisfies ChatReq))
   }
-  sendBtn.addEventListener('click', submit)
+  ;($('composer') as HTMLFormElement).addEventListener('submit', (e) => { e.preventDefault(); submit() })
+  stopBtn.addEventListener('click', () => {
+    if (dc?.readyState === 'open') dc.send(JSON.stringify({ type: 'stop', id: reqId } satisfies StopReq))
+  })
+  inp.addEventListener('input', () => autoGrow(inp))
   inp.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
   })

@@ -21,8 +21,11 @@ import {
 } from './engine-core.js'
 import { parseVariantFlags } from './variants.js'
 import { bootEngine, setBadge } from './loading-ui.js'
-import { renderMarkdown, wireCopyButton, ICON_REFRESH } from './markdown.js'
 import { installBenchConsole } from './bench-console.js'
+import {
+  setChatIdentity, quantTagFor, autoGrow,
+  wireScrollFab, addUserMsg, addAiMsg, type AiMsgHandle,
+} from './chat-ui.js'
 
 // ============================================================
 // Active model — ?model=qwen3 selects Qwen3-4B, default is Phi-3.
@@ -30,11 +33,10 @@ import { installBenchConsole } from './bench-console.js'
 
 const SPEC = specFromSearch(location.search)
 const BRAND = modelBranding(SPEC)
-// Quant label for the message header + gate copy — from the spec, not a
-// literal: MLX checkpoints are affine group-64, not MLC's q4f16_1.
-const QUANT_TAG = SPEC.weightFormat === 'mlx-safetensors'
-  ? (SPEC.moe?.bits === 3 ? 'MLX 3-bit experts' : 'MLX 4-bit')
-  : 'q4f16_1'
+// Quant label for the message header + gate copy — derived in chat-ui.ts so
+// the remote guest page shows the same truth.
+const QUANT_TAG = quantTagFor(SPEC)
+setChatIdentity(BRAND.name, QUANT_TAG)
 // Dispatches per decode token: Phi-3 runs the fused path (32×7+4 = 228);
 // qkNorm specs (Qwen3) run unfused with the fused qk_norm+RoPE+append kernel
 // (default ?fuseqk on: 36×8+4 = 292; the reference chain is 10/layer); hybrid
@@ -87,171 +89,8 @@ function showLoadingError(msg: string, onRetry?: () => void) {
   el.classList.add('visible')
 }
 
-function hideWelcome() {
-  const w = $('welcome')
-  if (w && !w.classList.contains('hidden')) w.classList.add('hidden')
-}
-
-function autoGrow(ta: HTMLTextAreaElement) {
-  ta.style.height = 'auto'
-  ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
-}
-
-function scrollToBottom(force = false) {
-  const main = $('chat-main')
-  if (!main) return
-  const distance = main.scrollHeight - main.scrollTop - main.clientHeight
-  if (force || distance < 120) main.scrollTop = main.scrollHeight
-}
-
-let scrollFabWired = false
-function wireScrollFab() {
-  if (scrollFabWired) return
-  const main = $('chat-main'); const fab = $('scroll-fab')
-  if (!main || !fab) return
-  scrollFabWired = true
-  const update = () => {
-    const distance = main.scrollHeight - main.scrollTop - main.clientHeight
-    fab.classList.toggle('visible', distance > 140)
-  }
-  main.addEventListener('scroll', update, { passive: true })
-  fab.addEventListener('click', () => scrollToBottom(true))
-  update()
-}
-
-// ---------- Message construction ----------
-
-function addUserMsg(text: string): void {
-  hideWelcome()
-  const wrap = document.createElement('div')
-  wrap.className = 'msg user'
-  const bubble = document.createElement('div')
-  bubble.className = 'bubble'
-  bubble.textContent = text
-  wrap.appendChild(bubble)
-  $('messages')?.appendChild(wrap)
-  scrollToBottom(true)
-}
-
-interface AiMsgHandle {
-  wrap: HTMLElement
-  body: HTMLElement
-  cursor: HTMLElement
-  /** Replace the role tag with a thinking indicator (before first token). */
-  showThinking(): void
-  /** Re-render the full text (Markdown) into body on next animation frame. */
-  render(text: string): void
-  /** Remove cursor, add copy + stats + regenerate actions, stop streaming.
-   *  `notice` renders a persistent banner under the reply — used when the
-   *  reply was cut short, so it never just stops mid-word in silence. */
-  finish(opts: {
-    fullText: string
-    tokens: number
-    tokPerS: number
-    onRegenerate?: () => void
-    notice?: { text: string; onContinue?: () => void }
-  }): void
-}
-
-function addAiMsg(): AiMsgHandle {
-  hideWelcome()
-  const wrap = document.createElement('div')
-  wrap.className = 'msg ai'
-  wrap.innerHTML = `
-    <div class="role">
-      <span class="role-dot">Z</span>
-      <span class="role-name"></span>
-      <span class="model-tag">${QUANT_TAG}</span>
-    </div>
-    <div class="body"></div>
-    <div class="actions"></div>
-  `
-  ;(wrap.querySelector('.role-name') as HTMLElement).textContent = BRAND.name
-  const body = wrap.querySelector('.body') as HTMLElement
-  const cursor = document.createElement('span')
-  cursor.className = 'cursor'
-  body.appendChild(cursor)
-  $('messages')?.appendChild(wrap)
-  scrollToBottom(true)
-
-  let rafPending = false
-  let latestText = ''
-  const doRender = () => {
-    rafPending = false
-    const frag = renderMarkdown(latestText)
-    body.replaceChildren(frag, cursor)
-    scrollToBottom(false)
-  }
-
-  return {
-    wrap, body, cursor,
-    showThinking() {
-      // Replace the empty body (just cursor) with a thinking indicator.
-      body.replaceChildren()
-      const t = document.createElement('span')
-      t.className = 'thinking'
-      t.innerHTML = '<span></span><span></span><span></span>'
-      body.appendChild(t)
-    },
-    render(text: string) {
-      latestText = text
-      if (!rafPending) {
-        rafPending = true
-        requestAnimationFrame(doRender)
-      }
-    },
-    finish({ fullText, tokens, tokPerS, onRegenerate, notice }) {
-      // Ensure final markdown render without cursor.
-      const frag = renderMarkdown(fullText)
-      body.replaceChildren(frag)
-      // A resumed reply re-runs finish() on the same message — drop the
-      // banner that made it resumable before rebuilding.
-      wrap.querySelector('.truncation')?.remove()
-      const actions = wrap.querySelector('.actions') as HTMLElement | null
-      if (!actions) return
-      actions.replaceChildren()
-
-      const copy = document.createElement('button')
-      copy.type = 'button'
-      copy.className = 'action-btn'
-      wireCopyButton(copy, () => fullText)
-      actions.appendChild(copy)
-
-      if (onRegenerate) {
-        const regen = document.createElement('button')
-        regen.type = 'button'
-        regen.className = 'action-btn'
-        regen.innerHTML = `${ICON_REFRESH}<span>Regenerate</span>`
-        regen.addEventListener('click', onRegenerate)
-        actions.appendChild(regen)
-      }
-
-      const stats = document.createElement('span')
-      stats.className = 'msg-stats'
-      stats.textContent = `${tokens} tok · ${tokPerS.toFixed(1)} tok/s`
-      actions.appendChild(stats)
-
-      // .actions is hover-revealed; the cut-short banner must not be, so it
-      // gets its own always-visible row between the body and the actions.
-      if (notice) {
-        const el = document.createElement('div')
-        el.className = 'truncation'
-        const label = document.createElement('span')
-        label.textContent = notice.text
-        el.appendChild(label)
-        if (notice.onContinue) {
-          const btn = document.createElement('button')
-          btn.type = 'button'
-          btn.className = 'truncation-btn'
-          btn.textContent = 'Continue'
-          btn.addEventListener('click', notice.onContinue)
-          el.appendChild(btn)
-        }
-        wrap.insertBefore(el, actions)
-      }
-    },
-  }
-}
+// Message surface (bubbles, streaming markdown, actions, scroll) lives in
+// chat-ui.ts, shared verbatim with the remote-guest page (share.ts).
 
 // ============================================================
 // Boot helpers — SW registration, cache probe, download-gate UI

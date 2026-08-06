@@ -67,6 +67,9 @@ try {
   await host.waitForFunction(() => window.__shareReady === true, { timeout: 8 * 60_000, polling: 1000 })
   const link = await host.evaluate(() => window.__shareLink)
   console.log(`host ready — room link: ${link}`)
+  // Keep-awake toggle: wake lock may be denied under automation (caught in
+  // page code); what this asserts is that the AudioContext path doesn't throw.
+  await host.click('#awake')
 
   // ── GUEST ──
   const guest = await browser.newPage()
@@ -76,15 +79,16 @@ try {
   console.log('guest: DataChannel open (info received)')
 
   await guest.type('#inp', 'What is the capital of France? Answer in one short sentence.')
-  await guest.click('#send')
+  await guest.click('#btn')
   await guest.waitForFunction(() => {
     const ais = document.querySelectorAll('.msg.ai')
     const last = ais[ais.length - 1]
-    return !!last && (last.textContent ?? '').length > 5 && !document.getElementById('send').disabled
+    const btn = document.getElementById('btn')
+    return !!last && (last.textContent ?? '').length > 5 && !btn.hidden && !btn.disabled
   }, { timeout: 4 * 60_000, polling: 300 })
 
   const reply = await guest.$eval('.msg.ai:last-of-type', (el) => el.textContent ?? '')
-  const meta = await guest.$eval('.msg.ai:last-of-type .meta', (el) => el.textContent ?? '')
+  const meta = await guest.$eval('.msg.ai:last-of-type .msg-stats', (el) => el.textContent ?? '')
   console.log(`guest reply: ${JSON.stringify(reply.slice(0, 140))}`)
   console.log(`stats: ${meta}`)
 

@@ -7,89 +7,81 @@
   <meta name="description" content="Serve a model running in this tab to another device over an encrypted WebRTC data channel. No install on either end.">
   <meta name="robots" content="noindex">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/chat-ui.css">
   <style>
-    :root {
-      --bg: #0a0a0f; --panel: #12121a; --line: #23232f; --text: #d6d6dd;
-      --muted: #8a8a96; --accent: #10b981; --accent-tint: rgba(16,185,129,.08);
-      --danger: #ef4444;
-    }
+    /* Page chrome only — the conversational surface (palette, messages,
+       composer, FAB) comes from chat-ui.css, shared verbatim with the chat
+       page so the remote conversation looks exactly like the local one. */
     * { box-sizing: border-box; margin: 0; }
-    body { background: var(--bg); color: var(--text);
-           font: 15px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
-           min-height: 100vh; }
-    a { color: #6ea8ff; }
-    .wrap { max-width: 780px; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
-    header.top { display: flex; align-items: baseline; gap: .75rem; margin-bottom: 1.25rem; }
-    header.top h1 { font-size: 1.05rem; font-weight: 600; color: #eee; }
-    header.top a.back { font-size: .8rem; color: var(--muted); text-decoration: none; }
+    html, body { height: 100%; background: var(--bg); color: var(--text);
+                 font-family: var(--font); font-size: 15px; line-height: 1.6;
+                 -webkit-font-smoothing: antialiased; }
+    button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+    a { color: var(--accent); text-decoration: none; }
+    .icon { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+
+    .top { display: flex; align-items: center; gap: .75rem; padding: .65rem 1rem;
+           border-bottom: 1px solid var(--border); }
+    .top h1 { font-size: 1rem; font-weight: 600; }
+    .top a.back { font-size: .8rem; color: var(--text-dim); }
     .badge { display: inline-flex; align-items: center; gap: 6px; font-size: .72rem;
-             padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); }
+             padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px;
+             color: var(--muted); margin-left: auto; }
     .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
     .badge.loading { color: #fbbf24; } .badge.loading .dot { background: #fbbf24; }
     .badge.ready { color: var(--accent); border-color: rgba(16,185,129,.3); } .badge.ready .dot { background: var(--accent); }
     .badge.error { color: var(--danger); } .badge.error .dot { background: var(--danger); }
 
-    /* loading-ui.ts writes into these ids */
-    #progress-wrap { display: none; margin: 1rem 0; border: 1px solid var(--line);
+    /* host view */
+    .wrap { max-width: 780px; margin: 0 auto; padding: 1.25rem 1rem 3rem; }
+    #progress-wrap { display: none; margin: 1rem 0; border: 1px solid var(--border);
                      border-radius: 10px; padding: 1rem; background: var(--panel); }
     #progress-wrap.active { display: block; }
-    .progress-track { height: 6px; background: #1c1c26; border-radius: 3px; overflow: hidden; margin: .6rem 0; }
+    .progress-track { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin: .6rem 0; }
     #progress-bar { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
     #progress-status { font-size: .85rem; } #progress-detail { font-size: .72rem; color: var(--muted); }
-    #progress-log { font-size: .7rem; color: var(--muted); max-height: 9rem; overflow: auto; white-space: pre-wrap; margin-top: .5rem; }
+    #progress-log { font-size: .7rem; color: var(--muted); max-height: 9rem; overflow: auto;
+                    white-space: pre-wrap; margin-top: .5rem; font-family: var(--mono); }
     #loading-error { color: var(--danger); font-size: .8rem; margin-top: .5rem; }
-
-    section.card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+    section.card { border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
                    padding: 1rem 1.1rem; margin: 1rem 0; }
-    section.card h2 { font-size: .8rem; color: var(--muted); font-weight: 600;
+    section.card h2 { font-size: .78rem; color: var(--muted); font-weight: 600;
                       text-transform: uppercase; letter-spacing: .06em; margin-bottom: .6rem; }
     .linkrow { display: flex; gap: .5rem; align-items: center; }
-    .linkrow input { flex: 1; background: #0d0d14; color: var(--text); border: 1px solid var(--line);
-                     border-radius: 8px; padding: .55rem .7rem; font: inherit; font-size: .8rem; }
-    button { background: var(--accent); color: #04140d; border: 0; border-radius: 8px;
-             font: inherit; font-weight: 600; padding: .55rem 1rem; cursor: pointer; }
-    button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
-    button:disabled { opacity: .45; cursor: default; }
+    .linkrow input { flex: 1; background: var(--bg); color: var(--text); border: 1px solid var(--border-2);
+                     border-radius: 8px; padding: .55rem .7rem; font: inherit; font-size: .8rem;
+                     font-family: var(--mono); }
+    .linkrow button { background: var(--accent); color: #04140d; border-radius: 8px;
+                      font-weight: 600; padding: .55rem 1rem; }
     .hint { font-size: .74rem; color: var(--muted); margin-top: .55rem; }
+    label.opt { display: flex; align-items: center; gap: .5rem; font-size: .82rem; margin-top: .8rem; cursor: pointer; }
+    label.opt input { accent-color: var(--accent); width: 15px; height: 15px; }
+    #req-log { list-style: none; display: flex; flex-direction: column; gap: .4rem; padding: 0; }
+    #req-log li { font-size: .78rem; border-left: 2px solid var(--border-2); padding: .15rem .6rem; color: var(--muted); }
+    #req-log li .who { color: var(--accent-2); font-family: var(--mono); } #req-log li .st { color: var(--accent); }
 
-    /* host request log */
-    #req-log { list-style: none; display: flex; flex-direction: column; gap: .4rem; }
-    #req-log li { font-size: .78rem; border-left: 2px solid var(--line); padding: .15rem .6rem; color: var(--muted); }
-    #req-log li .who { color: #6ea8ff; } #req-log li .st { color: var(--accent); }
-
-    /* guest chat */
-    #messages { display: flex; flex-direction: column; gap: .9rem; margin: 1rem 0; }
-    .msg { border-radius: 10px; padding: .7rem .9rem; font-size: .9rem; max-width: 92%; overflow-wrap: anywhere; }
-    .msg.user { align-self: flex-end; background: #1b2333; }
-    .msg.ai { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
-    .msg.ai .meta { font-size: .68rem; color: var(--muted); margin-top: .45rem; }
-    .msg.ai pre { background: #0d0d14; padding: .6rem; border-radius: 6px; overflow-x: auto; font-size: .8rem; }
-    .msg.ai code { background: #0d0d14; padding: 0 .25em; border-radius: 4px; }
-    .composer { display: flex; gap: .5rem; }
-    .composer textarea { flex: 1; background: #0d0d14; color: var(--text); border: 1px solid var(--line);
-                         border-radius: 8px; padding: .6rem .7rem; font: inherit; font-size: .9rem;
-                         resize: vertical; min-height: 2.9rem; }
+    /* guest view = the chat shell */
+    #guest-view { display: flex; flex-direction: column; height: 100dvh; }
+    #guest-view .top { flex: none; }
     .hidden { display: none !important; }
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <!-- ─── HOST ─── -->
+  <div id="host-view" class="hidden">
     <header class="top">
       <a class="back" href="/">← zerotvm.com</a>
       <h1 id="page-title">Share a model</h1>
       <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">Waiting</span></span>
     </header>
-
-    <div id="progress-wrap">
-      <div id="progress-status">Starting…</div>
-      <div class="progress-track"><div id="progress-bar"></div></div>
-      <div id="progress-detail">0%</div>
-      <pre id="progress-log"></pre>
-      <div id="loading-error"></div>
-    </div>
-
-    <!-- ─── HOST ─── -->
-    <div id="host-view" class="hidden">
+    <div class="wrap">
+      <div id="progress-wrap">
+        <div id="progress-status">Starting…</div>
+        <div class="progress-track"><div id="progress-bar"></div></div>
+        <div id="progress-detail">0%</div>
+        <pre id="progress-log"></pre>
+        <div id="loading-error"></div>
+      </div>
       <section class="card">
         <h2>Room link</h2>
         <div class="linkrow">
@@ -99,23 +91,47 @@
         <p class="hint">Anyone with this link chats with the model running in THIS tab,
           over an encrypted peer-to-peer data channel. Keep the tab open and the
           machine awake; close the tab to end the room.</p>
+        <label class="opt">
+          <input type="checkbox" id="awake">
+          Keep this tab awake — screen wake-lock + a silent audio track, so the
+          browser throttles generation less when the tab is in the background
+        </label>
       </section>
       <section class="card">
         <h2>Requests</h2>
         <ul id="req-log"><li id="req-empty">No guests yet.</li></ul>
       </section>
     </div>
+  </div>
 
-    <!-- ─── GUEST ─── -->
-    <div id="guest-view" class="hidden">
-      <section class="card">
-        <h2 id="guest-model">Connecting…</h2>
-        <p class="hint" id="guest-status">Waiting for the host.</p>
-      </section>
-      <div id="messages"></div>
-      <div class="composer">
-        <textarea id="inp" placeholder="Message the remote model…" disabled></textarea>
-        <button id="send" type="button" disabled>Send</button>
+  <!-- ─── GUEST — the same shell as zero-tvm.html's chat ─── -->
+  <div id="guest-view" class="hidden">
+    <header class="top">
+      <a class="back" href="/">← zerotvm.com</a>
+      <h1 id="guest-model">Remote model</h1>
+      <span class="badge" id="guest-badge"><span class="dot"></span><span id="guest-badge-text">Connecting</span></span>
+    </header>
+    <main class="chat-main" id="chat-main">
+      <div class="chat-inner">
+        <div id="messages"></div>
+      </div>
+      <button class="scroll-fab" id="scroll-fab" title="Scroll to bottom" aria-label="Scroll to bottom">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+      </button>
+    </main>
+    <div class="composer-wrap">
+      <form class="composer" id="composer">
+        <textarea id="inp" rows="1" placeholder="Connecting to the host…" disabled></textarea>
+        <button class="composer-btn" data-variant="send" id="btn" type="submit" disabled aria-label="Send">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>
+        </button>
+        <button class="composer-btn" data-variant="stop" id="stop-btn" type="button" hidden aria-label="Stop">
+          <svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+        </button>
+      </form>
+      <div class="composer-hint">
+        <kbd>Enter</kbd> to send ·
+        <span id="guest-status" style="color:var(--text-dim)">Waiting for the host.</span>
       </div>
     </div>
   </div>
