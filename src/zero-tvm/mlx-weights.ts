@@ -274,17 +274,34 @@ export function planBytes(plan: BufferPlan, sourceBytes: (record: string) => num
  * callback so the same repacking runs over a local file in tests and over
  * ranged fetches in the browser — the format logic is the part worth sharing,
  * the I/O is not.
+ *
+ * `dtypeOf` (safetensors header dtype per record) makes the conversions
+ * dtype-AWARE: the plans' 'bf16->f16' means "the kernels read f16", not "the
+ * file is bf16" — Qwen MLX checkpoints ship scales/norms as BF16, but
+ * Llama-3.2's ships them F16 already, and running the bf16 shift over f16
+ * bits collapses every scale to ±0 (f16's exponent lands in bf16's ~1e-21
+ * range): zero logits, no error anywhere. Absent = assume BF16 (the historical
+ * behavior, kept for callers without header access).
  */
 export function buildBuffer(
   plan: BufferPlan,
   readRecord: (name: string) => Uint8Array,
+  dtypeOf?: (name: string) => string,
 ): { data: Uint8Array<ArrayBuffer>; overflow: number } {
   const pieces: Uint8Array[] = []
   let overflow = 0
   for (const part of plan.parts) {
     const raw = readRecord(part.record)
+    const dtype = dtypeOf?.(part.record) ?? 'BF16'
     if (part.convert === 'raw') {
       pieces.push(raw)
+    } else if (part.convert === 'bf16->f16' && dtype === 'F16') {
+      pieces.push(raw)   // already what the kernels read — pass through
+    } else if (dtype !== 'BF16') {
+      // f32-target plans (A_log/dt_bias) double their byte count in
+      // planBytes; a non-BF16 source would need that audit too. No shipped
+      // checkpoint hits this — fail loudly rather than resize silently.
+      throw new Error(`${plan.name}: ${part.record} is ${dtype}, expected BF16 for ${part.convert}`)
     } else {
       const src = new Uint16Array(raw.buffer, raw.byteOffset, raw.byteLength / 2)
       if (part.convert === 'bf16->f16') {

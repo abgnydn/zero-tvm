@@ -126,7 +126,7 @@ export async function buildPlan(
     const d = parts.get(n)
     if (!d) throw new Error(`internal: range for ${n} was not fetched`)
     return d
-  })
+  }, (n) => locate(n).info.dtype)
   return data
 }
 
