@@ -14,7 +14,10 @@
  * scripts/validate-model.mjs diffs a registered model against mlx_lm before
  * its card is worth believing.
  *
- * DELIBERATELY LIGHT: imports only model-spec.ts, which is dependency-free.
+ * DELIBERATELY LIGHT: imports only model-spec.ts, which is dependency-free —
+ * with the explicit .ts extension, which is load-bearing: scripts/
+ * validate-model.mjs imports this file under Node type stripping (no
+ * extension searching) to resolve a `?model=` param to its spec.
  * The landing page runs this in browsers WITHOUT WebGPU (where it must still
  * render cards and say "needs WebGPU") — and weight-loader.ts, the previous
  * home of modelBranding's neighbours, reads `GPUBufferUsage` at module scope,
@@ -24,8 +27,9 @@
 import {
   PHI3, QWEN3_4B, QWEN35_4B, QWEN36_35B_A3B, QWEN36_35B_A3B_Q3,
   type ModelSpec,
-} from '../compiler/model-spec.js'
-import { QWEN3_4B_MLX } from '../compiler/model-spec.js'
+} from '../compiler/model-spec.ts'
+import { QWEN3_4B_MLX } from '../compiler/model-spec.ts'
+import { LLAMA_3_2_1B_INSTRUCT_4BIT } from '../compiler/model-spec.ts'
 // ADD-MODEL:IMPORTS
 
 /** URL `?model=` value for each spec; Phi-3 is the no-flag default. */
@@ -38,6 +42,7 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
   { param: 'qwen36q3', spec: QWEN36_35B_A3B_Q3 },
   { param: 'qwen36', spec: QWEN36_35B_A3B },
   { param: 'qwen3mlx', spec: QWEN3_4B_MLX },
+  { param: 'llama32', spec: LLAMA_3_2_1B_INSTRUCT_4BIT },
   // ADD-MODEL:MODELS
 ]
 
@@ -82,6 +87,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // same Qwen3-4B as the MLC build above, from the MLX-affine checkpoint;
   // validated against mlx_lm (cosine 0.999879, greedy token-exact).
   [QWEN3_4B_MLX.id]: { name: 'Qwen3-4B', params: '4B dense · MLX 4-bit', sizeLabel: '~2.1 GB', rateLabel: '' },
+  [LLAMA_3_2_1B_INSTRUCT_4BIT.id]: { name: 'Llama-3.2-1B-Instruct', params: '1B dense', sizeLabel: '~0.6 GB', rateLabel: '' },
   // ADD-MODEL:BRANDINGS
 }
 

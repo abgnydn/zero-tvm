@@ -358,7 +358,7 @@ const paramsLine = flags.params ?? (bMatch ? `${bMatch[1]}B ${archLine}` : archL
 writeFileSync(SPEC_FILE, specSrc.replace(/\n\/\/ ADD-MODEL:SPECS\n/,
   `\n// ADD-MODEL:SPECS\n${specBlock}`))
 writeFileSync(REGISTRY_FILE, regSrc
-  .replace('// ADD-MODEL:IMPORTS', `import { ${exportName} } from '../compiler/model-spec.js'\n// ADD-MODEL:IMPORTS`)
+  .replace('// ADD-MODEL:IMPORTS', `import { ${exportName} } from '../compiler/model-spec.ts'\n// ADD-MODEL:IMPORTS`)
   .replace('  // ADD-MODEL:MODELS', `  { param: '${param}', spec: ${exportName} },\n  // ADD-MODEL:MODELS`)
   .replace('  // ADD-MODEL:BRANDINGS', `  [${exportName}.id]: { name: '${displayName}', params: '${paramsLine}', sizeLabel: '${sizeLabel}', rateLabel: ''${ramNote} },\n  // ADD-MODEL:BRANDINGS`))
 writeCompat()

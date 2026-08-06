@@ -18,6 +18,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { startHarness, stopHarness, newPage } from '../tests/e2e/harness.ts'
+import { specForParam } from '../src/zero-tvm/model-registry.ts'
 
 const param = process.argv[2]
 const refDir = process.argv[process.argv.indexOf('--ref') + 1]
@@ -63,9 +64,17 @@ try {
 
   const gen = await page.evaluate((ids, n) => window.__generate(ids, n), meta.prompt_ids, meta.greedy.length)
   let diverge = gen.findIndex((t, i) => t !== meta.greedy[i])
-  if (diverge < 0) diverge = gen.length
+  // The engine's generate() stops BEFORE emitting a stop id while mlx-ref's
+  // greedy INCLUDES it, so a reply shorter than the 8-token bar (Llama-3.2
+  // answers "The capital ... Paris." in 7) would fail with every token
+  // matching. Halting exactly where the reference emitted its stop id IS
+  // token-exact agreement — credit the stop as matched.
+  const stops = new Set(specForParam(param).stops)
+  if (diverge < 0) diverge = gen.length < meta.greedy.length && stops.has(meta.greedy[gen.length])
+    ? gen.length + 1 : gen.length
   check('greedy', diverge >= Math.min(8, meta.greedy.length),
-    diverge >= gen.length ? `all ${gen.length} tokens match mlx_lm` : `diverges at token ${diverge}/${gen.length}`)
+    diverge > gen.length ? `all ${gen.length} tokens + stop id match mlx_lm`
+      : diverge >= gen.length ? `all ${gen.length} tokens match mlx_lm` : `diverges at token ${diverge}/${gen.length}`)
   console.log(`  engine: [${gen.slice(0, 12).join(', ')}…]`)
   console.log(`  mlx_lm: [${meta.greedy.slice(0, 12).join(', ')}…]  ${JSON.stringify(meta.greedy_text).slice(0, 90)}`)
 
