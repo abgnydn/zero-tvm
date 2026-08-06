@@ -368,6 +368,7 @@ export default defineConfig({
       input: {
         index:         resolve(__dirname, 'index.html'),
         'zero-tvm':    resolve(__dirname, 'zero-tvm.html'),
+        share:         resolve(__dirname, 'share.html'),
         'compiler-chat': resolve(__dirname, 'compiler-chat.html'),
         demo:          resolve(__dirname, 'demo.html'),
         validate:      resolve(__dirname, 'validate.html'),

@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Share a model — Zero-TVM</title>
+  <meta name="description" content="Serve a model running in this tab to another device over an encrypted WebRTC data channel. No install on either end.">
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root {
+      --bg: #0a0a0f; --panel: #12121a; --line: #23232f; --text: #d6d6dd;
+      --muted: #8a8a96; --accent: #10b981; --accent-tint: rgba(16,185,129,.08);
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; }
+    body { background: var(--bg); color: var(--text);
+           font: 15px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+           min-height: 100vh; }
+    a { color: #6ea8ff; }
+    .wrap { max-width: 780px; margin: 0 auto; padding: 1.5rem 1rem 4rem; }
+    header.top { display: flex; align-items: baseline; gap: .75rem; margin-bottom: 1.25rem; }
+    header.top h1 { font-size: 1.05rem; font-weight: 600; color: #eee; }
+    header.top a.back { font-size: .8rem; color: var(--muted); text-decoration: none; }
+    .badge { display: inline-flex; align-items: center; gap: 6px; font-size: .72rem;
+             padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); }
+    .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+    .badge.loading { color: #fbbf24; } .badge.loading .dot { background: #fbbf24; }
+    .badge.ready { color: var(--accent); border-color: rgba(16,185,129,.3); } .badge.ready .dot { background: var(--accent); }
+    .badge.error { color: var(--danger); } .badge.error .dot { background: var(--danger); }
+
+    /* loading-ui.ts writes into these ids */
+    #progress-wrap { display: none; margin: 1rem 0; border: 1px solid var(--line);
+                     border-radius: 10px; padding: 1rem; background: var(--panel); }
+    #progress-wrap.active { display: block; }
+    .progress-track { height: 6px; background: #1c1c26; border-radius: 3px; overflow: hidden; margin: .6rem 0; }
+    #progress-bar { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+    #progress-status { font-size: .85rem; } #progress-detail { font-size: .72rem; color: var(--muted); }
+    #progress-log { font-size: .7rem; color: var(--muted); max-height: 9rem; overflow: auto; white-space: pre-wrap; margin-top: .5rem; }
+    #loading-error { color: var(--danger); font-size: .8rem; margin-top: .5rem; }
+
+    section.card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+                   padding: 1rem 1.1rem; margin: 1rem 0; }
+    section.card h2 { font-size: .8rem; color: var(--muted); font-weight: 600;
+                      text-transform: uppercase; letter-spacing: .06em; margin-bottom: .6rem; }
+    .linkrow { display: flex; gap: .5rem; align-items: center; }
+    .linkrow input { flex: 1; background: #0d0d14; color: var(--text); border: 1px solid var(--line);
+                     border-radius: 8px; padding: .55rem .7rem; font: inherit; font-size: .8rem; }
+    button { background: var(--accent); color: #04140d; border: 0; border-radius: 8px;
+             font: inherit; font-weight: 600; padding: .55rem 1rem; cursor: pointer; }
+    button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+    button:disabled { opacity: .45; cursor: default; }
+    .hint { font-size: .74rem; color: var(--muted); margin-top: .55rem; }
+
+    /* host request log */
+    #req-log { list-style: none; display: flex; flex-direction: column; gap: .4rem; }
+    #req-log li { font-size: .78rem; border-left: 2px solid var(--line); padding: .15rem .6rem; color: var(--muted); }
+    #req-log li .who { color: #6ea8ff; } #req-log li .st { color: var(--accent); }
+
+    /* guest chat */
+    #messages { display: flex; flex-direction: column; gap: .9rem; margin: 1rem 0; }
+    .msg { border-radius: 10px; padding: .7rem .9rem; font-size: .9rem; max-width: 92%; overflow-wrap: anywhere; }
+    .msg.user { align-self: flex-end; background: #1b2333; }
+    .msg.ai { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
+    .msg.ai .meta { font-size: .68rem; color: var(--muted); margin-top: .45rem; }
+    .msg.ai pre { background: #0d0d14; padding: .6rem; border-radius: 6px; overflow-x: auto; font-size: .8rem; }
+    .msg.ai code { background: #0d0d14; padding: 0 .25em; border-radius: 4px; }
+    .composer { display: flex; gap: .5rem; }
+    .composer textarea { flex: 1; background: #0d0d14; color: var(--text); border: 1px solid var(--line);
+                         border-radius: 8px; padding: .6rem .7rem; font: inherit; font-size: .9rem;
+                         resize: vertical; min-height: 2.9rem; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <a class="back" href="/">← zerotvm.com</a>
+      <h1 id="page-title">Share a model</h1>
+      <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">Waiting</span></span>
+    </header>
+
+    <div id="progress-wrap">
+      <div id="progress-status">Starting…</div>
+      <div class="progress-track"><div id="progress-bar"></div></div>
+      <div id="progress-detail">0%</div>
+      <pre id="progress-log"></pre>
+      <div id="loading-error"></div>
+    </div>
+
+    <!-- ─── HOST ─── -->
+    <div id="host-view" class="hidden">
+      <section class="card">
+        <h2>Room link</h2>
+        <div class="linkrow">
+          <input id="share-link" readonly value="…">
+          <button id="copy-link" type="button">Copy</button>
+        </div>
+        <p class="hint">Anyone with this link chats with the model running in THIS tab,
+          over an encrypted peer-to-peer data channel. Keep the tab open and the
+          machine awake; close the tab to end the room.</p>
+      </section>
+      <section class="card">
+        <h2>Requests</h2>
+        <ul id="req-log"><li id="req-empty">No guests yet.</li></ul>
+      </section>
+    </div>
+
+    <!-- ─── GUEST ─── -->
+    <div id="guest-view" class="hidden">
+      <section class="card">
+        <h2 id="guest-model">Connecting…</h2>
+        <p class="hint" id="guest-status">Waiting for the host.</p>
+      </section>
+      <div id="messages"></div>
+      <div class="composer">
+        <textarea id="inp" placeholder="Message the remote model…" disabled></textarea>
+        <button id="send" type="button" disabled>Send</button>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/zero-tvm/share.ts"></script>
+</body>
+</html>

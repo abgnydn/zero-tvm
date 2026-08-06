@@ -11,3 +11,6 @@ docs/webgpu-placement/real_scan.onnx
 docs/webgpu-placement/decoder_ablated_q4f16.onnx
 docs/webgpu-placement/real_chunked_scan.onnx
 .weights-local/kernel-refs/
+
+# wrangler local dev state (miniflare)
+.wrangler/

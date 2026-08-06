@@ -1,0 +1,345 @@
+/**
+ * SHARE — serve the model running in THIS tab to another device, browser to
+ * browser, over a WebRTC data channel.
+ *
+ * Two modes, decided by the URL fragment:
+ *   share.html?model=qwen36q3      HOST — boots the engine (same composition
+ *                                  as chat.ts), opens a room, serves requests
+ *   share.html#<roomId>            GUEST — thin chat client; needs no WebGPU,
+ *                                  downloads nothing, learns the model's name
+ *                                  over the channel
+ *
+ * Privacy model: the signaling worker (workers/share-signal) relays only
+ * SDP/ICE JSON; prompts and tokens travel the DataChannel, which WebRTC
+ * always DTLS-encrypts. With a direct P2P path nothing of the conversation
+ * touches any server. The room id is 128 random bits carried in the link's
+ * #fragment — browsers do not send fragments over HTTP, so the static host
+ * never logs it.
+ *
+ * The engine is single-stream (batch = 1), so guest requests are SERIALIZED:
+ * one generates, the rest hold a queue position and are told so. The host tab
+ * shows every request as it arrives — your machine should not run someone's
+ * prompt without you being able to see it.
+ *
+ * The wire protocol is TEXT in both directions (guest sends chat messages,
+ * host renders the template and tokenizes) — guests never need tokenizer
+ * files, and the host's decode loop is chat.ts's: re-decode the whole id
+ * sequence each token, send the full text so far. Full-text frames are
+ * O(n²) bytes per reply but a 512-token answer is still only ~1 MB across
+ * a channel that does orders of magnitude more; dropping mid-token UTF-8
+ * boundary bugs is worth far more than the bytes.
+ */
+
+import { renderMarkdown } from './markdown.js'
+
+// Signaling endpoint. Dev: `npx wrangler dev --port 8787` in
+// workers/share-signal (what scripts/share-e2e.mjs spawns). The production
+// URL is stamped here at first deploy of the worker. (Same import.meta cast
+// as weight-loader.ts — the repo has no vite/client types.)
+const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
+const SIGNAL_BASE = DEV
+  ? 'ws://localhost:8787'
+  : 'wss://zero-tvm-share-signal.abgunaydin.workers.dev'
+
+const ICE: RTCConfiguration = {
+  // STUN only, deliberately: same-network and home-NAT paths connect
+  // directly. Hostile (corporate) NATs need a TURN relay — a later problem,
+  // and a separate consent: TURN routes ciphertext through a third party.
+  iceServers: [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }],
+}
+
+// ── wire protocol ─────────────────────────────────────────────
+interface ChatReq { type: 'chat'; id: number; messages: { role: 'system' | 'user' | 'assistant'; content: string }[] }
+interface StopReq { type: 'stop'; id: number }
+type GuestMsg = ChatReq | StopReq
+type HostMsg =
+  | { type: 'info'; name: string; params: string; rateLabel: string }
+  | { type: 'text'; id: number; full: string }
+  | { type: 'done'; id: number; tokens: number; tps: number }
+  | { type: 'busy'; id: number; pos: number }
+  | { type: 'error'; id: number; message: string }
+
+const $ = (id: string) => document.getElementById(id) as HTMLElement
+
+function roomIdFrom(hash: string): string | null {
+  const id = hash.replace(/^#/, '')
+  return /^[A-Za-z0-9_-]{16,64}$/.test(id) ? id : null
+}
+
+const room = roomIdFrom(location.hash)
+if (room) void runGuest(room)
+else void runHost()
+
+// ============================================================
+// HOST
+// ============================================================
+
+async function runHost(): Promise<void> {
+  $('host-view').classList.remove('hidden')
+  // Everything GPU-touching is imported HERE, not at module scope — the guest
+  // path must run on machines without WebGPU, and weight-loader.ts reads
+  // GPUBufferUsage the moment it is imported.
+  const [{ specFromSearch, modelBranding, buildChatPromptFor }, loadingUi, variantsMod, engineMod] =
+    await Promise.all([
+      import('./model-select.js'),
+      import('./loading-ui.js'),
+      import('./variants.js'),
+      import('./engine-core.js'),
+    ])
+
+  const spec = specFromSearch(location.search)
+  const brand = modelBranding(spec)
+  $('page-title').textContent = `Sharing ${brand.name}`
+
+  // Same engine composition as chat.ts — this is the throughput path, not the
+  // scalar validation path.
+  const boot = await loadingUi.bootEngine({
+    spec,
+    optionalFeatures: ['subgroups' as GPUFeatureName],
+    probeSubgroups: true,
+    buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
+      const flags = variantsMod.parseVariantFlags(location.search, {
+        hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
+        sgSizeOk,
+      })
+      const fused = !s.qkNorm && s.weightFormat !== 'mlx-safetensors'
+      const kv = engineMod.allocKVPages(device, s)
+      return engineMod.buildDecodeEngine(device, weights, kv, { variants: flags, fused, spec: s })
+    },
+  })
+  if (!boot.ok) {
+    $('loading-error').textContent = boot.reason
+    return
+  }
+  const { engine, tokenizer } = boot
+  const enc = (messages: ChatReq['messages']) => buildChatPromptFor(spec, messages, tokenizer)
+
+  // ── room ──
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  const roomId = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  const link = `${location.origin}${location.pathname}#${roomId}`
+  const linkInput = $('share-link') as HTMLInputElement
+  linkInput.value = link
+  $('copy-link').addEventListener('click', () => {
+    void navigator.clipboard.writeText(link)
+    $('copy-link').textContent = 'Copied'
+    setTimeout(() => { $('copy-link').textContent = 'Copy' }, 1200)
+  })
+
+  const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=host`)
+  const peers = new Map<string, { pc: RTCPeerConnection; dc: RTCDataChannel | null }>()
+
+  // Serialized generation: the engine is single-stream. FIFO of pending
+  // requests across all guests; queue positions are reported honestly.
+  const queue: { guest: string; req: ChatReq }[] = []
+  let generating = false
+  const stopFlags = new Map<string, number>()   // guest -> request id to stop
+
+  const logRow = (guest: string, text: string): HTMLElement => {
+    $('req-empty')?.remove()
+    const li = document.createElement('li')
+    li.innerHTML = `<span class="who">${guest}</span> · <span class="body"></span> <span class="st"></span>`
+    ;(li.querySelector('.body') as HTMLElement).textContent = text
+    $('req-log').prepend(li)
+    return li.querySelector('.st') as HTMLElement
+  }
+
+  const send = (guest: string, msg: HostMsg): void => {
+    const dc = peers.get(guest)?.dc
+    if (dc?.readyState === 'open') dc.send(JSON.stringify(msg))
+  }
+
+  async function pump(): Promise<void> {
+    if (generating) return
+    const next = queue.shift()
+    if (!next) return
+    generating = true
+    const { guest, req } = next
+    const preview = req.messages.at(-1)?.content.slice(0, 80) ?? ''
+    const st = logRow(guest, preview)
+    try {
+      const promptIds = enc(req.messages)
+      const budget = Math.min(1024, spec.maxContext - promptIds.length - 8)
+      if (budget < 16) throw new Error(`prompt is ${promptIds.length} tokens — over this model's ${spec.maxContext}-token context`)
+      const allIds: number[] = []
+      const t0 = performance.now()
+      st.textContent = 'generating…'
+      await engine.generatePipelined(
+        promptIds, budget,
+        (id) => {
+          allIds.push(id)
+          send(guest, { type: 'text', id: req.id, full: tokenizer.decode(allIds) })
+        },
+        () => stopFlags.get(guest) === req.id || !peers.has(guest),
+      )
+      const secs = (performance.now() - t0) / 1000
+      const tps = allIds.length / Math.max(secs, 0.001)
+      send(guest, { type: 'done', id: req.id, tokens: allIds.length, tps })
+      st.textContent = `${allIds.length} tok · ${tps.toFixed(1)} tok/s`
+    } catch (e) {
+      send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
+      st.textContent = 'error'
+    } finally {
+      generating = false
+      void pump()
+    }
+  }
+
+  function onGuestMessage(guest: string, raw: string): void {
+    let msg: GuestMsg
+    try { msg = JSON.parse(raw) as GuestMsg } catch { return }
+    if (msg.type === 'stop') { stopFlags.set(guest, msg.id); return }
+    if (msg.type !== 'chat' || !Array.isArray(msg.messages)) return
+    stopFlags.delete(guest)
+    queue.push({ guest, req: msg })
+    const pos = queue.length - (generating ? 0 : 1)
+    if (pos > 0) send(guest, { type: 'busy', id: msg.id, pos })
+    void pump()
+  }
+
+  function makePeer(guest: string): void {
+    const pc = new RTCPeerConnection(ICE)
+    const entry = { pc, dc: null as RTCDataChannel | null }
+    peers.set(guest, entry)
+    const dc = pc.createDataChannel('chat', { ordered: true })
+    entry.dc = dc
+    dc.onopen = () => send(guest, { type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel })
+    dc.onmessage = (e) => onGuestMessage(guest, String(e.data))
+    pc.onicecandidate = (e) => {
+      if (e.candidate) ws.send(JSON.stringify({ to: guest, type: 'ice', candidate: e.candidate }))
+    }
+    void pc.createOffer()
+      .then(async (offer) => {
+        await pc.setLocalDescription(offer)
+        ws.send(JSON.stringify({ to: guest, type: 'offer', sdp: offer }))
+      })
+  }
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(String(e.data)) as { type: string; from?: string; sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+    const guest = msg.from
+    if (!guest) return
+    if (msg.type === 'peer-joined') makePeer(guest)
+    else if (msg.type === 'peer-left') { peers.get(guest)?.pc.close(); peers.delete(guest) }
+    else if (msg.type === 'answer' && msg.sdp) void peers.get(guest)?.pc.setRemoteDescription(msg.sdp)
+    else if (msg.type === 'ice' && msg.candidate) void peers.get(guest)?.pc.addIceCandidate(msg.candidate)
+  }
+  window.addEventListener('beforeunload', () => ws.close())
+
+  // e2e hooks
+  ;(window as unknown as Record<string, unknown>).__shareLink = link
+  ;(window as unknown as Record<string, unknown>).__shareReady = true
+}
+
+// ============================================================
+// GUEST
+// ============================================================
+
+async function runGuest(roomId: string): Promise<void> {
+  $('guest-view').classList.remove('hidden')
+  $('page-title').textContent = 'Remote model'
+  const setStatus = (t: string) => { $('guest-status').textContent = t }
+  const setBadge = (t: string, cls: 'loading' | 'ready' | 'error') => {
+    $('badge').className = `badge ${cls}`
+    $('badge-text').textContent = t
+  }
+  setBadge('Connecting', 'loading')
+
+  const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
+  const pc = new RTCPeerConnection(ICE)
+  let dc: RTCDataChannel | null = null
+
+  const history: ChatReq['messages'] = []
+  let reqId = 0
+  let liveBody: HTMLElement | null = null
+  let liveMeta: HTMLElement | null = null
+
+  const inp = $('inp') as HTMLTextAreaElement
+  const sendBtn = $('send') as HTMLButtonElement
+
+  const addMsg = (cls: 'user' | 'ai', text: string): HTMLElement => {
+    const div = document.createElement('div')
+    div.className = `msg ${cls}`
+    const body = document.createElement('div')
+    body.textContent = text
+    div.appendChild(body)
+    if (cls === 'ai') {
+      const meta = document.createElement('div')
+      meta.className = 'meta'
+      div.appendChild(meta)
+      liveMeta = meta
+    }
+    $('messages').appendChild(div)
+    div.scrollIntoView({ block: 'end' })
+    return body
+  }
+
+  const onHostMsg = (msg: HostMsg): void => {
+    if (msg.type === 'info') {
+      $('guest-model').textContent = `${msg.name} — ${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''}`
+      setStatus('Connected. The model runs on the host machine; this page holds only the conversation.')
+      setBadge('Ready', 'ready')
+      inp.disabled = false
+      sendBtn.disabled = false
+    } else if (msg.type === 'text') {
+      if (liveBody) {
+        liveBody.replaceChildren(renderMarkdown(msg.full))
+        liveBody.parentElement?.scrollIntoView({ block: 'end' })
+      }
+    } else if (msg.type === 'done') {
+      if (liveMeta) liveMeta.textContent = `${msg.tokens} tok · ${msg.tps.toFixed(1)} tok/s`
+      if (liveBody) history.push({ role: 'assistant', content: liveBody.textContent ?? '' })
+      liveBody = null
+      sendBtn.disabled = false
+    } else if (msg.type === 'busy') {
+      setStatus(`Host is generating for someone else — queue position ${msg.pos}.`)
+    } else if (msg.type === 'error') {
+      if (liveBody) liveBody.textContent = `⚠ ${msg.message}`
+      liveBody = null
+      sendBtn.disabled = false
+    }
+  }
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(String(e.data)) as { type: string; sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+    if (msg.type === 'no-host') {
+      setBadge('No host', 'error')
+      setStatus('Nobody is sharing a model in this room — the host tab is closed or the link expired.')
+    } else if (msg.type === 'host-left') {
+      setBadge('Host left', 'error')
+      setStatus('The host closed the tab. The conversation stays here; reconnect with a fresh link.')
+      inp.disabled = true
+      sendBtn.disabled = true
+    } else if (msg.type === 'offer' && msg.sdp) {
+      await pc.setRemoteDescription(msg.sdp)
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      ws.send(JSON.stringify({ type: 'answer', sdp: answer }))
+    } else if (msg.type === 'ice' && msg.candidate) {
+      await pc.addIceCandidate(msg.candidate)
+    }
+  }
+  pc.onicecandidate = (e) => {
+    if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }))
+  }
+  pc.ondatachannel = (e) => {
+    dc = e.channel
+    dc.onmessage = (ev) => onHostMsg(JSON.parse(String(ev.data)) as HostMsg)
+    dc.onclose = () => setBadge('Disconnected', 'error')
+  }
+
+  const submit = (): void => {
+    const text = inp.value.trim()
+    if (!text || !dc || dc.readyState !== 'open') return
+    inp.value = ''
+    sendBtn.disabled = true
+    history.push({ role: 'user', content: text })
+    addMsg('user', text)
+    liveBody = addMsg('ai', '…')
+    dc.send(JSON.stringify({ type: 'chat', id: ++reqId, messages: [...history] } satisfies ChatReq))
+  }
+  sendBtn.addEventListener('click', submit)
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
+  })
+}
