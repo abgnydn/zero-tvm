@@ -39,7 +39,7 @@ import { renderMarkdown } from './markdown.js'
 const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
 const SIGNAL_BASE = DEV
   ? 'ws://localhost:8787'
-  : 'wss://zero-tvm-share-signal.abgunaydin.workers.dev'
+  : 'wss://zero-tvm-share-signal.abgunaydin94.workers.dev'  // deployed 2026-08-06
 
 const ICE: RTCConfiguration = {
   // STUN only, deliberately: same-network and home-NAT paths connect
