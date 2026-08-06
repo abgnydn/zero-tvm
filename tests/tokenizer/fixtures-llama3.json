@@ -1,0 +1,742 @@
+{
+ "cases": [
+  {
+   "text": "Hello world",
+   "ids": [
+    9906,
+    1917
+   ],
+   "decoded": "Hello world"
+  },
+  {
+   "text": "The quick brown fox jumps over the lazy dog.",
+   "ids": [
+    791,
+    4062,
+    14198,
+    39935,
+    35308,
+    927,
+    279,
+    16053,
+    5679,
+    13
+   ],
+   "decoded": "The quick brown fox jumps over the lazy dog."
+  },
+  {
+   "text": "it's John's dog and we're sure they've left, I'll go, he'd agree, don't",
+   "ids": [
+    275,
+    596,
+    3842,
+    596,
+    5679,
+    323,
+    584,
+    2351,
+    2771,
+    814,
+    3077,
+    2163,
+    11,
+    358,
+    3358,
+    733,
+    11,
+    568,
+    4265,
+    7655,
+    11,
+    1541,
+    956
+   ],
+   "decoded": "it's John's dog and we're sure they've left, I'll go, he'd agree, don't"
+  },
+  {
+   "text": "DON'T SHOUT, I'M HERE, YOU'RE LOUD",
+   "ids": [
+    85741,
+    17773,
+    6570,
+    3740,
+    11,
+    358,
+    28703,
+    19804,
+    11,
+    15334,
+    95253,
+    5125,
+    4760
+   ],
+   "decoded": "DON'T SHOUT, I'M HERE, YOU'RE LOUD"
+  },
+  {
+   "text": "pi is 3.14159 and the answer is 42",
+   "ids": [
+    2554,
+    374,
+    220,
+    18,
+    13,
+    9335,
+    2946,
+    323,
+    279,
+    4320,
+    374,
+    220,
+    2983
+   ],
+   "decoded": "pi is 3.14159 and the answer is 42"
+  },
+  {
+   "text": "1234567890",
+   "ids": [
+    4513,
+    10961,
+    16474,
+    15
+   ],
+   "decoded": "1234567890"
+  },
+  {
+   "text": "year 2026, price $1,234.56 or 1.000.000₺",
+   "ids": [
+    3236,
+    220,
+    2366,
+    21,
+    11,
+    3430,
+    400,
+    16,
+    11,
+    11727,
+    13,
+    3487,
+    477,
+    220,
+    16,
+    13,
+    931,
+    13,
+    931,
+    16275,
+    118
+   ],
+   "decoded": "year 2026, price $1,234.56 or 1.000.000₺"
+  },
+  {
+   "text": "Today Date: 06 Aug 2026",
+   "ids": [
+    15724,
+    2696,
+    25,
+    220,
+    2705,
+    5033,
+    220,
+    2366,
+    21
+   ],
+   "decoded": "Today Date: 06 Aug 2026"
+  },
+  {
+   "text": " leading space",
+   "ids": [
+    6522,
+    3634
+   ],
+   "decoded": " leading space"
+  },
+  {
+   "text": "trailing space ",
+   "ids": [
+    376,
+    14612,
+    3634,
+    220
+   ],
+   "decoded": "trailing space "
+  },
+  {
+   "text": "multiple   spaces   between",
+   "ids": [
+    36773,
+    256,
+    12908,
+    256,
+    1990
+   ],
+   "decoded": "multiple   spaces   between"
+  },
+  {
+   "text": "line one\nline two",
+   "ids": [
+    1074,
+    832,
+    198,
+    1074,
+    1403
+   ],
+   "decoded": "line one\nline two"
+  },
+  {
+   "text": "paragraph one\n\nparagraph two",
+   "ids": [
+    28827,
+    832,
+    271,
+    28827,
+    1403
+   ],
+   "decoded": "paragraph one\n\nparagraph two"
+  },
+  {
+   "text": "def f(x):\n    return x * 2\n",
+   "ids": [
+    755,
+    282,
+    2120,
+    997,
+    262,
+    471,
+    865,
+    353,
+    220,
+    17,
+    198
+   ],
+   "decoded": "def f(x):\n    return x * 2\n"
+  },
+  {
+   "text": "\t\n mixed \r\n endings",
+   "ids": [
+    1602,
+    9709,
+    2591,
+    77697
+   ],
+   "decoded": "\t\n mixed \r\n endings"
+  },
+  {
+   "text": "emoji 😀 test",
+   "ids": [
+    38623,
+    91416,
+    1296
+   ],
+   "decoded": "emoji 😀 test"
+  },
+  {
+   "text": "rockets 🚀🔥 and flags 🇹🇷",
+   "ids": [
+    21161,
+    1441,
+    11410,
+    248,
+    222,
+    9468,
+    242,
+    98,
+    323,
+    8202,
+    11410,
+    229,
+    117,
+    9468,
+    229,
+    115
+   ],
+   "decoded": "rockets 🚀🔥 and flags 🇹🇷"
+  },
+  {
+   "text": "中文分词测试",
+   "ids": [
+    108891,
+    17620,
+    106015,
+    82805
+   ],
+   "decoded": "中文分词测试"
+  },
+  {
+   "text": "Türkçe karakterler: ğüşıöçİĞÜŞÖÇ",
+   "ids": [
+    108173,
+    103143,
+    91855,
+    1565,
+    25,
+    115892,
+    2448,
+    78413,
+    3029,
+    3209,
+    48880,
+    103531,
+    53591,
+    101579,
+    64461,
+    47013
+   ],
+   "decoded": "Türkçe karakterler: ğüşıöçİĞÜŞÖÇ"
+  },
+  {
+   "text": "café déjà vu",
+   "ids": [
+    936,
+    59958,
+    46939,
+    33614
+   ],
+   "decoded": "café déjà vu"
+  },
+  {
+   "text": "café déjà vu",
+   "ids": [
+    936,
+    1897,
+    54939,
+    409,
+    54939,
+    5697,
+    97649,
+    33614
+   ],
+   "decoded": "café déjà vu"
+  },
+  {
+   "text": "wait... what?!?! (really); [yes] {no} <maybe>",
+   "ids": [
+    11748,
+    1131,
+    1148,
+    27074,
+    27074,
+    320,
+    54760,
+    1237,
+    510,
+    9891,
+    60,
+    314,
+    2201,
+    92,
+    366,
+    37860,
+    29
+   ],
+   "decoded": "wait... what?!?! (really); [yes] {no} <maybe>"
+  },
+  {
+   "text": "<|begin_of_text|>",
+   "ids": [
+    128000
+   ],
+   "decoded": ""
+  },
+  {
+   "text": "before <|eot_id|> after",
+   "ids": [
+    15145,
+    220,
+    128009,
+    1306
+   ],
+   "decoded": "before  after"
+  },
+  {
+   "text": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+   "ids": [
+    128006,
+    78191,
+    128007,
+    271
+   ],
+   "decoded": "assistant\n\n"
+  },
+  {
+   "text": "a",
+   "ids": [
+    64
+   ],
+   "decoded": "a"
+  },
+  {
+   "text": " ",
+   "ids": [
+    220
+   ],
+   "decoded": " "
+  },
+  {
+   "text": "",
+   "ids": [],
+   "decoded": ""
+  },
+  {
+   "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 06 Aug 2026\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "ids": [
+    128000,
+    128006,
+    9125,
+    128007,
+    271,
+    38766,
+    1303,
+    33025,
+    2696,
+    25,
+    6790,
+    220,
+    2366,
+    18,
+    198,
+    15724,
+    2696,
+    25,
+    220,
+    2705,
+    5033,
+    220,
+    2366,
+    21,
+    271,
+    2675,
+    527,
+    264,
+    11190,
+    18328,
+    13,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    3923,
+    374,
+    279,
+    6864,
+    315,
+    9822,
+    30,
+    128009,
+    128006,
+    78191,
+    128007,
+    271
+   ],
+   "decoded": "system\n\nCutting Knowledge Date: December 2023\nToday Date: 06 Aug 2026\n\nYou are a helpful assistant.user\n\nWhat is the capital of France?assistant\n\n"
+  },
+  {
+   "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 06 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWrite a haiku about GPUs.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "ids": [
+    128000,
+    128006,
+    9125,
+    128007,
+    271,
+    38766,
+    1303,
+    33025,
+    2696,
+    25,
+    6790,
+    220,
+    2366,
+    18,
+    198,
+    15724,
+    2696,
+    25,
+    220,
+    2705,
+    5033,
+    220,
+    2366,
+    21,
+    271,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    8144,
+    264,
+    6520,
+    39342,
+    922,
+    71503,
+    13,
+    128009,
+    128006,
+    78191,
+    128007,
+    271
+   ],
+   "decoded": "system\n\nCutting Knowledge Date: December 2023\nToday Date: 06 Aug 2026\n\nuser\n\nWrite a haiku about GPUs.assistant\n\n"
+  },
+  {
+   "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 06 Aug 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWrite a haiku about GPUs.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nWarm silicon hums<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nContinue it<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "ids": [
+    128000,
+    128006,
+    9125,
+    128007,
+    271,
+    38766,
+    1303,
+    33025,
+    2696,
+    25,
+    6790,
+    220,
+    2366,
+    18,
+    198,
+    15724,
+    2696,
+    25,
+    220,
+    2705,
+    5033,
+    220,
+    2366,
+    21,
+    271,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    8144,
+    264,
+    6520,
+    39342,
+    922,
+    71503,
+    13,
+    128009,
+    128006,
+    78191,
+    128007,
+    271,
+    96375,
+    51692,
+    2854,
+    82,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    24433,
+    433,
+    128009,
+    128006,
+    78191,
+    128007,
+    271
+   ],
+   "decoded": "system\n\nCutting Knowledge Date: December 2023\nToday Date: 06 Aug 2026\n\nuser\n\nWrite a haiku about GPUs.assistant\n\nWarm silicon humsuser\n\nContinue itassistant\n\n"
+  }
+ ],
+ "templates": [
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "date_string": "06 Aug 2026",
+   "ids": [
+    128000,
+    128006,
+    9125,
+    128007,
+    271,
+    38766,
+    1303,
+    33025,
+    2696,
+    25,
+    6790,
+    220,
+    2366,
+    18,
+    198,
+    15724,
+    2696,
+    25,
+    220,
+    2705,
+    5033,
+    220,
+    2366,
+    21,
+    271,
+    2675,
+    527,
+    264,
+    11190,
+    18328,
+    13,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    3923,
+    374,
+    279,
+    6864,
+    315,
+    9822,
+    30,
+    128009,
+    128006,
+    78191,
+    128007,
+    271
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a haiku about GPUs."
+    }
+   ],
+   "date_string": "06 Aug 2026",
+   "ids": [
+    128000,
+    128006,
+    9125,
+    128007,
+    271,
+    38766,
+    1303,
+    33025,
+    2696,
+    25,
+    6790,
+    220,
+    2366,
+    18,
+    198,
+    15724,
+    2696,
+    25,
+    220,
+    2705,
+    5033,
+    220,
+    2366,
+    21,
+    271,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    8144,
+    264,
+    6520,
+    39342,
+    922,
+    71503,
+    13,
+    128009,
+    128006,
+    78191,
+    128007,
+    271
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "  Write a haiku about GPUs.\n"
+    },
+    {
+     "role": "assistant",
+     "content": "Warm silicon hums"
+    },
+    {
+     "role": "user",
+     "content": "Continue it"
+    }
+   ],
+   "date_string": "06 Aug 2026",
+   "ids": [
+    128000,
+    128006,
+    9125,
+    128007,
+    271,
+    38766,
+    1303,
+    33025,
+    2696,
+    25,
+    6790,
+    220,
+    2366,
+    18,
+    198,
+    15724,
+    2696,
+    25,
+    220,
+    2705,
+    5033,
+    220,
+    2366,
+    21,
+    271,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    8144,
+    264,
+    6520,
+    39342,
+    922,
+    71503,
+    13,
+    128009,
+    128006,
+    78191,
+    128007,
+    271,
+    96375,
+    51692,
+    2854,
+    82,
+    128009,
+    128006,
+    882,
+    128007,
+    271,
+    24433,
+    433,
+    128009,
+    128006,
+    78191,
+    128007,
+    271
+   ]
+  }
+ ]
+}

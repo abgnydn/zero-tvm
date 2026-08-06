@@ -20,7 +20,7 @@ import type { ModelSpec } from '../compiler/model-spec.js'
 import { specForParam } from './model-registry.js'
 import { resolveModelBase } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
-import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt } from './tokenizer-bpe.js'
+import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt, buildLlama3ChatPrompt } from './tokenizer-bpe.js'
 
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
 
@@ -59,6 +59,11 @@ export function buildChatPromptFor(
     // Qwen3 v1 chat is non-thinking: emit the template's explicit
     // `enable_thinking is false` suffix so the model skips the <think> block.
     return buildChatMLPrompt(messages, tokenizer, { thinking: false })
+  }
+  if (spec.chatTemplateId === 'llama3') {
+    // Llama-3 header template (pinned token-exact vs mlx_lm apply_chat_template
+    // — tests/tokenizer/tokenizer-llama3.test.ts).
+    return buildLlama3ChatPrompt(messages, tokenizer)
   }
   return buildPhi3ChatPrompt(messages, tokenizer)
 }

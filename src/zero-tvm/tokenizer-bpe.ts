@@ -66,6 +66,16 @@
 // ============================================================
 
 export interface ByteLevelTokenizerJSON {
+  /** Qwen3 ships {type:'NFC'}; Llama-3 ships null (no normalizer). */
+  normalizer?: { type: string } | null
+  /** Sequence[Split(regex), ByteLevel] — the Split pattern differs per family
+   *  (Qwen3 splits single digits, Llama-3 digit runs of ≤3), so encode()
+   *  translates the repo's OWN regex instead of assuming Qwen3's. */
+  pre_tokenizer?: {
+    type: string
+    pretokenizers?: Array<{ type: string; pattern?: { Regex?: string } }>
+    pattern?: { Regex?: string }
+  } | null
   model: {
     type: string
     vocab: Record<string, number>
@@ -135,6 +145,36 @@ const PRETOKENIZE_RE =
   /'(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu
 
 /**
+ * Split-pretokenizer regex from the repo's OWN tokenizer.json. Llama-3's
+ * pattern differs from Qwen3's in exactly one branch — `\p{N}{1,3}` (digit
+ * runs of up to 3) where Qwen3 has `\p{N}` — so assuming the hardcoded
+ * PRETOKENIZE_RE would silently mistokenize every number in a Llama prompt.
+ *
+ * The only oniguruma construct JS lacks is the inline case-insensitive group
+ * `(?i:...)`, and both families ship the identical contraction group, so the
+ * translation is one exact-string replacement (same per-branch expansion the
+ * hardcoded regex documents); everything else (`\p{L}`, `\p{N}{1,3}`, the
+ * `(?!\S)` lookahead) is valid JS with /u. Falls back to the Qwen3 regex when
+ * the JSON has no Split pattern — for Qwen3 itself the translation and the
+ * fallback are the same regex (pinned by tests/tokenizer fixtures).
+ */
+function pretokenizeRegexFrom(json: ByteLevelTokenizerJSON): RegExp {
+  const pt = json.pre_tokenizer
+  const parts = pt?.pretokenizers ?? (pt ? [pt] : [])
+  const pattern = parts.find((p) => p.type === 'Split')?.pattern?.Regex
+  if (typeof pattern !== 'string') return PRETOKENIZE_RE
+  const js = pattern.replace(
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)",
+    "'(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])",
+  )
+  try {
+    return new RegExp(js, 'gu')
+  } catch {
+    return PRETOKENIZE_RE
+  }
+}
+
+/**
  * GPT-2 byte↔unicode table: printable latin-1 bytes map to themselves,
  * everything else (controls, space, DEL, ...) maps to U+0100+n so every
  * byte-level token is a string of visible, single-code-unit chars.
@@ -164,6 +204,11 @@ const utf8Encoder = new TextEncoder()
 export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): ByteLevelTokenizer {
   const vocab = json.model.vocab   // token_str → id
   const { byteToChar, charToByte } = buildByteUnicodeMaps()
+  const pretokRe = pretokenizeRegexFrom(json)
+  // Qwen3 normalizes NFC; Llama-3 ships normalizer: null (raw text). The
+  // field predates this file supporting Llama, so treat "absent" as Qwen3's
+  // NFC to keep the committed fixtures' contract.
+  const nfc = json.normalizer === undefined || json.normalizer !== null
 
   // Build reverse vocab: id → token_str. (No Math.max(...values) here —
   // spreading 151k vocab ids overflows the call stack.)
@@ -202,10 +247,14 @@ export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): ByteLeve
 
   // Qwen3 has no BOS token (tokenizer_config.json bos_token: null); MLC's
   // config re-uses <|endoftext|> as bos_token_id, so mirror that here to
-  // keep the Tokenizer interface shape.
-  const eosId = addedTokens.get('<|im_end|>') ?? 151645
-  const bosId = addedTokens.get('<|endoftext|>') ?? 151643
-  const stopIds = [eosId, bosId]
+  // keep the Tokenizer interface shape. Llama-3 ships neither ChatML name —
+  // fall through to its own specials (<|eot_id|>/<|begin_of_text|>). Nothing
+  // engine-side consumes these (spec.stops drives the decode loops); they
+  // exist for the Tokenizer interface shape and the unit tests.
+  const eosId = addedTokens.get('<|im_end|>') ?? addedTokens.get('<|eot_id|>') ?? 151645
+  const bosId = addedTokens.get('<|endoftext|>') ?? addedTokens.get('<|begin_of_text|>') ?? 151643
+  // ChatML: [<|im_end|>, <|endoftext|>]; Llama-3: [<|eot_id|>, <|end_of_text|>].
+  const stopIds = [eosId, addedTokens.get('<|end_of_text|>') ?? bosId]
 
   // --------------------------------------------------------
   // BPE core: same greedy lowest-rank merge loop as tokenizer.ts, plus a
@@ -250,7 +299,7 @@ export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): ByteLeve
   function pretokenize(text: string): string[] {
     const pieces: string[] = []
     let last = 0
-    for (const m of text.matchAll(PRETOKENIZE_RE)) {
+    for (const m of text.matchAll(pretokRe)) {
       if (m.index > last) pieces.push(text.slice(last, m.index))
       pieces.push(m[0])
       last = m.index + m[0].length
@@ -284,8 +333,9 @@ export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): ByteLeve
         }
       }
 
-      // Steps 2-4: NFC normalize, regex-split, byte→unicode map, BPE.
-      for (const piece of pretokenize(part.normalize('NFC'))) {
+      // Steps 2-4: normalize (NFC when the JSON declares it — Llama-3 ships
+      // normalizer: null), regex-split, byte→unicode map, BPE.
+      for (const piece of pretokenize(nfc ? part.normalize('NFC') : part)) {
         let mapped = ''
         for (const byte of utf8Encoder.encode(piece)) mapped += byteToChar[byte]
 
@@ -403,5 +453,57 @@ export function buildChatPrompt(
   }
   text += '<|im_start|>assistant\n'
   if (opts?.thinking === false) text += '<think>\n\n</think>\n\n'
+  return tokenizer.encode(text)
+}
+
+// ============================================================
+// Chat template for Llama-3 (header style)
+//
+// <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n
+// Cutting Knowledge Date: December 2023\nToday Date: {date}\n\n{system}<|eot_id|>
+// <|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>
+// <|start_header_id|>assistant<|end_header_id|>\n\n     ← generation prompt
+//
+// Ground truth: tokenizer_config.json chat_template of
+// mlx-community/Llama-3.2-1B-Instruct-4bit (the no-tools path), pinned
+// TOKEN-exact against mlx_lm's apply_chat_template by
+// tests/tokenizer/tokenizer-llama3.test.ts. Two behaviors that are easy to
+// get wrong: the template ALWAYS emits a system block — the knowledge-cutoff
+// line plus today's date (strftime_now "%d %b %Y"), with the caller's system
+// message (if any) appended after the blank line — and every message content
+// is |trim'ed. Stop ids: <|eot_id|> (128009), <|end_of_text|> (128001).
+// ============================================================
+
+const LLAMA3_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** Python strftime("%d %b %Y") in the C locale — what the template's
+ *  strftime_now emits, e.g. "06 Aug 2026" (day zero-padded). */
+export function llama3DateString(d: Date = new Date()): string {
+  return `${String(d.getDate()).padStart(2, '0')} ${LLAMA3_MONTHS[d.getMonth()]} ${d.getFullYear()}`
+}
+
+export function buildLlama3ChatPrompt(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  // dateString exists so tests can pin the fixture date; live chat renders
+  // today's, exactly like mlx_lm running the template with strftime_now.
+  opts?: { dateString?: string },
+): number[] {
+  const date = opts?.dateString ?? llama3DateString()
+  // The template extracts a leading system message into the fixed system
+  // block; everything else renders as header turns.
+  let rest = messages
+  let system = ''
+  if (rest[0]?.role === 'system') {
+    system = rest[0].content.trim()
+    rest = rest.slice(1)
+  }
+  let text = '<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n'
+  text += `Cutting Knowledge Date: December 2023\nToday Date: ${date}\n\n`
+  text += `${system}<|eot_id|>`
+  for (const msg of rest) {
+    text += `<|start_header_id|>${msg.role}<|end_header_id|>\n\n${msg.content.trim()}<|eot_id|>`
+  }
+  text += '<|start_header_id|>assistant<|end_header_id|>\n\n'
   return tokenizer.encode(text)
 }
