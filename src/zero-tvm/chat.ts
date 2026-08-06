@@ -30,6 +30,11 @@ import { installBenchConsole } from './bench-console.js'
 
 const SPEC = specFromSearch(location.search)
 const BRAND = modelBranding(SPEC)
+// Quant label for the message header + gate copy — from the spec, not a
+// literal: MLX checkpoints are affine group-64, not MLC's q4f16_1.
+const QUANT_TAG = SPEC.weightFormat === 'mlx-safetensors'
+  ? (SPEC.moe?.bits === 3 ? 'MLX 3-bit experts' : 'MLX 4-bit')
+  : 'q4f16_1'
 // Dispatches per decode token: Phi-3 runs the fused path (32×7+4 = 228);
 // qkNorm specs (Qwen3) run unfused with the fused qk_norm+RoPE+append kernel
 // (default ?fuseqk on: 36×8+4 = 292; the reference chain is 10/layer); hybrid
@@ -156,7 +161,7 @@ function addAiMsg(): AiMsgHandle {
     <div class="role">
       <span class="role-dot">Z</span>
       <span class="role-name"></span>
-      <span class="model-tag">q4f16_1</span>
+      <span class="model-tag">${QUANT_TAG}</span>
     </div>
     <div class="body"></div>
     <div class="actions"></div>
@@ -309,7 +314,7 @@ function showDownloadGate(): Promise<void> {
       <div id="start-screen" class="start-screen" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;gap:1.25rem;text-align:center;padding:2rem">
         <div class="title" style="font-size:1.1rem;font-weight:600;color:#ccc"></div>
         <div class="desc" style="font-size:0.85rem;color:#888;max-width:440px;line-height:1.6">
-          First load downloads the q4f16_1 weights and caches them
+          First load downloads the ${QUANT_TAG} weights and caches them
           locally (OPFS). Every subsequent visit — including the WebLLM comparison
           page — is instant; weights are served from the same shared browser cache.
         </div>
@@ -360,7 +365,10 @@ async function main(): Promise<void> {
       // RoPE+append into the projection with no per-head norm hook, and the
       // int8-KV path rides on qkv_fused_scratch, so ?kv8 is gated off too
       // until an unfused-int8 composition is verified end-to-end.
-      const fused = !spec.qkNorm
+      // ...and MLX-affine specs likewise: qkv_fused dequantises symmetric
+      // group-32 inline, so affine checkpoints take the unfused matmul path
+      // whether or not they carry qkNorm.
+      const fused = !spec.qkNorm && spec.weightFormat !== 'mlx-safetensors'
       const int8KV = flags.int8KV && fused
       if (flags.int8KV && !int8KV) {
         log(`?kv8=1 ignored for ${spec.id} — int8 KV requires the fused QKV path (Phi-3 only for now)`)

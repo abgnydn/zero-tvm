@@ -803,8 +803,10 @@ export interface LoadedWeights {
     // Dense FFN — absent on a MoE spec, which has `moe` below instead.
     ffnWeights?: GPUBuffer
     ffnScales?: GPUBuffer
+    ffnBiases?: GPUBuffer
     ffnDownWeights?: GPUBuffer
     ffnDownScales?: GPUBuffer
+    ffnDownBiases?: GPUBuffer
     qNormGamma?: GPUBuffer   // per-head q RMSNorm over head_dim (Qwen3 only)
     kNormGamma?: GPUBuffer   // per-head k RMSNorm over head_dim (Qwen3 only)
     // GatedDeltaNet records — present iff spec.layerKinds[L] === 'gdn' (Qwen3.5).

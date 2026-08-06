@@ -152,15 +152,16 @@ export interface BufferPlan {
 /**
  * Every buffer one Qwen3.6 decoder layer needs, and which records build it.
  *
- * `prefix` is everything before `layers.N.` — 'language_model.model.' for this
- * checkpoint, because the repo is multimodal and the text tower is nested
- * under a vision-capable root.
+ * `prefix` is everything before `layers.N.` — `spec.mlxPrefix + 'model.'` by
+ * default: 'model.' for a text-only checkpoint, 'language_model.model.' for
+ * Qwen3.6, whose repo is multimodal and nests the text tower under a
+ * vision-capable root.
  *
  * Attention and GDN layers are different shapes, so the plan branches on
  * `spec.layerKinds[L]` exactly as the engine does.
  */
-export function planLayer(spec: ModelSpec, L: number, prefix = 'language_model.model.'): BufferPlan[] {
-  const p = `${prefix}layers.${L}`
+export function planLayer(spec: ModelSpec, L: number, prefix?: string): BufferPlan[] {
+  const p = `${prefix ?? `${spec.mlxPrefix ?? ''}model.`}layers.${L}`
   const q = (base: string) => [
     { record: `${base}.weight`, convert: 'raw' as Convert },
     { record: `${base}.scales`, convert: 'bf16->f16' as Convert },
@@ -186,8 +187,10 @@ export function planLayer(spec: ModelSpec, L: number, prefix = 'language_model.m
     // gated_qkv_split expects, so K and V simply follow it.
     plans.push(...trio('c_attn', [`${p}.self_attn.q_proj`, `${p}.self_attn.k_proj`, `${p}.self_attn.v_proj`]))
     plans.push(...trio('o_proj', [`${p}.self_attn.o_proj`]))
-    plans.push({ name: 'q_norm', parts: [{ record: `${p}.self_attn.q_norm.weight`, convert: 'bf16->f16' }] })
-    plans.push({ name: 'k_norm', parts: [{ record: `${p}.self_attn.k_norm.weight`, convert: 'bf16->f16' }] })
+    if (spec.qkNorm) {
+      plans.push({ name: 'q_norm', parts: [{ record: `${p}.self_attn.q_norm.weight`, convert: 'bf16->f16' }] })
+      plans.push({ name: 'k_norm', parts: [{ record: `${p}.self_attn.k_norm.weight`, convert: 'bf16->f16' }] })
+    }
   } else {
     const g = `${p}.linear_attn`
     // One K=d matmul of gdnProjRows rows; the downstream kernels read z and
@@ -219,16 +222,22 @@ export function planLayer(spec: ModelSpec, L: number, prefix = 'language_model.m
  * The buffers that are NOT per-layer: the embedding table, the untied lm_head,
  * and the final norm.
  *
- * `prefix` stops one level higher than planLayer's. The text tower lives under
- * `language_model.model.` but lm_head is `language_model.lm_head` — a level up,
- * because it is not part of the decoder stack. Getting that wrong is a missing
- * record, so it fails loudly; it is called out because it looks like a typo.
+ * `prefix` stops one level higher than planLayer's (default `spec.mlxPrefix`).
+ * The text tower lives under `<prefix>model.` but lm_head is `<prefix>lm_head`
+ * — a level up, because it is not part of the decoder stack. Getting that
+ * wrong is a missing record, so it fails loudly; it is called out because it
+ * looks like a typo.
+ *
+ * Tied-embeddings checkpoints ship NO lm_head records at all (mlx_lm reuses
+ * the quantized embedding matrix), so the lm_head trio is skipped and the
+ * loader aliases the embedding buffers instead — see assembleMlx.
  *
  * Bias record names come from `spec.paramNaming.biasFor` rather than a suffix
  * spelled here a second time — that field exists precisely so one place knows
  * how MLX names companions.
  */
-export function planGlobal(spec: ModelSpec, prefix = 'language_model.'): BufferPlan[] {
+export function planGlobal(spec: ModelSpec, prefix?: string): BufferPlan[] {
+  const pre = prefix ?? spec.mlxPrefix ?? ''
   const bias = spec.paramNaming.biasFor
   if (!bias) throw new Error(`${spec.id}: planGlobal needs paramNaming.biasFor (affine checkpoints only)`)
   const q = (name: string, base: string): BufferPlan[] => [
@@ -237,9 +246,9 @@ export function planGlobal(spec: ModelSpec, prefix = 'language_model.'): BufferP
     { name: `${name}_b`, parts: [{ record: bias(`${base}.weight`), convert: 'bf16->f16' }] },
   ]
   return [
-    ...q('embed', `${prefix}model.embed_tokens`),
-    ...q('lm_head', `${prefix}lm_head`),          // NOT under model. — see above
-    { name: 'final_norm', parts: [{ record: `${prefix}model.norm.weight`, convert: 'bf16->f16' }] },
+    ...q('embed', `${pre}model.embed_tokens`),
+    ...(spec.tiedEmbeddings ? [] : q('lm_head', `${pre}lm_head`)),  // NOT under model. — see above
+    { name: 'final_norm', parts: [{ record: `${pre}model.norm.weight`, convert: 'bf16->f16' }] },
   ]
 }
 

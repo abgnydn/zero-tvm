@@ -77,13 +77,19 @@ export interface ParamNaming {
   biasFor?: (weightRecord: string) => string
 }
 
-/** Sparse-MoE FFN (Qwen3.6). Absent = the dense gate_up/down FFN. */
+/** Sparse-MoE FFN (Qwen3.6). Absent = the dense gate_up/down FFN.
+ *
+ *  Two facts the engine assumes rather than parameterises (add-model's
+ *  constraint check enforces both from config.json):
+ *    - the router is 8-bit quantized — moe_router_logits.wgsl hardcodes the
+ *      8-bit unpack, there is no 4-bit router variant;
+ *    - shared_expert_intermediate_size == moe_intermediate_size (`ffn`) —
+ *      the shared expert is STACKED as expert index E of every expert
+ *      tensor, which only works if its rows are the same width. */
 export interface MoeDims {
   experts: number             // routed experts (num_experts)
   topK: number                // experts per token (num_experts_per_tok)
-  sharedIntermediate: number  // shared_expert_intermediate_size
   normTopkProb: boolean       // renormalise the top-K probabilities to sum to 1
-  routerBits: 4 | 8           // the router ships at 8 bits while the FFN is 4
   /** Expert-stack precision. 3 selects the q3 bitstream kernels and a
    *  checkpoint whose switch_mlp/shared_expert were requantised to 3 bits
    *  (scripts/convert-q3-experts.py). Default 4. */
@@ -165,6 +171,14 @@ export interface ModelSpecBase {
    * Default 'mlc'.
    */
   weightFormat?: 'mlc' | 'mlx-safetensors'
+  /**
+   * MLX checkpoints only: the record-name prefix before `model.*` / `lm_head`.
+   * '' for a text-only checkpoint (`model.layers.0…`, `lm_head.weight`);
+   * 'language_model.' for Qwen3.6's multimodal root
+   * (`language_model.model.layers.0…`). mlx-weights.ts derives every record
+   * name from this — the loader has no other prefix knowledge.
+   */
+  mlxPrefix?: string
 }
 
 export interface ModelSpec extends ModelSpecBase {
@@ -233,6 +247,61 @@ export interface ModelSpec extends ModelSpecBase {
    *  gate within the router — both are appended at the end, so both are
    *  `moe.experts`. -1 for dense specs. */
   sharedExpertIndex: number
+}
+
+/**
+ * The standard MLX record-name table for a checkpoint under `prefix`
+ * (= the spec's `mlxPrefix`: '' text-only, 'language_model.' multimodal).
+ *
+ * MLX names every quantized tensor `<base>.weight/.scales/.biases` and ships
+ * projections unfused, so the whole table is mechanical — generated specs call
+ * this instead of restating forty lines of names. The entries name the records
+ * the engine binds by; concatenation (c_attn = q++k++v etc.) is
+ * mlx-weights.ts's business, not the spec's. QWEN36_35B_A3B predates this
+ * helper and spells the same names inline.
+ */
+export function mlxParamNaming(prefix: string): ParamNaming {
+  const m = `${prefix}model.`
+  return {
+    embedWeight: [`${m}embed_tokens.weight`],
+    embedScale: [`${m}embed_tokens.scales`],
+    lmHeadWeight: [`${prefix}lm_head.weight`],
+    lmHeadScale: [`${prefix}lm_head.scales`],
+    finalNorm: [`${m}norm.weight`],
+    biasFor: (w: string) => w.replace(/\.weight$/, '.biases'),
+    layer: (L: number) => {
+      const p = `${m}layers.${L}`
+      const g = `${p}.linear_attn`
+      return {
+        qkvWeight: [`${p}.self_attn.q_proj.weight`],
+        qkvScale: [`${p}.self_attn.q_proj.scales`],
+        oProjWeight: [`${p}.self_attn.o_proj.weight`],
+        oProjScale: [`${p}.self_attn.o_proj.scales`],
+        norm1: [`${p}.input_layernorm.weight`],
+        norm2: [`${p}.post_attention_layernorm.weight`],
+        ffnWeight: [`${p}.mlp.gate_proj.weight`],
+        ffnScale: [`${p}.mlp.gate_proj.scales`],
+        ffnDownWeight: [`${p}.mlp.down_proj.weight`],
+        ffnDownScale: [`${p}.mlp.down_proj.scales`],
+        qNorm: [`${p}.self_attn.q_norm.weight`],
+        kNorm: [`${p}.self_attn.k_norm.weight`],
+        gdnQkvWeight: [`${g}.in_proj_qkv.weight`],
+        gdnQkvScale: [`${g}.in_proj_qkv.scales`],
+        gdnZWeight: [`${g}.in_proj_z.weight`],
+        gdnZScale: [`${g}.in_proj_z.scales`],
+        gdnAWeight: [`${g}.in_proj_a.weight`],
+        gdnAScale: [`${g}.in_proj_a.scales`],
+        gdnBWeight: [`${g}.in_proj_b.weight`],
+        gdnBScale: [`${g}.in_proj_b.scales`],
+        gdnALog: [`${g}.A_log`],
+        gdnDtBias: [`${g}.dt_bias`],
+        gdnConvWeight: [`${g}.conv1d.weight`],
+        gdnNormWeight: [`${g}.norm.weight`],
+        gdnOutWeight: [`${g}.out_proj.weight`],
+        gdnOutScale: [`${g}.out_proj.scales`],
+      }
+    },
+  }
 }
 
 export function makeModelSpec(base: ModelSpecBase): ModelSpec {
@@ -570,11 +639,12 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
   hfRepo: 'lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit',
   manifestName: 'model.safetensors.index.json',
   weightFormat: 'mlx-safetensors',
+  mlxPrefix: 'language_model.',  // multimodal checkpoint — text tower under language_model.
   fullAttnInterval: 4,       // layers 3, 7, ... 39 are full attention (10 of 40)
   gdn: { kHeads: 16, vHeads: 32, headK: 128, headV: 128, convK: 4 },
   partialRotaryFactor: 0.25, // rotary_dim = 64 of 256 dims per head
   attnGate: true,
-  moe: { experts: 256, topK: 8, sharedIntermediate: 512, normTopkProb: true, routerBits: 8 },
+  moe: { experts: 256, topK: 8, normTopkProb: true },
   // MLX names every quantized tensor <base>.weight / .scales / .biases, and
   // ships the projections UNFUSED — src/zero-tvm/mlx-weights.ts holds the
   // concatenation plan (c_attn = q++k++v, gdn proj = qkv++z++a++b, expert
@@ -645,3 +715,37 @@ export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
   hfRepo: 'abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp',
   moe: { ...QWEN36_35B_A3B.moe!, bits: 3 },
 })
+
+// ============================================================
+// Generated specs — scripts/add-model.mjs appends below this marker after its
+// constraint check passes. Hand-edits above survive; below, expect churn.
+// ADD-MODEL:SPECS
+
+// mlx-community/Qwen3-4B-4bit — generated by scripts/add-model.mjs (2026-08-06)
+export const QWEN3_4B_MLX: ModelSpec = makeModelSpec({
+  id: 'qwen3-4b-mlx',
+  d: 2560,
+  layers: 36,
+  heads: 32,
+  kvHeads: 8,
+  headDim: 128,
+  ffn: 9728,
+  vocab: 151936,
+  pageSize: 16,
+  // 7168 tokens on the 1 GiB KV budget rule (144 KiB/token × 36 attn layers).
+  maxPages: 448,
+  maxSeq: 40960,
+  ropeTheta: 1000000,
+  rmsEps: 0.000001,
+  tiedEmbeddings: true,
+  qkNorm: true,
+  // Resolved from THIS repo's tokenizer.json added_tokens by name, not assumed.
+  stops: [151645, 151643],
+  chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'mlx-community/Qwen3-4B-4bit',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  paramNaming: mlxParamNaming(""),
+})
+// ============================================================

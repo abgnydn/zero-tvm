@@ -174,6 +174,34 @@ npm run test:kernels:mlx      # byte-exact repack + loader replay + model budget
 npm run test:kernels:real     # kernels vs mlx_lm's own modules on real weights
 ```
 
+## Adding models (`scripts/add-model.mjs`)
+
+Covered-architecture MLX checkpoints are added by pipeline, not by hand:
+
+```bash
+npm run add-model -- <hf-repo> [--param <url>] [--check-only]
+# green: spec generated into model-spec.ts (ADD-MODEL:SPECS marker) + registry
+#        rows (model-registry.ts markers) + compile gate under the new dims
+# red:   per-failure {rule, detail, needs-this-kernel} report, exit 1
+npm run add-model -- --compat        # regenerate docs/COMPAT.md from constraints.ts
+node tests/kernels/compile-spec.mjs <SPEC_EXPORT>   # generic compile gate
+
+# numerical trust (weights required locally):
+hf download <repo> --local-dir .weights-local/<repo-tail>
+cd ~/dev/ml-research && uv run python ~/dev/zero-tvm/scripts/mlx-ref.py \
+    --model ~/dev/zero-tvm/.weights-local/<tail> --out /tmp/ref-<param>
+node scripts/validate-model.mjs <param> --ref /tmp/ref-<param>
+```
+
+Constraint matrix lives in `src/compiler/constraints.ts` (checks + the
+SUPPORT_MATRIX docs/COMPAT.md is generated from). The registry
+(`model-registry.ts`) is the single source for `?model=` params, landing
+cards, switcher and branding — `specFromSearch` derives from it. Proof run
+2026-08-06: `mlx-community/Qwen3-4B-4bit` → `?model=qwen3mlx`, logits cosine
+0.999879 vs mlx_lm, greedy token-exact ("The capital of France is
+**Paris**."); dense MLX models run the affine FFN chain (gate_up matmul →
+silu_mul → down; fused_ffn is symmetric-only).
+
 ## Cross-site context
 
 `sites.json` is synced from `~/sites-shared/sites.ts`. Edit URLs,

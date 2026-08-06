@@ -280,6 +280,20 @@ export function buildDecodeEngine(
   // gated_qkv_split and the win is 2 of 12 dispatches on 8 of 32 layers).
   const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm
 
+  // MLX-affine checkpoints run a restricted composition: every fused kernel
+  // that dequantises inline (qkv_fused, qkv_fused_scratch, fused_ffn) is
+  // symmetric group-32 only, so affine specs must take the unfused paths.
+  // The qkNorm guard above already forces this for Qwen-family specs; this
+  // one exists so an affine spec WITHOUT qkNorm fails loudly instead of
+  // running symmetric dequant math over affine nibbles.
+  const AFFINE = S.weightFormat === 'mlx-safetensors'
+  if (AFFINE && fused) {
+    throw new Error(
+      'buildDecodeEngine: fused QKV is incompatible with MLX-affine weights — '
+      + 'qkv_fused dequantises symmetric group-32 inline. Use unfused mode.'
+    )
+  }
+
   // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and
   // SCALES = K/QGROUP. K = d for the QKV/gate_up projections, qDim for o_proj
   // (== d when heads == kvHeads), ffn for down_proj.
@@ -289,7 +303,7 @@ export function buildDecodeEngine(
   // uniforms and index the scale array with it, so a 32 here against 64-wide
   // groups reads the WRONG SCALE for everything past the first group. It runs
   // clean, every value is finite, and the logits are nonsense.
-  const QGROUP = S.weightFormat === 'mlx-safetensors' ? 64 : GROUP
+  const QGROUP = AFFINE ? 64 : GROUP
   const QKV_K_PACKED    = S.d / PACK          // Phi-3: 384  (K=3072)
   const QKV_SCALES      = S.d / QGROUP        // Phi-3: 96
   const OPROJ_K_PACKED  = S.qDim / PACK       // Phi-3: 384 (qDim == d)
@@ -449,6 +463,13 @@ export function buildDecodeEngine(
     B.moeH         = makeBuf(device, S.moeSlots * S.ffn * 2, 'moeH')
     B.moeDown      = makeBuf(device, S.moeSlots * S.d * 2, 'moeDown')
   }
+  // Dense FFN on an affine spec: fused_ffn dequantises symmetric group-32
+  // inline and has no affine sibling, so gate_up runs as ONE 2·ffn-row K=d
+  // affine matmul into this buffer (rows 0..ffn-1 = gate, ffn.. = up — the
+  // loader concatenates gate_proj ++ up_proj, and that is exactly the [gate|up]
+  // layout silu_mul reads at SLOTS = 1), then silu_mul writes B.ffnOut and the
+  // down matmul proceeds as in the MLC chain.
+  const ffnGateUp = AFFINE && !S.moe ? makeBuf(device, 2 * S.ffn * 2, 'ffnGateUp') : null
 
   // Static uniforms — matmul shapes (K_packed, scales_per_row, M)
   const qkvU   = fused ? null : uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(S.qkvDim)])
@@ -474,6 +495,10 @@ export function buildDecodeEngine(
     : null
   const moeCombU = S.moe ? uniformBuf(device, [u32(S.d), u32(S.moeSlots)]) : null
   const ffnDnU = uniformBuf(device, [u32(FFN_DN_K_PACKED), u32(FFN_DN_SCALES), u32(S.d)])
+  // Affine dense gate_up: a K=d matmul instance over 2·ffn rows (same shape
+  // family as qkvU), plus silu_mul pinned to a single slot.
+  const ffnGateUpU = ffnGateUp ? uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(2 * S.ffn)]) : null
+  const ffnSiluU = ffnGateUp ? uniformBuf(device, [i32(1), i32(Math.ceil(S.ffn / 256))]) : null
   const lmHdU  = uniformBuf(device, [u32(QKV_K_PACKED),    u32(QKV_SCALES),    u32(S.vocab)])
   const embU   = uniformBuf(device, [u32(1), u32(D_WGS)])
   const normU  = uniformBuf(device, [u32(1)])
@@ -703,7 +728,6 @@ export function buildDecodeEngine(
   // is what keeps ONE bind-group construction serving both families — and a
   // mismatch is a loud bind-group validation error ("5 entries, expected 6"),
   // not a wrong number, which is the only reason this is safe to centralise.
-  const AFFINE = S.weightFormat === 'mlx-safetensors'
   const withBias = (entries: BindEntry[], bias: GPUBuffer | undefined, what: string): BindEntry[] => {
     if (!AFFINE) return entries
     if (!bias) throw new Error(`buildDecodeEngine: ${S.id} is affine but ${what} has no bias buffer`)
@@ -758,7 +782,8 @@ export function buildDecodeEngine(
     }
     oProj: GPUBindGroup         // attn: o_proj | gdn: out_proj (both → hidden2)
     addNorm1?: GPUBindGroup     // post-attention: reads residual, writes residual2 (absent w/ ?fuseprologue=1)
-    ffn?: GPUBindGroup          // dense FFN; absent on a MoE spec
+    ffn?: GPUBindGroup          // dense FFN; absent on a MoE spec. Affine: the 2·ffn-row gate_up matmul
+    ffnSilu?: GPUBindGroup      // affine dense only: silu_mul(ffnGateUp) → ffnOut (fused_ffn has no affine sibling)
     ffnDown?: GPUBindGroup      // prologue mode: writes hidden3 (hidden2 must survive for add3_norm)
     /** The MoE block's seven bind groups, present iff spec.moe. Replaces
      *  ffn/ffnDown between addNorm1 and addNorm2 — the surrounding residual
@@ -779,6 +804,9 @@ export function buildDecodeEngine(
   }
   if (hybrid && R.ffnPrologue) {
     throw new Error('buildDecodeEngine: ?fuseprologue=1 is not supported for hybrid (GDN) specs')
+  }
+  if (AFFINE && R.ffnPrologue) {
+    throw new Error('buildDecodeEngine: ?fuseprologue=1 uses the symmetric fused FFN kernel — MLX-affine specs run the unfused gate_up/silu/down chain')
   }
   const layerBGs: LayerBG[] = []
   for (let L = 0; L < S.layers; L++) {
@@ -853,9 +881,8 @@ export function buildDecodeEngine(
       oProjBG = bg(device, R.matmulOProj, withBias(
         [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
     } else if (!fused) {
-      qkvBG = bg(device, R.matmul, [
-        B.qkvOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, qkvU!,
-      ])
+      qkvBG = bg(device, R.matmul, withBias(
+        [B.qkvOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, qkvU!], lw.qkvBiases, 'qkv_proj'))
       if (fuseQk) {
         // ?fuseqk: one fused kernel replaces qk_norm → rope → kv_append.
         if (!lw.qNormGamma || !lw.kNormGamma) {
@@ -871,7 +898,8 @@ export function buildDecodeEngine(
         ])
       }
       attnBG = attnF16BG()
-      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
+      oProjBG = bg(device, R.matmulOProj, withBias(
+        [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
     } else if (int8Mode) {
       qkvBG = bg(device, P.qkvFusedScratch, [
         B.qOut, B.kSlot!, B.vSlot!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, B.posMap, qkvFusedScratchU!,
@@ -955,9 +983,16 @@ export function buildDecodeEngine(
       gdn: gdnBG,
       oProj: oProjBG,
       addNorm1: bg(device, P.addNorm, [B.hidden2, B.residual, lw.normGamma2, B.hidden1, B.residual2, normU]),
-      ffn: S.moe ? undefined : bg(device, R.ffn, [B.ffnOut, B.hidden1, lw.ffnScales!, lw.ffnWeights!, ffnU]),
+      // Affine dense: gate_up as one 2·ffn-row K=d affine matmul (fused_ffn is
+      // symmetric-only), then silu_mul collapses [gate|up] → ffnOut.
+      ffn: S.moe ? undefined : ffnGateUp
+        ? bg(device, R.matmul, withBias(
+            [ffnGateUp, B.hidden1, lw.ffnScales!, lw.ffnWeights!, ffnGateUpU!], lw.ffnBiases, 'gate_up'))
+        : bg(device, R.ffn, [B.ffnOut, B.hidden1, lw.ffnScales!, lw.ffnWeights!, ffnU]),
+      ffnSilu: ffnGateUp ? bg(device, P.siluMul, [B.ffnOut, ffnGateUp, ffnSiluU!]) : undefined,
       ffnDown: S.moe ? undefined
-        : bg(device, R.matmulFfnDown, [B.hidden2, B.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, ffnDnU]),
+        : bg(device, R.matmulFfnDown, withBias(
+            [B.hidden2, B.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, ffnDnU], lw.ffnDownBiases, 'down_proj')),
       moe: moeBG,
       addNorm2: bg(device, P.addNorm, [B.hidden2, B.residual2, nextGamma, B.hidden1, B.residual, normU]),
     })
@@ -1106,6 +1141,13 @@ export function buildDecodeEngine(
           dispatch(enc, P.siluMul, blk.moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
           dispatch(enc, moeMM!, blk.moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
           dispatch(enc, P.moeCombine, blk.moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
+        } else if (blk.ffnSilu) {
+          // Affine dense FFN: gate_up matmul (2·ffn rows, K=d) → silu_mul →
+          // down matmul. Three dispatches where MLC runs two — the price of
+          // fused_ffn having no affine sibling.
+          dispatch(enc, R.matmul, blk.ffn!, (2 * S.ffn) / R.matmulRowsPerWG, 1, 1, 'ffnGateUp')
+          dispatch(enc, P.siluMul, blk.ffnSilu, Math.ceil(S.ffn / 256), 1, 1, 'ffnSilu')
+          dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
         } else {
         // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
         dispatch(enc, R.ffn, blk.ffn!, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
@@ -1635,12 +1677,13 @@ export function buildDecodeEngine(
   //      batching a chunk would apply one token's expert choice to all of them.
   // The cost is per-token prefill; correctness is not negotiable for a speedup.
   const chunkPrefill: ChunkPrefill | null =
-    hybrid && !S.moe && (opts.chunkedPrefill ?? true) && P.int4MatmulBatchedDyn
+    hybrid && !S.moe && !AFFINE && (opts.chunkedPrefill ?? true) && P.int4MatmulBatchedDyn
       ? buildChunkPrefill()
       : null
   if (hybrid) {
     const why = chunkPrefill ? `on (cap ${CHUNK_CAP})`
       : S.moe ? 'off (per-token — MoE: affine has no batched_dyn, and ids[] has no token dim)'
+      : AFFINE ? 'off (per-token — affine has no batched_dyn)'
       : 'off (per-token)'
     console.log(`[engine] chunked prefill: ${why}`)
   }

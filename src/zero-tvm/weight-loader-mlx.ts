@@ -165,8 +165,8 @@ const SLOTS: Record<string, Slot> = {
   moe_up_proj_w: ['moe', 'upWeights'], moe_up_proj_s: ['moe', 'upScales'], moe_up_proj_b: ['moe', 'upBiases'],
   moe_down_proj_w: ['moe', 'downWeights'], moe_down_proj_s: ['moe', 'downScales'], moe_down_proj_b: ['moe', 'downBiases'],
   router_w: ['moe', 'routerWeights'], router_s: ['moe', 'routerScales'], router_b: ['moe', 'routerBiases'],
-  ffn_w: ['layer', 'ffnWeights'], ffn_s: ['layer', 'ffnScales'], ffn_b: ['layer', 'ffnWeights'],
-  ffn_down_w: ['layer', 'ffnDownWeights'], ffn_down_s: ['layer', 'ffnDownScales'], ffn_down_b: ['layer', 'ffnDownScales'],
+  ffn_w: ['layer', 'ffnWeights'], ffn_s: ['layer', 'ffnScales'], ffn_b: ['layer', 'ffnBiases'],
+  ffn_down_w: ['layer', 'ffnDownWeights'], ffn_down_s: ['layer', 'ffnDownScales'], ffn_down_b: ['layer', 'ffnDownBiases'],
 }
 
 export interface MlxLoadHooks {
@@ -232,6 +232,16 @@ export async function assembleMlx(
   }
 
   root.layers = layers
+  // Tied embeddings: the checkpoint ships no lm_head records (planGlobal skips
+  // the trio), and mlx_lm's own forward reuses the quantized embedding matrix.
+  // The buffer layouts agree — both are [vocab] rows of K=d — so the alias is
+  // the whole implementation, exactly as the MLC path's paramNaming points
+  // lmHeadWeight at the embed records.
+  if (spec.tiedEmbeddings) {
+    root.lmHeadWeights = root.embdWeights
+    root.lmHeadScales = root.embdScales
+    root.lmHeadBiases = root.embdBiases
+  }
   // The MLC path exposes layer 0's input_layernorm separately; the engine reads
   // it before the layer loop.
   root.initNormGamma = layers[0].normGamma1

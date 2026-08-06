@@ -1,0 +1,53 @@
+<!doctype html><meta charset="utf-8"><title>model smoke probe</title>
+<body style="font:13px ui-monospace,monospace;padding:1rem"><pre id="log">…</pre>
+<script type="module">
+// MODEL SMOKE — dev-only probe scripts/validate-model.mjs drives: boots the
+// chat-config engine for ?model=<param> (registry-resolved, so a generated
+// spec is reachable the moment add-model registers it) and exposes
+// window.__forward / window.__generate for the node side to diff against
+// mlx_lm's reference dump. Not in the Vite build graph; vite dev serves it.
+const L=[],el=document.getElementById('log')
+const say=(...a)=>{L.push(a.join(' '));el.textContent=L.slice(-60).join('\n');console.log('[T]',a.join(' '))}
+window.__phase='boot'; window.__done=false
+try{
+  const { specFromSearch } = await import('/src/zero-tvm/model-select.ts')
+  const { compile } = await import('/src/compiler/compiler.ts')
+  const { loadWeights } = await import('/src/zero-tvm/weight-loader.ts')
+  const { buildDecodeEngine, allocKVPages } = await import('/src/zero-tvm/engine-core.ts')
+  const { SCALAR_VARIANTS } = await import('/src/zero-tvm/variants.ts')
+  const S = specFromSearch(location.search)
+  say('spec:', S.id, '| format:', S.weightFormat ?? 'mlc')
+
+  const ad = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' })
+  const feats = [...ad.features].filter(f=>/shader-f16|subgroups/.test(f))
+  const dev = await ad.requestDevice({ requiredFeatures: feats, requiredLimits: {
+    maxBufferSize: ad.limits.maxBufferSize,
+    maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize,
+  }})
+  let gpuErrs = 0
+  dev.addEventListener('uncapturederror', e => { gpuErrs++; say('GPU ERROR:', e.error.message.split('\n')[0]) })
+  window.__gpuErrs = () => gpuErrs
+
+  const t0 = performance.now()
+  const weights = await loadWeights(dev, m => { if(/ready|headers|shard/.test(m)) say(m) }, null, S)
+  say(`weights ok in ${((performance.now()-t0)/1000).toFixed(0)}s`)
+  const kv = allocKVPages(dev, S)
+  // Chat-shaped composition: subgroups + tiled matmul (what users actually
+  // run); fused stays off — engine-core forces unfused for qkNorm/affine.
+  const engine = buildDecodeEngine(dev, weights, kv, {
+    spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' },
+  })
+  say('engine built')
+
+  window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
+  window.__generate = async (ids, n) => {
+    const out = await engine.generate(ids, 0, n, () => {})
+    return Array.from(out)
+  }
+  window.__phase='loaded'
+}catch(e){
+  say('ERROR:', e && e.stack ? e.stack.split('\n').slice(0,4).join(' | ') : String(e))
+  window.__phase='error'; window.__error=String(e && e.message || e)
+}
+window.__done=true
+</script>

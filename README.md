@@ -67,6 +67,23 @@ modules on the actual checkpoint, and greedy decode against `mlx_lm`'s output.
 Performance claims are measured under the written protocol in
 [BENCH.md](BENCH.md), including the negative results and the withdrawn pairs.
 
+## Adding a model
+
+Models whose blocks the kernel set already covers are added mechanically:
+
+```bash
+npm run add-model -- mlx-community/Qwen3-4B-4bit --param qwen3mlx
+```
+
+One command probes the checkpoint (a few hundred KB of ranged reads), checks
+it against the constraint matrix, generates the `ModelSpec`, registers it on
+every surface (landing cards, switcher, `?model=` URL), and compiles every
+kernel under the new dims. If the model needs a kernel that doesn't exist, the
+same command says exactly which one — [docs/COMPAT.md](docs/COMPAT.md) is the
+full support matrix. Numerical trust comes from
+`scripts/validate-model.mjs`, which diffs the browser engine's logits and
+greedy decode against `mlx_lm` on the same checkpoint.
+
 ## The repository as an argument
 
 The directory layout is the narrative arc of the project. Each page is a milestone.

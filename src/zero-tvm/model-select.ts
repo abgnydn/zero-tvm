@@ -16,22 +16,18 @@
  *   - display copy (model name + approximate download size) for gate/header UI
  */
 
-import { PHI3, QWEN3_4B, QWEN35_4B, QWEN36_35B_A3B, QWEN36_35B_A3B_Q3, type ModelSpec } from '../compiler/model-spec.js'
+import type { ModelSpec } from '../compiler/model-spec.js'
+import { specForParam } from './model-registry.js'
 import { resolveModelBase } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
 import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt } from './tokenizer-bpe.js'
 
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
 
-/** `?model=qwen3` selects QWEN3_4B, `?model=qwen35` selects QWEN35_4B;
- *  default (and anything else) is PHI3. */
+/** `?model=<param>` → spec, straight from SHIPPED_MODELS — registering a model
+ *  there is what creates its URL. Default (and anything unknown) is Phi-3. */
 export function specFromSearch(search: string): ModelSpec {
-  const model = new URLSearchParams(search).get('model')
-  if (model === 'qwen36q3') return QWEN36_35B_A3B_Q3
-  if (model === 'qwen36') return QWEN36_35B_A3B
-  if (model === 'qwen35') return QWEN35_4B
-  if (model === 'qwen3') return QWEN3_4B
-  return PHI3
+  return specForParam(new URLSearchParams(search).get('model'))
 }
 
 export { modelBranding, SHIPPED_MODELS } from './model-registry.js'
