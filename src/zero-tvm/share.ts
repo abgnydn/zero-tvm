@@ -159,7 +159,10 @@ async function runHost(): Promise<void> {
     const st = logRow(guest, preview)
     try {
       const promptIds = enc(req.messages)
-      const budget = Math.min(1024, spec.maxContext - promptIds.length - 8)
+      // The per-reply cap is the KV room the prompt leaves behind, not a magic
+      // constant — same rule as chat.ts. (v1 shipped a min(1024, …) here and a
+      // guest's long refactor request was cut mid-function at exactly 1024.)
+      const budget = spec.maxContext - promptIds.length
       if (budget < 16) throw new Error(`prompt is ${promptIds.length} tokens — over this model's ${spec.maxContext}-token context`)
       const allIds: number[] = []
       const t0 = performance.now()
