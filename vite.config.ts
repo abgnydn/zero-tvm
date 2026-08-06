@@ -355,6 +355,16 @@ export default defineConfig({
     // pages (test-shaders, test-chain) are intentionally excluded — they're
     // in-repo for debugging and not linked from the site.
     rollupOptions: {
+      // 10-char content hashes (default 8). Changed once on 2026-08-06 to
+      // rotate EVERY asset URL past a poisoned edge-cache entry: the zone had
+      // cached an HTML fallback for a chunk URL under /assets/*'s immutable
+      // header (alias flipped mid-deploy), and nothing on this machine holds
+      // zone-purge permission. Content addressing is unchanged.
+      output: {
+        chunkFileNames: 'assets/[name]-[hash:10].js',
+        entryFileNames: 'assets/[name]-[hash:10].js',
+        assetFileNames: 'assets/[name]-[hash:10][extname]',
+      },
       input: {
         index:         resolve(__dirname, 'index.html'),
         'zero-tvm':    resolve(__dirname, 'zero-tvm.html'),
