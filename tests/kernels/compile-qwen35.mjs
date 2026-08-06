@@ -41,7 +41,7 @@ import {
   MM,
 } from './gpu.mjs'
 import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
-import { withPrelude, QWEN35_4B } from '../../src/compiler/shader-prelude.ts'
+import { withPrelude, QWEN35_4B, ropeInvFreqTable } from '../../src/compiler/shader-prelude.ts'
 import {
   int4MatmulWGSL,
   int4MatmulEntry,
@@ -470,6 +470,7 @@ async function testRopePartial(device) {
     buffer(device, f16Array(qkv), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Int32Array([pos]), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Uint32Array([1, 0, 1, QKV / 256]), BU.UNIFORM | BU.COPY_DST),
+    buffer(device, ropeInvFreqTable(Q), BU.STORAGE | BU.COPY_DST), // inv_freq (binding 6)
   ]
   const [qb, kb, vb] = await runComputeReads(device, pipe, buffers, [QKV / 256], [
     { index: 0, bytes: Q.qDim * 2 },
@@ -631,6 +632,7 @@ async function testGatedAttnBlockChain(device) {
   const kGammaBuf = buffer(device, f16Array(kGamma), BU.STORAGE | BU.COPY_DST)
 
   const WGS_NORM = Q.heads + Q.kvHeads
+  const ropeFreqsBuf = buffer(device, ropeInvFreqTable(Q), BU.STORAGE | BU.COPY_DST) // inv_freq (binding 6)
   const pods = {
     cAttn: buffer(device, new Uint32Array([cAttnW.KP, cAttnW.SPR, Q.cAttnDim, 0]), BU.UNIFORM | BU.COPY_DST),
     o: buffer(device, new Uint32Array([oW.KP, oW.SPR, d, 0]), BU.UNIFORM | BU.COPY_DST),
@@ -669,7 +671,7 @@ async function testGatedAttnBlockChain(device) {
     await dispatch(mm, [cAttnOut, hidden, cAttnScales, cAttnWeights, pods.cAttn], [Q.cAttnDim])
     await dispatch(split, [qkvBuf, gateBuf, cAttnOut, pods.split], [Q.cAttnDim / 256])
     await dispatch(qkNorm, [qkvBuf, qGammaBuf, kGammaBuf, pods.norm], [WGS_NORM])
-    await dispatch(rope, [qBuf, kBuf, vBuf, qkvBuf, posBuf, pods.rope], [Q.qkvDim / 256])
+    await dispatch(rope, [qBuf, kBuf, vBuf, qkvBuf, posBuf, pods.rope, ropeFreqsBuf], [Q.qkvDim / 256])
     await dispatch(kvAppend, [kBuf, vBuf, pages, posBuf, pods.append], [Q.kvDim / 256])
     await dispatch(attn, [qBuf, indptr, pageVals, pages, lenBuf, attnOut, pods.attn], [1, Q.heads])
     await dispatch(gateP, [attnOut, gateBuf, pods.gate], [Q.qDim / 256])

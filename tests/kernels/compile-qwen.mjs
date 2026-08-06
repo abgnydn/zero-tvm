@@ -30,7 +30,7 @@ import {
   MM,
 } from './gpu.mjs'
 import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
-import { withPrelude, QWEN3_4B } from '../../src/compiler/shader-prelude.ts'
+import { withPrelude, QWEN3_4B, ropeInvFreqTable } from '../../src/compiler/shader-prelude.ts'
 import { resolveMatmul } from '../../src/zero-tvm/variants.ts'
 import {
   int4MatmulWGSL,
@@ -257,6 +257,7 @@ function testRope(device) {
     buffer(device, f16Array(qkv), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Int32Array([pos]), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Uint32Array([1, 0, 1, QKV / 256]), BU.UNIFORM | BU.COPY_DST),
+    buffer(device, ropeInvFreqTable(Q), BU.STORAGE | BU.COPY_DST), // inv_freq (binding 6)
   ]
   const reads = [
     { index: 0, bytes: Q.qDim * 2 },

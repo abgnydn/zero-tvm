@@ -22,7 +22,7 @@ import { getDevice, pipelineFor, buffer, runCompute, BU, MM } from './gpu.mjs'
 import { f16Array, f16BitsToF32 } from './half.mjs'
 import { int4MatmulWGSL, int4MatmulEntry } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import { withPrelude } from '../../src/compiler/shader-prelude.ts'
-import { QWEN35_4B, QWEN36_35B_A3B } from '../../src/compiler/model-spec.ts'
+import { QWEN35_4B, QWEN36_35B_A3B, ropeInvFreqTable } from '../../src/compiler/model-spec.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const REFS = join(ROOT, '.weights-local/kernel-refs')
@@ -470,7 +470,8 @@ async function qwen36Attn(device, dir, meta) {
     [split, [qkv, gate, cAttn, i32([1, S.cAttnDim / 256])], [S.cAttnDim / 256]],
     [qkNorm, [qkv, st('q_norm_f16', Uint16Array), st('k_norm_f16', Uint16Array),
               i32([1, WGS_NORM])], [WGS_NORM]],
-    [rope, [qB, kB, vB, qkv, pos, u32([1, 0, 1, S.qkvDim / 256])], [S.qkvDim / 256]],
+    [rope, [qB, kB, vB, qkv, pos, u32([1, 0, 1, S.qkvDim / 256]),
+            buffer(device, ropeInvFreqTable(S), BU.STORAGE | BU.COPY_DST)], [S.qkvDim / 256]],
     [kvAppend, [kB, vB, pages, pos, u32([1, PAGES, 0, 0, S.kvDim / 256])], [S.kvDim / 256]],
     [attention, [qB, buffer(device, new Int32Array([0, PAGES]), BU.STORAGE | BU.COPY_DST),
                  buffer(device, new Int32Array([0]), BU.STORAGE | BU.COPY_DST), pages, len, attnOut,

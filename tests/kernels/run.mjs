@@ -28,7 +28,7 @@ import {
 import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
 // Node ≥23 strips TS types on import, so the tests share the exact prelude
 // and int4 generator the app compiles with — no duplicated logic.
-import { withPrelude, PHI3 } from '../../src/compiler/shader-prelude.ts'
+import { withPrelude, PHI3, ropeInvFreqTable } from '../../src/compiler/shader-prelude.ts'
 import {
   int4MatmulWGSL,
   int4MatmulEntry,
@@ -262,6 +262,7 @@ function testRope(device) {
     buffer(device, f16Array(qkv), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Int32Array([pos]), BU.STORAGE | BU.COPY_DST),
     buffer(device, new Uint32Array([1, 0, 1, QKV / 256]), BU.UNIFORM | BU.COPY_DST), // apply_rope, offset, seq_len, packGridDimX
+    buffer(device, ropeInvFreqTable(PHI3), BU.STORAGE | BU.COPY_DST), // inv_freq (binding 6)
   ]
   const reads = [0, 1, 2].map((index) => ({ index, bytes: 3072 * 2 }))
   return runComputeReads(device, pipe, buffers, [QKV / 256], reads).then(([qb, kb, vb]) => {

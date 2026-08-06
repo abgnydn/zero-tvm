@@ -100,6 +100,19 @@ export interface MoeDims {
 // ModelSpec
 // ============================================================
 
+/** llama3-type RoPE frequency scaling (HF config `rope_scaling`,
+ *  rope_type 'llama3' — Llama-3.1/3.2). The piecewise remapping itself lives
+ *  in ropeInvFreqTable() below; kernels never see these numbers, only the
+ *  precomputed table. yarn/longrope are different formulas and stay
+ *  unsupported (constraints.ts keeps them red). */
+export interface RopeScaling {
+  ropeType: 'llama3'
+  factor: number
+  lowFreqFactor: number
+  highFreqFactor: number
+  originalMaxPositionEmbeddings: number
+}
+
 /** Gated-DeltaNet (linear attention) dimensions — Qwen3.5 `linear_attn`. */
 export interface GdnDims {
   kHeads: number   // linear_num_key_heads (Q and K share these heads)
@@ -133,11 +146,13 @@ export interface ModelSpecBase {
   maxPages: number
   maxSeq: number     // model's trained context length
   ropeTheta: number
+  /** llama3 frequency remapping (Llama-3.1/3.2). Absent = plain RoPE. */
+  ropeScaling?: RopeScaling
   rmsEps: number
   tiedEmbeddings: boolean  // lm_head reuses the quantized embedding matrix
   qkNorm: boolean          // per-head q_norm/k_norm RMSNorm before RoPE
   stops: readonly number[] // stop token ids for the decode loops
-  chatTemplateId: 'phi3' | 'chatml'
+  chatTemplateId: 'phi3' | 'chatml' | 'llama3'
   tokenizerKind: 'spm' | 'byteLevel'  // which tokenizer pipeline tokenizer.json needs
   hfRepo: string           // HuggingFace repo with the MLC q4f16_1 layout
   /** Weight-manifest filename in the repo. Older MLC repos ship
@@ -375,6 +390,45 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
     moeSlots: base.moe ? base.moe.topK + 1 : 1,
     sharedExpertIndex: base.moe ? base.moe.experts : -1,
   })
+}
+
+// ============================================================
+// RoPE inverse-frequency table
+// ============================================================
+
+/**
+ * Per-pair RoPE inverse frequencies — the f32 table rope.wgsl binds
+ * (binding 6, HALF_ROTARY entries). Computed on the CPU so llama3-style
+ * rope_scaling is a table swap, not a kernel variant: for plain specs
+ * entry i is theta^(-2i/rotaryDim) (what the kernel used to compute with
+ * pow() inline); with `ropeScaling` set, the llama3 piecewise remapping from
+ * HF transformers' _compute_llama3_parameters is applied verbatim —
+ * wavelengths shorter than orig_ctx/high_freq_factor keep their frequency,
+ * longer than orig_ctx/low_freq_factor divide by `factor`, and the band
+ * between interpolates smoothly.
+ */
+export function ropeInvFreqTable(spec: ModelSpec): Float32Array<ArrayBuffer> {
+  const out = new Float32Array(spec.halfRotary)
+  const rs = spec.ropeScaling
+  for (let i = 0; i < spec.halfRotary; i++) {
+    let inv = Math.pow(spec.ropeTheta, -(2 * i) / spec.rotaryDim)
+    if (rs) {
+      const lowFreqWavelen = rs.originalMaxPositionEmbeddings / rs.lowFreqFactor
+      const highFreqWavelen = rs.originalMaxPositionEmbeddings / rs.highFreqFactor
+      const wavelen = (2 * Math.PI) / inv
+      if (wavelen > lowFreqWavelen) {
+        inv = inv / rs.factor
+      } else if (!(wavelen < highFreqWavelen)) {
+        // medium band — smooth_factor interpolation, boundaries inclusive
+        // (torch.where order in _compute_llama3_parameters)
+        const smooth = (rs.originalMaxPositionEmbeddings / wavelen - rs.lowFreqFactor)
+          / (rs.highFreqFactor - rs.lowFreqFactor)
+        inv = (1 - smooth) * (inv / rs.factor) + smooth * inv
+      }
+    }
+    out[i] = inv
+  }
+  return out
 }
 
 // ============================================================

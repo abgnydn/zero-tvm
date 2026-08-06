@@ -21,6 +21,7 @@
  */
 
 import { LoadedWeights } from './weight-loader.js'
+import { ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
 
@@ -273,12 +274,24 @@ export function buildDecodeEngine(
       'the per-head Q/K RMSNorm must run between the QKV matmul and RoPE. Use unfused mode.'
     )
   }
+  // Scaled-RoPE specs (llama3 rope_scaling) must run rope.wgsl: it is the only
+  // kernel that binds the precomputed inv_freq table — qkv_fused and
+  // qk_norm_rope_append still compute plain theta^(-2i/d) frequencies inline,
+  // so routing a scaled spec through either would silently rotate with the
+  // wrong frequencies.
+  if (S.ropeScaling && fused) {
+    throw new Error(
+      'buildDecodeEngine: fused QKV is incompatible with rope_scaling specs — ' +
+      'qkv_fused computes unscaled RoPE frequencies inline. Use unfused mode.'
+    )
+  }
   // Fused qk_norm+RoPE+KV-append (?fuseqk, default on via parseVariantFlags):
   // on the unfused qkNorm path the 3 post-matmul dispatches collapse into 1
   // (10 → 8 per layer). Pure-attention specs only — the hybrid gated-attention
   // chain keeps the reference composition (its rope input comes from
   // gated_qkv_split and the win is 2 of 12 dispatches on 8 of 32 layers).
-  const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm
+  // Scaled-RoPE specs keep the reference chain too (see the guard above).
+  const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm && !S.ropeScaling
 
   // MLX-affine checkpoints run a restricted composition: every fused kernel
   // that dequantises inline (qkv_fused, qkv_fused_scratch, fused_ffn) is
@@ -508,6 +521,14 @@ export function buildDecodeEngine(
   // Hoisted per-layer uniforms — all fields are constant across tokens.
   // Unfused: rope + kv_append. Fused: qkv_fused (f16) or scratch + quantize (int8).
   const ropeU  = fused ? null : uniformBuf(device, [i32(1), i32(0), i32(1), u32(QKV_WGS)])
+  // RoPE inverse-frequency table (f32, HALF_ROTARY entries) — rope.wgsl
+  // binding 6. Computed on the CPU (model-spec.ts ropeInvFreqTable) so
+  // llama3-style rope_scaling is a table swap, not a kernel variant.
+  const ropeFreqs = fused ? null : (() => {
+    const b = makeBuf(device, S.halfRotary * 4, 'ropeFreqs')
+    device.queue.writeBuffer(b, 0, ropeInvFreqTable(S))
+    return b
+  })()
   const kvAppU = fused ? null : uniformBuf(device, [i32(1), i32(S.maxPages), i32(0), i32(0), u32(KV_WGS)])
   // Qwen3 per-head Q/K RMSNorm — one 32-thread WG per (token, head), heads
   // ordered Q then K: grid = seq_len × (HEADS + KV_HEADS). seq_len is 1 on
@@ -748,7 +769,7 @@ export function buildDecodeEngine(
     B.hidden1, B.residual, weights.layers[0].normGamma1, normU,
   ])
   const bgRope = fused ? null : bg(device, P.rope, [
-    B.qOut, B.kOut!, B.vOut!, B.qkvOut!, B.posMap, ropeU!,
+    B.qOut, B.kOut!, B.vOut!, B.qkvOut!, B.posMap, ropeU!, ropeFreqs!,
   ])
   const bgLmHead = bg(device, R.matmulF32, withBias(
     [B.logits, B.hidden1, weights.lmHeadScales, weights.lmHeadWeights, lmHdU],
@@ -1588,7 +1609,7 @@ export function buildDecodeEngine(
           cAttn: bg(device, dyn, [CB.cAttnOut, CB.hidden1, lw.qkvScales!, lw.qkvWeights!, cU.cAttn]),
           gatedSplit: bg(device, P.gatedQkvSplit, [CB.qkvOut, CB.gateRaw, CB.cAttnOut, cU.gatedSplit]),
           qkNorm: bg(device, P.qkNorm, [CB.qkvOut, lw.qNormGamma!, lw.kNormGamma!, cU.qkNorm]),
-          rope: bg(device, P.rope, [CB.qOut, CB.kOut, CB.vOut, CB.qkvOut, CB.posMap, cU.rope]),
+          rope: bg(device, P.rope, [CB.qOut, CB.kOut, CB.vOut, CB.qkvOut, CB.posMap, cU.rope, ropeFreqs!]),
           kvApp: bg(device, P.kvAppend, [CB.kOut, CB.vOut, kvPages[kvIndex[L]], CB.posMap, cU.kvApp]),
           attn: bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
           attnGate: bg(device, P.attnGate, [CB.attnOut, CB.gateRaw, cU.attnGate]),

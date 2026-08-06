@@ -22,7 +22,7 @@
 // rewriteRelativeImportExtensions so tsc emit stays correct.
 import { PHI3, type ModelSpec } from './model-spec.ts'
 
-export { PHI3, QWEN3_4B, QWEN35_4B, makeModelSpec } from './model-spec.ts'
+export { PHI3, QWEN3_4B, QWEN35_4B, makeModelSpec, ropeInvFreqTable } from './model-spec.ts'
 export type { ModelSpec, ModelSpecBase, ParamNaming, LayerParamNames, GdnDims } from './model-spec.ts'
 
 /** Emit a float literal that is valid WGSL AbstractFloat (always has a dot or exponent). */

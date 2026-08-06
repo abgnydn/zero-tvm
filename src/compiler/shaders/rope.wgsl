@@ -15,12 +15,18 @@
 // rotate — pairs at distance HALF_ROTARY inside the rotary slice, per the HF
 // GLM-style non-interleaved convention (modeling_qwen3_5.apply_rotary_pos_emb:
 // q_rot = q[..., :rotary_dim] rotates, q_pass copies through) — with
-//   theta = position / (ROPE_THETA ^ (2i/ROTARY_DIM)),  i = dim % HALF_ROTARY.
+//   theta = position * inv_freq[dim % HALF_ROTARY].
 // For full-rotation specs ROTARY_DIM == HEAD_DIM, so Phi-3/Qwen3 behavior is
-// bit-identical to the historical kernel.
+// unchanged (within f32 rounding of the old inline pow()).
+//
+// inv_freq is a precomputed f32 table (model-spec.ts ropeInvFreqTable) rather
+// than the historical inline theta^(-2i/ROTARY_DIM): llama3-style rope_scaling
+// (Llama-3.1/3.2) remaps frequencies piecewise, which a pow() cannot express —
+// binding the table for EVERY spec keeps one code path (plain specs get the
+// same power series, computed in f64 on the CPU).
 //
 // Model-shape constants (Q_DIM, KV_DIM, QKV_DIM, HEAD_DIM, ROTARY_DIM,
-// HALF_ROTARY, ROPE_THETA) are injected by src/compiler/shader-prelude.ts.
+// HALF_ROTARY) are injected by src/compiler/shader-prelude.ts.
 
 enable f16;
 
@@ -29,6 +35,7 @@ enable f16;
 @group(0) @binding(2) var<storage, read_write> v_out : array<f16>;
 @group(0) @binding(3) var<storage, read> qkv : array<f16>;
 @group(0) @binding(4) var<storage, read> position_map : array<i32>;
+@group(0) @binding(6) var<storage, read> inv_freq : array<f32>;   // HALF_ROTARY entries
 
 struct PODArgs {
   apply_rope: i32,
@@ -66,7 +73,7 @@ fn rope_kernel(
     var out_val : f16 = qkv_val;
     if (podArgs.apply_rope != 0 && dim_idx < ROTARY_DIM) {
       let pos : f32 = f32(position_map[seq_idx + podArgs.position_map_elem_offset]);
-      let freq : f32 = pos / pow(ROPE_THETA, f32((dim_idx % HALF_ROTARY) * 2) / f32(ROTARY_DIM));
+      let freq : f32 = pos * inv_freq[dim_idx % HALF_ROTARY];
       let cos_f : f32 = cos(freq);
       let sin_f : f32 = sin(freq);
 
@@ -85,7 +92,7 @@ fn rope_kernel(
     var out_val : f16 = qkv_val;
     if (podArgs.apply_rope != 0 && dim_idx < ROTARY_DIM) {
       let pos : f32 = f32(position_map[seq_idx + podArgs.position_map_elem_offset]);
-      let freq : f32 = pos / pow(ROPE_THETA, f32((dim_idx % HALF_ROTARY) * 2) / f32(ROTARY_DIM));
+      let freq : f32 = pos * inv_freq[dim_idx % HALF_ROTARY];
       let cos_f : f32 = cos(freq);
       let sin_f : f32 = sin(freq);
 
