@@ -25,7 +25,7 @@ models:
 
 # Zero-TVM
 
-**Models from a 3.8B dense to a 35B sparse MoE, running in your browser on ~4,600 lines of hand-written WGSL. No TVM. No ONNX. No WASM runtime.**
+Models from a 3.8B dense to a 35B sparse MoE, running in the browser on hand-written WGSL. No TVM, no ONNX, no WASM runtime.
 
 The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles (70 WGSL shaders — 42 files + 28 generated int4 variants, counting subgroup / tiled / int8 / affine / MoE variants) and about 2,000 lines of TypeScript** — and runs models WebLLM ships (same weights, measured faster) as well as one it does not: Qwen3.6-35B-A3B, a 256-expert sparse MoE.
 

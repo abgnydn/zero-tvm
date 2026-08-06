@@ -730,7 +730,7 @@
   <a href="#" class="nav-logo">Zero<span>TVM</span></a>
   <ul>
     <li><a href="#models">Models</a></li>
-    <li><a href="#why">Why</a></li>
+    <li><a href="#why">About</a></li>
     <li><a href="#tools">Tools</a></li>
     <li><a href="docs.html">Docs</a></li>
     <li><a href="zero-tvm.html" class="nav-cta">Try it →</a></li>
@@ -739,8 +739,6 @@
 
 <!-- ── HERO ── -->
 <section class="hero">
-  <div class="hero-badge">⚡ WebGPU · No frameworks · Readable end-to-end</div>
-
   <h1>
     LLM inference in the browser,<br>
     <span class="green">on hand-written WebGPU kernels.</span>
@@ -753,7 +751,7 @@
   </p>
 
   <div class="hero-actions">
-    <a href="#models" class="btn-primary">Pick a model ↓</a>
+    <a href="#models" class="btn-primary">Models ↓</a>
     <a href="https://github.com/abgnydn/zero-tvm" class="btn-ghost" target="_blank" rel="noopener">GitHub ↗</a>
     <button class="btn-ghost" onclick="document.getElementById('share-modal').classList.add('open')" style="cursor:pointer;font-family:inherit;">Share</button>
   </div>
@@ -763,10 +761,11 @@
 <section id="models">
   <div class="section-inner">
     <div class="section-label">Models</div>
-    <h2 class="section-title">Weights stream once, then cache in your browser.</h2>
+    <h2 class="section-title">Models</h2>
     <p class="section-sub">
-      These cards render from the same model table the engine compiles from —
-      this list cannot go stale, because updating it <em>is</em> how a model ships.
+      Weights download once and cache in the browser (OPFS); inference runs on your GPU
+      and nothing leaves your machine. This list renders from
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/zero-tvm/model-registry.ts" style="color:var(--accent);">src/zero-tvm/model-registry.ts</a>.
     </p>
     <div id="model-cards" class="model-cards">
       <noscript><p class="mc-webgpu-note">JavaScript required — the cards render from the engine's own model table.</p></noscript>
@@ -774,31 +773,32 @@
   </div>
 </section>
 
-<!-- ── TERMINAL DEMO ── -->
+<!-- ── A REAL KERNEL ── -->
 <div class="demo-wrap">
   <div class="terminal">
     <div class="terminal-bar">
       <div class="dot-r"></div>
       <div class="dot-y"></div>
       <div class="dot-g"></div>
-      <span class="terminal-title">zero-tvm · phi-3-mini · browser</span>
+      <span class="terminal-title">src/compiler/shaders/rms_norm.wgsl — as shipped, not an illustration</span>
     </div>
     <div class="terminal-body">
-      <div><span class="t-dim">// No WebLLM. No TVM. No WASM runtime.</span></div>
-      <div><span class="t-dim">// hand-written WGSL · raw WebGPU · no frameworks.</span></div>
+      <div><span class="t-dim">// RMSNORM — normalize hidden state. output[i] = (input[i] / rms) * gamma[i]</span></div>
+      <div><span class="t-purple">@compute @workgroup_size</span><span class="t-white">(64, 1, 1)</span></div>
+      <div><span class="t-purple">fn</span> <span class="t-green">rms_norm</span><span class="t-white">(...) {</span></div>
+      <div><span class="t-white">  <span class="t-dim">// Phase 1: sum of squares in f32</span></span></div>
+      <div><span class="t-white">  var sum_sq : f32 = 0.0;</span></div>
+      <div><span class="t-white">  for (var i = 0; i &lt; D / 64; i++) {</span></div>
+      <div><span class="t-white">    let val = f32(input_buf[base + tid * (D / 64) + i]);</span></div>
+      <div><span class="t-white">    sum_sq = sum_sq + val * val;</span></div>
+      <div><span class="t-white">  }</span></div>
+      <div><span class="t-white">  <span class="t-dim">// tree-reduce across 64 threads, then:</span></span></div>
+      <div><span class="t-white">  let rms_inv = 1.0 / sqrt(red_buf[0] / f32(D) + RMS_EPS);</span></div>
+      <div><span class="t-white">  output_buf[base + idx] = f16(val * rms_inv * f32(gamma[idx]));</span></div>
+      <div><span class="t-white">}</span></div>
       <br>
-      <div><span class="t-green">[local]</span> <span class="t-white">ndarray-cache.json</span></div>
-      <div><span class="t-green">[cache]</span> <span class="t-white">params_shard_0.bin</span> <span class="t-dim">49.3 MB</span></div>
-      <div><span class="t-dim">...</span></div>
-      <div><span class="t-green">✓ All weights loaded · 2.1 GB · GPU ready</span></div>
-      <br>
-      <div><span class="t-yellow">YOU</span>  <span class="t-white">What is the capital of Australia?</span></div>
-      <br>
-      <div><span class="t-purple">PHI-3</span> <span class="t-white">The capital of Australia is Canberra.</span></div>
-      <div>      <span class="t-white">It was selected as the capital in 1908 as a</span></div>
-      <div>      <span class="t-white">compromise between rivals Sydney and Melbourne.</span></div>
-      <br>
-      <div><span class="t-dim">88 tokens · <!--bench:zt-->69.55<!--/bench:zt--> tok/s (M2 Max) · 100% local · zero server</span> <span class="t-cursor"></span></div>
+      <div><span class="t-dim">// one of the 10 kernel roles. all of them read like this:</span></div>
+      <div><span class="t-white"><a href="https://github.com/abgnydn/zero-tvm/tree/main/src/compiler/shaders" style="color:var(--green);">github.com/abgnydn/zero-tvm/src/compiler/shaders</a></span></div>
     </div>
   </div>
 </div>
@@ -807,22 +807,28 @@
 
 <!-- ── HOW IT WORKS ── -->
 <section id="why">
-  <div class="section-inner" style="text-align:center;">
-    <div class="section-label">Why this exists</div>
-    <h2 class="section-title">One readable answer to a compiled stack.</h2>
-    <p class="section-sub">
-      Browser LLM runtimes ship compiler-emitted shader blobs. This repo makes the
-      opposite bet: a forward pass you can read in one sitting, competitive with the
-      compiled stacks on identical weights &mdash; and reaching where they haven't shipped:
-      the newest model here is a 35B sparse MoE that no compiler stack offers a build
-      of at all. Every layer is validated against the reference implementation's own
-      modules before it ships, and every performance claim is measured under a written
-      protocol &mdash; including the ones we withdrew.
+  <div class="section-inner">
+    <div class="section-label">About</div>
+    <h2 class="section-title">What this is</h2>
+    <p class="section-sub" style="margin-left:0;">
+      Zero-TVM is an LLM inference engine for the browser. The standard stacks compile
+      their shaders (WebLLM/TVM emits 85 autotuned kernels behind a WASM scheduler);
+      this engine is written by hand instead.
     </p>
-    <div class="why-links">
-      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm#readme" target="_blank" rel="noopener">The full argument &#8599;</a>
-      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md" target="_blank" rel="noopener">Numbers &amp; protocol &#8599;</a>
-      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm/tree/main/src/compiler/shaders" target="_blank" rel="noopener">Read our kernels &#8599;</a>
+    <ul style="max-width:640px;line-height:2;color:var(--muted);list-style:none;padding:0;">
+      <li>10 kernel roles — 42 WGSL files plus a small generator</li>
+      <li>No runtime dependencies: no WebLLM, no TVM, no ONNX, no WASM</li>
+      <li>int4 / int3 quantized weights, loaded by byte range, cached in OPFS</li>
+      <li>Paged KV cache, gated DeltaNet, sparse-MoE routing — all in plain WGSL</li>
+      <li>Layers validated against reference implementations (mlx_lm's own modules)</li>
+      <li>Benchmarked against WebLLM on identical weights; protocol and all numbers in BENCH.md</li>
+      <li>MIT</li>
+    </ul>
+    <div class="why-links" style="justify-content:flex-start;">
+      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm#readme" target="_blank" rel="noopener">README</a>
+      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md" target="_blank" rel="noopener">BENCH.md</a>
+      <a class="btn-ghost" href="validate.html">Validation</a>
+      <a class="btn-ghost" href="docs.html">Docs</a>
     </div>
   </div>
 </section>
@@ -830,9 +836,9 @@
 <section id="tools">
   <div class="section-inner">
     <div class="section-label">Explore deeper</div>
-    <h2 class="section-title">Every page is a milestone of the argument.</h2>
+    <h2 class="section-title">Pages</h2>
     <p class="section-sub">
-      The repo is organized so each HTML file demonstrates one claim — some are dated snapshots of the argument as it stood, kept rather than rewritten. Open any of them to inspect the stack at a different layer.
+      Each page demonstrates one claim. Some are dated snapshots, kept rather than rewritten.
     </p>
 
     <div class="shaders-grid">
@@ -914,16 +920,7 @@
 <hr class="divider">
 
 <!-- ── CTA ── -->
-<section class="cta-section">
-  <div class="section-inner" style="display:flex;flex-direction:column;align-items:center;">
-    <div class="section-label">Try it</div>
-    <h2>Open the chat. No install. No account.</h2>
-    <p>Every model runs entirely on your GPU. Your conversation never leaves your browser.</p>
-    <div class="hero-actions">
-      <a href="zero-tvm.html" class="btn-primary">Open Zero TVM Chat →</a>
-    </div>
-  </div>
-</section>
+
 
 <!-- ── FOOTER ── -->
 <footer>
