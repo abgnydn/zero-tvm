@@ -10,7 +10,9 @@
  *
  * scripts/add-model.mjs appends rows at the ADD-MODEL markers below after its
  * constraint check and compile gate pass — a generated model reaches every
- * surface through exactly this file.
+ * surface through exactly this file. Numerical trust comes separately:
+ * scripts/validate-model.mjs diffs a registered model against mlx_lm before
+ * its card is worth believing.
  *
  * DELIBERATELY LIGHT: imports only model-spec.ts, which is dependency-free.
  * The landing page runs this in browsers WITHOUT WebGPU (where it must still
