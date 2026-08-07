@@ -219,12 +219,25 @@ each with a SHA-256 the receiver checks. The guest then runs the model locally.
 The hash catches corruption, NOT a dishonest host — in a room you already trust
 the host to run the model.
 
+A room holds MANY hosts. `?model=X#<room>` serves an EXISTING room from this
+device — the URL a guest is offered after it copies the weights, which is how a
+room grows into a swarm. The DO assigns each guest to the least-loaded host and
+REASSIGNS its guests when a host's tab closes; the guest rebuilds its peer
+connection and keeps the conversation (history lives on the guest, and the host
+is stateless between requests).
+
 ```bash
 npx wrangler deploy                      # in workers/share-signal (prod relay)
+node scripts/room-routing-test.mjs       # multi-host routing, no browser, ~10s
 node scripts/share-e2e.mjs               # vite + wrangler dev + 2 tabs, real RTC
 node scripts/peer-weights-e2e.mjs        # TWO browser profiles; replicates 2.26 GB
 MODEL=qwen35 node scripts/peer-weights-e2e.mjs
 ```
+
+Room routing (assignment, relaying, takeover, departure) is tested with plain
+WebSocket clients against `wrangler dev` — seconds, deterministic. Do NOT test
+it by booting two engines in one browser: two full models on one GPU hangs long
+before it proves anything about routing (tried; the tab never answered).
 
 Gotchas: `?sig=<port|url>` overrides the signaling relay in DEV ONLY (two test
 drivers run their own wrangler concurrently; in prod a link could otherwise

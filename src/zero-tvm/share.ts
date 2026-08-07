@@ -77,15 +77,22 @@ function roomIdFrom(hash: string): string | null {
   return /^[A-Za-z0-9_-]{16,64}$/.test(id) ? id : null
 }
 
+// URL grammar, three cases:
+//   ?model=X              host a NEW room
+//   #<room>               join as a guest (the link you hand out)
+//   ?model=X#<room>       serve an EXISTING room from this device too
+// The third is what turns a room into a swarm: a guest that copied the
+// weights adds ?model= to the link it already has and starts serving.
 const room = roomIdFrom(location.hash)
-if (room) void runGuest(room)
-else void runHost()
+const wantsToHost = new URLSearchParams(location.search).has('model')
+if (room && !wantsToHost) void runGuest(room)
+else void runHost(room)
 
 // ============================================================
 // HOST
 // ============================================================
 
-async function runHost(): Promise<void> {
+async function runHost(existingRoom: string | null): Promise<void> {
   $('host-view').classList.remove('hidden')
   // Everything GPU-touching is imported HERE, not at module scope — the guest
   // path must run on machines without WebGPU, and weight-loader.ts reads
@@ -158,11 +165,15 @@ async function runHost(): Promise<void> {
   const enc = (messages: ChatReq['messages']) => buildChatPromptFor(spec, messages, tokenizer)
 
   // ── room ──
+  // Joining an existing room keeps its id (that is what makes this device an
+  // ADDITIONAL host rather than a second room nobody has the link to).
   const bytes = crypto.getRandomValues(new Uint8Array(16))
-  const roomId = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  const roomId = existingRoom
+    ?? btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   // Carry a dev signaling override into the guest link, or the guest dials the
   // default relay and the room never forms.
   const link = `${location.origin}${location.pathname}${SIG_OVERRIDE ? `?sig=${encodeURIComponent(SIG_OVERRIDE)}` : ''}#${roomId}`
+  if (existingRoom) $('page-title').textContent = `Serving ${brand.name} in a shared room`
   const linkInput = $('share-link') as HTMLInputElement
   linkInput.value = link
   $('copy-link').addEventListener('click', () => {
@@ -248,6 +259,9 @@ async function runHost(): Promise<void> {
   const param = new URLSearchParams(location.search).get('model') ?? ''
 
   function makePeer(guest: string): void {
+    // A reassigned guest (its previous host closed) arrives as a fresh
+    // peer-joined here; drop any half-built connection under the same id.
+    peers.get(guest)?.pc.close()
     const pc = new RTCPeerConnection(ICE)
     const entry = { pc, dc: null as RTCDataChannel | null }
     peers.set(guest, entry)
@@ -274,7 +288,16 @@ async function runHost(): Promise<void> {
   }
 
   ws.onmessage = (e) => {
-    const msg = JSON.parse(String(e.data)) as { type: string; from?: string; sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+    const msg = JSON.parse(String(e.data)) as {
+      type: string; from?: string; hosts?: number; guests?: number
+      sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit
+    }
+    if (msg.type === 'room') {
+      const h = msg.hosts ?? 1, g = msg.guests ?? 0
+      $('room-stats').textContent =
+        `${h} ${h === 1 ? 'machine' : 'machines'} serving · ${g} ${g === 1 ? 'guest' : 'guests'} connected`
+      return
+    }
     const guest = msg.from
     if (!guest) return
     if (msg.type === 'peer-joined') makePeer(guest)
@@ -304,14 +327,18 @@ async function runGuest(roomId: string): Promise<void> {
   wireScrollFab()
 
   const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
-  const pc = new RTCPeerConnection(ICE)
+  // The peer connection is REBUILT whenever the room reassigns this guest to
+  // another host (the previous one closed its tab). Everything above it — the
+  // conversation, the rendered messages — survives, because history lives here
+  // and the host is stateless between requests.
+  let pc = new RTCPeerConnection(ICE)
   let dc: RTCDataChannel | null = null
   // The weights channel and the `info` frame race: the host opens both
   // channels at once, so info can land on 'chat' before 'weights' has even
   // been announced here. Awaiting a promise removes the race — the offer is
   // built when BOTH have arrived, in whichever order that happens.
   let weightsReady: (dc: RTCDataChannel) => void = () => {}
-  const weightsChannel = new Promise<RTCDataChannel>((r) => { weightsReady = r })
+  let weightsChannel = new Promise<RTCDataChannel>((r) => { weightsReady = r })
 
   const history: ChatReq['messages'] = []
   let reqId = 0
@@ -359,16 +386,59 @@ async function runGuest(roomId: string): Promise<void> {
     }
   }
 
+  /** Wire a freshly-created RTCPeerConnection to this page. */
+  function wirePeer(): void {
+    pc.onicecandidate = (e) => {
+      if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }))
+    }
+    pc.ondatachannel = (e) => {
+      if (e.channel.label === 'weights') {
+        const ch = e.channel
+        ch.binaryType = 'arraybuffer'
+        if (ch.readyState === 'open') weightsReady(ch)
+        else ch.addEventListener('open', () => weightsReady(ch), { once: true })
+        return
+      }
+      dc = e.channel
+      dc.onmessage = (ev) => onHostMsg(JSON.parse(String(ev.data)) as HostMsg)
+      // Only a channel that is still the CURRENT one may report a disconnect;
+      // a reassignment closes the old channel while the new one is opening.
+      const closing = dc
+      dc.onclose = () => { if (dc === closing) setBadge('Disconnected', 'error') }
+    }
+  }
+  wirePeer()
+
   ws.onmessage = async (e) => {
-    const msg = JSON.parse(String(e.data)) as { type: string; sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+    const msg = JSON.parse(String(e.data)) as {
+      type: string; hosts?: number; guests?: number
+      sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit
+    }
     if (msg.type === 'no-host') {
       setBadge('No host', 'error')
-      setStatus('Nobody is sharing a model in this room — the host tab is closed or the link expired.')
+      setStatus('Nobody is serving a model in this room — every host tab is closed, or the link expired.')
     } else if (msg.type === 'host-left') {
       setBadge('Host left', 'error')
-      setStatus('The host closed the tab. The conversation stays here; reconnect with a fresh link.')
+      setStatus('Every machine serving this room went away. The conversation stays here; it resumes if one comes back.')
       inp.disabled = true
       sendBtn.disabled = true
+    } else if (msg.type === 'host-changed') {
+      // Another machine in the room took this guest over. Tear the old
+      // connection down and wait for the new host's offer — the conversation
+      // and everything on screen are untouched.
+      setBadge('Switching host', 'loading')
+      setStatus('The machine serving you went away; another one in the room is taking over…')
+      pc.close()
+      pc = new RTCPeerConnection(ICE)
+      dc = null
+      weightsChannel = new Promise<RTCDataChannel>((r) => { weightsReady = r })
+      wirePeer()
+      settle()
+      inp.disabled = true
+      sendBtn.disabled = true
+    } else if (msg.type === 'room') {
+      const h = msg.hosts ?? 0
+      $('room-count').textContent = h > 1 ? `${h} machines serving` : ''
     } else if (msg.type === 'offer' && msg.sdp) {
       await pc.setRemoteDescription(msg.sdp)
       const answer = await pc.createAnswer()
@@ -377,21 +447,6 @@ async function runGuest(roomId: string): Promise<void> {
     } else if (msg.type === 'ice' && msg.candidate) {
       await pc.addIceCandidate(msg.candidate)
     }
-  }
-  pc.onicecandidate = (e) => {
-    if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }))
-  }
-  pc.ondatachannel = (e) => {
-    if (e.channel.label === 'weights') {
-      const ch = e.channel
-      ch.binaryType = 'arraybuffer'
-      if (ch.readyState === 'open') weightsReady(ch)
-      else ch.addEventListener('open', () => weightsReady(ch), { once: true })
-      return
-    }
-    dc = e.channel
-    dc.onmessage = (ev) => onHostMsg(JSON.parse(String(ev.data)) as HostMsg)
-    dc.onclose = () => setBadge('Disconnected', 'error')
   }
 
   /**
@@ -435,8 +490,13 @@ async function runGuest(roomId: string): Promise<void> {
       }, inv)
         .then((res) => {
           const secs = ((performance.now() - t) / 1000).toFixed(0)
+          const p = encodeURIComponent(param)
+          const sig = SIG_OVERRIDE ? `&sig=${encodeURIComponent(SIG_OVERRIDE)}` : ''
           status.innerHTML = `Done — ${(res.bytes / 1e9).toFixed(2)} GB in ${secs}s. `
-            + `<a href="/zero-tvm.html?model=${encodeURIComponent(param)}">Open the chat on this device →</a>`
+            + `<a href="/zero-tvm.html?model=${p}">Open the chat on this device →</a><br>`
+            // The swarm-forming link: this device has the weights now, so it
+            // can serve the SAME room instead of only consuming it.
+            + `<a href="/share.html?model=${p}${sig}#${roomId}">…or serve this room from here too →</a>`
           btn.remove()
           ;(window as unknown as Record<string, unknown>).__pullDone = res
         })
