@@ -263,12 +263,25 @@ skipping layers would save no download. A tied lm_head IS the embedding table,
 so a tied model carries that table on BOTH ends (Qwen3.6-35B is untied and does
 not).
 
+`share.html?model=X&layers=0-k` hosts a room holding the first layers;
+`share.html?model=X&layers=k-N#<room>` joins it holding the rest (the helper
+signs in as a GUEST and offers compute — the relay never learns a third role).
+A normal guest chats with the pair; a third DataChannel, `pipeline`, carries
+one residual per token.
+
+```bash
+node scripts/split-serve-e2e.mjs          # two Chrome profiles, real WebRTC
+MODEL=qwen3mlx SPLIT=18 node scripts/split-serve-e2e.mjs
+```
+
+Measured 2026-08-07: llama32 split 0-8 / 8-16 answers "The capital of France
+is Paris." at 25.3 ms per token across the two stages.
+
 Verified 2026-08-07: splits at layers 1 / mid / N-1 reproduce the whole model
 token-for-token on llama32 (real prompt; the whole model's answer matches
 mlx_lm) and on qwen35 (32 layers, GDN state per stage). With each stage loading
 only its own layers — the real arrangement — llama32 is 0.42 + 0.42 GB against
-0.70 GB whole, still token-identical. What is NOT built yet: the network
-transport between stages and a driver that owns the token loop above them.
+0.70 GB whole, still token-identical.
 
 Gotchas: `?sig=<port|url>` overrides the signaling relay in DEV ONLY (two test
 drivers run their own wrangler concurrently; in prod a link could otherwise
