@@ -239,6 +239,29 @@ WebSocket clients against `wrangler dev` — seconds, deterministic. Do NOT test
 it by booting two engines in one browser: two full models on one GPU hangs long
 before it proves anything about routing (tried; the tab never answered).
 
+## Pipeline stages (`layerRange`)
+
+`buildDecodeEngine(..., { layerRange: { start, end } })` builds ONE stage of a
+split model: no embedding when `start > 0`, no final norm / LM head / argmax
+when `end < layers`, and bind groups only for the layers in range (so a stage
+can run without ever loading the others' weights). Drive a stage with
+`pipelineStep(input, position)` — token id in / residual out on the first,
+residual in / token out on the last. The hand-off is the bare RESIDUAL (d f16
+= 4-5 KB per token): every stage re-normalises with its own first layer's
+gamma, so no stage needs a weight from its neighbour. Each stage keeps the KV
+cache and GDN state of its own layers.
+
+```bash
+node scripts/pipeline-split-test.mjs --ref /tmp/ref-llama32 llama32
+node scripts/pipeline-split-test.mjs qwen35     # hybrid GDN path
+```
+
+Verified 2026-08-07: splits at layers 1 / mid / N-1 reproduce the whole model
+token-for-token on llama32 (against a real prompt whose answer matches mlx_lm)
+and on qwen35 (32 layers, GDN state per stage). What is NOT built yet: partial
+weight loading (a stage still loads the whole checkpoint) and the network
+transport between stages.
+
 Gotchas: `?sig=<port|url>` overrides the signaling relay in DEV ONLY (two test
 drivers run their own wrangler concurrently; in prod a link could otherwise
 point a guest's signaling at a third party). The host tab needs the "keep this

@@ -39,6 +39,29 @@ try{
   })
   say('engine built')
 
+  // Split the SAME weights into two pipeline stages and drive them by hand.
+  // Both stages live on this one device — the point is the numerics, not the
+  // transport: if A(0..k) + B(k..N) does not reproduce the whole model's
+  // tokens, no amount of WebRTC will fix it.
+  window.__splitCheck = async (ids, k, n) => {
+    const A = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }, layerRange: { start: 0, end: k },
+    })
+    const B = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }, layerRange: { start: k, end: S.layers },
+    })
+    const step = async (tokenId, pos) => {
+      const mid = await A.pipelineStep({ tokenId }, pos)
+      return (await B.pipelineStep({ residual: mid.residual }, pos)).tokenId
+    }
+    // Prefill the prompt one position at a time; the last one yields token #1.
+    let tok = 0
+    for (let i = 0; i < ids.length; i++) tok = await step(ids[i], i)
+    const out = [tok]
+    for (let i = 1; i < n; i++) out.push(tok = await step(tok, ids.length + i - 1))
+    return out
+  }
+
   window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
   window.__generate = async (ids, n) => {
     const out = await engine.generate(ids, 0, n, () => {})

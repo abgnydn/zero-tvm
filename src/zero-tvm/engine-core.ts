@@ -170,6 +170,16 @@ export interface DecodeEngine {
   ): Promise<number[]>
   /** Run a forward pass through prefill of `promptIds` and return f32 logits at the final position. */
   forwardLogits(promptIds: number[]): Promise<Float32Array>
+  /**
+   * One token through ONE pipeline stage (see DecodeEngineOptions.layerRange).
+   * First stage: token id in, residual out. Last: residual in, token out.
+   * A whole-model engine accepts a token id and returns the token, which is
+   * decodeToken with an extra copy — the split is what this exists for.
+   */
+  pipelineStep(
+    input: { tokenId: number } | { residual: ArrayBuffer },
+    position: number,
+  ): Promise<{ residual: ArrayBuffer } | { tokenId: number }>
   /** Reset KV-cache invalidation tracking (call when starting a fresh conversation). */
   resetKVTracking(): void
   /**
@@ -234,6 +244,23 @@ export interface DecodeEngineOptions {
    * projections + one gdn_recur dispatch per layer per chunk.
    */
   chunkedPrefill?: boolean
+  /**
+   * Run only layers [start, end) — pipeline parallelism, one stage per device.
+   *
+   * A stage with start > 0 has no embedding: its input is the RESIDUAL the
+   * previous stage handed over (d f16 values — 4 KB for Qwen3.6, one round
+   * trip per token). A stage with end < layers has no final norm, LM head or
+   * argmax; its output is that residual. Only the last stage produces tokens.
+   *
+   * The hand-off is the residual ALONE, not the normed activation beside it:
+   * every stage re-normalises with its own first layer's gamma (the same
+   * dispatch a whole-model pass runs before layer 0), so a stage needs no
+   * weight from its neighbours.
+   *
+   * Each stage keeps the KV cache and GDN state of ITS layers, which is what
+   * makes the split worth doing — two 16 GB machines hold a model neither can.
+   */
+  layerRange?: { start: number; end: number }
 }
 
 export function buildDecodeEngine(
@@ -259,6 +286,15 @@ export function buildDecodeEngine(
   const hybrid = S.layerKinds.includes('gdn')
   if (hybrid && (fused || int8Mode)) {
     throw new Error('buildDecodeEngine: hybrid (GDN) specs require the unfused f16-KV composition')
+  }
+  // Pipeline stage bounds. Default is the whole model, which is what every
+  // existing caller gets — L0 === 0 and L1 === S.layers make every branch
+  // below collapse to the single-device behaviour.
+  const L0 = opts.layerRange?.start ?? 0
+  const L1 = opts.layerRange?.end ?? S.layers
+  const partial = L0 !== 0 || L1 !== S.layers
+  if (L0 < 0 || L1 > S.layers || L0 >= L1) {
+    throw new Error(`buildDecodeEngine: layerRange [${L0}, ${L1}) is not a range inside [0, ${S.layers})`)
   }
   const kvIndex: number[] = []
   {
@@ -649,6 +685,13 @@ export function buildDecodeEngine(
   const nnzPagesScratch = new Uint32Array(1)   // reused per token for writeBuffer
   const gdnPosScratch = new Int32Array(1)      // reused per token for gdnConvU.pos
 
+  // Residual hand-off readback (pipeline stages that do not end the model).
+  const residualReadBuf = L1 === S.layers ? null : device.createBuffer({
+    size: S.d * 2,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    label: 'residualHandoff',
+  })
+
   // Token readback buffer for the blocking path — allocated once, reused
   // every decode step.
   const readBuf = device.createBuffer({
@@ -761,20 +804,26 @@ export function buildDecodeEngine(
   // One name for both the bind group and the dispatch: with layout:'auto' each
   // pipeline owns a DISTINCT layout object even when structurally identical, so
   // binding against one and dispatching the other is a validation error.
+  // Embedding and LM head belong to the FIRST and LAST stage respectively;
+  // a middle stage builds neither, so it can run without ever having loaded
+  // the two largest tensors in the model.
   const embeddingPipeline = AFFINE ? P.embeddingAffine : P.embedding
-  const bgEmbedding = bg(device, embeddingPipeline, withBias(
+  const bgEmbedding = L0 !== 0 ? null : bg(device, embeddingPipeline, withBias(
     [B.residual, B.inputIds, weights.embdScales, weights.embdWeights, embU],
     weights.embdBiases, 'embed_tokens'))
+  // The pre-layer norm of this stage's FIRST layer — layer 0 for a whole-model
+  // engine, layer L0 for a later pipeline stage, which is exactly why the
+  // hand-off can be the bare residual.
   const bgInitNorm = bg(device, P.rmsNorm, [
-    B.hidden1, B.residual, weights.layers[0].normGamma1, normU,
+    B.hidden1, B.residual, weights.layers[L0].normGamma1, normU,
   ])
   const bgRope = fused ? null : bg(device, P.rope, [
     B.qOut, B.kOut!, B.vOut!, B.qkvOut!, B.posMap, ropeU!, ropeFreqs!,
   ])
-  const bgLmHead = bg(device, R.matmulF32, withBias(
+  const bgLmHead = L1 !== S.layers ? null : bg(device, R.matmulF32, withBias(
     [B.logits, B.hidden1, weights.lmHeadScales, weights.lmHeadWeights, lmHdU],
     weights.lmHeadBiases, 'lm_head'))
-  const bgArgmax = bg(device, R.argmax, [
+  const bgArgmax = L1 !== S.layers ? null : bg(device, R.argmax, [
     B.logits, B.tokenOut, argmaxU,
   ])
   // Split-K combine reads the shared partials scratch and writes attnOut —
@@ -829,13 +878,20 @@ export function buildDecodeEngine(
   if (AFFINE && R.ffnPrologue) {
     throw new Error('buildDecodeEngine: ?fuseprologue=1 uses the symmetric fused FFN kernel — MLX-affine specs run the unfused gate_up/silu/down chain')
   }
+  // Only this stage's layers get bind groups — a partial stage may hold no
+  // weights at all for the others. Indexed by L - L0 (see recordForward).
   const layerBGs: LayerBG[] = []
-  for (let L = 0; L < S.layers; L++) {
+  for (let L = L0; L < L1; L++) {
     const lw = weights.layers[L]
     const isGdn = S.layerKinds[L] === 'gdn'
-    const nextGamma = L < S.layers - 1
+    // addNorm2 folds the NEXT layer's pre-norm into this layer's epilogue. At
+    // the end of a partial stage there is no next layer here, and the value is
+    // discarded anyway (the receiving stage re-norms from the residual), so it
+    // binds a gamma this stage certainly owns rather than reaching for one it
+    // may not have loaded.
+    const nextGamma = L + 1 < L1
       ? weights.layers[L + 1].normGamma1
-      : weights.finalNormGamma
+      : L1 === S.layers ? weights.finalNormGamma : lw.normGamma2
 
     let qkvBG: GPUBindGroup | undefined
     let attnBG: GPUBindGroup | undefined
@@ -1060,8 +1116,11 @@ export function buildDecodeEngine(
    */
   function recordForward(enc: GPUCommandEncoder): void {
     // --- EMBEDDING → B.residual (ping) ---
-    dispatch(enc, embeddingPipeline, bgEmbedding, D_WGS, 1, 1, 'embedding')
-    // --- INITIAL RMSNORM: B.residual → B.hidden1 (layer 0's normGamma1) ---
+    // Pipeline stages past the first have no embedding table and no token to
+    // look up: B.residual already holds the state handed over by the previous
+    // stage (written by pipelineStep before this encoder was built).
+    if (L0 === 0) dispatch(enc, embeddingPipeline, bgEmbedding!, D_WGS, 1, 1, 'embedding')
+    // --- INITIAL RMSNORM: B.residual → B.hidden1 (layer L0's normGamma1) ---
     dispatch(enc, P.rmsNorm, bgInitNorm, 1, 1, 1, 'rmsNorm_init')
 
     // --- TRANSFORMER LAYERS ---
@@ -1071,8 +1130,8 @@ export function buildDecodeEngine(
     // per-head Q/K RMSNorm between qkv matmul and rope; 8 with ?fuseqk, which
     // fuses qkNorm+rope+kvAppend into one pass). Fused f16: 7. Fused int8: 8
     // (adds a kv_quantize pass between qkv_fused_scratch and attention_int8).
-    for (let L = 0; L < S.layers; L++) {
-      const blk = layerBGs[L]
+    for (let L = L0; L < L1; L++) {
+      const blk = layerBGs[L - L0]
 
       // Attention on the f16 KV layout — split-K (?splitk=N) turns the one
       // WG-per-head dispatch into a partial pass over N partitions per head
@@ -1182,6 +1241,10 @@ export function buildDecodeEngine(
       }
     }
 
+    // A stage that does not end the model stops here: B.residual is the
+    // hand-off, and there is no LM head on this device to run.
+    if (L1 !== S.layers) return
+
     // --- LM HEAD: B.hidden1 (already normalized with model.norm) → B.logits ---
     // vocab (Phi-3: 32064, Qwen3: 151936) is divisible by 4, so rowsPerWG=4
     // works exactly. Grids past maxComputeWorkgroupsPerDimension (65535 —
@@ -1190,12 +1253,12 @@ export function buildDecodeEngine(
     const lmWGs = S.vocab / R.matmulRowsPerWG
     if (lmWGs > 65535) {
       const lmX = 16384
-      dispatch(enc, R.matmulF32, bgLmHead, lmX, 1, Math.ceil(lmWGs / lmX), 'lmHead')
+      dispatch(enc, R.matmulF32, bgLmHead!, lmX, 1, Math.ceil(lmWGs / lmX), 'lmHead')
     } else {
-      dispatch(enc, R.matmulF32, bgLmHead, lmWGs, 1, 1, 'lmHead')
+      dispatch(enc, R.matmulF32, bgLmHead!, lmWGs, 1, 1, 'lmHead')
     }
     // --- ARGMAX: B.logits → B.tokenOut ---
-    dispatch(enc, R.argmax, bgArgmax, 1, 1, 1, 'argmax')
+    dispatch(enc, R.argmax, bgArgmax!, 1, 1, 1, 'argmax')
   }
 
   /**
@@ -1240,7 +1303,59 @@ export function buildDecodeEngine(
   // Blocking path — decodeToken / forwardLogits (validation harness)
   // ============================================================
 
+  /**
+   * One token through THIS pipeline stage.
+   *
+   * The first stage takes a token id and returns the residual to hand on; the
+   * last takes a residual and returns the argmax token; a middle stage does
+   * both. One round trip per token, carrying d f16 values — 4 KB for Qwen3.6,
+   * which is nothing next to the 2-5 ms a LAN hop costs. Latency, not
+   * bandwidth, is what bounds a split model.
+   *
+   * Deliberately NOT wired into generate()/generatePipelined(): those own the
+   * whole loop, and in a split the loop lives above both stages (in share.ts's
+   * pipeline driver, or a test). This is the primitive they drive.
+   */
+  async function pipelineStep(
+    input: { tokenId: number } | { residual: ArrayBuffer },
+    position: number,
+  ): Promise<{ residual: ArrayBuffer } | { tokenId: number }> {
+    if (position < 0 || position >= MAX_CONTEXT) {
+      throw new Error(`zero-tvm: pipelineStep position ${position} outside the ${MAX_CONTEXT}-token context`)
+    }
+    if ('residual' in input) {
+      if (L0 === 0) throw new Error('pipelineStep: the first stage takes a token id, not a residual')
+      device.queue.writeBuffer(B.residual, 0, input.residual)
+      writeStepState(null, position)
+    } else {
+      if (L0 !== 0) throw new Error(`pipelineStep: stage starting at layer ${L0} takes a residual, not a token id`)
+      writeStepState(input.tokenId, position)
+    }
+
+    const enc = device.createCommandEncoder()
+    if (position === 0) clearGdnState(enc)
+    recordForward(enc)
+    const last = L1 === S.layers
+    if (last) enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
+    else enc.copyBufferToBuffer(B.residual, 0, residualReadBuf!, 0, S.d * 2)
+    device.queue.submit([enc.finish()])
+    gdnStatePos = position + 1
+
+    if (last) {
+      await readBuf.mapAsync(GPUMapMode.READ)
+      const tokenId = new DataView(readBuf.getMappedRange()).getInt32(0, true)
+      readBuf.unmap()
+      return { tokenId }
+    }
+    await residualReadBuf!.mapAsync(GPUMapMode.READ)
+    // slice() copies out of the mapped range — unmap() invalidates it.
+    const residual = residualReadBuf!.getMappedRange().slice(0)
+    residualReadBuf!.unmap()
+    return { residual }
+  }
+
   async function decodeToken(tokenId: number, position: number): Promise<number> {
+    if (partial) throw new Error('decodeToken: this engine is one pipeline stage — drive it with pipelineStep')
     if (position < 0 || position >= MAX_CONTEXT) {
       throw new Error(
         `zero-tvm: context overflow — position ${position} exceeds max context ` +
@@ -1698,7 +1813,7 @@ export function buildDecodeEngine(
   //      batching a chunk would apply one token's expert choice to all of them.
   // The cost is per-token prefill; correctness is not negotiable for a speedup.
   const chunkPrefill: ChunkPrefill | null =
-    hybrid && !S.moe && !AFFINE && (opts.chunkedPrefill ?? true) && P.int4MatmulBatchedDyn
+    hybrid && !S.moe && !AFFINE && !partial && (opts.chunkedPrefill ?? true) && P.int4MatmulBatchedDyn
       ? buildChunkPrefill()
       : null
   if (hybrid) {
@@ -2116,6 +2231,7 @@ export function buildDecodeEngine(
     generate,
     generatePipelined,
     forwardLogits,
+    pipelineStep,
     resetKVTracking,
     debugCompareReuse,
     getLastPrefill,
