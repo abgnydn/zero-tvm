@@ -63,6 +63,10 @@
     /* guest view = the chat shell */
     #guest-view { display: flex; flex-direction: column; height: 100dvh; }
     #guest-view .top { flex: none; }
+    #local-copy { max-width: var(--msg-max); margin: 1rem auto; }
+    #local-copy button { background: var(--accent); color: #04140d; border-radius: 8px;
+                         font-weight: 600; padding: .5rem 1rem; margin-top: .6rem; }
+    #local-copy button:disabled { opacity: .5; cursor: default; }
     .hidden { display: none !important; }
   </style>
 </head>
@@ -113,6 +117,12 @@
     </header>
     <main class="chat-main" id="chat-main">
       <div class="chat-inner">
+        <!-- Shown only when the host has a weight cache this device could copy. -->
+        <section class="card hidden" id="local-copy">
+          <h2>Run it on this device</h2>
+          <p class="hint" id="lc-status"></p>
+          <button id="lc-btn" type="button"></button>
+        </section>
         <div id="messages"></div>
       </div>
       <button class="scroll-fab" id="scroll-fab" title="Scroll to bottom" aria-label="Scroll to bottom">

@@ -53,6 +53,23 @@ export function specForParam(model: string | null): ModelSpec {
   return hit ? hit.spec : PHI3
 }
 
+/** Root OPFS directory the weight cache lives under. */
+export const WEIGHTS_OPFS_DIR = 'zero-tvm-weights'
+
+/**
+ * Per-model OPFS dir. Phi-3 keeps the historical unsuffixed name for cache
+ * compatibility; other models get a `.`-joined suffix. The separator MUST NOT
+ * be `-`: openOPFS() deletes stale `zero-tvm-weights-<rev>` dirs left by old
+ * loader revisions, and a dash-suffixed model dir would match that sweep.
+ *
+ * Lives HERE rather than in weight-loader.ts (which re-exports it) because
+ * peer-weights.ts replicates this directory on machines that may have no
+ * WebGPU at all — and weight-loader reads GPUBufferUsage at module scope.
+ */
+export function opfsDirFor(spec: ModelSpec): string {
+  return spec.id === PHI3.id ? WEIGHTS_OPFS_DIR : `${WEIGHTS_OPFS_DIR}.${spec.id}`
+}
+
 export interface ModelBrand {
   name: string
   /** Parameter-count line for cards ("4B hybrid", "35B-A3B MoE"). */

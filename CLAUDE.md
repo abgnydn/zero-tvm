@@ -202,6 +202,38 @@ cards, switcher and branding — `specFromSearch` derives from it. Proof run
 **Paris**."); dense MLX models run the affine FFN chain (gate_up matmul →
 silu_mul → down; fused_ffn is symmetric-only).
 
+## Sharing + peer weights (`share.html`, `workers/share-signal/`)
+
+`share.html?model=<param>` hosts the model running in that tab; `share.html#<room>`
+is the guest. Prompts and tokens ride a DTLS-encrypted WebRTC DataChannel; the
+Cloudflare Durable Object at `workers/share-signal/` relays SDP/ICE only. The
+room id is 128 random bits in the link fragment (never sent to the static host).
+The guest renders with `chat-ui.ts` + `public/chat-ui.css` — the same surface as
+the chat page, which is why the two cannot drift.
+
+A SECOND channel (`weights`) replicates the host's OPFS weight cache to the
+guest's device, so a second machine never re-downloads gigabytes the first one
+has: `peer-weights.ts` streams the model's OPFS **directory** (format-agnostic —
+MLC shards and MLX built buffers are both flat files there) in 240 KB pieces,
+each with a SHA-256 the receiver checks. The guest then runs the model locally.
+The hash catches corruption, NOT a dishonest host — in a room you already trust
+the host to run the model.
+
+```bash
+npx wrangler deploy                      # in workers/share-signal (prod relay)
+node scripts/share-e2e.mjs               # vite + wrangler dev + 2 tabs, real RTC
+node scripts/peer-weights-e2e.mjs        # TWO browser profiles; replicates 2.26 GB
+MODEL=qwen35 node scripts/peer-weights-e2e.mjs
+```
+
+Gotchas: `?sig=<port|url>` overrides the signaling relay in DEV ONLY (two test
+drivers run their own wrangler concurrently; in prod a link could otherwise
+point a guest's signaling at a third party). The host tab needs the "keep this
+tab awake" checkbox when backgrounded — Chrome throttles it to ~1 MB/s serving
+and ~23 tok/s generating otherwise. DataChannel backpressure must re-CHECK
+`bufferedAmount` in a loop; waiting on a single `bufferedamountlow` event
+deadlocks when the queue drains between the check and the listener.
+
 ## Cross-site context
 
 `sites.json` is synced from `~/sites-shared/sites.ts`. Edit URLs,

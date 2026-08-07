@@ -36,14 +36,21 @@ import {
   setChatIdentity, quantTagFor, autoGrow, wireScrollFab,
   addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
+import { specForParam } from './model-registry.js'
+import { serveWeights, fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
 
 // Signaling endpoint. Dev: `npx wrangler dev --port 8787` in
 // workers/share-signal (what scripts/share-e2e.mjs spawns). (Same import.meta
 // cast as weight-loader.ts — the repo has no vite/client types.)
 const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
-const SIGNAL_BASE = DEV
-  ? 'ws://localhost:8787'
-  : 'wss://zero-tvm-share-signal.abgunaydin94.workers.dev'  // deployed 2026-08-06
+const PROD_SIGNAL = 'wss://zero-tvm-share-signal.abgunaydin94.workers.dev'  // deployed 2026-08-06
+/** `?sig=<port|ws-url>` overrides the relay — DEV ONLY, so a shared link can
+ *  never point a guest's signaling at a third party in production. Two test
+ *  drivers run their own wrangler on different ports concurrently. */
+const SIG_OVERRIDE = DEV ? new URLSearchParams(location.search).get('sig') : null
+const SIGNAL_BASE = SIG_OVERRIDE
+  ? (/^wss?:\/\//.test(SIG_OVERRIDE) ? SIG_OVERRIDE : `ws://localhost:${SIG_OVERRIDE}`)
+  : DEV ? 'ws://localhost:8787' : PROD_SIGNAL
 
 const ICE: RTCConfiguration = {
   // STUN only, deliberately: same-network and home-NAT paths connect
@@ -57,7 +64,7 @@ interface ChatReq { type: 'chat'; id: number; messages: { role: 'system' | 'user
 interface StopReq { type: 'stop'; id: number }
 type GuestMsg = ChatReq | StopReq
 type HostMsg =
-  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string }
+  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string; specId: string }
   | { type: 'text'; id: number; full: string }
   | { type: 'done'; id: number; tokens: number; tps: number }
   | { type: 'busy'; id: number; pos: number }
@@ -153,7 +160,9 @@ async function runHost(): Promise<void> {
   // ── room ──
   const bytes = crypto.getRandomValues(new Uint8Array(16))
   const roomId = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-  const link = `${location.origin}${location.pathname}#${roomId}`
+  // Carry a dev signaling override into the guest link, or the guest dials the
+  // default relay and the room never forms.
+  const link = `${location.origin}${location.pathname}${SIG_OVERRIDE ? `?sig=${encodeURIComponent(SIG_OVERRIDE)}` : ''}#${roomId}`
   const linkInput = $('share-link') as HTMLInputElement
   linkInput.value = link
   $('copy-link').addEventListener('click', () => {
@@ -236,15 +245,22 @@ async function runHost(): Promise<void> {
     void pump()
   }
 
+  const param = new URLSearchParams(location.search).get('model') ?? ''
+
   function makePeer(guest: string): void {
     const pc = new RTCPeerConnection(ICE)
     const entry = { pc, dc: null as RTCDataChannel | null }
     peers.set(guest, entry)
     const dc = pc.createDataChannel('chat', { ordered: true })
     entry.dc = dc
+    // A SECOND channel carries weight replication. Separate because a 2 GB
+    // transfer and a token stream must not share a queue: DataChannels are
+    // head-of-line blocked, so pieces in flight would stall every reply.
+    const weights = pc.createDataChannel('weights', { ordered: true })
+    serveWeights(weights, spec, (m) => logRow(guest, `weights — ${m}`))
     dc.onopen = () => send(guest, {
       type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel,
-      tag: quantTagFor(spec),
+      tag: quantTagFor(spec), param, specId: spec.id,
     })
     dc.onmessage = (e) => onGuestMessage(guest, String(e.data))
     pc.onicecandidate = (e) => {
@@ -290,6 +306,12 @@ async function runGuest(roomId: string): Promise<void> {
   const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
   const pc = new RTCPeerConnection(ICE)
   let dc: RTCDataChannel | null = null
+  // The weights channel and the `info` frame race: the host opens both
+  // channels at once, so info can land on 'chat' before 'weights' has even
+  // been announced here. Awaiting a promise removes the race — the offer is
+  // built when BOTH have arrived, in whichever order that happens.
+  let weightsReady: (dc: RTCDataChannel) => void = () => {}
+  const weightsChannel = new Promise<RTCDataChannel>((r) => { weightsReady = r })
 
   const history: ChatReq['messages'] = []
   let reqId = 0
@@ -319,6 +341,7 @@ async function runGuest(roomId: string): Promise<void> {
       inp.disabled = false
       inp.placeholder = 'Message the remote model…'
       sendBtn.disabled = false
+      void offerLocalCopy(msg.param, msg.specId)
     } else if (msg.type === 'text') {
       liveFull = msg.full
       live?.render(liveFull)
@@ -359,9 +382,69 @@ async function runGuest(roomId: string): Promise<void> {
     if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }))
   }
   pc.ondatachannel = (e) => {
+    if (e.channel.label === 'weights') {
+      const ch = e.channel
+      ch.binaryType = 'arraybuffer'
+      if (ch.readyState === 'open') weightsReady(ch)
+      else ch.addEventListener('open', () => weightsReady(ch), { once: true })
+      return
+    }
     dc = e.channel
     dc.onmessage = (ev) => onHostMsg(JSON.parse(String(ev.data)) as HostMsg)
     dc.onclose = () => setBadge('Disconnected', 'error')
+  }
+
+  /**
+   * Offer to copy the model's weights from the host to THIS device, so it can
+   * run locally afterwards instead of chatting through the host — the second
+   * machine never re-downloads gigabytes the first one already has.
+   *
+   * The spec is resolved from the registry by `param` and cross-checked
+   * against the host's spec id: the OPFS directory this writes into is chosen
+   * LOCALLY, never from a string the host sent.
+   */
+  async function offerLocalCopy(param: string, specId: string): Promise<void> {
+    const panel = $('local-copy')
+    const spec = specForParam(param)
+    if (spec.id !== specId) return   // this build doesn't know the host's model — offer nothing
+    const weightsDc = await Promise.race([
+      weightsChannel,
+      new Promise<null>((r) => setTimeout(() => r(null), 20_000)),
+    ])
+    if (!weightsDc) return           // host build predates weight sharing
+    const status = $('lc-status')
+    const btn = $('lc-btn') as HTMLButtonElement
+    let inv: Inventory
+    try {
+      inv = await fetchInventory(weightsDc)
+    } catch {
+      return   // host cannot serve weights (nothing cached) — stay quiet
+    }
+    if (!inv.files) return
+    const gb = (inv.bytes / 1e9).toFixed(2)
+    panel.classList.remove('hidden')
+    status.textContent = `The host has ${gb} GB cached. Copying it here lets this device run ${spec.id} on its own GPU.`
+    btn.textContent = `Copy ${gb} GB to this device`
+    btn.addEventListener('click', () => {
+      btn.disabled = true
+      const t = performance.now()
+      void pullWeights(weightsDc, spec, (p) => {
+        const pct = p.bytesTotal ? Math.round((p.bytesDone / p.bytesTotal) * 100) : 0
+        status.textContent = `${pct}% · ${(p.bytesDone / 1e9).toFixed(2)}/${gb} GB · `
+          + `${p.filesDone}/${p.filesTotal} files · ${(p.rate / 1e6).toFixed(0)} MB/s`
+      }, inv)
+        .then((res) => {
+          const secs = ((performance.now() - t) / 1000).toFixed(0)
+          status.innerHTML = `Done — ${(res.bytes / 1e9).toFixed(2)} GB in ${secs}s. `
+            + `<a href="/zero-tvm.html?model=${encodeURIComponent(param)}">Open the chat on this device →</a>`
+          btn.remove()
+          ;(window as unknown as Record<string, unknown>).__pullDone = res
+        })
+        .catch((err: Error) => {
+          status.textContent = `Copy failed: ${err.message}`
+          btn.disabled = false
+        })
+    })
   }
 
   const submit = (): void => {

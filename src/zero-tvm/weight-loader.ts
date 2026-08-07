@@ -33,18 +33,14 @@ export const PHI3_MODEL_BASE = modelBaseUrl(PHI3)
  *
  * KEEP IN SYNC with SHARED_DIR in public/weights-cache-sw.js — the SW is plain
  * JS and cannot import this constant, so the two definitions are paired by hand.
+ *
+ * Both names are DEFINED in model-registry.ts (the WebGPU-free module) and
+ * re-exported here, where every existing caller imports them from: peer weight
+ * replication runs on machines with no GPU, and this module reads
+ * GPUBufferUsage at import time.
  */
-export const WEIGHTS_OPFS_DIR = 'zero-tvm-weights'
-
-/**
- * Per-model OPFS dir. Phi-3 keeps the historical unsuffixed name for cache
- * compatibility; other models get a `.`-joined suffix. The separator MUST NOT
- * be `-`: openOPFS() deletes stale `zero-tvm-weights-<rev>` dirs left by old
- * loader revisions, and a dash-suffixed model dir would match that sweep.
- */
-export function opfsDirFor(spec: ModelSpec): string {
-  return spec.id === PHI3.id ? WEIGHTS_OPFS_DIR : `${WEIGHTS_OPFS_DIR}.${spec.id}`
-}
+import { WEIGHTS_OPFS_DIR, opfsDirFor } from './model-registry.js'
+export { WEIGHTS_OPFS_DIR, opfsDirFor }
 
 /** Max concurrent shard fetches. HTTP/2 multiplexes fine but we don't want to
  *  hold ~2 GB of in-flight ArrayBuffers on low-RAM devices. */
