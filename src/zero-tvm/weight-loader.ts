@@ -515,7 +515,18 @@ export async function loadWeights(
   onProgress?: (msg: string) => void,
   onStats?: (stats: WeightLoadStats) => void,
   spec: ModelSpec = PHI3,
+  /**
+   * Load ONE PIPELINE STAGE — layers [start, end) plus the embedding only if
+   * it starts the model and the lm_head / final norm only if it ends it. This
+   * is what makes a split worth doing: the stage's VRAM is its share, not the
+   * whole checkpoint. MLX checkpoints only — the MLC path fetches whole shards,
+   * so skipping layers would save no download.
+   */
+  layerRange?: { start: number; end: number },
 ): Promise<LoadedWeights> {
+  if (layerRange && spec.weightFormat !== 'mlx-safetensors') {
+    throw new Error(`loadWeights: layerRange needs an MLX checkpoint; ${spec.id} ships MLC shards`)
+  }
   const baseUrl = modelBaseUrl(spec)
   const opfsDir = opfsDirFor(spec)
   const mirrorBase = localMirrorBase(spec)
@@ -544,7 +555,7 @@ export async function loadWeights(
     const src = mlxSource(baseUrl, mirrorBase, onProgress)
     onProgress?.('Reading safetensors headers…')
     const { locate, shards } = await openMlxCheckpoint(src)
-    const total = planModel(spec).length
+    const total = planModel(spec, layerRange).length
     onProgress?.(`${shards.length} shards, ${total} buffers to build`)
     const t0 = performance.now()
     const lw = await assembleMlx(device, spec, src, locate, USAGE, {
@@ -570,7 +581,7 @@ export async function loadWeights(
           persisted,
         })
       },
-    })
+    }, layerRange)
     await Promise.all(pendingWrites)
     onProgress?.(`Weights ready (${((performance.now() - t0) / 1000).toFixed(0)}s)`)
     return lw as unknown as LoadedWeights

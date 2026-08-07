@@ -236,8 +236,17 @@ export function planLayer(spec: ModelSpec, L: number, prefix?: string): BufferPl
  * spelled here a second time — that field exists precisely so one place knows
  * how MLX names companions.
  */
-export function planGlobal(spec: ModelSpec, prefix?: string): BufferPlan[] {
+export function planGlobal(
+  spec: ModelSpec,
+  prefix?: string,
+  /** Pipeline stage bounds. The embedding belongs to the stage that starts the
+   *  model and the lm_head / final norm to the one that ends it; a middle
+   *  stage loads neither, which is most of what makes a stage small. */
+  range?: { start: number; end: number },
+): BufferPlan[] {
   const pre = prefix ?? spec.mlxPrefix ?? ''
+  const first = (range?.start ?? 0) === 0
+  const last = (range?.end ?? spec.layers) === spec.layers
   const bias = spec.paramNaming.biasFor
   if (!bias) throw new Error(`${spec.id}: planGlobal needs paramNaming.biasFor (affine checkpoints only)`)
   const q = (name: string, base: string): BufferPlan[] => [
@@ -246,9 +255,11 @@ export function planGlobal(spec: ModelSpec, prefix?: string): BufferPlan[] {
     { name: `${name}_b`, parts: [{ record: bias(`${base}.weight`), convert: 'bf16->f16' }] },
   ]
   return [
-    ...q('embed', `${pre}model.embed_tokens`),
-    ...(spec.tiedEmbeddings ? [] : q('lm_head', `${pre}lm_head`)),  // NOT under model. — see above
-    { name: 'final_norm', parts: [{ record: `${pre}model.norm.weight`, convert: 'bf16->f16' }] },
+    // A tied lm_head IS the embedding table, so the last stage needs it even
+    // when it does not start the model.
+    ...(first || (last && spec.tiedEmbeddings) ? q('embed', `${pre}model.embed_tokens`) : []),
+    ...(spec.tiedEmbeddings || !last ? [] : q('lm_head', `${pre}lm_head`)),  // NOT under model. — see above
+    ...(last ? [{ name: 'final_norm', parts: [{ record: `${pre}model.norm.weight`, convert: 'bf16->f16' as Convert }] }] : []),
   ]
 }
 

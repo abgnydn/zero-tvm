@@ -74,6 +74,26 @@ try {
       : `[${split.join(', ')}] vs [${whole.join(', ')}]`)
   }
 
+  // The arrangement a real split uses: each stage loads ONLY its own layers,
+  // which is the whole reason to split — the stage's VRAM is its share.
+  if (spec.weightFormat === 'mlx-safetensors') {
+    const k = Math.floor(spec.layers / 2)
+    const r = await page.evaluate((ids, kk, n) => window.__splitLoadCheck(ids, kk, n), PROMPT, k, TOKENS)
+    const prefixSame = whole.every((t, i) => t === r.tokens[i])
+    const extra = r.tokens.slice(whole.length)
+    const same = prefixSame && (extra.length === 0 || (extra.length === 1 && spec.stops.includes(extra[0])))
+    const gb = (b) => (b / 1e9).toFixed(2)
+    check('partial load matches', same, same ? `${whole.length} tokens identical` : `[${r.tokens}] vs [${whole}]`)
+    const wholeBytes = await page.evaluate(() => window.__wholeBytes())
+    // Neither stage may hold the whole model. The SUM can still exceed it: a
+    // tied lm_head IS the embedding table, so a tied model carries that table
+    // on both ends (llama32 does; Qwen3.6-35B is untied and does not).
+    check('stages hold a share', r.bytesA < wholeBytes && r.bytesB < wholeBytes,
+      `whole ${gb(wholeBytes)} GB · stage A ${gb(r.bytesA)} (layers 0-${k}) + stage B ${gb(r.bytesB)} `
+      + `(layers ${k}-${spec.layers}) = ${gb(r.bytesA + r.bytesB)} GB`
+      + (spec.tiedEmbeddings ? ' — tied embedding table sits on both ends' : ''))
+  }
+
   const gpuErrs = await page.evaluate(() => window.__gpuErrs())
   check('gpu errors', gpuErrs === 0, String(gpuErrs))
 } catch (e) {

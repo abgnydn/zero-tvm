@@ -256,11 +256,19 @@ node scripts/pipeline-split-test.mjs --ref /tmp/ref-llama32 llama32
 node scripts/pipeline-split-test.mjs qwen35     # hybrid GDN path
 ```
 
+`loadWeights(..., spec, { start, end })` loads ONE stage's weights — its
+layers, the embedding only if it starts the model, the lm_head / final norm
+only if it ends it. MLX checkpoints only: the MLC path fetches whole shards, so
+skipping layers would save no download. A tied lm_head IS the embedding table,
+so a tied model carries that table on BOTH ends (Qwen3.6-35B is untied and does
+not).
+
 Verified 2026-08-07: splits at layers 1 / mid / N-1 reproduce the whole model
-token-for-token on llama32 (against a real prompt whose answer matches mlx_lm)
-and on qwen35 (32 layers, GDN state per stage). What is NOT built yet: partial
-weight loading (a stage still loads the whole checkpoint) and the network
-transport between stages.
+token-for-token on llama32 (real prompt; the whole model's answer matches
+mlx_lm) and on qwen35 (32 layers, GDN state per stage). With each stage loading
+only its own layers — the real arrangement — llama32 is 0.42 + 0.42 GB against
+0.70 GB whole, still token-identical. What is NOT built yet: the network
+transport between stages and a driver that owns the token loop above them.
 
 Gotchas: `?sig=<port|url>` overrides the signaling relay in DEV ONLY (two test
 drivers run their own wrangler concurrently; in prod a link could otherwise

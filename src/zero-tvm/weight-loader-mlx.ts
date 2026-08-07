@@ -83,11 +83,23 @@ export async function openMlxCheckpoint(src: MlxSource): Promise<{
   return { locate, records: Object.keys(map), shards }
 }
 
-/** Every buffer the model needs, in the order they should be built. */
-export function planModel(spec: ModelSpec): { plan: BufferPlan; layer: number | null }[] {
+/**
+ * Every buffer the model needs, in the order they should be built.
+ *
+ * With `range` this is ONE PIPELINE STAGE's buffers: its layers, plus the
+ * embedding only if it starts the model and the lm_head / final norm only if
+ * it ends it. That is what lets two machines hold a model neither of them
+ * could — nothing else in the loader has to know about the split.
+ */
+export function planModel(
+  spec: ModelSpec,
+  range?: { start: number; end: number },
+): { plan: BufferPlan; layer: number | null }[] {
+  const L0 = range?.start ?? 0
+  const L1 = range?.end ?? spec.layers
   const out: { plan: BufferPlan; layer: number | null }[] = []
-  for (const p of planGlobal(spec)) out.push({ plan: p, layer: null })
-  for (let L = 0; L < spec.layers; L++) {
+  for (const p of planGlobal(spec, undefined, range)) out.push({ plan: p, layer: null })
+  for (let L = L0; L < L1; L++) {
     for (const p of planLayer(spec, L)) out.push({ plan: p, layer: L })
   }
   return out
@@ -194,8 +206,10 @@ export async function assembleMlx(
   locate: (record: string) => RecordLoc,
   usage: number,
   hooks: MlxLoadHooks = {},
+  /** Load ONE pipeline stage's buffers (see planModel). */
+  range?: { start: number; end: number },
 ): Promise<Record<string, unknown>> {
-  const plans = planModel(spec)
+  const plans = planModel(spec, range)
   const root: Record<string, unknown> = { device }
   const layers: Record<string, unknown>[] = Array.from({ length: spec.layers }, () => ({}))
   let done = 0
@@ -242,8 +256,10 @@ export async function assembleMlx(
     root.lmHeadScales = root.embdScales
     root.lmHeadBiases = root.embdBiases
   }
-  // The MLC path exposes layer 0's input_layernorm separately; the engine reads
-  // it before the layer loop.
-  root.initNormGamma = layers[0].normGamma1
+  // The MLC path exposes the first layer's input_layernorm separately; the
+  // engine reads it before the layer loop. On a pipeline stage the first
+  // LOADED layer is the one that matters, not layer 0 (which may be a
+  // different machine's).
+  root.initNormGamma = layers[range?.start ?? 0].normGamma1
   return root
 }

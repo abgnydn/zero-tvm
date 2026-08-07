@@ -29,7 +29,10 @@ try{
   window.__gpuErrs = () => gpuErrs
 
   const t0 = performance.now()
-  const weights = await loadWeights(dev, m => { if(/ready|headers|shard/.test(m)) say(m) }, null, S)
+  let wholeBytes = 0
+  const weights = await loadWeights(dev, m => { if(/ready|headers|shard/.test(m)) say(m) },
+    (st) => { wholeBytes = st.bytesLoaded }, S)
+  window.__wholeBytes = () => wholeBytes
   say(`weights ok in ${((performance.now()-t0)/1000).toFixed(0)}s`)
   const kv = allocKVPages(dev, S)
   // Chat-shaped composition: subgroups + tiled matmul (what users actually
@@ -60,6 +63,29 @@ try{
     const out = [tok]
     for (let i = 1; i < n; i++) out.push(tok = await step(tok, ids.length + i - 1))
     return out
+  }
+
+  // Same split, but each stage LOADS ONLY ITS OWN LAYERS — the arrangement a
+  // real two-machine run uses. Reports the bytes each stage actually holds.
+  window.__splitLoadCheck = async (ids, k, n) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }
+    const mk = async (start, end) => {
+      let bytes = 0
+      const w = await loadWeights(dev, undefined, (s) => { bytes = s.bytesLoaded }, S, { start, end })
+      const e = buildDecodeEngine(dev, w, allocKVPages(dev, S), { spec: S, variants: V, layerRange: { start, end } })
+      return { e, bytes }
+    }
+    const A = await mk(0, k)
+    const B = await mk(k, S.layers)
+    const step = async (tokenId, pos) => {
+      const mid = await A.e.pipelineStep({ tokenId }, pos)
+      return (await B.e.pipelineStep({ residual: mid.residual }, pos)).tokenId
+    }
+    let tok = 0
+    for (let i = 0; i < ids.length; i++) tok = await step(ids[i], i)
+    const out = [tok]
+    for (let i = 1; i < n; i++) out.push(tok = await step(tok, ids.length + i - 1))
+    return { tokens: out, bytesA: A.bytes, bytesB: B.bytes }
   }
 
   window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
