@@ -38,6 +38,7 @@ import {
 } from './chat-ui.js'
 import { specForParam } from './model-registry.js'
 import { serveWeights, fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
+import { serveStage, makeStageClient } from './pipeline-peer.js'
 
 // Signaling endpoint. Dev: `npx wrangler dev --port 8787` in
 // workers/share-signal (what scripts/share-e2e.mjs spawns). (Same import.meta
@@ -62,13 +63,17 @@ const ICE: RTCConfiguration = {
 // ── wire protocol ─────────────────────────────────────────────
 interface ChatReq { type: 'chat'; id: number; messages: { role: 'system' | 'user' | 'assistant'; content: string }[] }
 interface StopReq { type: 'stop'; id: number }
-type GuestMsg = ChatReq | StopReq
+/** A peer that holds the REST of a split model, offering to run it. */
+interface StageOffer { type: 'stage-offer'; start: number; end: number; specId: string }
+type GuestMsg = ChatReq | StopReq | StageOffer
 type HostMsg =
   | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string; specId: string }
   | { type: 'text'; id: number; full: string }
   | { type: 'done'; id: number; tokens: number; tps: number }
   | { type: 'busy'; id: number; pos: number }
   | { type: 'error'; id: number; message: string }
+  | { type: 'stage-accept'; start: number; end: number }
+  | { type: 'stage-reject'; message: string }
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement
 
@@ -83,41 +88,38 @@ function roomIdFrom(hash: string): string | null {
 //   ?model=X#<room>       serve an EXISTING room from this device too
 // The third is what turns a room into a swarm: a guest that copied the
 // weights adds ?model= to the link it already has and starts serving.
+/** `?layers=0-20` — this device holds that slice of the model, nothing else. */
+function stageRangeFrom(search: string): { start: number; end: number } | null {
+  const m = /^(\d+)-(\d+)$/.exec(new URLSearchParams(search).get('layers') ?? '')
+  return m ? { start: Number(m[1]), end: Number(m[2]) } : null
+}
+
 const room = roomIdFrom(location.hash)
 const wantsToHost = new URLSearchParams(location.search).has('model')
-if (room && !wantsToHost) void runGuest(room)
-else void runHost(room)
+const stage = stageRangeFrom(location.search)
+// A stage that does not start the model cannot serve chat — it has no
+// embedding and no tokenizer role — so it JOINS someone else's room and
+// offers its layers there. Everything else follows the earlier grammar.
+if (room && stage && stage.start > 0) void runHelper(room, stage)
+else if (room && !wantsToHost) void runGuest(room)
+else void runHost(room, stage)
 
-// ============================================================
-// HOST
-// ============================================================
-
-async function runHost(existingRoom: string | null): Promise<void> {
-  $('host-view').classList.remove('hidden')
-  // Everything GPU-touching is imported HERE, not at module scope — the guest
-  // path must run on machines without WebGPU, and weight-loader.ts reads
-  // GPUBufferUsage the moment it is imported.
-  const [{ specFromSearch, modelBranding, buildChatPromptFor }, loadingUi, variantsMod, engineMod] =
-    await Promise.all([
-      import('./model-select.js'),
-      import('./loading-ui.js'),
-      import('./variants.js'),
-      import('./engine-core.js'),
-    ])
-
-  const spec = specFromSearch(location.search)
-  const brand = modelBranding(spec)
-  $('page-title').textContent = `Sharing ${brand.name}`
-
-  // ── keep-awake: screen wake-lock + a silent audio track. The wake lock
-  // stops the machine sleeping; the audio track is the standard exemption
-  // from background-tab throttling (measured: a backgrounded host generated
-  // at ~23 tok/s where the focused tab does ~65). Both are user-toggled and
-  // honestly labeled — the browser shows its audio indicator on the tab.
-  const awake = $('awake') as HTMLInputElement
+/**
+ * Keep-awake toggle — screen wake-lock plus a silent audio track. The wake
+ * lock stops the machine sleeping; the audio track is the standard exemption
+ * from background-tab throttling (measured: a backgrounded host generated at
+ * ~23 tok/s where the focused tab does ~65, and served weights at ~1 MB/s).
+ * Honestly labeled: the browser shows its audio indicator on the tab.
+ *
+ * Both serving roles need it — a helper stage especially, since it is a
+ * background tab for its whole life.
+ */
+function wireKeepAwake(): void {
+  const awake = $('awake') as HTMLInputElement | null
+  if (!awake) return
   let wakeLock: WakeLockSentinel | null = null
   let audioCtx: AudioContext | null = null
-  async function applyAwake(on: boolean): Promise<void> {
+  const apply = async (on: boolean): Promise<void> => {
     if (on) {
       try { wakeLock = await navigator.wakeLock.request('screen') } catch { /* unsupported / not visible */ }
       if (!audioCtx) {
@@ -135,11 +137,40 @@ async function runHost(existingRoom: string | null): Promise<void> {
       void audioCtx?.suspend()
     }
   }
-  awake.addEventListener('change', () => void applyAwake(awake.checked))
+  awake.addEventListener('change', () => void apply(awake.checked))
   document.addEventListener('visibilitychange', () => {
     // The UA releases wake locks on hide; re-acquire when we come back.
-    if (awake.checked && document.visibilityState === 'visible') void applyAwake(true)
+    if (awake.checked && document.visibilityState === 'visible') void apply(true)
   })
+}
+
+// ============================================================
+// HOST
+// ============================================================
+
+async function runHost(existingRoom: string | null, stageRange: { start: number; end: number } | null): Promise<void> {
+  $('host-view').classList.remove('hidden')
+  // Everything GPU-touching is imported HERE, not at module scope — the guest
+  // path must run on machines without WebGPU, and weight-loader.ts reads
+  // GPUBufferUsage the moment it is imported.
+  const [{ specFromSearch, modelBranding, buildChatPromptFor }, loadingUi, variantsMod, engineMod] =
+    await Promise.all([
+      import('./model-select.js'),
+      import('./loading-ui.js'),
+      import('./variants.js'),
+      import('./engine-core.js'),
+    ])
+
+  const spec = specFromSearch(location.search)
+  const brand = modelBranding(spec)
+  $('page-title').textContent = stageRange
+    ? `Sharing ${brand.name} — layers ${stageRange.start}-${stageRange.end} here`
+    : `Sharing ${brand.name}`
+  if (stageRange && stageRange.start !== 0) {
+    throw new Error(`share: a hosting stage must start at layer 0 (got ${stageRange.start}); later stages join a room as helpers`)
+  }
+
+  wireKeepAwake()
 
   // Same engine composition as chat.ts — this is the throughput path, not the
   // scalar validation path.
@@ -147,6 +178,7 @@ async function runHost(existingRoom: string | null): Promise<void> {
     spec,
     optionalFeatures: ['subgroups' as GPUFeatureName],
     probeSubgroups: true,
+    layerRange: stageRange ?? undefined,
     buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
       const flags = variantsMod.parseVariantFlags(location.search, {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
@@ -154,8 +186,14 @@ async function runHost(existingRoom: string | null): Promise<void> {
       })
       const fused = !s.qkNorm && s.weightFormat !== 'mlx-safetensors'
       const kv = engineMod.allocKVPages(device, s)
-      return engineMod.buildDecodeEngine(device, weights, kv, { variants: flags, fused, spec: s })
+      return engineMod.buildDecodeEngine(device, weights, kv, {
+        variants: flags, fused, spec: s, layerRange: stageRange ?? undefined,
+      })
     },
+    // A stage cannot run the default warmup (forwardLogits needs the whole
+    // model); one pipelineStep at position 0 JITs the same shaders, and the
+    // real prefill overwrites position 0 anyway.
+    warmup: stageRange ? async (e) => { await e.pipelineStep({ tokenId: 1 }, 0) } : undefined,
   })
   if (!boot.ok) {
     $('loading-error').textContent = boot.reason
@@ -184,6 +222,7 @@ async function runHost(existingRoom: string | null): Promise<void> {
 
   const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=host`)
   const peers = new Map<string, { pc: RTCPeerConnection; dc: RTCDataChannel | null }>()
+  const pipelines = new Map<string, RTCDataChannel>()
 
   // Serialized generation: the engine is single-stream. FIFO of pending
   // requests across all guests; queue positions are reported honestly.
@@ -205,6 +244,44 @@ async function runHost(existingRoom: string | null): Promise<void> {
     if (dc?.readyState === 'open') dc.send(JSON.stringify(msg))
   }
 
+  // ── the other half of a split model ───────────────────────────────────────
+  // Set when a helper peer offers exactly the layers this stage lacks. Until
+  // then a split host has a model it cannot finish, and says so rather than
+  // generating from half a network.
+  let downstream: { guest: string; step: (pos: number, residual: ArrayBuffer) => Promise<number>; meanHopMs: () => number } | null = null
+
+  /**
+   * The token loop for a SPLIT model — the whole-model generatePipelined
+   * cannot run here, because this engine holds only the first layers.
+   *
+   * Per token: this stage's layers, then a round trip to the peer holding the
+   * rest, which returns the argmax. Prefill runs the same way, one position at
+   * a time (chunked prefill is a whole-model optimisation).
+   */
+  async function generateSplit(
+    promptIds: number[], budget: number,
+    onToken: (id: number) => void, shouldStop: () => boolean,
+  ): Promise<number[]> {
+    const down = downstream
+    if (!down) throw new Error('the other half of this model is not connected')
+    const stepBoth = async (tokenId: number, pos: number): Promise<number> => {
+      const mid = await engine.pipelineStep({ tokenId }, pos)
+      if (!('residual' in mid)) throw new Error('this stage ended the model — nothing to hand on')
+      return down.step(pos, mid.residual)
+    }
+    let tok = 0
+    for (let i = 0; i < promptIds.length; i++) tok = await stepBoth(promptIds[i], i)
+    const out: number[] = []
+    for (let n = 0; n < budget; n++) {
+      // Stop ids are consumed, never shown — same contract as generate().
+      if (spec.stops.includes(tok) || shouldStop()) break
+      out.push(tok)
+      onToken(tok)
+      tok = await stepBoth(tok, promptIds.length + n)
+    }
+    return out
+  }
+
   async function pump(): Promise<void> {
     if (generating) return
     const next = queue.shift()
@@ -223,18 +300,18 @@ async function runHost(existingRoom: string | null): Promise<void> {
       const allIds: number[] = []
       const t0 = performance.now()
       st.textContent = 'generating…'
-      await engine.generatePipelined(
-        promptIds, budget,
-        (id) => {
-          allIds.push(id)
-          send(guest, { type: 'text', id: req.id, full: tokenizer.decode(allIds) })
-        },
-        () => stopFlags.get(guest) === req.id || !peers.has(guest),
-      )
+      const onTok = (id: number) => {
+        allIds.push(id)
+        send(guest, { type: 'text', id: req.id, full: tokenizer.decode(allIds) })
+      }
+      const stop = () => stopFlags.get(guest) === req.id || !peers.has(guest)
+      if (stageRange) await generateSplit(promptIds, budget, onTok, stop)
+      else await engine.generatePipelined(promptIds, budget, onTok, stop)
       const secs = (performance.now() - t0) / 1000
       const tps = allIds.length / Math.max(secs, 0.001)
       send(guest, { type: 'done', id: req.id, tokens: allIds.length, tps })
       st.textContent = `${allIds.length} tok · ${tps.toFixed(1)} tok/s`
+        + (downstream ? ` · ${downstream.meanHopMs().toFixed(1)} ms/hop to the other stage` : '')
     } catch (e) {
       send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
       st.textContent = 'error'
@@ -248,6 +325,7 @@ async function runHost(existingRoom: string | null): Promise<void> {
     let msg: GuestMsg
     try { msg = JSON.parse(raw) as GuestMsg } catch { return }
     if (msg.type === 'stop') { stopFlags.set(guest, msg.id); return }
+    if (msg.type === 'stage-offer') { acceptStage(guest, msg); return }
     if (msg.type !== 'chat' || !Array.isArray(msg.messages)) return
     stopFlags.delete(guest)
     queue.push({ guest, req: msg })
@@ -257,6 +335,33 @@ async function runHost(existingRoom: string | null): Promise<void> {
   }
 
   const param = new URLSearchParams(location.search).get('model') ?? ''
+
+  /**
+   * A peer says it holds the rest of the model. Accept only if it is EXACTLY
+   * the complement of this stage on the SAME spec — a mismatched range would
+   * produce fluent nonsense, which is worse than refusing.
+   */
+  function acceptStage(guest: string, offer: StageOffer): void {
+    const pipe = pipelines.get(guest)
+    const ok = !!stageRange && !!pipe && offer.specId === spec.id
+      && offer.start === stageRange.end && offer.end === spec.layers
+    if (!ok) {
+      const why = !stageRange ? 'this host runs the whole model'
+        : offer.specId !== spec.id ? `different model (${offer.specId} vs ${spec.id})`
+        : !pipe ? 'the pipeline channel is not open'
+        : `layers ${offer.start}-${offer.end} do not continue ${stageRange.start}-${stageRange.end}`
+      send(guest, { type: 'stage-reject', message: why })
+      logRow(guest, `stage offer refused — ${why}`)
+      return
+    }
+    const client = makeStageClient(pipe)
+    downstream = { guest, step: client.step, meanHopMs: client.meanHopMs }
+    send(guest, { type: 'stage-accept', start: offer.start, end: offer.end })
+    $('room-stats').textContent =
+      `split model — layers ${stageRange!.start}-${stageRange!.end} here, ${offer.start}-${offer.end} on a peer`
+    logRow(guest, `serving layers ${offer.start}-${offer.end} — the model is complete`)
+    ;(window as unknown as Record<string, unknown>).__stagePaired = true
+  }
 
   function makePeer(guest: string): void {
     // A reassigned guest (its previous host closed) arrives as a fresh
@@ -272,6 +377,11 @@ async function runHost(existingRoom: string | null): Promise<void> {
     // head-of-line blocked, so pieces in flight would stall every reply.
     const weights = pc.createDataChannel('weights', { ordered: true })
     serveWeights(weights, spec, (m) => logRow(guest, `weights — ${m}`))
+    // Third channel: residuals to a peer holding the rest of a split model.
+    // Its own queue again — a hand-off must never wait behind a token stream.
+    const pipeline = pc.createDataChannel('pipeline', { ordered: true })
+    pipeline.binaryType = 'arraybuffer'
+    pipelines.set(guest, pipeline)
     dc.onopen = () => send(guest, {
       type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel,
       tag: quantTagFor(spec), param, specId: spec.id,
@@ -301,7 +411,16 @@ async function runHost(existingRoom: string | null): Promise<void> {
     const guest = msg.from
     if (!guest) return
     if (msg.type === 'peer-joined') makePeer(guest)
-    else if (msg.type === 'peer-left') { peers.get(guest)?.pc.close(); peers.delete(guest) }
+    else if (msg.type === 'peer-left') {
+      peers.get(guest)?.pc.close()
+      peers.delete(guest)
+      pipelines.delete(guest)
+      if (downstream?.guest === guest) {
+        downstream = null
+        $('room-stats').textContent = `split model — waiting for layers ${stageRange!.end}-${spec.layers} again`
+        logRow(guest, 'the other half of the model left')
+      }
+    }
     else if (msg.type === 'answer' && msg.sdp) void peers.get(guest)?.pc.setRemoteDescription(msg.sdp)
     else if (msg.type === 'ice' && msg.candidate) void peers.get(guest)?.pc.addIceCandidate(msg.candidate)
   }
@@ -310,6 +429,100 @@ async function runHost(existingRoom: string | null): Promise<void> {
   // e2e hooks
   ;(window as unknown as Record<string, unknown>).__shareLink = link
   ;(window as unknown as Record<string, unknown>).__shareReady = true
+}
+
+// ============================================================
+// HELPER — this device holds the END of a split model
+// ============================================================
+
+/**
+ * Join someone else's room and offer the layers they lack.
+ *
+ * Signalling-wise this is a GUEST: it takes the same offer/answer path and the
+ * same three channels, then says "I hold layers k..N" on the chat channel
+ * instead of asking a question. Reusing the guest role rather than teaching
+ * the relay a third one is what keeps this feature small — the room only ever
+ * routes, and what a peer DOES with its channels is between the peers.
+ */
+async function runHelper(roomId: string, range: { start: number; end: number }): Promise<void> {
+  $('host-view').classList.remove('hidden')
+  // A helper hands out no link of its own — it joined someone else's room.
+  // (The keep-awake card is deliberately a SEPARATE section, so removing this
+  // one does not take the toggle with it.)
+  $('share-link').closest('section')?.remove()
+  wireKeepAwake()
+  const [{ specFromSearch, modelBranding }, loadingUi, variantsMod, engineMod] = await Promise.all([
+    import('./model-select.js'),
+    import('./loading-ui.js'),
+    import('./variants.js'),
+    import('./engine-core.js'),
+  ])
+  const spec = specFromSearch(location.search)
+  const brand = modelBranding(spec)
+  $('page-title').textContent = `Serving ${brand.name} layers ${range.start}-${range.end}`
+  const stats = $('room-stats')
+  stats.textContent = `loading layers ${range.start}-${range.end} of ${spec.layers}…`
+
+  const boot = await loadingUi.bootEngine({
+    spec,
+    optionalFeatures: ['subgroups' as GPUFeatureName],
+    probeSubgroups: true,
+    layerRange: range,
+    buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
+      const flags = variantsMod.parseVariantFlags(location.search, {
+        hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
+        sgSizeOk,
+      })
+      return engineMod.buildDecodeEngine(device, weights, engineMod.allocKVPages(device, s), {
+        variants: flags, fused: false, spec: s, layerRange: range,
+      })
+    },
+    // A residual of zeros JITs this stage's shaders; the real prefill starts
+    // at position 0 again and overwrites it.
+    warmup: async (e) => { await e.pipelineStep({ residual: new ArrayBuffer(spec.d * 2) }, 0) },
+  })
+  if (!boot.ok) { $('loading-error').textContent = boot.reason; return }
+
+  const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
+  const pc = new RTCPeerConnection(ICE)
+  let chat: RTCDataChannel | null = null
+  pc.onicecandidate = (e) => {
+    if (e.candidate) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }))
+  }
+  pc.ondatachannel = (e) => {
+    if (e.channel.label === 'pipeline') {
+      serveStage(e.channel, boot.engine, (m) => { stats.textContent = `layers ${range.start}-${range.end} · ${m}` })
+      return
+    }
+    if (e.channel.label !== 'chat') return
+    chat = e.channel
+    chat.onopen = () => chat!.send(JSON.stringify({
+      type: 'stage-offer', start: range.start, end: range.end, specId: spec.id,
+    } satisfies StageOffer))
+    chat.onmessage = (ev) => {
+      const msg = JSON.parse(String(ev.data)) as HostMsg
+      if (msg.type === 'stage-accept') {
+        stats.textContent = `paired — this device runs layers ${range.start}-${range.end}, the host runs the rest`
+        ;(window as unknown as Record<string, unknown>).__helperPaired = true
+      } else if (msg.type === 'stage-reject') {
+        stats.textContent = `the host refused this stage: ${msg.message}`
+      }
+    }
+  }
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(String(e.data)) as { type: string; sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+    if (msg.type === 'offer' && msg.sdp) {
+      await pc.setRemoteDescription(msg.sdp)
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      ws.send(JSON.stringify({ type: 'answer', sdp: answer }))
+    } else if (msg.type === 'ice' && msg.candidate) {
+      await pc.addIceCandidate(msg.candidate)
+    } else if (msg.type === 'no-host' || msg.type === 'host-left') {
+      stats.textContent = 'no host in this room to pair with — open the room link on the machine holding the first layers'
+    }
+  }
+  ;(window as unknown as Record<string, unknown>).__helperReady = true
 }
 
 // ============================================================
@@ -399,6 +612,11 @@ async function runGuest(roomId: string): Promise<void> {
         else ch.addEventListener('open', () => weightsReady(ch), { once: true })
         return
       }
+      // Match the CHAT channel by name. The host opens three (chat, weights,
+      // pipeline) and a plain guest uses one; taking whichever arrived last
+      // sent this page's questions down the pipeline channel, where nothing
+      // was listening — the request simply vanished.
+      if (e.channel.label !== 'chat') return
       dc = e.channel
       dc.onmessage = (ev) => onHostMsg(JSON.parse(String(ev.data)) as HostMsg)
       // Only a channel that is still the CURRENT one may report a disconnect;

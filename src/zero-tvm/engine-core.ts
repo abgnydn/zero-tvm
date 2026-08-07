@@ -1434,6 +1434,7 @@ export function buildDecodeEngine(
     onToken: (id: number) => void
   ): Promise<number[]> {
     const tokens: number[] = []
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
 
     // Prefill from startPos to populate KV cache for the new tokens.
     // KV slots [0, startPos) already contain valid entries from the previous
@@ -1500,6 +1501,7 @@ export function buildDecodeEngine(
    * these logits is the model's next-token prediction for the prompt.
    */
   async function forwardLogits(promptIds: number[]): Promise<Float32Array> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
     if (promptIds.length === 0) throw new Error('forwardLogits: empty prompt')
     // Prefill all but the last token.
     for (let i = 0; i < promptIds.length - 1; i++) {
@@ -1878,6 +1880,7 @@ export function buildDecodeEngine(
     shouldStop?: () => boolean
   ): Promise<number[]> {
     const tokens: number[] = []
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
     if (promptIds.length === 0 || maxTokens <= 0) return tokens
     // Refuse oversized prompts up front — prefilling at position >= MAX_CONTEXT
     // would write past the last KV page and silently corrupt the cache.

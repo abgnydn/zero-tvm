@@ -144,6 +144,9 @@ export interface BootEngineOptions {
   /** Allocate the KV cache and build the engine. Default: f16 KV pages +
    * buildDecodeEngine defaults (unfused reference path, scalar shaders). */
   buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean; spec: ModelSpec }) => DecodeEngine
+  /** Load only ONE PIPELINE STAGE's weights (see loadWeights). The caller's
+   *  buildEngine must pass the same range to buildDecodeEngine. */
+  layerRange?: { start: number; end: number }
   /** Warm the lazily-JIT'd pipelines. Default: one forwardLogits pass. */
   warmup?: (engine: DecodeEngine, tokenizer: Tokenizer, log?: (msg: string) => void) => Promise<void>
 }
@@ -249,7 +252,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
           (s.etaSec > 0 ? ` · ~${formatEta(s.etaSec)} left` : ''),
       )
       setBadge(`${pct}%`, 'loading')
-    }, spec)
+    }, spec, opts.layerRange)
   } catch (e) {
     setBadge('Download failed', 'error')
     setProgress(10, `Weight load error: ${e}`)
