@@ -185,6 +185,10 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
         sgSizeOk,
       })
       const fused = !s.qkNorm && s.weightFormat !== 'mlx-safetensors'
+      // Both halves of a split model MUST run the same kernels: two stages on
+      // different machines that resolve different variants agree for a while
+      // and then fork, which reads as a split bug and is not one.
+      ;(window as unknown as Record<string, unknown>).__variants = { ...flags, fused }
       const kv = engineMod.allocKVPages(device, s)
       return engineMod.buildDecodeEngine(device, weights, kv, {
         variants: flags, fused, spec: s, layerRange: stageRange ?? undefined,
@@ -473,6 +477,7 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
       })
+      ;(window as unknown as Record<string, unknown>).__variants = { ...flags, fused: false }
       return engineMod.buildDecodeEngine(device, weights, engineMod.allocKVPages(device, s), {
         variants: flags, fused: false, spec: s, layerRange: range,
       })

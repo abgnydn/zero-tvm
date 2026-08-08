@@ -87,6 +87,12 @@ async function round(mode) {
     await stageB.waitForFunction(() => window.__helperReady === true, { timeout: 10 * 60_000, polling: 1000 })
     await stageB.click('#awake')
     await stageA.waitForFunction(() => window.__stagePaired === true, { timeout: 60_000, polling: 200 })
+    const vA = await stageA.evaluate(() => window.__variants)
+    const vB = await stageB.evaluate(() => window.__variants)
+    const same = JSON.stringify(vA) === JSON.stringify(vB)
+    console.log(`  variants ${same ? 'MATCH' : 'DIFFER'}  A=${JSON.stringify(vA)}${same ? '' : ` B=${JSON.stringify(vB)}`}`)
+  } else {
+    console.log(`  variants whole  ${JSON.stringify(await stageA.evaluate(() => window.__variants))}`)
   }
 
   const guest = await A.newPage()
@@ -102,6 +108,10 @@ async function round(mode) {
   }, { timeout: 15 * 60_000, polling: 300 })
 
   const log = await stageA.$eval('#req-log', (el) => el.textContent ?? '')
+  // textContent of a message also sweeps up the action row and the per-reply
+  // stats ("Copy311 tok · 249.7 tok/s"), which necessarily differ between the
+  // two shapes. Cut there: what must match is the model's words.
+  const reply = (await guest.$eval('.msg.ai:last-of-type', (el) => el.textContent ?? '')).split('Copy')[0]
   await guest.close()
   // Park the helper so a WHOLE round that follows does not share the GPU with
   // a still-resident second engine.
@@ -110,7 +120,7 @@ async function round(mode) {
   const m = /(\d+) tok · ([\d.]+) tok\/s/.exec(log)
   if (!m) throw new Error(`no rate in host log: ${log.slice(0, 120)}`)
   const hop = /([\d.]+) ms\/hop/.exec(log)
-  return { tokens: Number(m[1]), rate: Number(m[2]), hop: hop ? Number(hop[1]) : null }
+  return { tokens: Number(m[1]), rate: Number(m[2]), hop: hop ? Number(hop[1]) : null, reply }
 }
 
 const results = { whole: [], split: [] }
@@ -164,6 +174,19 @@ if (results.whole.length && results.split.length) {
   if (drift !== null) console.log(`drift across WHOLE rounds: ${(drift * 100).toFixed(1)}%`)
   console.log(`\nsplit keeps ${(100 * mean(s) / mean(w)).toFixed(1)}% of whole-model throughput`
     + ` — UPPER BOUND on the cost (one GPU serves both stages here)`)
+  // Same model, same prompt: the two shapes must produce the same text. They
+  // did not on the first run of this harness (311 vs 268 tokens), which the
+  // 8-token split proof could never have shown, so the check lives here now.
+  const wt = results.whole[0].reply, st = results.split[0].reply
+  if (wt === st) console.log('replies identical')
+  else {
+    let i = 0
+    while (i < wt.length && i < st.length && wt[i] === st[i]) i++
+    console.log(`\nREPLIES DIFFER at char ${i} of ${wt.length}/${st.length}`)
+    console.log(`  agreed tail: ${JSON.stringify(wt.slice(Math.max(0, i - 70), i))}`)
+    console.log(`  whole next : ${JSON.stringify(wt.slice(i, i + 70))}`)
+    console.log(`  split next : ${JSON.stringify(st.slice(i, i + 70))}`)
+  }
   const hops = results.split.map((r) => r.hop).filter((h) => h !== null)
   if (hops.length) console.log(`hop: ${hops.map((h) => h.toFixed(1)).join(' / ')} ms per token (loopback)`)
 }

@@ -46,12 +46,16 @@ try{
   // Both stages live on this one device — the point is the numerics, not the
   // transport: if A(0..k) + B(k..N) does not reproduce the whole model's
   // tokens, no amount of WebRTC will fix it.
-  window.__splitCheck = async (ids, k, n) => {
+  // `v` overrides the variant set. It matters: the default here is a scalar
+  // kernel set the app does not ship, so a split proven exact with it says
+  // nothing about the split the app actually runs.
+  window.__splitCheck = async (ids, k, n, v) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
     const A = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
-      spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }, layerRange: { start: 0, end: k },
+      spec: S, variants: V, layerRange: { start: 0, end: k },
     })
     const B = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
-      spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }, layerRange: { start: k, end: S.layers },
+      spec: S, variants: V, layerRange: { start: k, end: S.layers },
     })
     const step = async (tokenId, pos) => {
       const mid = await A.pipelineStep({ tokenId }, pos)
@@ -88,10 +92,29 @@ try{
     return { tokens: out, bytesA: A.bytes, bytesB: B.bytes }
   }
 
+  // The whole model under an ARBITRARY variant set — the control for
+  // __splitCheck(v). Without it, "the split forks under app variants" cannot
+  // be told apart from "app variants fork, split or not".
+  window.__wholeCheck = async (ids, n, v) => {
+    const e = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) },
+    })
+    return Array.from(await e.generate(ids, 0, n, () => {}))
+  }
   window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
   window.__generate = async (ids, n) => {
     const out = await engine.generate(ids, 0, n, () => {})
     return Array.from(out)
+  }
+  // The path share.ts uses to serve a WHOLE model. It differs from generate()
+  // in one way that matters to anyone comparing sequences: chunked prefill.
+  // A split model cannot use it (a stage holds only some layers and prefills
+  // one position at a time), so this is what a whole-vs-split text diff is
+  // really comparing against.
+  window.__generatePipelined = async (ids, n) => {
+    const out = []
+    await engine.generatePipelined(ids, n, (t) => out.push(t), () => false)
+    return out
   }
   window.__phase='loaded'
 }catch(e){

@@ -34,7 +34,12 @@ const param = args.filter((a, i) => !a.startsWith('--') && !(refIdx >= 0 && i ==
 const spec = specForParam(param)
 const ref = refDir ? JSON.parse(readFileSync(join(refDir, 'meta.json'), 'utf8')) : null
 const PROMPT = ref ? ref.prompt_ids : [1, 2, 3, 4]
-const TOKENS = ref ? Math.min(8, ref.greedy.length) : 8
+// 8 is enough to catch a stage that re-normalises from the wrong tensor — that
+// breaks immediately. It is NOT enough to catch a divergence that takes tens of
+// tokens to surface: split-cost-bench generated 300 tokens through the real
+// transport and the split answer ran to a different length. Raise it with
+// TOKENS=<n> to hunt for the first differing index.
+const TOKENS = Number(process.env.TOKENS) || (ref ? Math.min(8, ref.greedy.length) : 8)
 
 let failed = false
 const check = (name, pass, detail) => {
@@ -60,8 +65,14 @@ try {
       `${JSON.stringify(ref.greedy_text)} — the sequence the split must reproduce`)
   }
 
+  // Two variant sets, because for a long time this only ran the first one: a
+  // scalar kernel set nobody ships. Under the SHIPPED flags (sgAttn + splitK)
+  // a stage pair used to reproduce the whole model for 248 tokens and then
+  // fork — invisible to both the scalar set and the old 8-token window.
+  const VARIANT_SETS = [['scalar', undefined], ['shipped (sgAttn+splitK)', { sgAttn: true, splitK: 8 }]]
+  for (const [vLabel, V] of VARIANT_SETS)
   for (const k of [1, Math.floor(spec.layers / 2), spec.layers - 1]) {
-    const split = await page.evaluate((ids, kk, n) => window.__splitCheck(ids, kk, n), PROMPT, k, TOKENS)
+    const split = await page.evaluate((ids, kk, n, v) => window.__splitCheck(ids, kk, n, v), PROMPT, k, TOKENS, V)
     // generate() HALTS on a stop id without emitting it; the hand-driven split
     // loop runs a fixed count, so it emits that stop id as one extra token.
     // Reproducing every token the whole model emitted and then stopping where
@@ -69,9 +80,11 @@ try {
     const prefixSame = whole.every((t, i) => t === split[i])
     const extra = split.slice(whole.length)
     const same = prefixSame && (extra.length === 0 || (extra.length === 1 && spec.stops.includes(extra[0])))
-    check(`split at layer ${k}`, same, same
+    const at = whole.findIndex((t, i) => t !== split[i])
+    check(`split at layer ${k} · ${vLabel}`, same, same
       ? `${whole.length} tokens identical${extra.length ? ` (then the stop id ${extra[0]}, where the whole model halted)` : ''}`
-      : `[${split.join(', ')}] vs [${whole.join(', ')}]`)
+      : `diverges at token ${at}/${whole.length}: split ${split[at]} vs whole ${whole[at]}`
+        + ` — agreed on [${whole.slice(Math.max(0, at - 4), at).join(', ')}]`)
   }
 
   // The arrangement a real split uses: each stage loads ONLY its own layers,

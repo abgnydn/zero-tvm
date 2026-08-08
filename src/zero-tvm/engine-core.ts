@@ -392,7 +392,19 @@ export function buildDecodeEngine(
   if (int8Mode && R.splitK) {
     console.warn('[engine] ?splitk ignored with int8 KV (attention_int8 has no split-K variant)')
   }
-  const splitK = int8Mode ? 0 : R.splitK
+  // Split-K attention is OFF on a pipeline stage. Measured on llama32 with the
+  // shipped variant set: a stage pair cut at layer 4, 8 or 15 reproduces the
+  // whole model for 248 tokens and then forks, always at the same absolute
+  // position, for splitK 4 and 8 but not 2 or 16 — the signature of a near-tie
+  // argmax tipped by the order split-K sums its partials, not of corruption.
+  // The whole model is token-exact against mlx_lm under the same flags, so the
+  // stage is the odd one out and a shared model must not answer differently
+  // depending on how it was cut. Root cause still open; see
+  // scripts/pipeline-split-test.mjs, which now covers the shipped variants.
+  if (partial && R.splitK) {
+    console.warn('[engine] split-K attention disabled on a pipeline stage (divergence from the whole model)')
+  }
+  const splitK = int8Mode || partial ? 0 : R.splitK
   console.log(
     `[engine] attention=${R.attentionLabel} argmax=${R.argmaxLabel} qkv=${R.qkvLabel} ` +
     `ffn=${R.ffnLabel} matmul=${R.matmulLabel} rowsPerWG=${R.matmulRowsPerWG} ` +
