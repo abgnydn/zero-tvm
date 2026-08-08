@@ -81,3 +81,54 @@ fn moe_router_logits(
   }
   if (tid == 0u) { logits[e] = red[0]; }
 }
+
+// ── 4-BIT ROUTER ────────────────────────────────────────────────────────────
+// Qwen3.6 ships an 8-bit router as a per-tensor quantization OVERRIDE. A
+// checkpoint without that override (Qwen3-30B-A3B) leaves the router at the
+// model's base 4 bits, and the 8-bit entry above then reads D/4 words per row
+// against a row that is only D/8 long — every expert's logit is computed from
+// the next expert's bytes, so routing is garbage and the model emits noise
+// rather than an error. Same affine scheme, same bindings; only the unpack
+// width, the words-per-row, and the group stride differ.
+//
+//   8-bit: 4 values per word, 16 words per group of 64, g = wi >> 4
+//   4-bit: 8 values per word,  8 words per group of 64, g = wi >> 3
+@compute @workgroup_size(64, 1, 1)
+fn moe_router_logits_q4(
+  @builtin(workgroup_id) blockIdx : vec3<u32>,
+  @builtin(local_invocation_id) threadIdx : vec3<u32>
+) {
+  let e : u32 = blockIdx.x;
+  if (e >= podArgs.rows) { return; }
+
+  let WPR : u32 = podArgs.D / 8u;    // u32 words per expert row (8 nibbles each)
+  let GPR : u32 = podArgs.D / 64u;   // affine groups per row
+  let tid : u32 = threadIdx.x;
+
+  var acc : f32 = 0.0;
+  for (var wi : u32 = tid; wi < WPR; wi = wi + 64u) {
+    let word : u32 = w[e * WPR + wi];
+    let g : u32 = wi >> 3u;
+    let s : f32 = f32(scales[e * GPR + g]);
+    let b : f32 = f32(biases[e * GPR + g]);
+    let base : u32 = wi * 8u;
+    var dot : f32 = 0.0;
+    var xs : f32 = 0.0;
+    // Unsigned nibbles, no -7 offset: MLX affine stores w = s*q + b directly
+    // (the -7 in int4_matmul's symmetric path is an MLC artifact).
+    for (var n : u32 = 0u; n < 8u; n = n + 1u) {
+      let v : f32 = f32(x[base + n]);
+      dot = dot + v * f32((word >> (4u * n)) & 15u);
+      xs = xs + v;
+    }
+    acc = acc + s * dot + b * xs;
+  }
+
+  red[tid] = acc;
+  workgroupBarrier();
+  for (var st : u32 = 32u; st > 0u; st = st >> 1u) {
+    if (tid < st) { red[tid] = red[tid] + red[tid + st]; }
+    workgroupBarrier();
+  }
+  if (tid == 0u) { logits[e] = red[0]; }
+}

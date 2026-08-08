@@ -505,7 +505,9 @@ export function buildDecodeEngine(
   // stray dense dispatch should fail loudly, not corrupt slot 0.
   if (S.moe) {
     const M = S.moe
-    B.routerLogits = makeBuf(device, (M.experts + 1) * 4, 'routerLogits')
+    // Router rows: one per routed expert, plus the shared expert's gate when
+    // the checkpoint has one (the loader stacks it as row E).
+    B.routerLogits = makeBuf(device, (M.experts + (S.sharedExpertIndex >= 0 ? 1 : 0)) * 4, 'routerLogits')
     B.moeIds       = makeBuf(device, S.moeSlots * 4, 'moeIds')
     B.moeScores    = makeBuf(device, S.moeSlots * 4, 'moeScores')
     B.moeGateUp    = makeBuf(device, S.moeSlots * 2 * S.ffn * 2, 'moeGateUp')
@@ -527,9 +529,15 @@ export function buildDecodeEngine(
   // variant adds IN_SLOT_STRIDE and OUT_SLOT_STRIDE. IN_SLOT_STRIDE 0 means
   // every slot reads the SAME activation (gate/up); down strides both.
   // Affine groups are 64, so scales-per-row is K/64, not K/32.
-  const moeRouterU = S.moe ? uniformBuf(device, [u32(S.d), u32(S.moe.experts + 1)]) : null
+  const MOE_ROUTER_ROWS = S.moe ? S.moe.experts + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
+  // 4-bit vs 8-bit router: two entry points, chosen once. Picking the wrong one
+  // is silent — the 8-bit reader walks a 4-bit row at twice the stride and the
+  // model emits noise — so this is resolved from the spec, never guessed.
+  const moeRouterPipe = S.moe && (S.moe.routerBits ?? 8) === 4 ? P.moeRouterLogitsQ4 : P.moeRouterLogits
+  const moeRouterU = S.moe ? uniformBuf(device, [u32(S.d), u32(MOE_ROUTER_ROWS)]) : null
   const moeTopkU = S.moe
-    ? uniformBuf(device, [u32(S.moe.experts), u32(S.moe.topK), u32(S.moe.normTopkProb ? 1 : 0)])
+    ? uniformBuf(device, [u32(S.moe.experts), u32(S.moe.topK), u32(S.moe.normTopkProb ? 1 : 0),
+                          u32(S.sharedExpertIndex >= 0 ? 1 : 0)])
     : null
   // K_PACKED is words per weight row: K*bits/32 (4-bit: K/8, 3-bit: 3K/32).
   const moeBits = S.moe?.bits ?? 4
@@ -1028,7 +1036,7 @@ export function buildDecodeEngine(
     const m = lw.moe
     const moeBG = S.moe && m
       ? {
-          routerLogits: bg(device, P.moeRouterLogits,
+          routerLogits: bg(device, moeRouterPipe,
             [B.routerLogits!, B.hidden1, m.routerWeights, m.routerScales, m.routerBiases, moeRouterU!]),
           routerTopk: bg(device, P.moeRouterTopk!, [B.moeIds!, B.moeScores!, B.routerLogits!, moeTopkU!]),
           // gate and up write interleaved halves of one [slot][2*ffn] buffer:
@@ -1210,10 +1218,10 @@ export function buildDecodeEngine(
         dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
         if (blk.moe) {
           // Sparse MoE, seven dispatches, B.hidden1 → B.hidden2. Every slot —
-          // the top-K routed experts AND the shared one at index E — rides in
-          // grid z, so the expert count costs dispatches, not the top-k.
-          const M = S.moe!
-          dispatch(enc, P.moeRouterLogits, blk.moe.routerLogits, M.experts + 1, 1, 1, 'moeRouterLogits')
+          // the top-K routed experts, plus the shared one at index E when the
+          // checkpoint has one — rides in grid z, so the expert count costs
+          // dispatches, not the top-k.
+          dispatch(enc, moeRouterPipe, blk.moe.routerLogits, MOE_ROUTER_ROWS, 1, 1, 'moeRouterLogits')
           dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, 1, 1, 1, 'moeRouterTopk')
           const rows = S.ffn / MOE_RPW
           dispatch(enc, moeMM!, blk.moe.gate, rows, 1, S.moeSlots, 'moeGate')

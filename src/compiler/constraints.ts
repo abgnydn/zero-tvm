@@ -38,6 +38,9 @@ export interface DetectedMoe {
   /** shared_expert_intermediate_size — must equal `ffn` for the stacking. */
   sharedFfn: number | null
   normTopkProb: boolean
+  /** Router quantization width: an 8-bit per-tensor override when the
+   *  checkpoint has one, otherwise the model's base bits. */
+  routerBits: number
 }
 
 export interface DetectedGdn {
@@ -214,21 +217,32 @@ export function checkModel(m: DetectedModel): CheckResult {
     // (K=qDim), ffn down (K=ffn), GDN out (K=vHeads*headV).
     const ks: [string, number][] = [['d', d], ['qDim', qDim], ['ffn', ffn]]
     if (m.gdn) ks.push(['gdnVDim', m.gdn.vHeads * m.gdn.headV])
+    // The general int4 matmul strides K by the workgroup width and stops on a
+    // bound, so a ragged K keeps its tail — only the scale grouping constrains
+    // the shape now. The _vec4 / _vec4h siblings still want K % 1024 / % 512,
+    // but resolveMatmul() gates them per INSTANCE and falls through to the
+    // general pipeline, so they never force a whole model out.
     for (const [name, k] of ks) {
-      if (k % 512 !== 0) fail('dims', `matmul K=${name} (${k}) % 512 != 0`,
-        'the scalar int4 matmul unrolls K in 512-element strides (validate.html\'s reference path)')
       if (k % 64 !== 0) fail('dims', `matmul K=${name} (${k}) % 64 != 0`, 'affine scale groups are 64 wide')
     }
   }
 
   // ── MoE ────────────────────────────────────────────────────
   if (m.moe) {
-    if (!m.moe.sharedExpert) {
-      fail('moe', 'MoE without a shared expert (Mixtral / Qwen3-MoE style)',
-        'the loader stacks the shared expert as index E and the router carries its gate as row E — an optional-shared-slot layout does not exist yet')
-    } else if (m.moe.sharedFfn !== null && m.ffn !== null && m.moe.sharedFfn !== m.ffn) {
+    // No shared expert is fine: the loader stops appending index E, the router
+    // drops to E rows, and moe_router_topk emits K slots instead of K+1. The
+    // WIDTH check below still applies when there IS one, because that is what
+    // stacking it into the expert tensors requires.
+    if (m.moe.sharedExpert && m.moe.sharedFfn !== null && m.ffn !== null && m.moe.sharedFfn !== m.ffn) {
       fail('moe', `shared expert width ${m.moe.sharedFfn} != moe_intermediate ${m.ffn}`,
         'stacking the shared expert into the expert tensors requires equal row width')
+    }
+    // The router width decides which moe_router_logits entry point runs. Only
+    // 4 and 8 have one; anything else would silently read the row at the wrong
+    // stride, which is noise, not an error.
+    if (m.moe.routerBits !== 4 && m.moe.routerBits !== 8) {
+      fail('moe', `router is ${m.moe.routerBits}-bit`,
+        'moe_router_logits.wgsl has a 4-bit and an 8-bit entry point and no other unpack width')
     }
     if (m.moe.experts > 256) fail('moe', `${m.moe.experts} experts > 256`,
       'moe_router_topk.wgsl holds expert scores in 32 lanes × 8 registers')
@@ -279,7 +293,7 @@ export const SUPPORT_MATRIX: MatrixRow[] = [
   { area: 'RoPE', supported: 'plain theta (any base), partial rotary factor, llama3 frequency scaling (precomputed inv_freq table)', not: 'yarn / longrope frequency scaling', needs: 'a frequency formula in model-spec.ts ropeInvFreqTable() — rope.wgsl already reads the table' },
   { area: 'FFN', supported: 'SwiGLU dense (fused kernel for MLC, matmul+silu_mul chain for MLX-affine)', not: 'GeGLU / ReLU / non-gated FFN, FFN biases', needs: 'activation-parameterised fused_ffn.wgsl + silu_mul.wgsl' },
   { area: 'Norm', supported: 'RMSNorm with plain gamma', not: 'LayerNorm (beta), Gemma-style (1+gamma), post-norm sandwiches', needs: 'variants of rms_norm/add_norm.wgsl' },
-  { area: 'MoE', supported: '≤256 routed experts, top-K ≤32, stacked shared expert (width == moe_intermediate), 8-bit router, norm_topk_prob; subgroups required', not: 'MoE without shared expert (Mixtral, Qwen3-MoE), grouped/expert-parallel routing', needs: 'optional-shared-slot layout in loader + moe_router_topk.wgsl' },
+  { area: 'MoE', supported: '≤256 routed experts, top-K ≤32, with OR without a shared expert (when present it stacks as index E and must equal moe_intermediate in width), 8-bit router, norm_topk_prob; subgroups required', not: 'grouped/expert-parallel routing', needs: 'a routing layout where experts are sharded across dispatches rather than stacked' },
   { area: 'Linear attention', supported: 'GatedDeltaNet (Qwen3.5/3.6): GVA, headV %32 ≤256, conv width 4', not: 'Mamba/S4, RWKV, conv hybrids (LFM2 layer_types \'conv\'), other conv widths', needs: 'new recurrence kernels' },
   { area: 'Embedding / head', supported: 'quantised embedding (symmetric or affine), tied or untied lm_head, vocab %4', not: 'unquantised embedding tables', needs: 'f16 gather path' },
   { area: 'Tokenizer', supported: 'SentencePiece (Phi-3), byte-level BPE (Qwen/Llama-style tokenizer.json)', not: 'tekken, WordPiece, custom pipelines', needs: 'new pipeline beside tokenizer-bpe.ts' },

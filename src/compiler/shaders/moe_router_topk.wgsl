@@ -26,12 +26,17 @@
 // Ties are broken on the lower expert index (subgroupMin over the winners), so
 // two identical probabilities can never both claim the same output slot.
 //
-// The block has one more slot than it has routed experts: the SHARED expert,
-// which every token uses. It is not routed, so it skips the softmax entirely and
-// takes sigmoid of its own logit — row E of the router, which stage 1 already
-// computed. Emitting it here as slot K, with expert index E (where the loader
-// stacked its weights), is what lets the expert matmul cover all K+1 slots in
-// one dispatch and `moe_combine` stay a plain weighted sum.
+// When the checkpoint has a SHARED expert (Qwen3.5/3.6 style) the block has one
+// more slot than it has routed experts. It is not routed, so it skips the
+// softmax entirely and takes sigmoid of its own logit — row E of the router,
+// which stage 1 already computed. Emitting it here as slot K, with expert index
+// E (where the loader stacked its weights), is what lets the expert matmul cover
+// all K+1 slots in one dispatch and `moe_combine` stay a plain weighted sum.
+//
+// `hasShared = 0` (Mixtral / Qwen3-MoE style) is the whole of the difference:
+// the router has E rows instead of E+1, the stacks have no index E, and this
+// kernel writes exactly K slots. Every other kernel in the block already reads
+// its slot count from a uniform, so none of them change.
 //
 // Outputs are written in DESCENDING score order (slot 0 = largest). mlx's
 // argpartition happens to return ascending; the block output is order-invariant,
@@ -47,7 +52,8 @@ enable subgroups;
 struct PODArgs {
   E: u32,         // number of routed experts (<= 256)
   K: u32,         // experts per token (<= 32)
-  normTopk: u32   // 1 = renormalise the K scores to sum to 1
+  normTopk: u32,  // 1 = renormalise the K scores to sum to 1
+  hasShared: u32  // 1 = emit the shared expert as slot K (see the note above)
 }
 @group(0) @binding(3) var<uniform> podArgs : PODArgs;
 
@@ -105,7 +111,13 @@ fn moe_router_topk(@builtin(local_invocation_id) threadIdx : vec3<u32>) {
   if (t == 0u) {
     let scale : f32 = select(1.0 / denom, 1.0 / total, podArgs.normTopk == 1u);
     for (var k : u32 = 0u; k < K; k = k + 1u) { out_score[k] = top[k] * scale; }
-    out_idx[K] = E;                                       // shared expert's slot in the stack
-    out_score[K] = 1.0 / (1.0 + exp(-logits[E]));
+    // The shared slot exists only when the checkpoint has a shared expert.
+    // Without one there is no row E in the router and no index E in the expert
+    // stacks, so the block is exactly its K routed slots and nothing is
+    // written past them — moe_combine sums SLOTS, which is K in that case.
+    if (podArgs.hasShared == 1u) {
+      out_idx[K] = E;                                     // shared expert's slot in the stack
+      out_score[K] = 1.0 / (1.0 + exp(-logits[E]));
+    }
   }
 }

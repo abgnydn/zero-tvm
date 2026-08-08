@@ -156,6 +156,8 @@ export interface Pipelines {
   // ── Sparse MoE block (Qwen3.6). Seven dispatches: router logits, top-k,
   // gate, up, silu_mul, down, combine. moeMatmul folds the expert into grid z.
   moeRouterLogits: GPUComputePipeline
+  /** 4-bit sibling — see the entry-point note in moe_router_logits.wgsl. */
+  moeRouterLogitsQ4: GPUComputePipeline
   /** null without subgroups — moe_router_topk.wgsl declares `enable subgroups`,
    *  so the shader module itself fails to create. There is no scalar fallback:
    *  the engine throws for a MoE spec without subgroups rather than silently
@@ -292,6 +294,7 @@ export function compile(
     int4MatmulF32SgAffine: subgroups ? mm({ outF32: true, subgroups: true, affine: true }) : null,
     int4MatmulF32TiledAffine: subgroups ? mm({ outF32: true, subgroups: true, rowsPerWG: 4, affine: true }) : null,
     moeRouterLogits: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits'),
+    moeRouterLogitsQ4: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits_q4'),
     moeRouterTopk: subgroups ? createPipeline(device, moeRouterTopkSrc, 'moe_router_topk') : null,
     moeMatmul: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4 }) : null,
     moeMatmulQ3: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: true }) : null,

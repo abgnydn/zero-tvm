@@ -201,6 +201,12 @@ const detected = {
     sharedExpert: records.some((r) => r.includes('.shared_expert.')),
     sharedFfn: num(tc.shared_expert_intermediate_size),
     normTopkProb: tc.norm_topk_prob === true,
+    // The router is 8-bit only when the checkpoint says so as a per-tensor
+    // OVERRIDE; with none it sits at the model's base bits. This is not
+    // cosmetic — the two widths need different unpacks and the wrong one is
+    // silent (Qwen3-30B-A3B: 4-bit router, read as 8-bit, cosine 0.087).
+    routerBits: Object.entries(overrides).find(([p]) => /(^|\.)mlp\.(gate|shared_expert_gate)$/.test(p))?.[1]?.bits
+      ?? quantCfg?.bits ?? 4,
   } : null,
   gdn: isGdn ? {
     kHeads: num(tc.linear_num_key_heads),
@@ -311,7 +317,7 @@ const lines = [
   ...(detected.partialRotaryFactor && detected.partialRotaryFactor !== 1
     ? [`  partialRotaryFactor: ${detected.partialRotaryFactor},`] : []),
   ...(detected.moe ? [
-    `  moe: { experts: ${detected.moe.experts}, topK: ${detected.moe.topK}, normTopkProb: ${detected.moe.normTopkProb} },`,
+    `  moe: { experts: ${detected.moe.experts}, topK: ${detected.moe.topK}, normTopkProb: ${detected.moe.normTopkProb}, sharedExpert: ${detected.moe.sharedExpert}, routerBits: ${detected.moe.routerBits} },`,
   ] : []),
   `  paramNaming: mlxParamNaming(${JSON.stringify(mlxPrefix)}),`,
   `})`,
@@ -334,7 +340,7 @@ const spec = makeModelSpec({
     attnGate: true,
   } : {}),
   ...(detected.partialRotaryFactor && detected.partialRotaryFactor !== 1 ? { partialRotaryFactor: detected.partialRotaryFactor } : {}),
-  ...(detected.moe ? { moe: { experts: detected.moe.experts, topK: detected.moe.topK, normTopkProb: detected.moe.normTopkProb } } : {}),
+  ...(detected.moe ? { moe: { experts: detected.moe.experts, topK: detected.moe.topK, normTopkProb: detected.moe.normTopkProb, sharedExpert: detected.moe.sharedExpert, routerBits: detected.moe.routerBits } } : {}),
   paramNaming: mlxParamNaming(mlxPrefix),
 })
 
@@ -405,7 +411,8 @@ ${rows}
 
 Dimension rules (all enforced by the checker): heads divisible by kvHeads;
 headDim %32 and ≤256; d, qkvDim, kvDim %256; every matmul K (d, qDim, ffn,
-gdnVDim) %512; vocab %4.
+gdnVDim) %64 — the scale-group width, since the general int4 matmul strides K
+and stops on a bound rather than a trip count; vocab %4.
 `)
   console.log(`wrote docs/COMPAT.md (${SUPPORT_MATRIX.length} rows)`)
 }

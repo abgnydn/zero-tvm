@@ -30,6 +30,7 @@ import {
 } from '../compiler/model-spec.ts'
 import { QWEN3_4B_MLX } from '../compiler/model-spec.ts'
 import { LLAMA_3_2_1B_INSTRUCT_4BIT } from '../compiler/model-spec.ts'
+import { QWEN3_30B_A3B_4BIT } from '../compiler/model-spec.ts'
 // ADD-MODEL:IMPORTS
 
 /** URL `?model=` value for each spec; Phi-3 is the no-flag default. */
@@ -43,6 +44,7 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
   { param: 'qwen36', spec: QWEN36_35B_A3B },
   { param: 'qwen3mlx', spec: QWEN3_4B_MLX },
   { param: 'llama32', spec: LLAMA_3_2_1B_INSTRUCT_4BIT },
+  { param: 'qwen30b', spec: QWEN3_30B_A3B_4BIT },
   // ADD-MODEL:MODELS
 ]
 
@@ -105,6 +107,12 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // validated against mlx_lm (cosine 0.999879, greedy token-exact).
   [QWEN3_4B_MLX.id]: { name: 'Qwen3-4B', params: '4B dense · MLX 4-bit', sizeLabel: '~2.1 GB', rateLabel: '' },
   [LLAMA_3_2_1B_INSTRUCT_4BIT.id]: { name: 'Llama-3.2-1B-Instruct', params: '1B dense', sizeLabel: '~0.6 GB', rateLabel: '' },
+  // First MoE WITHOUT a shared expert, and the first 4-bit router — both are
+  // spec flags now rather than engine assumptions. Validated against mlx_lm in
+  // f32: cosine 0.999985, greedy token-exact through the stop id. (Against
+  // mlx's own bf16 forward it scores 0.9978 — that is bf16's error, not the
+  // engine's; see the dtype note in scripts/mlx-ref.py.)
+  [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~16.0 GB', rateLabel: '', ramNote: 'needs ~20 GB free RAM' },
   // ADD-MODEL:BRANDINGS
 }
 

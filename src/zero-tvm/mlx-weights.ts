@@ -205,12 +205,20 @@ export function planLayer(spec: ModelSpec, L: number, prefix?: string): BufferPl
   }
 
   if (spec.moe) {
-    // The shared expert is appended to every stacked tensor, and its gate to
-    // the router, so nothing downstream treats it as a special case.
+    // When the checkpoint has a shared expert it is appended to every stacked
+    // tensor, and its gate to the router, so nothing downstream treats it as a
+    // special case. Without one (Mixtral / Qwen3-MoE style) the stacks simply
+    // end at the routed experts — there is no index E to append, and
+    // moe_router_topk stops emitting the slot that would have read it.
+    const shared = spec.moe.sharedExpert ?? true
     for (const proj of ['gate_proj', 'up_proj', 'down_proj']) {
-      plans.push(...trio(`moe_${proj}`, [`${p}.mlp.switch_mlp.${proj}`, `${p}.mlp.shared_expert.${proj}`]))
+      plans.push(...trio(`moe_${proj}`, shared
+        ? [`${p}.mlp.switch_mlp.${proj}`, `${p}.mlp.shared_expert.${proj}`]
+        : [`${p}.mlp.switch_mlp.${proj}`]))
     }
-    plans.push(...trio('router', [`${p}.mlp.gate`, `${p}.mlp.shared_expert_gate`]))
+    plans.push(...trio('router', shared
+      ? [`${p}.mlp.gate`, `${p}.mlp.shared_expert_gate`]
+      : [`${p}.mlp.gate`]))
   } else {
     plans.push(...trio('ffn', [`${p}.mlp.gate_proj`, `${p}.mlp.up_proj`]))
     plans.push(...trio('ffn_down', [`${p}.mlp.down_proj`]))

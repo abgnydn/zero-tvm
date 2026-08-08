@@ -183,6 +183,151 @@ function testRmsNorm(device) {
   })
 }
 
+// ── moe_router_logits.wgsl : the [rows, D] affine matvec that picks experts.
+//
+// Two entry points, one per router width, because the width is a property of
+// the CHECKPOINT and not of the family: Qwen3.6 ships the router as an 8-bit
+// per-tensor override, Qwen3-30B-A3B leaves it at the model's base 4 bits.
+// Running the wrong one is not an error — the 8-bit reader walks a 4-bit row at
+// twice the stride and every expert's logit comes out of the next expert's
+// bytes — so each width is checked here against the same reference formula:
+//
+//   logit[e] = Sum_g ( s[e,g] * Sum_i x[i]*q[e,i] + b[e,g] * Sum_i x[i] )
+//
+// with i running over group g's 64 values, q unsigned (MLX affine stores
+// w = s*q + b directly, no -7 offset).
+function makeRouterLogitsTest(bits) {
+  const entry = bits === 4 ? 'moe_router_logits_q4' : 'moe_router_logits'
+  return function routerLogitsTest(device) {
+    const r = rng(11 + bits)
+    const D = 2048            // Qwen3-30B-A3B / Qwen3.6 hidden size
+    const rows = 9            // 8 routed experts + a shared gate — shape is irrelevant here
+    const GPR = D / 64        // affine groups per row
+    const PER_WORD = 32 / bits
+    const MAXQ = (1 << bits) - 1
+
+    const x = arr(D, () => toF16(r() * 2 - 1))
+    const q = arr(rows * D, () => Math.floor(r() * (MAXQ + 1)))
+    const scales = arr(rows * GPR, () => toF16(r() * 0.02 + 0.005))
+    const biases = arr(rows * GPR, () => toF16(r() * 0.2 - 0.1))
+
+    const ref = arr(rows, (_, e) => {
+      let acc = 0
+      for (let g = 0; g < GPR; g++) {
+        let dot = 0, xs = 0
+        for (let j = 0; j < 64; j++) {
+          const i = g * 64 + j
+          dot += x[i] * q[e * D + i]
+          xs += x[i]
+        }
+        acc += scales[e * GPR + g] * dot + biases[e * GPR + g] * xs
+      }
+      return acc
+    })
+
+    // Pack q into u32 words, little end first — the same order the kernel
+    // unpacks with `word >> (bits * n)`.
+    const words = new Uint32Array((rows * D) / PER_WORD)
+    for (let w = 0; w < words.length; w++) {
+      let v = 0
+      for (let n = 0; n < PER_WORD; n++) v |= q[w * PER_WORD + n] << (bits * n)
+      words[w] = v >>> 0
+    }
+
+    const pipe = pipelineFor(device, wgsl('moe_router_logits.wgsl'), entry)
+    const out = device.createBuffer({ size: rows * 4, usage: BU.STORAGE | BU.COPY_SRC })
+    const buffers = [
+      out,
+      buffer(device, f16Array(x), BU.STORAGE | BU.COPY_DST),
+      buffer(device, words, BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
+      buffer(device, f16Array(biases), BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Uint32Array([D, rows]), BU.UNIFORM | BU.COPY_DST),
+    ]
+    // One workgroup per row, exactly as the engine dispatches it.
+    return runCompute(device, pipe, buffers, [rows], 0, rows * 4).then((bytes) => {
+      const got = Array.from(new Float32Array(bytes))
+      // Inputs are f16-exact on both sides, so the only difference left is f32
+      // summation order (per-word + tree reduction vs. per-group). A wrong
+      // unpack width is off by O(1), nowhere near this.
+      const maxRel = Math.max(...ref.map((v, i) => Math.abs(got[i] - v) / (Math.abs(v) + 1e-2)))
+      return {
+        name: entry,
+        pass: maxRel < 1e-4,
+        detail: `${rows} rows × ${D} · ${bits}-bit · max rel err ${maxRel.toExponential(2)}`,
+      }
+    })
+  }
+}
+
+// ── moe_router_topk.wgsl : softmax over E, then the top-K, plus the OPTIONAL
+// shared slot. The shared expert is what most large MoE checkpoints (Mixtral,
+// Qwen3-MoE) do NOT have, so `hasShared = 0` is a first-class shape here, not
+// a degenerate one: the router has E rows instead of E+1, the block runs K
+// slots instead of K+1, and slot K must be left completely untouched.
+function makeMoeTopkTest(E, K, normTopk, hasShared) {
+  const label = `moe_router_topk_${hasShared ? 'shared' : 'noshared'}_e${E}k${K}`
+  return function moeTopkTest(device) {
+    const r = rng(7)
+    const rows = E + (hasShared ? 1 : 0)
+    const logits = arr(rows, () => r() * 8 - 4)
+
+    // Reference: softmax over the ROUTED experts only (the shared gate, when
+    // present, is row E and never enters the softmax — it takes a sigmoid).
+    const peak = Math.max(...logits.slice(0, E))
+    const ex = logits.slice(0, E).map((v) => Math.exp(v - peak))
+    const denom = ex.reduce((a, b) => a + b, 0)
+    // Descending score; ties break on the LOWER expert index (subgroupMin).
+    const order = ex.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0] || a[1] - b[1])
+    const sel = order.slice(0, K)
+    const total = sel.reduce((a, [v]) => a + v, 0)
+    const scale = normTopk ? 1 / total : 1 / denom
+    const refIdx = sel.map(([, i]) => i)
+    const refScore = sel.map(([v]) => v * scale)
+    if (hasShared) {
+      refIdx.push(E)
+      refScore.push(1 / (1 + Math.exp(-logits[E])))
+    }
+
+    // Allocate K+1 either way and poison the last slot: on the no-shared path
+    // the kernel must not write it, which a K-sized buffer could never detect.
+    const POISON = 0xdeadbeef
+    const idxBuf = buffer(device, new Uint32Array(K + 1).fill(POISON), BU.STORAGE | BU.COPY_SRC | BU.COPY_DST)
+    const scoreBuf = buffer(device, new Float32Array(K + 1).fill(-999), BU.STORAGE | BU.COPY_SRC | BU.COPY_DST)
+
+    const pipe = pipelineFor(device, wgsl('moe_router_topk.wgsl'), 'moe_router_topk')
+    const buffers = [
+      idxBuf,
+      scoreBuf,
+      buffer(device, new Float32Array(logits), BU.STORAGE | BU.COPY_DST),
+      buffer(device, new Uint32Array([E, K, normTopk ? 1 : 0, hasShared ? 1 : 0]), BU.UNIFORM | BU.COPY_DST),
+    ]
+    return runComputeReads(device, pipe, buffers, [1], [
+      { index: 0, bytes: (K + 1) * 4 },
+      { index: 1, bytes: (K + 1) * 4 },
+    ]).then(([idxBytes, scoreBytes]) => {
+      const gotIdx = Array.from(new Uint32Array(idxBytes))
+      const gotScore = Array.from(new Float32Array(scoreBytes))
+      const n = refIdx.length
+      const idxOk = refIdx.every((v, i) => v === gotIdx[i])
+      const maxErr = Math.max(...refScore.map((v, i) => Math.abs(v - gotScore[i])))
+      // The slot past the block must still hold the poison on the no-shared path.
+      const tailClean = hasShared || (gotIdx[K] === POISON && gotScore[K] === -999)
+      const sum = gotScore.slice(0, K).reduce((a, b) => a + b, 0)
+      return {
+        name: label,
+        pass: idxOk && maxErr < 2e-6 && tailClean,
+        detail: !idxOk
+          ? `indices differ: ${gotIdx.slice(0, n)} vs ${refIdx}`
+          : !tailClean
+            ? `wrote past slot ${K - 1} on a no-shared block (idx=${gotIdx[K]}, score=${gotScore[K]})`
+            : `${n} slots · max score err ${maxErr.toExponential(2)}`
+              + ` · routed sum ${sum.toFixed(4)}${hasShared ? ` · shared ${gotScore[K].toFixed(4)}` : ' · slot K untouched'}`,
+      }
+    })
+  }
+}
+
 // ── argmax[_sg].wgsl : index of the (first) maximum logit ────────────────────
 function makeArgmaxTest(file, entry) {
   return function argmaxTest(device) {
@@ -817,6 +962,52 @@ const TESTS = [
       affine: true,
       outF32: true,
     }),
+  },
+  // ── RAGGED K: every case above uses K=512, so none of them would notice a
+  // K-loop that truncates its tail. These use the two widths that actually
+  // blocked real models — 768 (Qwen3-30B-A3B moe_intermediate) and 1408
+  // (Qwen1.5-MoE ffn). Both are %64 (the scale-group width) but neither is
+  // %512, so a trip-count division drops 256 / 384 elements per row and the
+  // result is silently wrong rather than an error.
+  {
+    label: 'int4_matmul_affine_k768',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ affine: true }), 'int4_matmul_affine', {
+      affine: true,
+      K: 768,
+    }),
+  },
+  {
+    label: 'int4_matmul_tiled_affine_k1408',
+    fn: makeInt4MatmulTest(
+      int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, affine: true }),
+      'int4_matmul_tiled_affine',
+      { affine: true, rowsPerWG: 4, K: 1408 },
+    ),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_affine_q3_k768',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ affine: true, q3: true }), 'int4_matmul_affine_q3', {
+      affine: true,
+      q3: true,
+      K: 768,
+    }),
+  },
+  // Both router widths against the same reference — the wrong one is silent.
+  { label: 'moe_router_logits', fn: makeRouterLogitsTest(8) },
+  { label: 'moe_router_logits_q4', fn: makeRouterLogitsTest(4) },
+  // Qwen3.6 shape (256 experts, top-8, WITH a shared expert) and Qwen3-30B-A3B
+  // shape (128 experts, top-8, WITHOUT one) — the two sides of the flag.
+  { label: 'moe_topk_shared', fn: makeMoeTopkTest(256, 8, true, true), minSg: 32 },
+  { label: 'moe_topk_noshared', fn: makeMoeTopkTest(128, 8, true, false), minSg: 32 },
+  { label: 'moe_topk_noshared_nonorm', fn: makeMoeTopkTest(128, 8, false, false), minSg: 32 },
+  {
+    // K=1408, not 768: the _sg variant is a 32-thread workgroup, so 768/8 = 96
+    // words divides evenly and would NOT be ragged here. 1408/8 = 176 leaves a
+    // remainder of 16 against 32 lanes, which is the case worth guarding.
+    label: 'int4_matmul_sg_k1408',
+    fn: makeInt4MatmulTest(int4MatmulWGSL({ subgroups: true }), 'int4_matmul_sg', { K: 1408 }),
+    minSg: 32,
   },
   { label: 'rms_norm', fn: testRmsNorm },
   { label: 'argmax', fn: makeArgmaxTest('argmax.wgsl', 'argmax_kernel') },

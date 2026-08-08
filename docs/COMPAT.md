@@ -15,7 +15,7 @@ same file as this table's source, so they cannot drift far.
 | RoPE | plain theta (any base), partial rotary factor, llama3 frequency scaling (precomputed inv_freq table) | yarn / longrope frequency scaling | a frequency formula in model-spec.ts ropeInvFreqTable() — rope.wgsl already reads the table |
 | FFN | SwiGLU dense (fused kernel for MLC, matmul+silu_mul chain for MLX-affine) | GeGLU / ReLU / non-gated FFN, FFN biases | activation-parameterised fused_ffn.wgsl + silu_mul.wgsl |
 | Norm | RMSNorm with plain gamma | LayerNorm (beta), Gemma-style (1+gamma), post-norm sandwiches | variants of rms_norm/add_norm.wgsl |
-| MoE | ≤256 routed experts, top-K ≤32, stacked shared expert (width == moe_intermediate), 8-bit router, norm_topk_prob; subgroups required | MoE without shared expert (Mixtral, Qwen3-MoE), grouped/expert-parallel routing | optional-shared-slot layout in loader + moe_router_topk.wgsl |
+| MoE | ≤256 routed experts, top-K ≤32, with OR without a shared expert (when present it stacks as index E and must equal moe_intermediate in width), 8-bit router, norm_topk_prob; subgroups required | grouped/expert-parallel routing | a routing layout where experts are sharded across dispatches rather than stacked |
 | Linear attention | GatedDeltaNet (Qwen3.5/3.6): GVA, headV %32 ≤256, conv width 4 | Mamba/S4, RWKV, conv hybrids (LFM2 layer_types 'conv'), other conv widths | new recurrence kernels |
 | Embedding / head | quantised embedding (symmetric or affine), tied or untied lm_head, vocab %4 | unquantised embedding tables | f16 gather path |
 | Tokenizer | SentencePiece (Phi-3), byte-level BPE (Qwen/Llama-style tokenizer.json) | tekken, WordPiece, custom pipelines | new pipeline beside tokenizer-bpe.ts |
@@ -24,4 +24,5 @@ same file as this table's source, so they cannot drift far.
 
 Dimension rules (all enforced by the checker): heads divisible by kvHeads;
 headDim %32 and ≤256; d, qkvDim, kvDim %256; every matmul K (d, qDim, ffn,
-gdnVDim) %512; vocab %4.
+gdnVDim) %64 — the scale-group width, since the general int4 matmul strides K
+and stops on a bound rather than a trip count; vocab %4.

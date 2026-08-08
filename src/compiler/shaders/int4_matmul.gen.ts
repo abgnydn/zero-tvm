@@ -382,10 +382,11 @@ ${accDecl}
 
 ${rowDecl}
 
-  // 8-value blocks; K_PACKED is 3K/32 here, so the loop bound comes from
-  // SCALES_PER_ROW (= K/64): blocks per thread pass = K/8 / ${wgSize}.
-  for (var chunk : u32 = 0u; chunk < SCALES_PER_ROW * 8u / ${wgSize}u; chunk = chunk + 1u) {
-    let w_offset : u32 = tid + chunk * ${wgSize}u;   // 8-value block index
+  // 8-value blocks; K_PACKED is 3K/32 here, so the block count comes from
+  // SCALES_PER_ROW (= K/64): K/8 blocks in total. Strided-and-bounded rather
+  // than a trip count, so a K that is not a multiple of ${wgSize * 8} keeps its
+  // tail instead of having it silently truncated away by the division.
+  for (var w_offset : u32 = tid; w_offset < SCALES_PER_ROW * 8u; w_offset = w_offset + ${wgSize}u) {
     let base : u32 = ${moe ? 'inBase + ' : ''}w_offset * 8u;
     let sc_idx : u32 = w_offset >> 3u;
     let bit : u32 = w_offset * 24u;
@@ -404,8 +405,9 @@ ${accDecl}
 
 ${rowDecl}
 
-  for (var chunk : u32 = 0u; chunk < K_PACKED / ${wgSize}u; chunk = chunk + 1u) {
-    let w_offset : u32 = tid + chunk * ${wgSize}u;
+  // Strided-and-bounded, not a trip count: K_PACKED / ${wgSize} would truncate
+  // the tail of any K that is not a multiple of ${wgSize * 8}.
+  for (var w_offset : u32 = tid; w_offset < K_PACKED; w_offset = w_offset + ${wgSize}u) {
     let base : u32 = ${moe ? 'inBase + ' : ''}w_offset * 8u;
     let sc_idx : u32 = w_offset >> ${affine ? '3' : '2'}u;
 
@@ -454,8 +456,9 @@ ${accDecl}
 
 ${rowDecl}
 
-  for (var chunk : u32 = 0u; chunk < K_PACKED / ${wgSize}u; chunk = chunk + 1u) {
-    let w_offset : u32 = tid + chunk * ${wgSize}u;
+  // Strided-and-bounded — see the M=1 path: a trip-count division drops the
+  // tail of any K that is not a multiple of ${wgSize * 8}.
+  for (var w_offset : u32 = tid; w_offset < K_PACKED; w_offset = w_offset + ${wgSize}u) {
     let base : u32 = w_offset * 8u;
     let sc_idx : u32 = w_offset >> 2u;
 
@@ -612,8 +615,9 @@ ${rows.map((r) => `  let r${r} = row_base${r ? ` + ${r}u` : ''};`).join('\n')}
   for (var mb : u32 = 0u; mb * 4u < M; mb = mb + 1u) {
 ${batches.map((b) => '    ' + rows.map((r) => `var a${b}${r} : f32 = 0.0;`).join(' ')).join('\n')}
 
-    for (var chunk : u32 = 0u; chunk < K_PACKED / 32u; chunk = chunk + 1u) {
-      let w_offset : u32 = tid + chunk * 32u;
+    // Strided-and-bounded. The subgroupAdds are OUTSIDE this loop, so lanes
+    // taking one fewer iteration on a ragged K stay uniform where it matters.
+    for (var w_offset : u32 = tid; w_offset < K_PACKED; w_offset = w_offset + 32u) {
       let base : u32 = w_offset * 8u;
       let sc_idx : u32 = w_offset >> 2u;
 
