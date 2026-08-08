@@ -28,6 +28,21 @@ args = p.parse_args()
 
 model, tokenizer = load(args.model)
 
+# Run the reference in FLOAT32. mlx_lm loads a checkpoint at its published
+# activation dtype, which for these repos is bf16 — and a bf16 forward pass is
+# NOT precise enough to grade the engine against. Measured on Qwen3-30B-A3B
+# (48 layers), against this same model in f32:
+#
+#     engine        cosine 0.999985   rms 0.017
+#     mlx in bf16   cosine 0.997726   rms 0.216
+#
+# so the bf16 reference "failed" the 0.999 gate by contributing twelve times
+# more error than the thing it was measuring. The error is broadband and grows
+# with depth, which is why a 36-layer dense model still scored 0.9999 and this
+# one did not. Only the non-quantized tensors upcast (the quantized weights stay
+# packed), so the cost is small even on the 35B.
+model.set_dtype(mx.float32)
+
 if args.prompt_ids:
     ids = [int(t) for t in args.prompt_ids.split(",")]
 else:
