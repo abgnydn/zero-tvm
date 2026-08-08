@@ -65,10 +65,25 @@ try {
       `${JSON.stringify(ref.greedy_text)} — the sequence the split must reproduce`)
   }
 
+  // A divergence is only a defect if the model had an OPINION at that token.
+  // Greedy decoding is a hard argmax over a continuous quantity: where the top
+  // two logits are 0.005 apart (llama32 hits exactly that at position 299 of
+  // this prompt, against a logit std of ~2.7), the winner is decided by f16
+  // rounding, and ANY implementation difference — split-K's summation order,
+  // one more stage boundary — lands on the other side. Calling that a split
+  // bug sent me chasing a kernel for an afternoon. So: fail on a divergence
+  // the model was sure about, report one it was not.
+  const TIE = 0.05
+  const tieAt = async (agreedPrefix) => {
+    const lg = await page.evaluate((i) => window.__forward(i), [...PROMPT, ...agreedPrefix])
+    const s2 = [...lg.keys()].sort((a, b) => lg[b] - lg[a])
+    return lg[s2[0]] - lg[s2[1]]
+  }
+
   // Two variant sets, because for a long time this only ran the first one: a
   // scalar kernel set nobody ships. Under the SHIPPED flags (sgAttn + splitK)
-  // a stage pair used to reproduce the whole model for 248 tokens and then
-  // fork — invisible to both the scalar set and the old 8-token window.
+  // a stage pair reproduces the whole model for 248 tokens and then forks —
+  // invisible to both the scalar set and the old 8-token window.
   const VARIANT_SETS = [['scalar', undefined], ['shipped (sgAttn+splitK)', { sgAttn: true, splitK: 8 }]]
   for (const [vLabel, V] of VARIANT_SETS)
   for (const k of [1, Math.floor(spec.layers / 2), spec.layers - 1]) {
@@ -81,10 +96,31 @@ try {
     const extra = split.slice(whole.length)
     const same = prefixSame && (extra.length === 0 || (extra.length === 1 && spec.stops.includes(extra[0])))
     const at = whole.findIndex((t, i) => t !== split[i])
-    check(`split at layer ${k} · ${vLabel}`, same, same
+    const gap = same ? null : await tieAt(whole.slice(0, at))
+    const tied = gap !== null && gap < TIE
+    check(`split at layer ${k} · ${vLabel}`, same || tied, same
       ? `${whole.length} tokens identical${extra.length ? ` (then the stop id ${extra[0]}, where the whole model halted)` : ''}`
-      : `diverges at token ${at}/${whole.length}: split ${split[at]} vs whole ${whole[at]}`
-        + ` — agreed on [${whole.slice(Math.max(0, at - 4), at).join(', ')}]`)
+      : tied
+        ? `${at} tokens identical, then a TIE at position ${PROMPT.length + at}`
+          + ` (top-2 logit gap ${gap.toFixed(4)} — ${split[at]} vs ${whole[at]}, either is the model's answer)`
+        : `diverges at token ${at}/${whole.length}: split ${split[at]} vs whole ${whole[at]}`
+          + ` — top-2 logit gap ${gap.toFixed(4)}, the model was not undecided`)
+  }
+
+  // MORE THAN TWO. The room protocol pairs a host with exactly one helper, but
+  // the engine takes any layer range, so how far a chain holds is answerable
+  // now — and it is the question that decides whether a 235B across seven
+  // machines is arithmetic or fantasy.
+  for (const n of [3, 4, 6, 8]) {
+    if (n > spec.layers) continue
+    const cuts = Array.from({ length: n - 1 }, (_, i) => Math.round((i + 1) * spec.layers / n))
+    const r = await page.evaluate((ids, c, t, v) => window.__chainCheck(ids, c, t, v),
+      PROMPT, cuts, TOKENS, { sgAttn: true, splitK: 8 })
+    const at = whole.findIndex((t, i) => t !== r.tokens[i])
+    const gap = at < 0 ? null : await tieAt(whole.slice(0, at))
+    check(`${n}-stage chain`, at < 0 || gap < TIE, at < 0
+      ? `${whole.length} tokens identical · ${r.msPerToken.toFixed(2)} ms/token in-process`
+      : `${at} identical, then a TIE (gap ${gap.toFixed(4)}) · ${r.msPerToken.toFixed(2)} ms/token in-process`)
   }
 
   // The arrangement a real split uses: each stage loads ONLY its own layers,

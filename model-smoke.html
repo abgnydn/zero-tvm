@@ -69,6 +69,31 @@ try{
     return out
   }
 
+  // N stages, not two. The room protocol only pairs a host with one helper,
+  // but the engine takes any layer range, so the numerics of a 6-way chain can
+  // be settled here before any of that gets built. `cuts` are the interior
+  // boundaries: [6,12,18] over 24 layers means 4 stages.
+  window.__chainCheck = async (ids, cuts, n, v) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
+    const bounds = [0, ...cuts, S.layers]
+    const stages = bounds.slice(0, -1).map((start, i) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: V, layerRange: { start, end: bounds[i + 1] },
+    }))
+    const step = async (tokenId, pos) => {
+      let carry = await stages[0].pipelineStep({ tokenId }, pos)
+      for (let i = 1; i < stages.length; i++) {
+        carry = await stages[i].pipelineStep({ residual: carry.residual }, pos)
+      }
+      return carry.tokenId
+    }
+    let tok = 0
+    for (let i = 0; i < ids.length; i++) tok = await step(ids[i], i)
+    const out = [tok]
+    const t0 = performance.now()
+    for (let i = 1; i < n; i++) out.push(tok = await step(tok, ids.length + i - 1))
+    return { tokens: out, msPerToken: (performance.now() - t0) / (n - 1), stages: stages.length }
+  }
+
   // Same split, but each stage LOADS ONLY ITS OWN LAYERS — the arrangement a
   // real two-machine run uses. Reports the bytes each stage actually holds.
   window.__splitLoadCheck = async (ids, k, n) => {
