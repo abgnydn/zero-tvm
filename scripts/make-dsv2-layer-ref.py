@@ -140,10 +140,46 @@ kva = h1 @ Wkva.T
 c = rms(kva[:, :KV_LORA], g_kva)
 k_pe = kva[:, KV_LORA:]
 
+# ── the de-interleave, moved off the runtime path ──────────────────────────
+# DeepSeek de-interleaves q_pe/k_pe before rotating. That is a permutation of a
+# PROJECTION'S OUTPUT, and a permutation of the output commutes with permuting
+# the matrix's ROWS — so doing it once to the weights leaves the runtime with
+# ordinary half-split RoPE and no new kernel. Asserted below rather than
+# assumed, because "obviously equivalent" is how the interleave got missed in
+# the first place.
+DEINT = np.arange(ROPE).reshape(ROPE // 2, 2).T.reshape(ROPE)   # [0,2,4,…,1,3,5,…]
+
+Wq_perm = Wq.reshape(HEADS, NOPE + ROPE, D).copy()
+Wq_perm[:, NOPE:, :] = Wq_perm[:, NOPE:, :][:, DEINT, :]
+Wq_perm = Wq_perm.reshape(HEADS * (NOPE + ROPE), D)
+Wkva_perm = Wkva.copy()
+Wkva_perm[KV_LORA:, :] = Wkva_perm[KV_LORA:, :][DEINT, :]
+
 inv = yarn_inv_freq(ROPE)
 pos = np.arange(T, dtype=np.float32)[:, None]
 q_pe_r = np.stack([rope_interleaved(q_pe[t], pos[t], inv) for t in range(T)])
 k_pe_r = np.stack([rope_interleaved(k_pe[t], pos[t], inv) for t in range(T)])
+
+# Same rotation, half-split, on the permuted projections' output.
+def rope_halfsplit(x, pos, inv_freq):
+    dim = x.shape[-1]
+    ang = pos * np.concatenate([inv_freq, inv_freq])
+    cos, sin = np.cos(ang, dtype=np.float32), np.sin(ang, dtype=np.float32)
+    half = dim // 2
+    rot = np.concatenate([-x[..., half:], x[..., :half]], axis=-1)
+    return x * cos + rot * sin
+
+
+q_perm = (h1 @ Wq_perm.T).reshape(T, HEADS, NOPE + ROPE)
+kva_perm = h1 @ Wkva_perm.T
+q_pe_alt = np.stack([rope_halfsplit(q_perm[t, :, NOPE:], pos[t], inv) for t in range(T)])
+k_pe_alt = np.stack([rope_halfsplit(kva_perm[t, KV_LORA:], pos[t], inv) for t in range(T)])
+for label, a, b in (("q_pe", q_pe_alt, q_pe_r), ("k_pe", k_pe_alt, k_pe_r)):
+    err = np.max(np.abs(a - b)) / (np.max(np.abs(b)) + 1e-9)
+    if err > 1e-6:
+        raise SystemExit(f"permuting {label} rows does NOT reproduce the interleaved rotation ({err:.2e})")
+print(f"row permutation reproduces DeepSeek's interleaved RoPE exactly "
+      f"(q_pe {np.max(np.abs(q_pe_alt - q_pe_r)):.2e}, k_pe {np.max(np.abs(k_pe_alt - k_pe_r)):.2e})")
 
 mscale = 0.1 * args.mscale_all_dim * math.log(args.factor) + 1.0
 scale = (NOPE + ROPE) ** -0.5 * mscale * mscale
