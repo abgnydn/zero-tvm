@@ -38,7 +38,7 @@ import {
 } from './chat-ui.js'
 import { specForParam } from './model-registry.js'
 import { serveWeights, fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
-import { serveStage, makeStageClient } from './pipeline-peer.js'
+import { serveStage, makeStageClient, type StageReply } from './pipeline-peer.js'
 
 // Signaling endpoint. Dev: `npx wrangler dev --port 8787` in
 // workers/share-signal (what scripts/share-e2e.mjs spawns). (Same import.meta
@@ -74,6 +74,7 @@ type HostMsg =
   | { type: 'error'; id: number; message: string }
   | { type: 'stage-accept'; start: number; end: number }
   | { type: 'stage-reject'; message: string }
+  | { type: 'stage-wait'; message: string }
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement
 
@@ -248,11 +249,34 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     if (dc?.readyState === 'open') dc.send(JSON.stringify(msg))
   }
 
-  // ── the other half of a split model ───────────────────────────────────────
-  // Set when a helper peer offers exactly the layers this stage lacks. Until
-  // then a split host has a model it cannot finish, and says so rather than
-  // generating from half a network.
-  let downstream: { guest: string; step: (pos: number, residual: ArrayBuffer) => Promise<number>; meanHopMs: () => number } | null = null
+  // ── the rest of a split model ─────────────────────────────────────────────
+  // A split host holds layers [0, k) and needs the remaining layers to exist
+  // somewhere. They arrive as helper peers, each announcing its own range, and
+  // are assembled here into an ordered CHAIN. Until that chain reaches the last
+  // layer the host has a model it cannot finish, and says so rather than
+  // generating from part of a network.
+  //
+  // Stages connect to the host, not to each other, so a token walks out and
+  // back once per stage: N-1 round trips rather than the N-1 one-way legs a
+  // direct stage-to-stage chain would cost. That is a real ~2x on the dominant
+  // term, and it is deliberate for now — hub-and-spoke reuses the pairing and
+  // NAT traversal that already work, and no helper needs a route to any other
+  // helper. Worth revisiting once N-way is proven on real machines.
+  interface DownStage {
+    guest: string
+    start: number
+    end: number
+    step: (pos: number, residual: ArrayBuffer) => Promise<StageReply>
+    meanHopMs: () => number
+  }
+  const chain: DownStage[] = []
+  // Offers that are valid but not yet adjacent to the assembled chain. Six
+  // tabs opened at once connect in whatever order they finish loading, so a
+  // stage that arrives early waits instead of being refused.
+  const pendingStages = new Map<string, StageOffer>()
+  /** The first layer still missing — where the next stage must start. */
+  const chainEnd = (): number => (chain.length ? chain[chain.length - 1].end : stageRange!.end)
+  const chainComplete = (): boolean => !!stageRange && chainEnd() === spec.layers
 
   /**
    * The token loop for a SPLIT model — the whole-model generatePipelined
@@ -266,13 +290,18 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     promptIds: number[], budget: number,
     onToken: (id: number) => void, shouldStop: () => boolean,
   ): Promise<number[]> {
-    const down = downstream
-    if (!down) throw new Error('the other half of this model is not connected')
-    const stepBoth = async (tokenId: number, pos: number): Promise<number> => {
-      const mid = await engine.pipelineStep({ tokenId }, pos)
-      if (!('residual' in mid)) throw new Error('this stage ended the model — nothing to hand on')
-      return down.step(pos, mid.residual)
+    if (!chainComplete()) throw new Error(`layers ${chainEnd()}-${spec.layers} of this model are not connected`)
+    const stages = [...chain]
+    const stepAll = async (tokenId: number, pos: number): Promise<number> => {
+      let out: StageReply = await engine.pipelineStep({ tokenId }, pos)
+      for (const s of stages) {
+        if ('tokenId' in out) throw new Error('a stage ended the model before the last one')
+        out = await s.step(pos, out.residual)
+      }
+      if (!('tokenId' in out)) throw new Error('the last stage returned a residual, not a token')
+      return out.tokenId
     }
+    const stepBoth = stepAll
     let tok = 0
     for (let i = 0; i < promptIds.length; i++) tok = await stepBoth(promptIds[i], i)
     const out: number[] = []
@@ -314,8 +343,12 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       const secs = (performance.now() - t0) / 1000
       const tps = allIds.length / Math.max(secs, 0.001)
       send(guest, { type: 'done', id: req.id, tokens: allIds.length, tps })
+      // One mean per stage would be noise; the sum is what a token actually
+      // waited on, which is the number that decides whether a long chain is
+      // usable at all.
+      const hopTotal = chain.reduce((a, s) => a + s.meanHopMs(), 0)
       st.textContent = `${allIds.length} tok · ${tps.toFixed(1)} tok/s`
-        + (downstream ? ` · ${downstream.meanHopMs().toFixed(1)} ms/hop to the other stage` : '')
+        + (chain.length ? ` · ${hopTotal.toFixed(1)} ms/hop across ${chain.length} stage${chain.length === 1 ? '' : 's'}` : '')
     } catch (e) {
       send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
       st.textContent = 'error'
@@ -329,7 +362,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     let msg: GuestMsg
     try { msg = JSON.parse(raw) as GuestMsg } catch { return }
     if (msg.type === 'stop') { stopFlags.set(guest, msg.id); return }
-    if (msg.type === 'stage-offer') { acceptStage(guest, msg); return }
+    if (msg.type === 'stage-offer') { offerStage(guest, msg); return }
     if (msg.type !== 'chat' || !Array.isArray(msg.messages)) return
     stopFlags.delete(guest)
     queue.push({ guest, req: msg })
@@ -340,31 +373,96 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
 
   const param = new URLSearchParams(location.search).get('model') ?? ''
 
+  // #room-stats has two things to say — who is in the room, and how much of the
+  // model is present — and they arrive from different places (the signaller's
+  // periodic `room` message, and stages attaching or leaving). They used to
+  // overwrite each other, so a split host lost its chain view the moment anyone
+  // joined. One renderer, one source of truth for each half.
+  let roomCounts = { hosts: 1, guests: 0 }
+  function renderRoomStats(): void {
+    const { hosts: h, guests: g } = roomCounts
+    const members = `${h} ${h === 1 ? 'machine' : 'machines'} serving · ${g} ${g === 1 ? 'guest' : 'guests'} connected`
+    $('room-stats').textContent = stageRange ? `${describeChain()} · ${members}` : members
+  }
+
+  /** What the room looks like right now, for the host's own eyes. */
+  function describeChain(): string {
+    const held = `${stageRange!.start}-${stageRange!.end} here`
+    const rest = chain.map((s) => `${s.start}-${s.end}`).join(' → ')
+    const missing = chainComplete() ? '' : ` · waiting for layers ${chainEnd()}-${spec.layers}`
+    return `split model — layers ${held}${rest ? ` → ${rest}` : ''}${missing}`
+  }
+
   /**
-   * A peer says it holds the rest of the model. Accept only if it is EXACTLY
-   * the complement of this stage on the SAME spec — a mismatched range would
-   * produce fluent nonsense, which is worse than refusing.
+   * A peer says which layers it holds. Refuse what can never fit; hold what
+   * fits but is not adjacent YET.
+   *
+   * The old rule was that a helper had to be the EXACT complement of this
+   * stage, which is what limited a room to two halves. The rule now is only
+   * that the accepted stages must tile [k, layers) contiguously — a mismatched
+   * range still produces fluent nonsense, so nothing is accepted on faith, but
+   * the tiling can be built from any number of peers arriving in any order.
    */
-  function acceptStage(guest: string, offer: StageOffer): void {
+  function offerStage(guest: string, offer: StageOffer): void {
     const pipe = pipelines.get(guest)
-    const ok = !!stageRange && !!pipe && offer.specId === spec.id
-      && offer.start === stageRange.end && offer.end === spec.layers
-    if (!ok) {
-      const why = !stageRange ? 'this host runs the whole model'
-        : offer.specId !== spec.id ? `different model (${offer.specId} vs ${spec.id})`
-        : !pipe ? 'the pipeline channel is not open'
-        : `layers ${offer.start}-${offer.end} do not continue ${stageRange.start}-${stageRange.end}`
-      send(guest, { type: 'stage-reject', message: why })
-      logRow(guest, `stage offer refused — ${why}`)
+    const bad = !stageRange ? 'this host runs the whole model'
+      : offer.specId !== spec.id ? `different model (${offer.specId} vs ${spec.id})`
+      : !pipe ? 'the pipeline channel is not open'
+      : !(offer.start < offer.end) ? `layers ${offer.start}-${offer.end} is not a range`
+      : offer.end > spec.layers ? `layers ${offer.start}-${offer.end} runs past this model's ${spec.layers}`
+      : offer.start < stageRange.end ? `layers ${offer.start}-${offer.end} overlaps the ${stageRange.start}-${stageRange.end} this host holds`
+      : chain.some((c) => offer.start < c.end && c.start < offer.end)
+        ? `layers ${offer.start}-${offer.end} overlap a stage already in the chain`
+        : null
+    if (bad) {
+      send(guest, { type: 'stage-reject', message: bad })
+      logRow(guest, `stage offer refused — ${bad}`)
       return
     }
-    const client = makeStageClient(pipe)
-    downstream = { guest, step: client.step, meanHopMs: client.meanHopMs }
-    send(guest, { type: 'stage-accept', start: offer.start, end: offer.end })
-    $('room-stats').textContent =
-      `split model — layers ${stageRange!.start}-${stageRange!.end} here, ${offer.start}-${offer.end} on a peer`
-    logRow(guest, `serving layers ${offer.start}-${offer.end} — the model is complete`)
-    ;(window as unknown as Record<string, unknown>).__stagePaired = true
+    pendingStages.set(guest, offer)
+    extendChain()
+    if (pendingStages.has(guest)) {
+      const why = `layers ${offer.start}-${offer.end} held — the chain needs ${chainEnd()} next`
+      send(guest, { type: 'stage-wait', message: why })
+      logRow(guest, why)
+    }
+  }
+
+  /** Attach every pending offer that now continues the chain, repeatedly: one
+   *  arrival can unblock several that came in out of order. */
+  function extendChain(): void {
+    for (;;) {
+      const want = chainEnd()
+      const hit = [...pendingStages].find(([, o]) => o.start === want)
+      if (!hit) break
+      const [guest, offer] = hit
+      const pipe = pipelines.get(guest)
+      if (!pipe) { pendingStages.delete(guest); continue }
+      pendingStages.delete(guest)
+      const client = makeStageClient(pipe)
+      chain.push({ guest, start: offer.start, end: offer.end, step: client.step, meanHopMs: client.meanHopMs })
+      send(guest, { type: 'stage-accept', start: offer.start, end: offer.end })
+      logRow(guest, `serving layers ${offer.start}-${offer.end}`)
+    }
+    renderRoomStats()
+    if (chainComplete()) {
+      logRow('room', `the model is complete across ${chain.length + 1} stages`)
+      ;(window as unknown as Record<string, unknown>).__stagePaired = true
+    }
+  }
+
+  /** A stage left. Everything downstream of it is orphaned: those peers are
+   *  still connected but their inputs are gone, so they go back to pending
+   *  rather than being dropped, and re-attach if a replacement arrives. */
+  function dropStage(guest: string): void {
+    const i = chain.findIndex((c) => c.guest === guest)
+    if (i < 0) { pendingStages.delete(guest); return }
+    const orphaned = chain.splice(i)
+    for (const o of orphaned.slice(1)) {
+      if (peers.has(o.guest)) pendingStages.set(o.guest, { type: 'stage-offer', start: o.start, end: o.end, specId: spec.id })
+    }
+    extendChain()
+    ;(window as unknown as Record<string, unknown>).__stagePaired = chainComplete()
   }
 
   function makePeer(guest: string): void {
@@ -407,9 +505,8 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit
     }
     if (msg.type === 'room') {
-      const h = msg.hosts ?? 1, g = msg.guests ?? 0
-      $('room-stats').textContent =
-        `${h} ${h === 1 ? 'machine' : 'machines'} serving · ${g} ${g === 1 ? 'guest' : 'guests'} connected`
+      roomCounts = { hosts: msg.hosts ?? 1, guests: msg.guests ?? 0 }
+      renderRoomStats()
       return
     }
     const guest = msg.from
@@ -419,10 +516,9 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       peers.get(guest)?.pc.close()
       peers.delete(guest)
       pipelines.delete(guest)
-      if (downstream?.guest === guest) {
-        downstream = null
-        $('room-stats').textContent = `split model — waiting for layers ${stageRange!.end}-${spec.layers} again`
-        logRow(guest, 'the other half of the model left')
+      if (stageRange && (chain.some((c) => c.guest === guest) || pendingStages.has(guest))) {
+        logRow(guest, 'a stage of the model left')
+        dropStage(guest)
       }
     }
     else if (msg.type === 'answer' && msg.sdp) void peers.get(guest)?.pc.setRemoteDescription(msg.sdp)
@@ -507,8 +603,11 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
     chat.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data)) as HostMsg
       if (msg.type === 'stage-accept') {
-        stats.textContent = `paired — this device runs layers ${range.start}-${range.end}, the host runs the rest`
+        stats.textContent = `in the chain — this device runs layers ${range.start}-${range.end} of ${spec.layers}`
         ;(window as unknown as Record<string, unknown>).__helperPaired = true
+      } else if (msg.type === 'stage-wait') {
+        // Not a refusal: this stage fits, the chain just has not reached it.
+        stats.textContent = `holding layers ${range.start}-${range.end} — ${msg.message}`
       } else if (msg.type === 'stage-reject') {
         stats.textContent = `the host refused this stage: ${msg.message}`
       }
