@@ -217,7 +217,11 @@ export function checkModel(m: DetectedModel): CheckResult {
         'int4_matmul.gen.ts affine kernels read 4-bit nibbles at group 64 (3-bit exists for MoE expert stacks only)')
     }
     for (const [path, q] of Object.entries(m.quant.overrides)) {
-      const routerOk = ROUTER_PATH.test(path) && q.bits === 8 && q.groupSize === 64
+      // 16 = the checkpoint marked this tensor as NOT quantized (add-model
+      // records `false` that way). Refusing it here contradicted routerBits 16,
+      // which the f16 router kernel and loader plan both support.
+      const routerOk = ROUTER_PATH.test(path)
+        && ((q.bits === 8 && q.groupSize === 64) || q.bits === 16)
       const expertOk = EXPERT_PATH.test(path) && (q.bits === 3 || q.bits === 4) && q.groupSize === 64
       if (!routerOk && !expertOk && !(q.bits === 4 && q.groupSize === 64)) {
         fail('quant', `'${path}' is ${q.bits}-bit group ${q.groupSize}`,

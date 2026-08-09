@@ -362,6 +362,12 @@ const lines = [
   `  maxPages: ${maxPages},`,
   `  maxSeq: ${detected.maxSeq},`,
   `  ropeTheta: ${detected.ropeTheta},`,
+  // yarn as well as llama3 — the checker turned yarn GREEN, and a generated
+  // spec that omitted it would run plain RoPE past the trained context with no
+  // error anywhere. The checker refuses a yarn config missing any of these.
+  ...(detected.ropeYarn ? [
+    `  ropeScaling: { ropeType: 'yarn', factor: ${detected.ropeYarn.factor}, betaFast: ${detected.ropeYarn.betaFast}, betaSlow: ${detected.ropeYarn.betaSlow}, originalMaxPositionEmbeddings: ${detected.ropeYarn.originalMaxPositionEmbeddings}, mscale: ${detected.ropeYarn.mscale ?? 1}, mscaleAllDim: ${detected.ropeYarn.mscaleAllDim ?? 0} },`,
+  ] : []),
   ...(detected.ropeScaling ? [
     `  // llama3 frequency remapping — ropeInvFreqTable() precomputes the table.`,
     `  ropeScaling: { ropeType: 'llama3', factor: ${detected.ropeScaling.factor}, lowFreqFactor: ${detected.ropeScaling.lowFreqFactor}, highFreqFactor: ${detected.ropeScaling.highFreqFactor}, originalMaxPositionEmbeddings: ${detected.ropeScaling.originalMaxPositionEmbeddings} },`,
@@ -399,6 +405,12 @@ const spec = makeModelSpec({
   headDim: detected.headDim, ffn: detected.ffn, vocab: detected.vocab, pageSize: 16, maxPages,
   maxSeq: detected.maxSeq, ropeTheta: detected.ropeTheta, rmsEps: detected.rmsEps,
   ...(detected.ropeScaling ? { ropeScaling: { ropeType: 'llama3', ...detected.ropeScaling } } : {}),
+  ...(detected.ropeYarn ? { ropeScaling: {
+    ropeType: 'yarn', factor: detected.ropeYarn.factor, betaFast: detected.ropeYarn.betaFast,
+    betaSlow: detected.ropeYarn.betaSlow,
+    originalMaxPositionEmbeddings: detected.ropeYarn.originalMaxPositionEmbeddings,
+    mscale: detected.ropeYarn.mscale ?? 1, mscaleAllDim: detected.ropeYarn.mscaleAllDim ?? 0,
+  } } : {}),
   tiedEmbeddings: detected.tied, qkNorm: detected.qkNorm, stops, chatTemplateId: chatTemplate,
   tokenizerKind: tokKind, hfRepo: repo, manifestName: 'model.safetensors.index.json',
   weightFormat: 'mlx-safetensors', mlxPrefix,

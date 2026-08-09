@@ -789,19 +789,30 @@ async function mlaAttention(device, dir, meta) {
 
   const errLat = relErr(Array.from(new Float32Array(latBytes)), rd('ref_olat', Float32Array))
   const errOut = relErr(Array.from(new Uint16Array(headBytes), f16BitsToF32), rd('ref_oheads', Float32Array))
+  // 1e-3, not 1e-2. Observed is 3-4e-4 (the f16 input floor), so a 2e-2 bound
+  // left ~50x of headroom — enough for either shader to drop its f32
+  // accumulator and still pass, which is the one thing these numbers exist to
+  // catch. Inputs are seeded and the kernels deterministic, so a tight bound
+  // is not a flaky one.
   return {
-    pass: errLat < 0.01 && errOut < 0.02,
+    pass: errLat < 1e-3 && errOut < 1e-3,
     detail: `latent context ${errLat.toExponential(2)} | back through kv_b's V half ${errOut.toExponential(2)}`
       + ` (${meta.cache_values_per_token} cached values/token vs ${meta.mha_equivalent_per_token} for MHA,`
       + ` q projected on GPU through Wk^T)`,
   }
 }
 
-/** A whole DeepSeek-V2 layer: MLA attention and the DENSE FFN that layer 0
- *  carries while every other layer is MoE. Two things here are covered nowhere
- *  else — the pe-row permutation applied to QUANTIZED rows (which is what makes
- *  DeepSeek's interleaved RoPE free), and yarn's mscale^2 folded into the
- *  softmax scale. */
+/** DeepSeek-V2 layer 0's ATTENTION path, end to end on real weights. Two things
+ *  are covered nowhere else — the pe-row permutation applied to QUANTIZED rows
+ *  (what makes DeepSeek's interleaved RoPE free) and yarn's mscale^2 in the
+ *  softmax scale.
+ *
+ *  NOT the dense FFN, though the bundle carries its weights and reference. That
+ *  half is an ordinary SwiGLU already covered by other bundles; what makes
+ *  layer 0 interesting for the mixed dense/MoE stack is engine WIRING (two FFN
+ *  widths chosen per layer), which is not a kernel question and is still open.
+ *  Said here because the earlier version of this comment claimed the FFN was
+ *  covered and it never was. */
 async function dsv2Layer(device, dir, meta) {
   const rd = (n, T) => read(dir, n, T)
   const { heads, nope: NOPE, rope: R, v: V, kv_lora: L, tokens: T,
@@ -947,8 +958,10 @@ async function dsv2Layer(device, dir, meta) {
   const parts = [['q_proj', errQ], ['kv_a_proj', errKv], ['q->latent', errQlat],
                  ['softmax', errProb], ['latent ctx', errOlat], ['->head', errOheads],
                  ['o_proj', errAttn]]
+  // See the note in mlaAttention: 2e-2 was ~50x the observed error and would
+  // not have noticed an f32 accumulator becoming f16.
   return {
-    pass: parts.every(([, e]) => e < 0.02),
+    pass: parts.every(([, e]) => e < 1e-3),
     detail: parts.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ')
       + ` (pe rows permuted at load, yarn scale ${scale.toFixed(4)})`,
   }

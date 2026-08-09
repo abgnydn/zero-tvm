@@ -59,6 +59,17 @@ fn mla_combine(
     scores[base + t] = e;
     su = su + e;
   }
+  // scores lives in the STORAGE address space and this is the one place in the
+  // repo where invocations hand data to each other through it: lane tid writes
+  // exp() for its own positions above, and every lane reads ALL positions in
+  // the accumulation below. workgroupBarrier() orders the WORKGROUP address
+  // space only — that is the entire distinction between it and storageBarrier()
+  // — so it supplies the execution sync but not the visibility. Tint lowers it
+  // to threadgroup_barrier(mem_threadgroup) on Metal and
+  // GroupMemoryBarrierWithGroupSync() on D3D12, neither of which orders device
+  // memory. It happens to pass on Metal today; that is luck about the backend,
+  // not correctness.
+  storageBarrier();
   red[tid] = su;
   workgroupBarrier();
   for (var st : u32 = 32u; st > 0u; st = st >> 1u) {

@@ -21,7 +21,7 @@
  */
 
 import { LoadedWeights } from './weight-loader.js'
-import { ropeInvFreqTable } from '../compiler/model-spec.js'
+import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
 
@@ -619,7 +619,12 @@ export function buildDecodeEngine(
                     S.weightFormat === 'mlx-safetensors').pipeline
     : null
 
-  const SM_SCALE = 1.0 / Math.sqrt(S.headDim)
+  // yarn scales attention LOGITS by mscale^2 on top of 1/sqrt(headDim). It is
+  // not part of RoPE, so nothing in the rope path applies it, and a table that
+  // is right without it is still a model that is wrong at every position.
+  // ropeAttnScale() returns 1 for every non-yarn spec, so this is identity for
+  // everything shipped today.
+  const SM_SCALE = ropeAttnScale(S) / Math.sqrt(S.headDim)
 
   // Hard KV ceiling — writing a slot at or past this position would run off
   // the last page and silently corrupt the cache.
