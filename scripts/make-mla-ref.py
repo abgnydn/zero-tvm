@@ -1,0 +1,177 @@
+"""MAKE-MLA-REF — a real-weights reference for multi-head latent attention.
+
+Consumes a bundle from scripts/pull-tensors.mjs (one layer, ~8 MB of Range
+requests) and produces the numbers a WGSL kernel has to reproduce.
+
+Run from an env with mlx:
+
+    cd ~/dev/ml-research && uv run python ~/dev/zero-tvm/scripts/make-mla-ref.py \
+        --bundle ~/dev/zero-tvm/.weights-local/kernel-refs/dsv2mla
+
+WHY TWO IMPLEMENTATIONS. MLA can be evaluated two ways, and the whole reason to
+want it is that they are equal:
+
+  NAIVE   up-project the latent into per-head K_nope and V, then ordinary
+          attention. This is what modeling_deepseek.py does, and it caches
+          nothing smaller than MHA unless you throw the up-projection away.
+  LATENT  push q_nope THROUGH kv_b_proj's K half into the 512-wide latent
+          space, score directly against the cached latent, and bring the
+          weighted sum back out through kv_b_proj's V half. The cache is then
+          one 512 latent plus one shared 64 RoPE key per token — 576 values
+          where MHA stores 4096.
+
+The second is what we would implement. Checking it against the first, here in
+Python where both are cheap, separates "we misunderstood MLA" from "the shader
+is wrong" — two failures that look identical from a WGSL test.
+
+RoPE IS OFF in this reference (--rope none). DeepSeek-V2 uses yarn, which is a
+separate refused feature, and rope.wgsl is already covered by its own kernel
+test; leaving it out keeps this bundle about the part that is actually new. The
+q_pe/k_pe path still runs, unrotated, so the shared-key contribution is
+exercised — what is deferred is only which angle it is rotated by.
+"""
+
+import argparse
+import json
+import pathlib
+
+import mlx.core as mx
+import numpy as np
+
+p = argparse.ArgumentParser()
+p.add_argument("--bundle", required=True)
+p.add_argument("--layer", default="model.layers.1")
+p.add_argument("--tokens", type=int, default=6, help="cache length to score against")
+p.add_argument("--rope", default="none", choices=["none"])
+p.add_argument("--seed", type=int, default=7)
+args = p.parse_args()
+
+bundle = pathlib.Path(args.bundle)
+meta = json.loads((bundle / "meta.json").read_text())
+T = meta["tensors"]
+
+DT = {"F16": np.float16, "BF16": None, "U32": np.uint32, "F32": np.float32}
+
+
+def load(name):
+    """A tensor exactly as it sits in the shard — shape and dtype from the
+    safetensors header, no reinterpretation."""
+    rec = T[f"{args.layer}.{name}"]
+    dt = DT[rec["dtype"]]
+    if dt is None:
+        raise SystemExit(f"{name}: dtype {rec['dtype']} not handled here")
+    a = np.frombuffer((bundle / rec["file"]).read_bytes(), dtype=dt)
+    return mx.array(np.ascontiguousarray(a.reshape(rec["shape"])))
+
+
+def dequant(name, group=64, bits=4):
+    """MLX affine: w = scale*q + bias, group 64 along the input axis."""
+    return mx.dequantize(load(f"{name}.weight"), load(f"{name}.scales"),
+                         load(f"{name}.biases"), group_size=group, bits=bits)
+
+
+def rms(x, gamma, eps=1e-6):
+    return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)) * gamma
+
+
+# ── the layer, dequantized ──────────────────────────────────────────────────
+Wq = dequant("self_attn.q_proj")                    # [heads*(nope+rope), d]
+Wkva = dequant("self_attn.kv_a_proj_with_mqa")      # [kv_lora + rope, d]
+Wkvb = dequant("self_attn.kv_b_proj")               # [heads*(nope+v), kv_lora]
+Wo = dequant("self_attn.o_proj")                    # [d, heads*v]
+g_in = load("input_layernorm.weight")
+g_kva = load("self_attn.kv_a_layernorm.weight")
+
+D = Wq.shape[1]
+KV_LORA = g_kva.shape[0]
+ROPE = Wkva.shape[0] - KV_LORA
+HEADS = Wo.shape[1] // ((Wkvb.shape[0] // (Wq.shape[0] // 1)) or 1) if False else None
+# Solve the head split from shapes rather than trusting config.json: q rows are
+# heads*(nope+rope) and kv_b rows are heads*(nope+v), with v == nope here.
+# heads = kv_b_rows / (2*nope) and q_rows = heads*(nope+rope) pin both.
+for heads in range(1, 129):
+    if Wq.shape[0] % heads or Wkvb.shape[0] % heads:
+        continue
+    nope = Wq.shape[0] // heads - ROPE
+    if nope > 0 and Wkvb.shape[0] // heads == 2 * nope:
+        HEADS, NOPE, VDIM = heads, nope, nope
+        break
+if HEADS is None:
+    raise SystemExit("could not solve the head split from the tensor shapes")
+print(f"d={D} heads={HEADS} nope={NOPE} rope={ROPE} v={VDIM} kv_lora={KV_LORA}")
+
+rng = np.random.default_rng(args.seed)
+xs = mx.array(rng.standard_normal((args.tokens, D), dtype=np.float32) * 0.5)
+
+# ── shared front half: what every position contributes to the cache ─────────
+h = rms(xs, g_in)                                   # [T, d]
+q_all = (h @ Wq.T).reshape(args.tokens, HEADS, NOPE + ROPE)
+q_nope, q_pe = q_all[..., :NOPE], q_all[..., NOPE:]
+
+kva = h @ Wkva.T                                    # [T, kv_lora + rope]
+c = rms(kva[:, :KV_LORA], g_kva)                    # [T, kv_lora]  ← THE CACHE
+k_pe = kva[:, KV_LORA:]                             # [T, rope]     ← shared key
+
+scale = (NOPE + ROPE) ** -0.5
+qi = args.tokens - 1                                # score the last position
+
+# ── NAIVE: up-project the whole cache, then ordinary attention ─────────────
+kv = (c @ Wkvb.T).reshape(args.tokens, HEADS, NOPE + VDIM)
+k_nope, v = kv[..., :NOPE], kv[..., NOPE:]
+scores_naive = (mx.sum(q_nope[qi][None] * k_nope, axis=-1).T
+                + (q_pe[qi] @ k_pe.T)) * scale      # [heads, T]
+p_naive = mx.softmax(scores_naive, axis=-1)
+o_naive = mx.sum(p_naive[..., None] * v.transpose(1, 0, 2), axis=1)   # [heads, v]
+out_naive = o_naive.reshape(-1) @ Wo.T
+
+# ── LATENT: never materialise K or V ───────────────────────────────────────
+# kv_b_proj's rows are [head][nope|v]; the K half turns a head's q_nope into a
+# latent query, the V half turns a latent context back into that head's output.
+Wkvb_h = Wkvb.reshape(HEADS, NOPE + VDIM, KV_LORA)
+Wk, Wv = Wkvb_h[:, :NOPE, :], Wkvb_h[:, NOPE:, :]
+
+q_lat = mx.sum(q_nope[qi][:, :, None] * Wk, axis=1)                   # [heads, kv_lora]
+scores_lat = (q_lat @ c.T + q_pe[qi] @ k_pe.T) * scale                # [heads, T]
+p_lat = mx.softmax(scores_lat, axis=-1)
+o_lat = p_lat @ c                                                      # [heads, kv_lora]
+o_heads = mx.sum(o_lat[:, None, :] * Wv, axis=2)                       # [heads, v]
+out_lat = o_heads.reshape(-1) @ Wo.T
+
+mx.eval(out_naive, out_lat, scores_naive, scores_lat)
+
+
+def relerr(a, b):
+    a, b = np.array(a, dtype=np.float64), np.array(b, dtype=np.float64)
+    return float(np.max(np.abs(a - b)) / (np.max(np.abs(b)) + 1e-9))
+
+
+err_s = relerr(scores_lat, scores_naive)
+err_o = relerr(out_lat, out_naive)
+print(f"latent vs naive — scores {err_s:.2e}, output {err_o:.2e}")
+if max(err_s, err_o) > 1e-4:
+    raise SystemExit("the two formulations DISAGREE — the latent algebra is wrong, "
+                     "and no shader written against it would be right")
+print("the two formulations agree: caching the 512 latent loses nothing")
+print(f"cache per token: {KV_LORA + ROPE} values, vs {HEADS * (NOPE + VDIM)} for the MHA equivalent")
+
+out = bundle
+np.save(out / "ref_x.npy", np.array(xs, dtype=np.float32))
+np.save(out / "ref_c.npy", np.array(c, dtype=np.float32))
+np.save(out / "ref_kpe.npy", np.array(k_pe, dtype=np.float32))
+np.save(out / "ref_qnope.npy", np.array(q_nope[qi], dtype=np.float32))
+np.save(out / "ref_qpe.npy", np.array(q_pe[qi], dtype=np.float32))
+np.save(out / "ref_scores.npy", np.array(scores_naive, dtype=np.float32))
+np.save(out / "ref_out.npy", np.array(out_naive, dtype=np.float32))
+(out / "mla-ref.json").write_text(json.dumps({
+    "kernel": "mla_attention",
+    "model": meta["repo"],
+    "layer": args.layer,
+    "reference": "mlx.core.dequantize + MLA computed two ways",
+    "d": D, "heads": HEADS, "nope": NOPE, "rope": ROPE, "v": VDIM,
+    "kv_lora": KV_LORA, "tokens": args.tokens, "query_at": qi,
+    "softmax_scale": scale, "rope_applied": args.rope,
+    "latent_vs_naive_rel_err": {"scores": err_s, "output": err_o},
+    "cache_values_per_token": KV_LORA + ROPE,
+    "mha_equivalent_per_token": HEADS * (NOPE + VDIM),
+}, indent=1) + "\n")
+print(f"wrote {out}/mla-ref.json + ref_*.npy")
