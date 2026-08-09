@@ -125,13 +125,33 @@ export interface MoeDims {
  *  in ropeInvFreqTable() below; kernels never see these numbers, only the
  *  precomputed table. yarn/longrope are different formulas and stay
  *  unsupported (constraints.ts keeps them red). */
-export interface RopeScaling {
-  ropeType: 'llama3'
-  factor: number
-  lowFreqFactor: number
-  highFreqFactor: number
-  originalMaxPositionEmbeddings: number
-}
+/** Frequency remapping that lets a model be used past the context it was
+ *  trained on. Both variants only reshape the inv_freq table rope.wgsl already
+ *  reads — yarn additionally scales the attention logits, which is NOT part of
+ *  RoPE and is easy to drop on the floor (see ropeAttnScale). */
+export type RopeScaling =
+  | {
+      ropeType: 'llama3'
+      factor: number
+      lowFreqFactor: number
+      highFreqFactor: number
+      originalMaxPositionEmbeddings: number
+    }
+  | {
+      ropeType: 'yarn'
+      factor: number
+      /** Rotations below which a dimension keeps its ORIGINAL frequency
+       *  (high-frequency dims carry local order and must not be stretched). */
+      betaFast: number
+      /** Rotations above which a dimension is fully interpolated. Between the
+       *  two the table ramps linearly, which is the whole of yarn. */
+      betaSlow: number
+      originalMaxPositionEmbeddings: number
+      /** Logit-scale coefficients. DeepSeek applies mscale_all_dim (squared)
+       *  and ignores mscale; a config carrying mscale alone changes nothing. */
+      mscale: number
+      mscaleAllDim: number
+    }
 
 /** Gated-DeltaNet (linear attention) dimensions — Qwen3.5 `linear_attn`. */
 export interface GdnDims {
@@ -428,9 +448,44 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
  * longer than orig_ctx/low_freq_factor divide by `factor`, and the band
  * between interpolates smoothly.
  */
+/** yarn's logit scale: 1 unless the config asks for mscale_all_dim, in which
+ *  case attention logits are multiplied by mscale^2. It rides here rather than
+ *  in the RoPE table because that is where the model applies it — folding it
+ *  into the frequencies instead would be silently wrong at every position. */
+export function ropeAttnScale(spec: ModelSpec): number {
+  const rs = spec.ropeScaling
+  if (!rs || rs.ropeType !== 'yarn' || !rs.mscaleAllDim || rs.factor <= 1) return 1
+  const m = 0.1 * rs.mscaleAllDim * Math.log(rs.factor) + 1
+  return m * m
+}
+
 export function ropeInvFreqTable(spec: ModelSpec): Float32Array<ArrayBuffer> {
   const out = new Float32Array(spec.halfRotary)
   const rs = spec.ropeScaling
+  if (rs?.ropeType === 'yarn') {
+    // Frequencies below `low` stay as trained, above `high` are divided by the
+    // factor, and in between the two are blended on a linear ramp. low/high are
+    // dimension indices solved from a rotation count:
+    //   d(rot) = dim * ln(origMax / (rot * 2pi)) / (2 * ln(base))
+    const dim = spec.rotaryDim
+    const corr = (rot: number) =>
+      (dim * Math.log(rs.originalMaxPositionEmbeddings / (rot * 2 * Math.PI))) / (2 * Math.log(spec.ropeTheta))
+    const low = Math.max(Math.floor(corr(rs.betaFast)), 0)
+    let high = Math.min(Math.ceil(corr(rs.betaSlow)), dim - 1)
+    if (high === low) high = low + 0.001    // the vendor's singularity guard
+    for (let i = 0; i < spec.halfRotary; i++) {
+      const extra = Math.pow(spec.ropeTheta, -(2 * i) / dim)
+      const inter = extra / rs.factor
+      // ramp 0 at `low` → 1 at `high`; the MASK is its complement, so a
+      // dimension inside the low band keeps `extra` and a high one takes
+      // `inter`. Getting this the wrong way round still produces a plausible
+      // table — it just breaks long context, quietly.
+      const ramp = Math.min(Math.max((i - low) / (high - low), 0), 1)
+      const mask = 1 - ramp
+      out[i] = inter * (1 - mask) + extra * mask
+    }
+    return out
+  }
   for (let i = 0; i < spec.halfRotary; i++) {
     let inv = Math.pow(spec.ropeTheta, -(2 * i) / spec.rotaryDim)
     if (rs) {

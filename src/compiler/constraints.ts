@@ -80,6 +80,15 @@ export interface DetectedMla {
 
 export interface DetectedModel {
   mla?: DetectedMla | null
+  /** yarn parameters when ropeScalingType is 'yarn'. */
+  ropeYarn?: {
+    factor: number | null
+    betaFast: number | null
+    betaSlow: number | null
+    originalMaxPositionEmbeddings: number | null
+    mscale: number | null
+    mscaleAllDim: number | null
+  } | null
   /** Top-level config.json fields matching neither CONFIG_KEYS_READ nor
    *  CONFIG_KEYS_IGNORED — see the `config` rule in checkModel. */
   unknownConfigKeys?: string[]
@@ -222,12 +231,22 @@ export function checkModel(m: DetectedModel): CheckResult {
     fail('activation', `hidden_act is '${m.hiddenAct}'`,
       'silu_mul.wgsl and fused_ffn.wgsl hardcode SiLU — a GeGLU/other-activation variant of both')
   }
-  // llama3 scaling is green: rope.wgsl binds a precomputed inv_freq table and
-  // ropeInvFreqTable() implements the llama3 piecewise remapping. yarn /
-  // longrope are DIFFERENT formulas and stay red until someone writes them.
-  if (m.ropeScalingType !== null && m.ropeScalingType !== 'llama3') {
-    fail('rope', `rope_scaling '${m.ropeScalingType}' (yarn/longrope-style frequency remapping)`,
+  // llama3 and yarn are both green: rope.wgsl binds a precomputed inv_freq
+  // table and ropeInvFreqTable() implements each remapping (yarn checked
+  // against DeepSeek's own helpers in tests/unit/rope-yarn.test.ts). longrope
+  // and anything newer stay red until someone writes them.
+  if (m.ropeScalingType !== null && m.ropeScalingType !== 'llama3' && m.ropeScalingType !== 'yarn') {
+    fail('rope', `rope_scaling '${m.ropeScalingType}' (longrope-style frequency remapping)`,
       'a frequency formula in model-spec.ts ropeInvFreqTable() — rope.wgsl already reads the table')
+  }
+  if (m.ropeScalingType === 'yarn') {
+    const y = m.ropeYarn
+    const missing = !y || [y.factor, y.betaFast, y.betaSlow, y.originalMaxPositionEmbeddings]
+      .some((v) => v === null || v === undefined)
+    if (missing) {
+      fail('rope', 'rope_scaling is yarn but the config omits factor / beta_fast / beta_slow / original_max_position_embeddings',
+        'all four decide the table; defaulting any of them would silently mis-stretch long context')
+    }
   }
   if (m.ropeScalingType === 'llama3') {
     const rs = m.ropeScaling

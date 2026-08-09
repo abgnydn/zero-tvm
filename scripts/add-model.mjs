@@ -215,6 +215,14 @@ const detected = {
     highFreqFactor: num(tc.rope_scaling.high_freq_factor),
     originalMaxPositionEmbeddings: num(tc.rope_scaling.original_max_position_embeddings),
   } : null,
+  ropeYarn: (tc.rope_scaling?.rope_type ?? tc.rope_scaling?.type) === 'yarn' ? {
+    factor: num(tc.rope_scaling.factor),
+    betaFast: num(tc.rope_scaling.beta_fast),
+    betaSlow: num(tc.rope_scaling.beta_slow),
+    originalMaxPositionEmbeddings: num(tc.rope_scaling.original_max_position_embeddings),
+    mscale: num(tc.rope_scaling.mscale),
+    mscaleAllDim: num(tc.rope_scaling.mscale_all_dim),
+  } : null,
   rmsEps: num(tc.rms_norm_eps),
   maxSeq: num(tc.max_position_embeddings),
   tied: tc.tie_word_embeddings === true
