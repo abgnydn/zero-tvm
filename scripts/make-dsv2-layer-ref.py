@@ -215,7 +215,13 @@ out = resid1 + ffn_out
 def dump(name, a):
     np.ascontiguousarray(np.asarray(a, np.float32)).tofile(bundle / f"{name}.bin")
 
-for n, a in [("ref_x", x), ("ref_h1", h1), ("ref_c", c), ("ref_kpe", k_pe_r),
+# Pre-RoPE outputs of the PERMUTED projections. The permutation is applied to
+# quantized rows at load, so a test needs to see that the int4 matmul over the
+# shuffled rows lands where the reference says before any rotation happens.
+for n, a in [("wk_t", np.transpose(Wk, (0, 2, 1))), ("wv", Wv),
+             ("ref_qperm", q_perm[qi]), ("ref_kvaperm", kva_perm[qi]),
+             ("ref_qnope", q_nope[qi]),
+             ("ref_x", x), ("ref_h1", h1), ("ref_c", c), ("ref_kpe", k_pe_r),
              ("ref_qlat", q_lat), ("ref_qpe", q_pe_r[qi]), ("ref_scores", scores),
              ("ref_olat", o_lat), ("ref_oheads", o_heads), ("ref_attn_out", attn_out),
              ("ref_resid1", resid1), ("ref_h2", h2), ("ref_ffn_out", ffn_out), ("ref_out", out)]:

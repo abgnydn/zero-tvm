@@ -797,11 +797,168 @@ async function mlaAttention(device, dir, meta) {
   }
 }
 
+/** A whole DeepSeek-V2 layer: MLA attention and the DENSE FFN that layer 0
+ *  carries while every other layer is MoE. Two things here are covered nowhere
+ *  else — the pe-row permutation applied to QUANTIZED rows (which is what makes
+ *  DeepSeek's interleaved RoPE free), and yarn's mscale^2 folded into the
+ *  softmax scale. */
+async function dsv2Layer(device, dir, meta) {
+  const rd = (n, T) => read(dir, n, T)
+  const { heads, nope: NOPE, rope: R, v: V, kv_lora: L, tokens: T,
+          softmax_scale: scale, d: D } = meta
+  const shader = (f, e) => pipelineFor(device, withPrelude(readFileSync(join(SHADERS, f), 'utf8')), e)
+  const affine = pipelineFor(device, withPrelude(int4MatmulWGSL({ affine: true })),
+                             int4MatmulEntry({ affine: true }))
+  const raw = (n, T2) => {
+    const rec = meta.tensors[`${meta.layer}.${n}`]
+    const b = readFileSync(join(dir, rec.file))
+    return new T2(b.buffer, b.byteOffset, b.byteLength / T2.BYTES_PER_ELEMENT)
+  }
+  const f16buf = (n) => buffer(device, f16Array(rd(n, Float32Array)), BU.STORAGE | BU.COPY_DST)
+  const u32u = (a) => buffer(device, new Uint32Array(a), BU.UNIFORM | BU.COPY_DST)
+
+  // ── the de-interleave, as the loader will do it ──
+  // Rows of a quantized matrix are independent — the affine scale groups run
+  // along the INPUT axis — so weight, scales and biases shuffle together and
+  // nothing is dequantized to do it. That independence is the whole reason
+  // DeepSeek's interleaved RoPE can be free.
+  // src[j] = which ORIGINAL row output row j takes. The de-interleave gathers
+  // the even indices then the odd ones, so row j < R/2 comes from 2j and the
+  // rest from 2(j-R/2)+1. Writing the inverse of this permutation still yields
+  // a plausible matrix — it just computes a different model.
+  const src = Array.from({ length: R }, (_, j) => (j < R / 2 ? 2 * j : 2 * (j - R / 2) + 1))
+  const permute = (arr, rowLen, moves) => {
+    const out = arr.slice()
+    for (const [dst, s] of moves) out.set(arr.subarray(s * rowLen, (s + 1) * rowLen), dst * rowLen)
+    return out
+  }
+  const qMoves = []
+  for (let h = 0; h < heads; h++) {
+    for (let j = 0; j < R; j++) {
+      qMoves.push([h * (NOPE + R) + NOPE + j, h * (NOPE + R) + NOPE + src[j]])
+    }
+  }
+  const kvMoves = Array.from({ length: R }, (_, j) => [L + j, L + src[j]])
+
+  /** One affine matvec over rows that may have been shuffled. */
+  const matvec = async (name, moves, N, K, xBuf) => {
+    const KP = K / 8, SPR = K / 64
+    const w = moves ? permute(raw(`${name}.weight`, Uint32Array), KP, moves) : raw(`${name}.weight`, Uint32Array)
+    const sc = moves ? permute(raw(`${name}.scales`, Uint16Array), SPR, moves) : raw(`${name}.scales`, Uint16Array)
+    const bi = moves ? permute(raw(`${name}.biases`, Uint16Array), SPR, moves) : raw(`${name}.biases`, Uint16Array)
+    const out = device.createBuffer({ size: N * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const bytes = await runCompute(device, affine, [
+      out, xBuf,
+      buffer(device, sc, BU.STORAGE | BU.COPY_DST),
+      buffer(device, w, BU.STORAGE | BU.COPY_DST),
+      u32u([KP, SPR, N, 0]),
+      buffer(device, bi, BU.STORAGE | BU.COPY_DST),
+    ], [N], 0, N * 2)
+    return Array.from(new Uint16Array(bytes), f16BitsToF32)
+  }
+
+  // ref_h1 is [T, D] — every position's normed hidden state. The projections
+  // take ONE row, the query's. Handing over the whole matrix silently projects
+  // token 0 instead, which produces a fully-formed wrong answer.
+  const qi = meta.query_at
+  const h1 = buffer(device, f16Array(rd('ref_h1', Float32Array).slice(qi * D, (qi + 1) * D)),
+                    BU.STORAGE | BU.COPY_DST)
+  const errQ = relErr(await matvec('self_attn.q_proj', qMoves, heads * (NOPE + R), D, h1),
+                      rd('ref_qperm', Float32Array))
+  const errKv = relErr(await matvec('self_attn.kv_a_proj_with_mqa', kvMoves, L + R, D, h1),
+                       rd('ref_kvaperm', Float32Array))
+
+  // ── MLA, from the reference's post-RoPE query and cache ──
+  const wgs = (n) => Math.ceil(n / 64)
+  const dims = (N, K) => u32u([N, K, 0, 0])
+  const cacheC = f16buf('ref_c')
+  const qLat = device.createBuffer({ size: heads * L * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+  const scores = device.createBuffer({ size: heads * T * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const outLat = device.createBuffer({ size: heads * L * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const oLat16 = device.createBuffer({ size: heads * L * 2, usage: BU.STORAGE | BU.COPY_DST })
+  const oHeads = device.createBuffer({ size: heads * V * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+  const mlaProj = shader('mla_proj.wgsl', 'mla_proj')
+
+  const pass1 = device.createCommandEncoder()
+  const p1 = pass1.beginComputePass()
+  const run = (pass, pipe, bufs, x, y) => {
+    pass.setPipeline(pipe)
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
+    }))
+    pass.dispatchWorkgroups(x, y, 1)
+  }
+  run(p1, mlaProj, [qLat, f16buf('ref_qnope'), f16buf('wk_t'), dims(L, NOPE)], wgs(L), heads)
+  // The scale carries yarn's mscale^2 (1.59 here) on top of 1/sqrt(nope+rope).
+  // Leaving it out is a 1.59x error on every logit and looks like nothing.
+  const skU = (() => {
+    const u = new ArrayBuffer(16), dv = new DataView(u)
+    dv.setUint32(0, L, true); dv.setUint32(4, R, true)
+    dv.setUint32(8, T, true); dv.setFloat32(12, scale, true)
+    return buffer(device, new Uint8Array(u), BU.UNIFORM | BU.COPY_DST)
+  })()
+  run(p1, shader('mla_scores.wgsl', 'mla_scores'),
+      [scores, qLat, f16buf('ref_qpe'), cacheC, f16buf('ref_kpe'), skU], T, heads)
+  run(p1, shader('mla_combine.wgsl', 'mla_combine'), [outLat, scores, cacheC, u32u([L, T, 0, 0])], heads, 1)
+  p1.end()
+  device.queue.submit([pass1.finish()])
+
+  const [qlatB, scoreB, latB] = await readBack(device,
+    [[qLat, heads * L * 2], [scores, heads * T * 4], [outLat, heads * L * 4]])
+  const errQlat = relErr(Array.from(new Uint16Array(qlatB), f16BitsToF32), rd('ref_qlat', Float32Array))
+  const errOlat = relErr(Array.from(new Float32Array(latB), (x) => x), rd('ref_olat', Float32Array))
+  // scores comes back holding UNNORMALISED exp(s - max): mla_combine
+  // exponentiates in place and applies 1/sum only to its output, so the buffer
+  // is not a probability distribution. Normalise both sides before comparing —
+  // the earlier version of this check compared against a softmax and failed at
+  // 8.2e-1 while the kernel was correct, which the passing latent context
+  // (o_lat = p @ c) had already proved.
+  const refS = rd('ref_scores', Float32Array)
+  const gotE = Array.from(new Float32Array(scoreB), (x) => x)
+  const norm = (row) => {
+    const m = Math.max(...row)
+    const e = row.map((s) => Math.exp(s - m))
+    const z = e.reduce((a, b) => a + b, 0)
+    return e.map((v) => v / z)
+  }
+  const refP = [], gotP = []
+  for (let h = 0; h < heads; h++) {
+    refP.push(...norm(Array.from({ length: T }, (_, t) => refS[h * T + t])))
+    const e = gotE.slice(h * T, (h + 1) * T)
+    const z = e.reduce((a, b) => a + b, 0)
+    gotP.push(...e.map((v) => v / z))
+  }
+  const errProb = relErr(gotP, refP)
+
+  // ── back out through kv_b's V half, then o_proj ──
+  device.queue.writeBuffer(oLat16, 0, f16Array(new Float32Array(latB)))
+  const pass2 = device.createCommandEncoder()
+  const p2 = pass2.beginComputePass()
+  run(p2, mlaProj, [oHeads, oLat16, f16buf('wv'), dims(V, L)], wgs(V), heads)
+  p2.end()
+  device.queue.submit([pass2.finish()])
+  const [headB] = await readBack(device, [[oHeads, heads * V * 2]])
+  const errOheads = relErr(Array.from(new Uint16Array(headB), f16BitsToF32), rd('ref_oheads', Float32Array))
+
+  const attn = await matvec('self_attn.o_proj', null, D, heads * V, oHeads)
+  const errAttn = relErr(attn, rd('ref_attn_out', Float32Array))
+
+  const parts = [['q_proj', errQ], ['kv_a_proj', errKv], ['q->latent', errQlat],
+                 ['softmax', errProb], ['latent ctx', errOlat], ['->head', errOheads],
+                 ['o_proj', errAttn]]
+  return {
+    pass: parts.every(([, e]) => e < 0.02),
+    detail: parts.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ')
+      + ` (pe rows permuted at load, yarn scale ${scale.toFixed(4)})`,
+  }
+}
+
 const KERNELS = {
   affine_matmul: affineMatmul, affine_matmul_q3: affineMatmul,
   affine_embedding: affineEmbedding, moe_block: moeBlock,
   qwen36_gdn: qwen36Gdn, qwen36_attn: qwen36Attn, qwen36_layer: qwen36Layer,
-  mla_attention: mlaAttention,
+  mla_attention: mlaAttention, dsv2_layer: dsv2Layer,
 }
 
 async function main() {
