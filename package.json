@@ -15,9 +15,21 @@
     "from-scratch",
     "no-tvm"
   ],
+  "types": "./dist-lib/types/lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist-lib/types/lib/index.d.ts",
+      "default": "./dist-lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist-lib"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:lib": "vite build --config vite.lib.config.ts && tsc --emitDeclarationOnly --outDir dist-lib/types",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
     "lint": "npm run typecheck",
