@@ -30,6 +30,12 @@ export interface DetectedQuant {
 }
 
 export interface DetectedMoe {
+  /** Layers running a DENSE FFN instead of the expert block. A non-empty list
+   *  (Qwen's mlp_only_layers, DeepSeek's first_k_dense_replace) means the stack
+   *  is not uniform, which ModelSpec has no way to express. */
+  denseLayers: number[]
+  /** Every Nth layer is MoE (Qwen's decoder_sparse_step). 1 = all of them. */
+  sparseStep: number
   experts: number
   topK: number
   /** Checkpoint ships a shared_expert (Qwen3.5/3.6 style). The engine STACKS
@@ -55,6 +61,9 @@ export interface DetectedGdn {
 /** Normalised view of config.json + the safetensors index. Numeric fields are
  *  null when the config did not yield them (unmapped family). */
 export interface DetectedModel {
+  /** Top-level config.json fields matching neither CONFIG_KEYS_READ nor
+   *  CONFIG_KEYS_IGNORED — see the `config` rule in checkModel. */
+  unknownConfigKeys?: string[]
   repo: string
   family: string              // config model_type ('' when unreadable)
   multimodal: boolean         // dims read from text_config / language_model root
@@ -81,6 +90,7 @@ export interface DetectedModel {
   tied: boolean
   qkNorm: boolean             // q_norm/k_norm records present in the index
   attnBias: boolean           // config attention_bias / any *.bias records
+  mlpBias?: boolean           // config mlp_bias — an additive bias on the FFN projections
   slidingWindow: boolean
   hiddenAct: string | null    // 'silu' expected
   quant: DetectedQuant | null // null = unquantised (f16/bf16) checkpoint
@@ -119,6 +129,39 @@ export interface CheckResult {
  *  expert stacks may be our own 3-bit conversion (int4_matmul.gen.ts q3). */
 const ROUTER_PATH = /(^|\.)mlp\.(gate|shared_expert_gate)$/
 const EXPERT_PATH = /(switch_mlp|shared_expert)\.(gate_proj|up_proj|down_proj)$/
+
+/**
+ * Config keys the detector READS, plus keys that carry no inference meaning.
+ * Anything in a config.json outside these two sets is machinery we would be
+ * silently dropping — see the `config` rule in checkModel for why that is
+ * refused rather than ignored.
+ */
+export const CONFIG_KEYS_READ: ReadonlySet<string> = new Set([
+  'model_type', 'text_config', 'hidden_size', 'num_hidden_layers', 'num_attention_heads',
+  'num_key_value_heads', 'head_dim', 'vocab_size', 'intermediate_size', 'moe_intermediate_size',
+  'num_experts', 'num_experts_per_tok', 'shared_expert_intermediate_size', 'norm_topk_prob',
+  'rope_theta', 'rope_scaling', 'rms_norm_eps', 'max_position_embeddings', 'tie_word_embeddings',
+  'attention_bias', 'sliding_window', 'use_sliding_window', 'hidden_act', 'hidden_activation',
+  'quantization', 'quantization_config', 'partial_rotary_factor', 'layer_types',
+  'linear_num_key_heads', 'linear_num_value_heads', 'linear_key_head_dim', 'linear_value_head_dim',
+  'linear_conv_kernel_dim', 'full_attention_interval',
+  'bos_token_id', 'eos_token_id',
+  // Read because their non-default values ARE architecture: mlp_bias adds an
+  // FFN bias epilogue, and decoder_sparse_step / mlp_only_layers say which
+  // layers are dense instead of MoE. max_window_layers only means anything
+  // when sliding_window is enabled, which is refused on its own.
+  'mlp_bias', 'decoder_sparse_step', 'mlp_only_layers', 'max_window_layers',
+])
+
+/** Bookkeeping, training-time, or serialization fields — no effect on a
+ *  forward pass, so ignoring them is safe rather than merely convenient. */
+export const CONFIG_KEYS_IGNORED: ReadonlySet<string> = new Set([
+  'architectures', 'auto_map', 'torch_dtype', 'dtype', 'transformers_version', 'use_cache',
+  'initializer_range', 'attention_dropout', 'hidden_dropout', 'pretraining_tp', 'pad_token_id',
+  'unk_token_id', '_name_or_path', 'output_router_logits', 'router_aux_loss_coef',
+  'aux_loss_alpha', 'seq_aux', 'output_attentions', 'output_hidden_states', 'return_dict',
+  'tokenizer_class', 'is_causal', 'attn_implementation', 'label2id', 'id2label',
+])
 
 export function checkModel(m: DetectedModel): CheckResult {
   const failures: Failure[] = []
@@ -170,6 +213,9 @@ export function checkModel(m: DetectedModel): CheckResult {
       fail('rope', 'rope_scaling llama3 without factor/low_freq_factor/high_freq_factor/original_max_position_embeddings',
         'the full parameter set in config.json — ropeInvFreqTable() cannot remap without it')
     }
+  }
+  if (m.mlpBias) {
+    fail('bias', 'FFN biases (mlp_bias)', 'the matmul kernels have no additive-bias epilogue')
   }
   if (m.attnBias) {
     fail('bias', 'linear-layer biases (attention_bias / *.bias records)',
@@ -227,8 +273,37 @@ export function checkModel(m: DetectedModel): CheckResult {
     }
   }
 
+  // ── UNRECOGNISED CONFIG ────────────────────────────────────
+  // The detector reads Qwen-shaped field names. A family that spells things
+  // differently does not fail — it produces a PLAUSIBLE WRONG picture, which
+  // is far worse. DeepSeek-V2-Lite reported as dense 16/16x128 MHA when it is
+  // actually MLA (kv_lora_rank 512) with a 64-expert MoE (n_routed_experts);
+  // fixing the two things this checker did flag would have turned it GREEN and
+  // it would have generated fluent nonsense.
+  //
+  // So an unknown key is a refusal. It over-refuses by design: adding a key to
+  // CONFIG_KEYS_IGNORED is a deliberate act that says "I read this and it does
+  // not change the forward pass", which is exactly the review that was missing.
+  if (m.unknownConfigKeys?.length) {
+    fail('config', `config.json carries ${m.unknownConfigKeys.length} field(s) this checker does not read: ${m.unknownConfigKeys.join(', ')}`,
+      'each one is either architecture we would silently ignore or a field to add to CONFIG_KEYS_IGNORED in constraints.ts after reading it')
+  }
+
   // ── MoE ────────────────────────────────────────────────────
   if (m.moe) {
+    // A stack that MIXES dense and MoE layers. ModelSpec carries one block kind
+    // for every layer, so a checkpoint whose layer 0 is dense would run the
+    // expert block over dense weights — fluent nonsense, no error. Both
+    // spellings are in the wild (Qwen's mlp_only_layers, DeepSeek's
+    // first_k_dense_replace).
+    if (m.moe.denseLayers.length) {
+      fail('moe', `layers [${m.moe.denseLayers.join(', ')}] run a dense FFN while the rest are MoE`,
+        'a per-layer block kind in ModelSpec, like layer_types for the hybrids')
+    }
+    if (m.moe.sparseStep !== 1) {
+      fail('moe', `only every ${m.moe.sparseStep}th layer is MoE (decoder_sparse_step)`,
+        'a per-layer block kind in ModelSpec, like layer_types for the hybrids')
+    }
     // No shared expert is fine: the loader stops appending index E, the router
     // drops to E rows, and moe_router_topk emits K slots instead of K+1. The
     // WIDTH check below still applies when there IS one, because that is what

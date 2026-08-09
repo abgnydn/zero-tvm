@@ -30,7 +30,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve, join } from 'node:path'
-import { checkModel, SUPPORT_MATRIX } from '../src/compiler/constraints.ts'
+import { checkModel, SUPPORT_MATRIX, CONFIG_KEYS_READ, CONFIG_KEYS_IGNORED } from '../src/compiler/constraints.ts'
 import { makeModelSpec, mlxParamNaming } from '../src/compiler/model-spec.ts'
 import { openMlxCheckpoint, planModel } from '../src/zero-tvm/weight-loader-mlx.ts'
 import { planBytes } from '../src/zero-tvm/mlx-weights.ts'
@@ -195,7 +195,10 @@ const detected = {
   slidingWindow: num(tc.sliding_window) !== null && tc.use_sliding_window !== false,
   hiddenAct: tc.hidden_act ?? tc.hidden_activation ?? null,
   quant: quantCfg ? { bits: quantCfg.bits ?? 0, groupSize: quantCfg.group_size ?? 0, overrides } : null,
+  mlpBias: tc.mlp_bias === true,
   moe: isMoe ? {
+    denseLayers: Array.isArray(tc.mlp_only_layers) ? tc.mlp_only_layers : [],
+    sparseStep: num(tc.decoder_sparse_step) ?? 1,
     experts: num(tc.num_experts),
     topK: num(tc.num_experts_per_tok) ?? 0,
     sharedExpert: records.some((r) => r.includes('.shared_expert.')),
@@ -221,6 +224,12 @@ const detected = {
   // Verbatim per-layer block claim — the checker refuses unknown kinds (LFM2's
   // 'conv' would otherwise detect as plain attention and fake-green).
   layerTypes: Array.isArray(tc.layer_types) ? tc.layer_types : null,
+  // Everything in the config this checker neither reads nor has explicitly
+  // dismissed. text_config's own keys count too — a multimodal text tower can
+  // carry architecture the root does not.
+  unknownConfigKeys: [...new Set([...Object.keys(cfg), ...Object.keys(cfg.text_config ?? {})])]
+    .filter((k) => !CONFIG_KEYS_READ.has(k) && !CONFIG_KEYS_IGNORED.has(k))
+    .sort(),
   hasIndex: !!checkpoint,
   tokenizer: tokKind,
   chatTemplate,
