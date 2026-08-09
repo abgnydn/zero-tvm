@@ -444,5 +444,5 @@ export const SUPPORT_MATRIX: MatrixRow[] = [
   { area: 'Embedding / head', supported: 'quantised embedding (symmetric or affine), tied or untied lm_head, vocab %4', not: 'unquantised embedding tables', needs: 'f16 gather path' },
   { area: 'Tokenizer', supported: 'SentencePiece (Phi-3), byte-level BPE (Qwen/Llama-style tokenizer.json)', not: 'tekken, WordPiece, custom pipelines', needs: 'new pipeline beside tokenizer-bpe.ts' },
   { area: 'Chat template', supported: 'Phi-3, ChatML (non-thinking), Llama-3 header template', not: 'Gemma turns, thinking-mode rendering', needs: 'renderer branch in model-select.ts' },
-  { area: 'Decoding', supported: 'greedy argmax, streaming, cross-turn prefix reuse', not: 'sampling (temperature/top-p), batch > 1', needs: 'sampling kernel after logits' },
+  { area: 'Decoding', supported: 'greedy argmax (default), seeded temperature / top-p / min-p sampling, streaming, cross-turn prefix reuse', not: 'top-k, repetition/presence penalties, beam search, batch > 1', needs: 'a rank selection pass beside sampler.wgsl\'s mass threshold; a per-sequence token-count buffer for penalties' },
 ]

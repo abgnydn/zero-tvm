@@ -55,6 +55,7 @@ function uniformBuf(device: GPUDevice, data: (number | ArrayBuffer)[]): GPUBuffe
 
 function u32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, v, true); return a }
 function i32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setInt32(0, v, true); return a }
+function f32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, v, true); return a }
 
 // Each entry is a whole buffer or a { buffer, offset, size } region view
 // (offset must respect minStorageBufferOffsetAlignment — the GDN packed-
@@ -226,6 +227,26 @@ export interface DecodeEngineOptions {
   int8KV?: boolean
   /** Model shape to build for. Default: PHI3. Must match the loaded weights. */
   spec?: ModelSpec
+  /**
+   * Turn on the sampler (src/compiler/shaders/sampler.wgsl). Absent, or
+   * `temperature <= 0`, leaves the argmax dispatch exactly as it was — greedy
+   * is not "the sampler at temperature 0" here, it is still argmax.wgsl,
+   * because every reference comparison in this repo pins greedy decoding and
+   * this path must not change at all. (The sampler's own greedy branch agrees
+   * with argmax token-for-token; tests/kernels/run.mjs checks that.)
+   *
+   * The draw is a pure function of (seed, position) — no GPU randomness — so a
+   * conversation replays identically, and a prefill replay or a prefix-reuse
+   * turn re-runs a position without changing its token.
+   */
+  sampling?: {
+    temperature: number
+    /** Nucleus mass. 1 (default) skips the threshold search entirely. */
+    topP?: number
+    /** Floor relative to the top token's probability. 0 (default) is off. */
+    minP?: number
+    seed?: number
+  }
   /**
    * Cross-turn prefix reuse in generatePipelined (default true; ?reuse=0 on
    * the chat page disables). The engine tracks the exact (position, token)
@@ -564,6 +585,25 @@ export function buildDecodeEngine(
   const normU  = uniformBuf(device, [u32(1)])
   const ffnU   = uniformBuf(device, [u32(S.ffn)])
   const argmaxU = uniformBuf(device, [u32(S.vocab)])
+  // Sampling. Temperature 0 resolves to null here, which is what keeps the
+  // greedy path dispatch-for-dispatch what it was.
+  const sampling = opts.sampling && opts.sampling.temperature > 0 ? opts.sampling : null
+  // Partitions in the sampler's reduce pass — a width, not a tuning knob: 64
+  // workgroups fill a GPU for every shipped vocabulary (32064 → 501 logits per
+  // partition, 248320 → 3880) and the select pass merges them serially.
+  const SAMPLE_PARTS = 64
+  const samplerU = sampling ? uniformBuf(device, [
+    u32(S.vocab), u32(SAMPLE_PARTS), f32(sampling.temperature),
+    f32(sampling.topP ?? 1), f32(sampling.minP ?? 0), u32(sampling.seed ?? 0), u32(0),
+  ]) : null
+  // (max, denominator) per partition — sampler.wgsl's PARTIAL_STRIDE.
+  const samplePartials = sampling ? makeBuf(device, SAMPLE_PARTS * 2 * 4, 'samplePartials') : null
+  if (sampling) {
+    console.log(
+      `[engine] sampling: temperature=${sampling.temperature} topP=${sampling.topP ?? 1} ` +
+      `minP=${sampling.minP ?? 0} seed=${sampling.seed ?? 0}`,
+    )
+  }
 
   // Hoisted per-layer uniforms — all fields are constant across tokens.
   // Unfused: rope + kv_append. Fused: qkv_fused (f16) or scratch + quantize (int8).
@@ -700,6 +740,7 @@ export function buildDecodeEngine(
   }
   const nnzPagesScratch = new Uint32Array(1)   // reused per token for writeBuffer
   const gdnPosScratch = new Int32Array(1)      // reused per token for gdnConvU.pos
+  const sampleCounterScratch = new Uint32Array(1)  // reused per token for samplerU.counter
 
   // Residual hand-off readback (pipeline stages that do not end the model).
   const residualReadBuf = L1 === S.layers ? null : device.createBuffer({
@@ -839,9 +880,17 @@ export function buildDecodeEngine(
   const bgLmHead = L1 !== S.layers ? null : bg(device, R.matmulF32, withBias(
     [B.logits, B.hidden1, weights.lmHeadScales, weights.lmHeadWeights, lmHdU],
     weights.lmHeadBiases, 'lm_head'))
-  const bgArgmax = L1 !== S.layers ? null : bg(device, R.argmax, [
+  const bgArgmax = L1 !== S.layers || sampling ? null : bg(device, R.argmax, [
     B.logits, B.tokenOut, argmaxU,
   ])
+  // Sampler bind groups. Both passes bind the same four buffers, which is why
+  // sample_reduce also writes `result` (see the sentinel note in sampler.wgsl)
+  // — a binding a pass never touches would be dropped from its layout:'auto'
+  // layout and the shared entry list would then fail validation on one of them.
+  const bgSampleReduce = sampling && L1 === S.layers
+    ? bg(device, P.sampleReduce, [B.logits, samplePartials!, B.tokenOut, samplerU!]) : null
+  const bgSampleSelect = sampling && L1 === S.layers
+    ? bg(device, P.sampleSelect, [B.logits, samplePartials!, B.tokenOut, samplerU!]) : null
   // Split-K combine reads the shared partials scratch and writes attnOut —
   // identical for every layer, so one bind group serves every layer.
   const bgAttnCombine = splitK
@@ -1277,8 +1326,17 @@ export function buildDecodeEngine(
     } else {
       dispatch(enc, R.matmulF32, bgLmHead!, lmWGs, 1, 1, 'lmHead')
     }
-    // --- ARGMAX: B.logits → B.tokenOut ---
-    dispatch(enc, R.argmax, bgArgmax!, 1, 1, 1, 'argmax')
+    // --- ARGMAX (or SAMPLER): B.logits → B.tokenOut ---
+    // Two dispatches when sampling, because the vocabulary needs a grid-wide
+    // reduction before anything can be thresholded — see sampler.wgsl. This is
+    // the only place a token is produced, so pipelineStep's last stage samples
+    // here too, and the on-GPU tokenOut → inputIds chain is unchanged.
+    if (bgSampleSelect) {
+      dispatch(enc, P.sampleReduce, bgSampleReduce!, SAMPLE_PARTS, 1, 1, 'sampleReduce')
+      dispatch(enc, P.sampleSelect, bgSampleSelect, 1, 1, 1, 'sampleSelect')
+    } else {
+      dispatch(enc, R.argmax, bgArgmax!, 1, 1, 1, 'argmax')
+    }
   }
 
   /**
@@ -1306,6 +1364,14 @@ export function buildDecodeEngine(
     if (gdnConvU) {
       gdnPosScratch[0] = position
       device.queue.writeBuffer(gdnConvU, 0, gdnPosScratch)
+    }
+    // The sampler's counter IS the position (byte offset 24 of its Params).
+    // Using the position rather than a running step count is what makes a
+    // re-run of a position — a prefill replay, a prefix-reuse turn,
+    // debugCompareReuse — draw the same token instead of a fresh one.
+    if (samplerU) {
+      sampleCounterScratch[0] = position
+      device.queue.writeBuffer(samplerU, 24, sampleCounterScratch)
     }
   }
 

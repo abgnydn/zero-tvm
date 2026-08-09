@@ -58,6 +58,7 @@ import add3NormSrc from './shaders/add3_norm.wgsl?raw'
 import embeddingSrc from './shaders/embedding.wgsl?raw'
 import argmaxSrc from './shaders/argmax.wgsl?raw'
 import argmaxSgSrc from './shaders/argmax_sg.wgsl?raw'
+import samplerSrc from './shaders/sampler.wgsl?raw'
 
 // ============================================================
 // Constants
@@ -146,6 +147,12 @@ export interface Pipelines {
   lmHead: GPUComputePipeline          // int4 matmul f32 output
   argmax: GPUComputePipeline
   argmaxSg: GPUComputePipeline | null // subgroup variant; null if `subgroups` feature absent
+  // Temperature / top-p / min-p sampler — dispatched INSTEAD of argmax when
+  // the engine is built with `sampling`. Two passes: per-partition
+  // online-softmax partials, then one workgroup that merges, thresholds and
+  // draws. Compiled always; a greedy engine simply never dispatches it.
+  sampleReduce: GPUComputePipeline
+  sampleSelect: GPUComputePipeline
   // ── MLX affine dense family (Qwen3.6). Same bindings as the symmetric
   // siblings plus a per-group bias at @binding(5); SCALES_PER_ROW is K/64.
   int4MatmulAffine: GPUComputePipeline
@@ -288,6 +295,8 @@ export function compile(
     lmHead: createPipeline(device, int4MatmulWGSL({ outF32: true }), 'int4_matmul_f32'),
     argmax: createPipeline(device, argmaxSrc, 'argmax_kernel'),
     argmaxSg: subgroups ? createPipeline(device, argmaxSgSrc, 'argmax_sg') : null,
+    sampleReduce: createPipeline(device, samplerSrc, 'sample_reduce'),
+    sampleSelect: createPipeline(device, samplerSrc, 'sample_select'),
     // Entry names come from int4MatmulEntry(opts), not literals: these differ
     // from their symmetric siblings by one suffix, and compile() runs on EVERY
     // model's boot path, so a typo here breaks Phi-3 too.

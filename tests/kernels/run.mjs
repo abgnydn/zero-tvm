@@ -367,6 +367,156 @@ function makeArgmaxTest(file, entry) {
   }
 }
 
+// ── sampler.wgsl : temperature / top-p / min-p over the logits ───────────────
+// The kernel answers with a token INDEX, so this compares EXACTLY — no
+// tolerance to hide behind. That only holds because the fixture is PEAKED:
+// WGSL's exp() is allowed ~3 ULP and the kernel accumulates in f32, so the two
+// arithmetics can disagree by ~1e-5 of the distribution's mass, and a flat
+// fixture puts every draw within that of a CDF boundary. Uniform logits are
+// exactly that trap — their top order statistics differ by ~6e-4, so the
+// nucleus is thousands of near-identical tokens. iid Gumbel logits give the
+// ~0.7 top probability a real LM head produces; every draw the fixtures below
+// take sits more than 1e-3 of the mass from the nearest boundary.
+const SAMPLE_PARTS = 64   // must match engine-core.ts's SAMPLE_PARTS
+
+// lowbias32, the hash sampler.wgsl draws with, in u32 JS arithmetic.
+function hash32(x) {
+  let h = x >>> 0
+  h = (h ^ (h >>> 16)) >>> 0
+  h = Math.imul(h, 0x7feb352d) >>> 0
+  h = (h ^ (h >>> 15)) >>> 0
+  h = Math.imul(h, 0x846ca68b) >>> 0
+  h = (h ^ (h >>> 16)) >>> 0
+  return h
+}
+
+// Greedy is NOT "the first maximiser": argmax.wgsl's tree reduction does not
+// preserve index order (after the first round slot t may hold index t+128, and
+// keeping the lower slot then keeps the later index), so on tied logits the
+// answer is a property of the exact partitioning. sample_select runs that loop
+// verbatim, and the reference has to say so — otherwise the tie fixture below
+// would be asserting the wrong contract.
+function argmaxRef(logits) {
+  const V = logits.length
+  const chunk = Math.ceil(V / 256)
+  const val = new Float32Array(256), idx = new Int32Array(256)
+  for (let t = 0; t < 256; t++) {
+    let bv = Math.fround(-1e30), bi = 0
+    for (let i = t * chunk, e = Math.min(t * chunk + chunk, V); i < e; i++) {
+      if (logits[i] > bv) { bv = logits[i]; bi = i }
+    }
+    val[t] = bv; idx[t] = bi
+  }
+  for (let s = 128; s > 0; s >>= 1) {
+    for (let t = 0; t < s; t++) if (val[t + s] > val[t]) { val[t] = val[t + s]; idx[t] = idx[t + s] }
+  }
+  return idx[0]
+}
+
+// The sampling math itself, written the obvious way: softmax the scaled
+// logits, SORT for the nucleus cut (the kernel bisects for the same cutoff
+// without sorting), intersect with min-p, walk the CDF. Filters are both
+// computed against the full distribution and intersected — see the note in
+// sampler.wgsl about why applying one to the other's output is a different
+// sampler.
+function samplerRef(logits, { temperature, topP = 1, minP = 0, seed = 0, counter = 0 }) {
+  const V = logits.length
+  const best = argmaxRef(logits)
+  if (temperature <= 0) return best
+
+  const invT = 1 / temperature
+  const M = logits[best] * invT
+  const w = new Float64Array(V)
+  let D = 0
+  for (let i = 0; i < V; i++) { w[i] = Math.exp(logits[i] * invT - M); D += w[i] }
+
+  // min-p is a threshold on w directly: p_i >= min_p * p_max and p_max = 1/D.
+  let tau = minP
+  if (topP < 1) {
+    const sorted = Array.from(w).sort((a, b) => b - a)
+    const want = topP * D
+    let cum = 0, k = 0
+    while (k < V) { cum += sorted[k]; k++; if (cum >= want) break }
+    tau = Math.max(tau, sorted[k - 1])
+  }
+
+  let kept = 0
+  for (let i = 0; i < V; i++) if (w[i] >= tau) kept += w[i]
+  const target = ((hash32(seed ^ hash32(counter)) >>> 8) / 16777216) * kept
+  let run = 0, picked = best
+  for (let i = 0; i < V; i++) {
+    if (w[i] >= tau) { run += w[i]; picked = i; if (run > target) break }
+  }
+  return picked
+}
+
+// iid Gumbel, the default fixture (see the note above).
+const gumbelLogits = (V) => {
+  const r = rng(31)
+  return Float32Array.from(arr(V, () => 2 * -Math.log(-Math.log(r()))))
+}
+
+function makeSamplerTest(V, cfg, draws, vsArgmax = false, makeLogits = gumbelLogits) {
+  return async function samplerTest(device) {
+    const logits = makeLogits(V)
+    const ref = arr(draws, (_, c) => samplerRef(logits, { ...cfg, counter: c }))
+
+    const reduce = pipelineFor(device, wgsl('sampler.wgsl'), 'sample_reduce')
+    const select = pipelineFor(device, wgsl('sampler.wgsl'), 'sample_select')
+    const logitBuf = buffer(device, logits, BU.STORAGE | BU.COPY_DST)
+    const partials = device.createBuffer({ size: SAMPLE_PARTS * 2 * 4, usage: BU.STORAGE })
+    // One output + one uniform per draw so every draw rides in ONE submit —
+    // this harness pays ~100 ms per submit whatever is in it (see gpu.mjs).
+    const outs = arr(draws, () => device.createBuffer({ size: 4, usage: BU.STORAGE | BU.COPY_SRC }))
+    const reads = arr(draws, () => device.createBuffer({ size: 4, usage: BU.COPY_DST | BU.MAP_READ }))
+
+    const enc = device.createCommandEncoder()
+    for (let c = 0; c < draws; c++) {
+      const params = podBuffer(device, [
+        { u32: V }, { u32: SAMPLE_PARTS }, { f32: cfg.temperature },
+        { f32: cfg.topP ?? 1 }, { f32: cfg.minP ?? 0 }, { u32: cfg.seed }, { u32: c },
+      ])
+      for (const [pipe, wgs] of [[reduce, SAMPLE_PARTS], [select, 1]]) {
+        const pass = enc.beginComputePass()
+        pass.setPipeline(pipe)
+        pass.setBindGroup(0, device.createBindGroup({
+          layout: pipe.getBindGroupLayout(0),
+          entries: [logitBuf, partials, outs[c], params]
+            .map((b, i) => ({ binding: i, resource: { buffer: b } })),
+        }))
+        pass.dispatchWorkgroups(wgs, 1, 1)
+        pass.end()
+      }
+      enc.copyBufferToBuffer(outs[c], 0, reads[c], 0, 4)
+    }
+    device.queue.submit([enc.finish()])
+    const got = []
+    for (const b of reads) {
+      await b.mapAsync(MM.READ)
+      got.push(new Int32Array(b.getMappedRange())[0])
+      b.unmap()
+    }
+
+    let pass = got.every((g, i) => g === ref[i])
+    let detail = `gpu=[${got}] ref=[${ref}]`
+
+    // Temperature 0 must be THE argmax path, not merely an argmax: every
+    // reference comparison in this repo pins greedy decoding, so a tie broken
+    // the other way would diverge silently from the harness it is checked with.
+    if (vsArgmax) {
+      const pipe = pipelineFor(device, wgsl('argmax.wgsl'), 'argmax_kernel')
+      const result = device.createBuffer({ size: 4, usage: BU.STORAGE | BU.COPY_SRC })
+      const bytes = await runCompute(device, pipe, [
+        logitBuf, result, buffer(device, new Uint32Array([V]), BU.UNIFORM | BU.COPY_DST),
+      ], [1], 1, 4)
+      const am = new Int32Array(bytes)[0]
+      detail += ` argmax=${am}`
+      pass = pass && got.every((g) => g === am)
+    }
+    return { name: 'sampler', pass, detail }
+  }
+}
+
 // ── embedding.wgsl : out[i] = dequant(embd_weight[token_id, i]) ──────────────
 function testEmbedding(device) {
   const r = rng(4)
@@ -1028,6 +1178,31 @@ const TESTS = [
   },
   { label: 'rms_norm', fn: testRmsNorm },
   { label: 'argmax', fn: makeArgmaxTest('argmax.wgsl', 'argmax_kernel') },
+  // Sampler fixtures. The two degenerate settings must land on the argmax
+  // token exactly: temperature 0 short-circuits, and top_p 0 drives the
+  // bisection to the top of its bracket so the nucleus is the peak alone.
+  { label: 'sampler_greedy', fn: makeSamplerTest(PHI3.vocab, { temperature: 0, seed: 7 }, 1, true) },
+  // Two logits tied at the maximum, placed so argmax.wgsl does NOT return the
+  // first of them (chunk = ceil(32064/256) = 126; slot 0 carries 126*128 out
+  // of the first reduction round and keeps it against slot 64's 126*64).
+  // Anything that merely finds "an" argmax picks 8064 here.
+  {
+    label: 'sampler_tie',
+    fn: makeSamplerTest(PHI3.vocab, { temperature: 0, seed: 7 }, 1, true, (V) => {
+      const l = new Float32Array(V).fill(-1)
+      l[126 * 64] = 9
+      l[126 * 128] = 9
+      return l
+    }),
+  },
+  { label: 'sampler_topp0', fn: makeSamplerTest(PHI3.vocab, { temperature: 1.0, topP: 0, seed: 7 }, 2, true) },
+  { label: 'sampler_temp', fn: makeSamplerTest(PHI3.vocab, { temperature: 1.5, seed: 7 }, 6) },
+  { label: 'sampler_topp', fn: makeSamplerTest(PHI3.vocab, { temperature: 1.5, topP: 0.9, seed: 7 }, 6) },
+  { label: 'sampler_minp', fn: makeSamplerTest(PHI3.vocab, { temperature: 1.5, minP: 0.02, seed: 7 }, 6) },
+  { label: 'sampler_both', fn: makeSamplerTest(PHI3.vocab, { temperature: 1.5, topP: 0.95, minP: 0.001, seed: 7 }, 6) },
+  // Qwen3.5's 248320 logits: 64 partitions of 3880, and a nucleus (1735
+  // tokens) that no workgroup could have held.
+  { label: 'sampler_wide', fn: makeSamplerTest(248320, { temperature: 1.5, topP: 0.99, seed: 7 }, 6) },
   { label: 'embedding', fn: testEmbedding },
   { label: 'rope', fn: testRope },
   { label: 'add_norm', fn: testAddNorm },

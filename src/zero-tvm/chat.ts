@@ -225,6 +225,19 @@ async function main(): Promise<void> {
       // Prefill A/B flags: ?reuse=0 disables cross-turn prefix reuse,
       // ?chunk=0 disables chunked GDN prefill (hybrid specs). Both default on.
       const q = new URLSearchParams(location.search)
+      // Sampling: ?temp=0.8&topp=0.95&minp=0.02&seed=1234. Absent or ?temp=0
+      // is greedy argmax, which is what the whole page has always done and
+      // what every reference comparison assumes.
+      const numFlag = (k: string, dflt: number): number => {
+        const raw = q.get(k)
+        if (raw === null) return dflt
+        const v = Number(raw)
+        return Number.isFinite(v) ? v : dflt
+      }
+      const temperature = numFlag('temp', 0)
+      if (temperature > 0) {
+        log(`Sampling: temperature ${temperature}, top-p ${numFlag('topp', 1)}, min-p ${numFlag('minp', 0)}`)
+      }
       return buildDecodeEngine(device, weights, kv, {
         variants: flags,
         fused,
@@ -232,6 +245,14 @@ async function main(): Promise<void> {
         spec,
         prefixReuse: q.get('reuse') !== '0',
         chunkedPrefill: q.get('chunk') !== '0',
+        sampling: temperature > 0
+          ? {
+              temperature,
+              topP: numFlag('topp', 1),
+              minP: numFlag('minp', 0),
+              seed: numFlag('seed', 0),
+            }
+          : undefined,
       })
     },
     // Pipeline warmup: one throwaway single-token generation behind the

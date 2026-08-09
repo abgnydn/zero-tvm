@@ -20,7 +20,7 @@ same file as this table's source, so they cannot drift far.
 | Embedding / head | quantised embedding (symmetric or affine), tied or untied lm_head, vocab %4 | unquantised embedding tables | f16 gather path |
 | Tokenizer | SentencePiece (Phi-3), byte-level BPE (Qwen/Llama-style tokenizer.json) | tekken, WordPiece, custom pipelines | new pipeline beside tokenizer-bpe.ts |
 | Chat template | Phi-3, ChatML (non-thinking), Llama-3 header template | Gemma turns, thinking-mode rendering | renderer branch in model-select.ts |
-| Decoding | greedy argmax, streaming, cross-turn prefix reuse | sampling (temperature/top-p), batch > 1 | sampling kernel after logits |
+| Decoding | greedy argmax (default), seeded temperature / top-p / min-p sampling, streaming, cross-turn prefix reuse | top-k, repetition/presence penalties, beam search, batch > 1 | a rank selection pass beside sampler.wgsl's mass threshold; a per-sequence token-count buffer for penalties |
 
 Dimension rules (all enforced by the checker): heads divisible by kvHeads;
 headDim %32 and ≤256; d, qkvDim, kvDim %256; every matmul K (d, qDim, ffn,
