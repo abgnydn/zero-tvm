@@ -18,6 +18,7 @@ import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
 import { int4MatmulWGSL, int4MatmulEntry } from './shaders/int4_matmul.gen'
 import embeddingAffineSrc from './shaders/embedding_affine.wgsl?raw'
 import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
+import moeRouterLogitsF16Src from './shaders/moe_router_logits_f16.wgsl?raw'
 import moeRouterTopkSrc from './shaders/moe_router_topk.wgsl?raw'
 import moeCombineSrc from './shaders/moe_combine.wgsl?raw'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
@@ -158,6 +159,9 @@ export interface Pipelines {
   moeRouterLogits: GPUComputePipeline
   /** 4-bit sibling — see the entry-point note in moe_router_logits.wgsl. */
   moeRouterLogitsQ4: GPUComputePipeline
+  /** Unquantized router (DeepSeek). Its own module: no scales/biases bindings,
+   *  so its bind group is four buffers rather than six. */
+  moeRouterLogitsF16: GPUComputePipeline
   /** null without subgroups — moe_router_topk.wgsl declares `enable subgroups`,
    *  so the shader module itself fails to create. There is no scalar fallback:
    *  the engine throws for a MoE spec without subgroups rather than silently
@@ -295,6 +299,7 @@ export function compile(
     int4MatmulF32TiledAffine: subgroups ? mm({ outF32: true, subgroups: true, rowsPerWG: 4, affine: true }) : null,
     moeRouterLogits: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits'),
     moeRouterLogitsQ4: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits_q4'),
+    moeRouterLogitsF16: createPipeline(device, moeRouterLogitsF16Src, 'moe_router_logits_f16'),
     moeRouterTopk: subgroups ? createPipeline(device, moeRouterTopkSrc, 'moe_router_topk') : null,
     moeMatmul: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4 }) : null,
     moeMatmulQ3: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: true }) : null,

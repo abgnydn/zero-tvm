@@ -533,7 +533,10 @@ export function buildDecodeEngine(
   // 4-bit vs 8-bit router: two entry points, chosen once. Picking the wrong one
   // is silent — the 8-bit reader walks a 4-bit row at twice the stride and the
   // model emits noise — so this is resolved from the spec, never guessed.
-  const moeRouterPipe = S.moe && (S.moe.routerBits ?? 8) === 4 ? P.moeRouterLogitsQ4 : P.moeRouterLogits
+  const routerBits = S.moe?.routerBits ?? 8
+  const moeRouterPipe = routerBits === 16 ? P.moeRouterLogitsF16
+    : routerBits === 4 ? P.moeRouterLogitsQ4
+    : P.moeRouterLogits
   const moeRouterU = S.moe ? uniformBuf(device, [u32(S.d), u32(MOE_ROUTER_ROWS)]) : null
   const moeTopkU = S.moe
     ? uniformBuf(device, [u32(S.moe.experts), u32(S.moe.topK), u32(S.moe.normTopkProb ? 1 : 0),
@@ -1036,8 +1039,12 @@ export function buildDecodeEngine(
     const m = lw.moe
     const moeBG = S.moe && m
       ? {
-          routerLogits: bg(device, moeRouterPipe,
-            [B.routerLogits!, B.hidden1, m.routerWeights, m.routerScales, m.routerBiases, moeRouterU!]),
+          // An unquantized router has no scales or biases to bind, and its
+          // module declares neither — passing six buffers to a four-binding
+          // layout is rejected outright.
+          routerLogits: bg(device, moeRouterPipe, routerBits === 16
+            ? [B.routerLogits!, B.hidden1, m.routerWeights, moeRouterU!]
+            : [B.routerLogits!, B.hidden1, m.routerWeights, m.routerScales, m.routerBiases, moeRouterU!]),
           routerTopk: bg(device, P.moeRouterTopk!, [B.moeIds!, B.moeScores!, B.routerLogits!, moeTopkU!]),
           // gate and up write interleaved halves of one [slot][2*ffn] buffer:
           // same kernel, `up` bound ffn*2 bytes in, which is the layout silu_mul

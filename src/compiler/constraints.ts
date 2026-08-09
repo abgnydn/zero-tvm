@@ -358,9 +358,13 @@ export function checkModel(m: DetectedModel): CheckResult {
       fail('moe', `router scoring '${m.moe.scoringFunc}' (not softmax)`,
         'moe_router_topk.wgsl softmaxes the routed logits — a scoring branch there')
     }
+    // The KERNEL for an unquantized router exists (moe_router_logits_f16.wgsl)
+    // and the engine binds it. What does not exist is a loader plan for a
+    // router tensor with no scales beside it — planLayer emits a quantized
+    // trio for every weight — so this stays red, on the narrower ground.
     if (m.moe.routerQuantized === false) {
       fail('moe', 'the router is not quantized (mlp.gate has no scales/biases)',
-        'moe_router_logits.wgsl unpacks 4- or 8-bit affine rows; an f16 router needs a plain matvec entry point')
+        'a loader plan for a bare f16 router — the kernel (moe_router_logits_f16) and the engine binding are in place')
     }
     if (m.moe.sparseStep !== 1) {
       fail('moe', `only every ${m.moe.sparseStep}th layer is MoE (decoder_sparse_step)`,
@@ -377,9 +381,9 @@ export function checkModel(m: DetectedModel): CheckResult {
     // The router width decides which moe_router_logits entry point runs. Only
     // 4 and 8 have one; anything else would silently read the row at the wrong
     // stride, which is noise, not an error.
-    if (m.moe.routerBits !== 4 && m.moe.routerBits !== 8) {
+    if (m.moe.routerBits !== 4 && m.moe.routerBits !== 8 && m.moe.routerBits !== 16) {
       fail('moe', `router is ${m.moe.routerBits}-bit`,
-        'moe_router_logits.wgsl has a 4-bit and an 8-bit entry point and no other unpack width')
+        'the router kernels cover 4-bit, 8-bit and unquantized f16 rows, and no other width')
     }
     if (m.moe.experts > 256) fail('moe', `${m.moe.experts} experts > 256`,
       'moe_router_topk.wgsl holds expert scores in 32 lanes × 8 registers')

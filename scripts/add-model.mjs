@@ -259,8 +259,12 @@ const detected = {
     // OVERRIDE; with none it sits at the model's base bits. This is not
     // cosmetic — the two widths need different unpacks and the wrong one is
     // silent (Qwen3-30B-A3B: 4-bit router, read as 8-bit, cosine 0.087).
-    routerBits: Object.entries(overrides).find(([p]) => /(^|\.)mlp\.(gate|shared_expert_gate)$/.test(p))?.[1]?.bits
-      ?? quantCfg?.bits ?? 4,
+    // A gate with no .scales beside it was never quantized — 16 selects the
+    // f16 router kernel, which is a different bind group, not just a width.
+    routerBits: records.some((r) => /\.mlp\.gate\.weight$/.test(r)) && !records.some((r) => /\.mlp\.gate\.scales$/.test(r))
+      ? 16
+      : Object.entries(overrides).find(([p]) => /(^|\.)mlp\.(gate|shared_expert_gate)$/.test(p))?.[1]?.bits
+        ?? quantCfg?.bits ?? 4,
   } : null,
   gdn: isGdn ? {
     kHeads: num(tc.linear_num_key_heads),

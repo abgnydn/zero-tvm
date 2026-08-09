@@ -197,7 +197,10 @@ function testRmsNorm(device) {
 // with i running over group g's 64 values, q unsigned (MLX affine stores
 // w = s*q + b directly, no -7 offset).
 function makeRouterLogitsTest(bits) {
-  const entry = bits === 4 ? 'moe_router_logits_q4' : 'moe_router_logits'
+  // 16 = the checkpoint left the router in f16 (DeepSeek). Different file,
+  // because its bind group has no scales or biases in it.
+  const file = bits === 16 ? 'moe_router_logits_f16.wgsl' : 'moe_router_logits.wgsl'
+  const entry = bits === 16 ? 'moe_router_logits_f16' : bits === 4 ? 'moe_router_logits_q4' : 'moe_router_logits'
   return function routerLogitsTest(device) {
     const r = rng(11 + bits)
     const D = 2048            // Qwen3-30B-A3B / Qwen3.6 hidden size
@@ -211,7 +214,15 @@ function makeRouterLogitsTest(bits) {
     const scales = arr(rows * GPR, () => toF16(r() * 0.02 + 0.005))
     const biases = arr(rows * GPR, () => toF16(r() * 0.2 - 0.1))
 
-    const ref = arr(rows, (_, e) => {
+    // f16 path: plain [rows, D] weights, no groups at all.
+    const w16 = bits === 16 ? arr(rows * D, () => toF16(r() * 0.1 - 0.05)) : null
+    const ref = bits === 16
+      ? arr(rows, (_, e) => {
+        let acc = 0
+        for (let i = 0; i < D; i++) acc += x[i] * w16[e * D + i]
+        return acc
+      })
+      : arr(rows, (_, e) => {
       let acc = 0
       for (let g = 0; g < GPR; g++) {
         let dot = 0, xs = 0
@@ -234,16 +245,21 @@ function makeRouterLogitsTest(bits) {
       words[w] = v >>> 0
     }
 
-    const pipe = pipelineFor(device, wgsl('moe_router_logits.wgsl'), entry)
+    const pipe = pipelineFor(device, wgsl(file), entry)
     const out = device.createBuffer({ size: rows * 4, usage: BU.STORAGE | BU.COPY_SRC })
-    const buffers = [
-      out,
-      buffer(device, f16Array(x), BU.STORAGE | BU.COPY_DST),
-      buffer(device, words, BU.STORAGE | BU.COPY_DST),
-      buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
-      buffer(device, f16Array(biases), BU.STORAGE | BU.COPY_DST),
-      buffer(device, new Uint32Array([D, rows]), BU.UNIFORM | BU.COPY_DST),
-    ]
+    // The f16 router carries its weights directly, so the reference below is
+    // the same formula with scale 1 and bias 0 — see `w16`.
+    const buffers = bits === 16
+      ? [out,
+         buffer(device, f16Array(x), BU.STORAGE | BU.COPY_DST),
+         buffer(device, f16Array(w16), BU.STORAGE | BU.COPY_DST),
+         buffer(device, new Uint32Array([D, rows]), BU.UNIFORM | BU.COPY_DST)]
+      : [out,
+         buffer(device, f16Array(x), BU.STORAGE | BU.COPY_DST),
+         buffer(device, words, BU.STORAGE | BU.COPY_DST),
+         buffer(device, f16Array(scales), BU.STORAGE | BU.COPY_DST),
+         buffer(device, f16Array(biases), BU.STORAGE | BU.COPY_DST),
+         buffer(device, new Uint32Array([D, rows]), BU.UNIFORM | BU.COPY_DST)]
     // One workgroup per row, exactly as the engine dispatches it.
     return runCompute(device, pipe, buffers, [rows], 0, rows * 4).then((bytes) => {
       const got = Array.from(new Float32Array(bytes))
@@ -996,6 +1012,7 @@ const TESTS = [
   // Both router widths against the same reference — the wrong one is silent.
   { label: 'moe_router_logits', fn: makeRouterLogitsTest(8) },
   { label: 'moe_router_logits_q4', fn: makeRouterLogitsTest(4) },
+  { label: 'moe_router_logits_f16', fn: makeRouterLogitsTest(16) },
   // Qwen3.6 shape (256 experts, top-8, WITH a shared expert) and Qwen3-30B-A3B
   // shape (128 experts, top-8, WITHOUT one) — the two sides of the flag.
   { label: 'moe_topk_shared', fn: makeMoeTopkTest(256, 8, true, true), minSg: 32 },

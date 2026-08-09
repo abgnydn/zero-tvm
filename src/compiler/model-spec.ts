@@ -107,9 +107,11 @@ export interface MoeDims {
    * leaves it at the model's base 4 bits. The two need different unpacks —
    * moe_router_logits.wgsl carries an entry point for each — and getting it
    * wrong produces noise rather than an error, because the 8-bit reader walks
-   * a 4-bit row at twice the stride. Default 8 (what shipped first).
+   * a 4-bit row at twice the stride. 16 means the quantizer skipped the tensor
+   * entirely (DeepSeek) — a different kernel again, and a different bind group,
+   * since there are no scales to bind. Default 8 (what shipped first).
    */
-  routerBits?: 4 | 8
+  routerBits?: 4 | 8 | 16
   /** Expert-stack precision. 3 selects the q3 bitstream kernels and a
    *  checkpoint whose switch_mlp/shared_expert were requantised to 3 bits
    *  (scripts/convert-q3-experts.py). Default 4. */
