@@ -30,6 +30,11 @@ export interface DetectedQuant {
 }
 
 export interface DetectedMoe {
+  /** config scoring_func — 'softmax' is the only one the top-k kernel does. */
+  scoringFunc?: string | null
+  /** False when mlp.gate ships unquantized (DeepSeek); the router kernels read
+   *  affine rows, so a full-precision router is a third unpack, not a bonus. */
+  routerQuantized?: boolean
   /** Layers running a DENSE FFN instead of the expert block. A non-empty list
    *  (Qwen's mlp_only_layers, DeepSeek's first_k_dense_replace) means the stack
    *  is not uniform, which ModelSpec has no way to express. */
@@ -60,7 +65,21 @@ export interface DetectedGdn {
 
 /** Normalised view of config.json + the safetensors index. Numeric fields are
  *  null when the config did not yield them (unmapped family). */
+/** Multi-head Latent Attention (DeepSeek V2/V3/V4). K and V are not cached per
+ *  head at all: one `kvLoraRank`-wide latent per token, plus a single
+ *  `qkRopeHeadDim` RoPE key shared across heads, and kv_b_proj up-projects on
+ *  demand. The reason to care is the cache — V2-Lite stores 576 values a token
+ *  where its 16x128 MHA equivalent would store 4096. */
+export interface DetectedMla {
+  kvLoraRank: number
+  qLoraRank: number | null    // null = q is one plain projection (V2-Lite)
+  qkNopeHeadDim: number
+  qkRopeHeadDim: number
+  vHeadDim: number
+}
+
 export interface DetectedModel {
+  mla?: DetectedMla | null
   /** Top-level config.json fields matching neither CONFIG_KEYS_READ nor
    *  CONFIG_KEYS_IGNORED — see the `config` rule in checkModel. */
   unknownConfigKeys?: string[]
@@ -151,6 +170,11 @@ export const CONFIG_KEYS_READ: ReadonlySet<string> = new Set([
   // layers are dense instead of MoE. max_window_layers only means anything
   // when sliding_window is enabled, which is refused on its own.
   'mlp_bias', 'decoder_sparse_step', 'mlp_only_layers', 'max_window_layers',
+  // DeepSeek's spellings. Read so the family is DESCRIBED rather than guessed
+  // at — the rules below refuse what we cannot run, which is most of it.
+  'kv_lora_rank', 'q_lora_rank', 'qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
+  'n_routed_experts', 'n_shared_experts', 'first_k_dense_replace', 'moe_layer_freq',
+  'scoring_func', 'topk_method', 'routed_scaling_factor', 'n_group', 'topk_group',
 ])
 
 /** Bookkeeping, training-time, or serialization fields — no effect on a
@@ -289,6 +313,16 @@ export function checkModel(m: DetectedModel): CheckResult {
       'each one is either architecture we would silently ignore or a field to add to CONFIG_KEYS_IGNORED in constraints.ts after reading it')
   }
 
+  // ── MLA ────────────────────────────────────────────────────
+  if (m.mla) {
+    const cached = m.mla.kvLoraRank + m.mla.qkRopeHeadDim
+    const mha = m.kvHeads !== null && m.headDim !== null ? m.kvHeads * m.headDim * 2 : 0
+    fail('attention', `multi-head latent attention (kv_lora_rank ${m.mla.kvLoraRank}`
+      + `, qk ${m.mla.qkNopeHeadDim}+${m.mla.qkRopeHeadDim}, v ${m.mla.vHeadDim})`,
+      `a latent KV cache of ${cached} values per token${mha ? ` instead of ${mha}` : ''} and an attention kernel that scores `
+      + 'against it: q_nope through kv_b_proj into latent space, one shared RoPE key, output re-expanded through kv_b_proj\'s V half')
+  }
+
   // ── MoE ────────────────────────────────────────────────────
   if (m.moe) {
     // A stack that MIXES dense and MoE layers. ModelSpec carries one block kind
@@ -299,6 +333,15 @@ export function checkModel(m: DetectedModel): CheckResult {
     if (m.moe.denseLayers.length) {
       fail('moe', `layers [${m.moe.denseLayers.join(', ')}] run a dense FFN while the rest are MoE`,
         'a per-layer block kind in ModelSpec, like layer_types for the hybrids')
+    }
+    // Routing that is not plain softmax + top-k.
+    if (m.moe.scoringFunc && m.moe.scoringFunc !== 'softmax') {
+      fail('moe', `router scoring '${m.moe.scoringFunc}' (not softmax)`,
+        'moe_router_topk.wgsl softmaxes the routed logits — a scoring branch there')
+    }
+    if (m.moe.routerQuantized === false) {
+      fail('moe', 'the router is not quantized (mlp.gate has no scales/biases)',
+        'moe_router_logits.wgsl unpacks 4- or 8-bit affine rows; an f16 router needs a plain matvec entry point')
     }
     if (m.moe.sparseStep !== 1) {
       fail('moe', `only every ${m.moe.sparseStep}th layer is MoE (decoder_sparse_step)`,

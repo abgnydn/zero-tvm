@@ -71,9 +71,19 @@ if (!repo) {
 const localDir = flags['local-dir'] ? resolve(flags['local-dir']) : null
 const base = `https://huggingface.co/${repo}/resolve/main`
 
+/** Thrown for a file the repo genuinely does not have — the only failure the
+ *  probe is allowed to interpret. Everything else (429, 503, a dropped
+ *  connection) means WE failed, not the model, and must not become evidence. */
+class Missing extends Error {}
+
 async function whole(file) {
-  if (localDir) return new Uint8Array(readFileSync(join(localDir, file)))
-  const res = await fetch(`${base}/${file}`)
+  if (localDir) {
+    try { return new Uint8Array(readFileSync(join(localDir, file))) }
+    catch (e) { throw e.code === 'ENOENT' ? new Missing(file) : e }
+  }
+  // No timeout here once hung the probe forever with no output at all.
+  const res = await fetch(`${base}/${file}`, { signal: AbortSignal.timeout(60_000) })
+  if (res.status === 404) throw new Missing(file)
   if (!res.ok) throw new Error(`${file}: HTTP ${res.status}`)
   return new Uint8Array(await res.arrayBuffer())
 }
@@ -82,17 +92,25 @@ async function range(file, begin, end) {
     const buf = readFileSync(join(localDir, file))   // probe files are small; shards are never read here
     return new Uint8Array(buf.buffer, buf.byteOffset + begin, end - begin)
   }
-  const res = await fetch(`${base}/${file}`, { headers: { Range: `bytes=${begin}-${end - 1}` } })
+  const res = await fetch(`${base}/${file}`, {
+    headers: { Range: `bytes=${begin}-${end - 1}` }, signal: AbortSignal.timeout(60_000),
+  })
+  if (res.status === 404) throw new Missing(file)
   if (res.status !== 206) throw new Error(`${file}: expected 206 for Range, got ${res.status}`)
   return new Uint8Array(await res.arrayBuffer())
 }
+/** null means the repo HAS NO such file. A transport failure aborts instead:
+ *  swallowing one into null let a rate-limited probe report a model as having
+ *  no tensors, no qk-norm and no shared expert — a confident wrong answer. */
 async function json(file) {
-  try { return JSON.parse(new TextDecoder().decode(await whole(file))) }
-  catch { return null }
+  let raw
+  try { raw = new TextDecoder().decode(await whole(file)) }
+  catch (e) { if (e instanceof Missing) return null; throw e }
+  try { return JSON.parse(raw) } catch { return null }
 }
 async function text(file) {
   try { return new TextDecoder().decode(await whole(file)) }
-  catch { return null }
+  catch (e) { if (e instanceof Missing) return null; throw e }
 }
 
 console.log(`probing ${localDir ?? repo} …`)
@@ -103,7 +121,15 @@ const tok = await json('tokenizer.json')
 
 let checkpoint = null
 try { checkpoint = await openMlxCheckpoint({ whole, range }) } catch (e) {
-  console.error(`  (no readable safetensors index: ${String(e.message).split('\n')[0]})`)
+  // An ABSENT index is a finding (the [index] rule reports it). An index we
+  // could not fetch is not — continuing would report every record-derived
+  // property as false.
+  if (!(e instanceof Missing)) {
+    console.error(`\nprobe FAILED reading the safetensors index: ${e.message}`)
+    console.error('this says nothing about the model — retry, or pass --local-dir')
+    process.exit(2)
+  }
+  console.error(`  (repo has no safetensors index)`)
 }
 const records = checkpoint ? checkpoint.records : []
 
@@ -121,7 +147,10 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const heads = num(tc.num_attention_heads)
 const d = num(tc.hidden_size)
 const headDim = num(tc.head_dim) ?? (heads && d ? d / heads : null)
-const isMoe = num(tc.num_experts) !== null
+// DeepSeek spells the expert count n_routed_experts; reading only Qwen's name
+// made a 64-expert MoE detect as a dense FFN.
+const isMoe = num(tc.num_experts) !== null || num(tc.n_routed_experts) !== null
+const isMla = num(tc.kv_lora_rank) !== null
 const isGdn = num(tc.linear_num_key_heads) !== null
 
 const quantCfg = cfg.quantization ?? cfg.quantization_config ?? null
@@ -196,12 +225,26 @@ const detected = {
   hiddenAct: tc.hidden_act ?? tc.hidden_activation ?? null,
   quant: quantCfg ? { bits: quantCfg.bits ?? 0, groupSize: quantCfg.group_size ?? 0, overrides } : null,
   mlpBias: tc.mlp_bias === true,
+  mla: isMla ? {
+    kvLoraRank: num(tc.kv_lora_rank),
+    qLoraRank: num(tc.q_lora_rank),
+    qkNopeHeadDim: num(tc.qk_nope_head_dim) ?? 0,
+    qkRopeHeadDim: num(tc.qk_rope_head_dim) ?? 0,
+    vHeadDim: num(tc.v_head_dim) ?? 0,
+  } : null,
   moe: isMoe ? {
-    denseLayers: Array.isArray(tc.mlp_only_layers) ? tc.mlp_only_layers : [],
-    sparseStep: num(tc.decoder_sparse_step) ?? 1,
-    experts: num(tc.num_experts),
+    // Qwen names the dense ones; DeepSeek says how many lead the stack.
+    denseLayers: Array.isArray(tc.mlp_only_layers) ? tc.mlp_only_layers
+      : Array.from({ length: num(tc.first_k_dense_replace) ?? 0 }, (_, i) => i),
+    sparseStep: num(tc.decoder_sparse_step) ?? num(tc.moe_layer_freq) ?? 1,
+    scoringFunc: tc.scoring_func ?? null,
+    // A quantized router ships .scales beside .weight; DeepSeek's does not.
+    routerQuantized: records.some((r) => /\.mlp\.gate\.weight$/.test(r))
+      ? records.some((r) => /\.mlp\.gate\.scales$/.test(r))
+      : undefined,
+    experts: num(tc.num_experts) ?? num(tc.n_routed_experts),
     topK: num(tc.num_experts_per_tok) ?? 0,
-    sharedExpert: records.some((r) => r.includes('.shared_expert.')),
+    sharedExpert: records.some((r) => r.includes('.shared_expert.') || r.includes('.shared_experts.')),
     sharedFfn: num(tc.shared_expert_intermediate_size),
     normTopkProb: tc.norm_topk_prob === true,
     // The router is 8-bit only when the checkpoint says so as a per-tensor
