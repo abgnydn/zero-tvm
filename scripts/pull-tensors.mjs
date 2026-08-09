@@ -44,7 +44,7 @@ async function whole(file) {
   if (!r.ok) throw new Error(`${file}: HTTP ${r.status}`)
   return new Uint8Array(await r.arrayBuffer())
 }
-async function range(file, begin, end) {
+async function rangeOnce(file, begin, end) {
   const r = await fetch(`${base}/${file}`, {
     headers: { Range: `bytes=${begin}-${end - 1}` },
     signal: AbortSignal.timeout(TIMEOUT),
@@ -53,7 +53,28 @@ async function range(file, begin, end) {
   // shard that is exactly the download this script exists to avoid, so it is
   // an error rather than something to slice locally.
   if (r.status !== 206) throw new Error(`${file}: expected 206 for Range, got ${r.status}`)
-  return new Uint8Array(await r.arrayBuffer())
+  const bytes = new Uint8Array(await r.arrayBuffer())
+  // A truncated body arrives as a short buffer, not an error; padding it into
+  // a tensor would corrupt the bundle silently.
+  if (bytes.byteLength !== end - begin) {
+    throw new Error(`${file}: short read, ${bytes.byteLength} of ${end - begin} bytes`)
+  }
+  return bytes
+}
+
+/** The link drops connections mid-chunk ("other side closed"), which is
+ *  transient and says nothing about the request. Without a retry a single drop
+ *  discards the whole run's progress on that tensor. */
+async function range(file, begin, end) {
+  let last
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try { return await rangeOnce(file, begin, end) } catch (e) {
+      last = e
+      process.stdout.write(`\n  retry ${attempt}/5 after ${String(e.message).slice(0, 60)}\n`)
+      await new Promise((r) => setTimeout(r, 1000 * attempt))
+    }
+  }
+  throw last
 }
 
 const re = new RegExp(match)

@@ -44,7 +44,10 @@ p.add_argument("--layer", default="model.layers.1")
 p.add_argument("--tokens", type=int, default=6, help="cache length to score against")
 p.add_argument("--rope", default="none", choices=["none"])
 p.add_argument("--seed", type=int, default=7)
+p.add_argument("--backend", default="mlx", choices=["mlx", "numpy", "both"],
+               help="both = compute with mlx and assert the portable numpy path agrees")
 args = p.parse_args()
+BACKEND = args.backend
 
 bundle = pathlib.Path(args.bundle)
 meta = json.loads((bundle / "meta.json").read_text())
@@ -64,10 +67,48 @@ def load(name):
     return mx.array(np.ascontiguousarray(a.reshape(rec["shape"])))
 
 
+def dequant_numpy(q, scales, biases, group=64, bits=4):
+    """MLX affine unpacking, without mlx.
+
+    Colab has no Apple silicon, so a reference that can only be produced on this
+    Mac cannot be produced where the bandwidth is. This is the same scheme the
+    WGSL kernels read: `bits` per value packed little-end-first into u32 words,
+    and one (scale, bias) per `group` values along the INPUT axis, with
+    w = scale*q + bias and q unsigned (no -7 offset — that is MLC's symmetric
+    layout, not this one).
+
+    Checked against mx.dequantize whenever mlx is present; see `--backend both`.
+    """
+    q = np.asarray(q, dtype=np.uint32)
+    per_word = 32 // bits
+    rows, words = q.shape
+    k = words * per_word
+    shifts = (np.arange(per_word, dtype=np.uint32) * bits)
+    vals = ((q[:, :, None] >> shifts[None, None, :]) & ((1 << bits) - 1)).reshape(rows, k)
+    s = np.asarray(scales, dtype=np.float32).repeat(group, axis=1)[:, :k]
+    b = np.asarray(biases, dtype=np.float32).repeat(group, axis=1)[:, :k]
+    # Narrowed to f16 because mx.dequantize does: its scales and biases are f16
+    # and so is its output. Returning f32 was closer to the true value and
+    # therefore WRONG as a stand-in — it disagreed with mlx by 6.1e-5, f16's
+    # ULP at that magnitude. A portable path that is quietly MORE precise than
+    # the one it replaces is not portable, it is a second reference.
+    return (vals.astype(np.float32) * s + b).astype(np.float16)
+
+
 def dequant(name, group=64, bits=4):
     """MLX affine: w = scale*q + bias, group 64 along the input axis."""
-    return mx.dequantize(load(f"{name}.weight"), load(f"{name}.scales"),
-                         load(f"{name}.biases"), group_size=group, bits=bits)
+    q, sc, bi = load(f"{name}.weight"), load(f"{name}.scales"), load(f"{name}.biases")
+    if BACKEND == "numpy":
+        return mx.array(dequant_numpy(np.array(q), np.array(sc), np.array(bi), group, bits))
+    out = mx.dequantize(q, sc, bi, group_size=group, bits=bits)
+    if BACKEND == "both":
+        ours = dequant_numpy(np.array(q), np.array(sc), np.array(bi), group, bits)
+        err = float(np.max(np.abs(ours.astype(np.float32) - np.array(out, dtype=np.float32))))
+        if err > 0:
+            raise SystemExit(f"{name}: numpy dequant differs from mlx by {err:.3e} — "
+                             "the portable path would produce a different reference")
+        print(f"  {name}: numpy dequant is bit-identical to mlx")
+    return out
 
 
 def rms(x, gamma, eps=1e-6):
