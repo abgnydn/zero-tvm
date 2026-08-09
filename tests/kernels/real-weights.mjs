@@ -734,6 +734,24 @@ async function mlaAttention(device, dir, meta) {
     buffer(device, new Uint32Array([L, T, 0, 0]), BU.UNIFORM | BU.COPY_DST),
   ]
 
+  // The whole chain, not just the attention: q_nope enters latent space through
+  // kv_b_proj's K half, attention happens entirely against the latent cache,
+  // and the result comes back out through the V half. Both hops are mla_proj —
+  // the same kernel, because Wk was transposed at prepare time.
+  const N_NOPE = meta.nope
+  const qNope = buffer(device, f16Array(rd('ref_qnope', Float32Array)), BU.STORAGE | BU.COPY_DST)
+  const qLat = device.createBuffer({ size: heads * L * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+  const oLatF16 = device.createBuffer({ size: heads * L * 2, usage: BU.STORAGE | BU.COPY_DST })
+  const oHeads = device.createBuffer({ size: heads * N_NOPE * 2, usage: BU.STORAGE | BU.COPY_SRC })
+  const wkT = buffer(device, f16Array(rd('wk_t', Float32Array)), BU.STORAGE | BU.COPY_DST)
+  const wv = buffer(device, f16Array(rd('wv', Float32Array)), BU.STORAGE | BU.COPY_DST)
+  const dims = (N, K) => buffer(device, new Uint32Array([N, K, 0, 0]), BU.UNIFORM | BU.COPY_DST)
+
+  // q_lat replaces the reference's, so the attention below is fed by the GPU's
+  // own projection — otherwise a wrong Wk orientation would never show up here.
+  scoreBufs[1] = qLat
+
+  const proj = shader('mla_proj.wgsl', 'mla_proj')
   const enc = device.createCommandEncoder()
   const pass = enc.beginComputePass()
   const run = (pipe, bufs, x, y) => {
@@ -744,19 +762,38 @@ async function mlaAttention(device, dir, meta) {
     }))
     pass.dispatchWorkgroups(x, y, 1)
   }
+  const wgs = (n) => Math.ceil(n / 64)
+  run(proj, [qLat, qNope, wkT, dims(L, N_NOPE)], wgs(L), heads)
   run(shader('mla_scores.wgsl', 'mla_scores'), scoreBufs, T, heads)
   // scores is read_write in both: stage 2 turns the logits into probabilities
   // in place, so it must not be read back before the combine has run.
   run(shader('mla_combine.wgsl', 'mla_combine'), combineBufs, heads, 1)
   pass.end()
+  // out_lat is f32 (it is a reduction target); mla_proj reads f16, so the hop
+  // back out is a second pass after a narrowing copy.
   device.queue.submit([enc.finish()])
+  const [latBytes] = await readBack(device, [[outLat, heads * L * 4]])
+  device.queue.writeBuffer(oLatF16, 0, f16Array(new Float32Array(latBytes)))
+  const enc2 = device.createCommandEncoder()
+  const p2 = enc2.beginComputePass()
+  p2.setPipeline(proj)
+  p2.setBindGroup(0, device.createBindGroup({
+    layout: proj.getBindGroupLayout(0),
+    entries: [oLatF16, wv, dims(N_NOPE, L)].map((b, i) => ({ binding: i + 1, resource: { buffer: b } }))
+      .concat([{ binding: 0, resource: { buffer: oHeads } }]),
+  }))
+  p2.dispatchWorkgroups(wgs(N_NOPE), heads, 1)
+  p2.end()
+  device.queue.submit([enc2.finish()])
+  const [headBytes] = await readBack(device, [[oHeads, heads * N_NOPE * 2]])
 
-  const [outBytes] = await readBack(device, [[outLat, heads * L * 4]])
-  const err = relErr(Array.from(new Float32Array(outBytes)), rd('ref_olat', Float32Array))
+  const errLat = relErr(Array.from(new Float32Array(latBytes)), rd('ref_olat', Float32Array))
+  const errOut = relErr(Array.from(new Uint16Array(headBytes), f16BitsToF32), rd('ref_oheads', Float32Array))
   return {
-    pass: err < 0.01,
-    detail: `max rel err ${err.toExponential(2)} on ${heads}x${L} latent context`
-      + ` (${meta.cache_values_per_token} cached values/token vs ${meta.mha_equivalent_per_token} for MHA)`,
+    pass: errLat < 0.01 && errOut < 0.02,
+    detail: `latent context ${errLat.toExponential(2)} | back through kv_b's V half ${errOut.toExponential(2)}`
+      + ` (${meta.cache_values_per_token} cached values/token vs ${meta.mha_equivalent_per_token} for MHA,`
+      + ` q projected on GPU through Wk^T)`,
   }
 }
 

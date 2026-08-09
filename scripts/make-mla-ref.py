@@ -163,6 +163,17 @@ def dump(name, arr):
     np.ascontiguousarray(np.array(arr, dtype=np.float32)).tofile(out / f"{name}.bin")
 
 
+# kv_b_proj, dequantized and SPLIT into the two roles it plays. Wk is stored
+# TRANSPOSED: q_lat = Wk^T q_nope contracts over kv_b's stored ROW axis, which
+# a quantized kernel cannot do (the scale groups run the other way). Flipping it
+# once at load turns both uses into ordinary row-major matvecs over the last
+# axis, and costs 4 MB a layer in f16 — 1% of the model, against a KV cache that
+# just got 7x smaller. Quantized-and-transposed would save that 1% and buy a
+# kernel with strided scale lookups; not worth it.
+dump("wk_t", mx.transpose(Wk, (0, 2, 1)))   # [heads, kv_lora, nope]
+dump("wv", Wv)                              # [heads, v, kv_lora]
+dump("ref_qnope", q_nope[qi])               # [heads, nope]   before the latent hop
+dump("ref_oheads", o_heads)                 # [heads, v]      after coming back out
 dump("ref_c", c)                    # [T, kv_lora]   the cache
 dump("ref_kpe", k_pe)               # [T, rope]      the shared key
 dump("ref_qlat", q_lat)             # [heads, kv_lora]  q_nope already in latent space
