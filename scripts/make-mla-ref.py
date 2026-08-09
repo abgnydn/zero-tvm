@@ -154,17 +154,29 @@ if max(err_s, err_o) > 1e-4:
 print("the two formulations agree: caching the 512 latent loses nothing")
 print(f"cache per token: {KV_LORA + ROPE} values, vs {HEADS * (NOPE + VDIM)} for the MHA equivalent")
 
+# Raw f32 .bin, not .npy — tests/kernels/real-weights.mjs reads bundles that
+# way and a second format would be a second thing to get wrong.
 out = bundle
-np.save(out / "ref_x.npy", np.array(xs, dtype=np.float32))
-np.save(out / "ref_c.npy", np.array(c, dtype=np.float32))
-np.save(out / "ref_kpe.npy", np.array(k_pe, dtype=np.float32))
-np.save(out / "ref_qnope.npy", np.array(q_nope[qi], dtype=np.float32))
-np.save(out / "ref_qpe.npy", np.array(q_pe[qi], dtype=np.float32))
-np.save(out / "ref_scores.npy", np.array(scores_naive, dtype=np.float32))
-np.save(out / "ref_out.npy", np.array(out_naive, dtype=np.float32))
-(out / "mla-ref.json").write_text(json.dumps({
+
+
+def dump(name, arr):
+    np.ascontiguousarray(np.array(arr, dtype=np.float32)).tofile(out / f"{name}.bin")
+
+
+dump("ref_c", c)                    # [T, kv_lora]   the cache
+dump("ref_kpe", k_pe)               # [T, rope]      the shared key
+dump("ref_qlat", q_lat)             # [heads, kv_lora]  q_nope already in latent space
+dump("ref_qpe", q_pe[qi])           # [heads, rope]
+dump("ref_scores", scores_naive)    # [heads, T]     pre-softmax, scaled
+dump("ref_olat", o_lat)             # [heads, kv_lora]  the kernel's output
+dump("ref_out", out_naive)          # [d]            after Wv and o_proj
+# Merged INTO meta.json rather than written beside it: real-weights.mjs walks
+# bundle dirs and dispatches on meta.kernel, so a bundle that keeps its identity
+# in a second file is a bundle that suite silently skips.
+meta.update({
     "kernel": "mla_attention",
     "model": meta["repo"],
+    "tensor": f"{args.layer}.self_attn (q/kv_a/kv_b/o)",
     "layer": args.layer,
     "reference": "mlx.core.dequantize + MLA computed two ways",
     "d": D, "heads": HEADS, "nope": NOPE, "rope": ROPE, "v": VDIM,
@@ -173,5 +185,6 @@ np.save(out / "ref_out.npy", np.array(out_naive, dtype=np.float32))
     "latent_vs_naive_rel_err": {"scores": err_s, "output": err_o},
     "cache_values_per_token": KV_LORA + ROPE,
     "mha_equivalent_per_token": HEADS * (NOPE + VDIM),
-}, indent=1) + "\n")
-print(f"wrote {out}/mla-ref.json + ref_*.npy")
+})
+(out / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+print(f"wrote {out}/meta.json + ref_*.bin")

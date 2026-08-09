@@ -129,7 +129,13 @@ async function moeBlock(device, dir, meta) {
     pass.dispatchWorkgroups(E + 1)   // row E is the shared-expert gate
     pass.setPipeline(rtK)
     pass.setBindGroup(0, bg(rtK, [rIdx, rScore, rLogits,
-      buffer(device, new Uint32Array([E, K, meta.norm_topk_prob ? 1 : 0]), BU.UNIFORM | BU.COPY_DST)]))
+      // hasShared = 1: Qwen3.6 has a shared expert. This field is not optional —
+      // moe_router_topk's PODArgs grew from three u32 to four when MoE-without-a-
+      // shared-expert landed, and a 12-byte uniform against a 16-byte struct is a
+      // bind-group validation failure. WebGPU answers that by skipping the
+      // dispatch, so the output keeps its zeros and reads as "the router picked
+      // expert 0 eight times" rather than as an error.
+      buffer(device, new Uint32Array([E, K, meta.norm_topk_prob ? 1 : 0, 1]), BU.UNIFORM | BU.COPY_DST)]))
     pass.dispatchWorkgroups(1)
     pass.end()
     device.queue.submit([enc.finish()])
@@ -616,7 +622,7 @@ async function qwen36Layer(device, dir, meta) {
     [rtL, [rLog, n2, stFrom(moeDir, 'router_w_u32', Uint32Array),
            stFrom(moeDir, 'router_s_f16', Uint16Array), stFrom(moeDir, 'router_b_f16', Uint16Array),
            u32([D, E + 1])], [E + 1]],
-    [rtK, [rIdx, rScore, rLog, u32([E, K, meta.norm_topk_prob ? 1 : 0])], [1]],
+    [rtK, [rIdx, rScore, rLog, u32([E, K, meta.norm_topk_prob ? 1 : 0, 1])], [1]],   // 1 = has a shared expert
   ]
   const bgMoe = (out, outOff, outSize, inp, proj2, pod) => [
     { buffer: out, offset: outOff, size: outSize }, inp, W[`${proj2}_s`], W[`${proj2}_w`], pod,
@@ -695,10 +701,70 @@ async function affineEmbedding(device, dir, meta) {
   return { pass: err < 0.005, detail: `max rel err ${err.toExponential(2)} over ${N} rows (vs ${meta.reference})` }
 }
 
+/** MLA attention on a real DeepSeek layer: score against the latent cache,
+ *  softmax, weighted-sum it back. The reference (scripts/make-mla-ref.py) got
+ *  these numbers by computing MLA the OTHER way — up-projecting the latent into
+ *  per-head K and V and running ordinary attention — so agreement here means
+ *  the shader reproduces the vendor's attention, not just our rearrangement of
+ *  it. Inputs go to the GPU as f16, which is the floor on the error below. */
+async function mlaAttention(device, dir, meta) {
+  const rd = (n, T) => read(dir, n, T)
+  const { heads, kv_lora: L, rope: R, tokens: T, softmax_scale: scale } = meta
+  const shader = (f, e) => pipelineFor(device, withPrelude(readFileSync(join(SHADERS, f), 'utf8')), e)
+
+  const scores = device.createBuffer({ size: heads * T * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const outLat = device.createBuffer({ size: heads * L * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const cacheC = buffer(device, f16Array(rd('ref_c', Float32Array)), BU.STORAGE | BU.COPY_DST)
+  const scoreBufs = [
+    scores,
+    buffer(device, f16Array(rd('ref_qlat', Float32Array)), BU.STORAGE | BU.COPY_DST),
+    buffer(device, f16Array(rd('ref_qpe', Float32Array)), BU.STORAGE | BU.COPY_DST),
+    cacheC,
+    buffer(device, f16Array(rd('ref_kpe', Float32Array)), BU.STORAGE | BU.COPY_DST),
+    buffer(device, (() => {
+      // {L, R, T} then a f32 scale — mixed types, so it is written by hand.
+      const u = new ArrayBuffer(16), dv = new DataView(u)
+      dv.setUint32(0, L, true); dv.setUint32(4, R, true)
+      dv.setUint32(8, T, true); dv.setFloat32(12, scale, true)
+      return new Uint8Array(u)
+    })(), BU.UNIFORM | BU.COPY_DST),
+  ]
+  const combineBufs = [
+    outLat, scores, cacheC,
+    buffer(device, new Uint32Array([L, T, 0, 0]), BU.UNIFORM | BU.COPY_DST),
+  ]
+
+  const enc = device.createCommandEncoder()
+  const pass = enc.beginComputePass()
+  const run = (pipe, bufs, x, y) => {
+    pass.setPipeline(pipe)
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
+    }))
+    pass.dispatchWorkgroups(x, y, 1)
+  }
+  run(shader('mla_scores.wgsl', 'mla_scores'), scoreBufs, T, heads)
+  // scores is read_write in both: stage 2 turns the logits into probabilities
+  // in place, so it must not be read back before the combine has run.
+  run(shader('mla_combine.wgsl', 'mla_combine'), combineBufs, heads, 1)
+  pass.end()
+  device.queue.submit([enc.finish()])
+
+  const [outBytes] = await readBack(device, [[outLat, heads * L * 4]])
+  const err = relErr(Array.from(new Float32Array(outBytes)), rd('ref_olat', Float32Array))
+  return {
+    pass: err < 0.01,
+    detail: `max rel err ${err.toExponential(2)} on ${heads}x${L} latent context`
+      + ` (${meta.cache_values_per_token} cached values/token vs ${meta.mha_equivalent_per_token} for MHA)`,
+  }
+}
+
 const KERNELS = {
   affine_matmul: affineMatmul, affine_matmul_q3: affineMatmul,
   affine_embedding: affineEmbedding, moe_block: moeBlock,
   qwen36_gdn: qwen36Gdn, qwen36_attn: qwen36Attn, qwen36_layer: qwen36Layer,
+  mla_attention: mlaAttention,
 }
 
 async function main() {
