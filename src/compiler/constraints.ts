@@ -349,9 +349,14 @@ export function checkModel(m: DetectedModel): CheckResult {
     // expert block over dense weights — fluent nonsense, no error. Both
     // spellings are in the wild (Qwen's mlp_only_layers, DeepSeek's
     // first_k_dense_replace).
+    // ModelSpec can now SAY this (moe.denseLayers + denseFfn -> ffnKinds) and
+    // the loader plans the right records per layer. What is still missing is
+    // the engine: buffer sizing and dispatch shapes come from a single S.ffn,
+    // and a stack with two widths needs both sets built and chosen per layer.
     if (m.moe.denseLayers.length) {
       fail('moe', `layers [${m.moe.denseLayers.join(', ')}] run a dense FFN while the rest are MoE`,
-        'a per-layer block kind in ModelSpec, like layer_types for the hybrids')
+        'engine-core sizes the FFN buffers from one width — a mixed stack needs both, chosen per layer '
+        + '(ModelSpec.ffnKinds/ffnWidthAt and the loader plans already handle it)')
     }
     // Routing that is not plain softmax + top-k.
     if (m.moe.scoringFunc && m.moe.scoringFunc !== 'softmax') {

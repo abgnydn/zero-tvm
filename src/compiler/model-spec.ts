@@ -112,6 +112,19 @@ export interface MoeDims {
    * since there are no scales to bind. Default 8 (what shipped first).
    */
   routerBits?: 4 | 8 | 16
+  /**
+   * Layers running an ORDINARY dense FFN instead of the expert block, and how
+   * wide it is. DeepSeek-V2 makes layer 0 dense at intermediate_size 10944
+   * while every other layer is MoE at moe_intermediate_size 1408 — two
+   * different widths in one stack, which is why this cannot be expressed by
+   * `ffn` alone. Empty (the default) means every layer is MoE.
+   *
+   * Getting this wrong is not a crash: the expert block would run over a dense
+   * layer's weights and produce fluent nonsense.
+   */
+  denseLayers?: readonly number[]
+  /** intermediate_size for the layers named in denseLayers. */
+  denseFfn?: number
   /** Expert-stack precision. 3 selects the q3 bitstream kernels and a
    *  checkpoint whose switch_mlp/shared_expert were requantised to 3 bits
    *  (scripts/convert-q3-experts.py). Default 4. */
@@ -273,7 +286,13 @@ export interface ModelSpec extends ModelSpecBase {
   // layerKinds all 'attn', gdn* mirror the attention dims) so the shader
   // prelude can emit every const unconditionally and all kernels compile
   // under every spec.
-  layerKinds: ReadonlyArray<'gdn' | 'attn'>  // per-layer block kind for the engine
+  layerKinds: ReadonlyArray<'gdn' | 'attn'>  // per-layer ATTENTION block kind
+  /** Per-layer FFN kind. All 'dense' for a dense spec, all 'moe' for a uniform
+   *  MoE one, mixed only when moe.denseLayers says so. Read it rather than
+   *  branching on `spec.moe`, which is a property of the MODEL, not the layer. */
+  ffnKinds: ReadonlyArray<'dense' | 'moe'>
+  /** FFN width for layer L — moe.ffn or moe.denseFfn depending on its kind. */
+  ffnWidthAt: (layer: number) => number
   rotaryDim: number     // headDim * partialRotaryFactor (RoPE-rotated dims per head)
   halfRotary: number    // rotaryDim / 2 (RoPE pair distance in the rotary slice)
   cAttnDim: number      // fused attention projection rows: qkvDim (+qDim gate rows when attnGate)
@@ -389,11 +408,22 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
       interval && (i + 1) % interval !== 0 ? 'gdn' : 'attn',
     ),
   )
+  const denseSet = new Set(base.moe?.denseLayers ?? [])
+  if (denseSet.size && base.moe?.denseFfn === undefined) {
+    throw new Error(`${base.id}: moe.denseLayers needs moe.denseFfn — a dense layer's width is not moe_intermediate_size`)
+  }
+  const ffnKinds = Object.freeze(
+    Array.from({ length: base.layers }, (_, i): 'dense' | 'moe' =>
+      base.moe && !denseSet.has(i) ? 'moe' : 'dense',
+    ),
+  )
   const rotaryDim = Math.round(base.headDim * (base.partialRotaryFactor ?? 1))
   if (rotaryDim % 2 !== 0) throw new Error(`${base.id}: rotaryDim must be even (RoPE pairs)`)
   return Object.freeze({
     ...base,
     layerKinds,
+    ffnKinds,
+    ffnWidthAt: (layer: number) => (ffnKinds[layer] === 'dense' && base.moe ? base.moe.denseFfn! : base.ffn),
     rotaryDim,
     halfRotary: rotaryDim / 2,
     cAttnDim: qDim + 2 * kvDim + (base.attnGate ? qDim : 0),

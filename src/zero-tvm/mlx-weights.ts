@@ -204,7 +204,7 @@ export function planLayer(spec: ModelSpec, L: number, prefix?: string): BufferPl
     plans.push({ name: 'gdn_dt_bias', parts: [{ record: `${g}.dt_bias`, convert: 'bf16->f32' }] })
   }
 
-  if (spec.moe) {
+  if (spec.ffnKinds[L] === 'moe' && spec.moe) {
     // When the checkpoint has a shared expert it is appended to every stacked
     // tensor, and its gate to the router, so nothing downstream treats it as a
     // special case. Without one (Mixtral / Qwen3-MoE style) the stacks simply
@@ -229,6 +229,8 @@ export function planLayer(spec: ModelSpec, L: number, prefix?: string): BufferPl
         : [`${p}.mlp.gate`]))
     }
   } else {
+    // Also the path a DENSE LAYER of a MoE model takes (DeepSeek's layer 0):
+    // the records are the ordinary mlp.* names, at moe.denseFfn width.
     plans.push(...trio('ffn', [`${p}.mlp.gate_proj`, `${p}.mlp.up_proj`]))
     plans.push(...trio('ffn_down', [`${p}.mlp.down_proj`]))
   }
