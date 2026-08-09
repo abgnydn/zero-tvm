@@ -18,7 +18,7 @@
 // --dry-run prints what it would fetch and the total, which is worth doing
 // first on a metered connection.
 
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { openMlxCheckpoint } from '../src/zero-tvm/weight-loader-mlx.ts'
 
@@ -37,7 +37,7 @@ if (!repo || !match || (!outDir && !dryRun)) {
 }
 
 const base = `https://huggingface.co/${repo}/resolve/main`
-const TIMEOUT = 120_000
+const TIMEOUT = 300_000   // per CHUNK, not per tensor
 
 async function whole(file) {
   const r = await fetch(`${base}/${file}`, { signal: AbortSignal.timeout(TIMEOUT) })
@@ -78,14 +78,41 @@ const out = resolve(outDir)
 mkdirSync(out, { recursive: true })
 const meta = { repo, match, tensors: {} }
 let done = 0
+// One tensor here can be 33 MB, which on a slow link is minutes for a single
+// request — long enough that the whole pull died on one timeout after
+// succeeding on twenty. So: fetch in CHUNKS, and skip whole tensors already on
+// disk at the right size. A re-run resumes instead of starting over, which is
+// the difference between a usable tool and one you cannot use on the link that
+// made you want it.
+const CHUNK = 8 * 1024 * 1024
 for (const { name, loc } of locs) {
-  const bytes = await range(loc.file, loc.begin, loc.end)
   // '/' is legal in a record name and not in a filename.
   const file = `${name.replace(/\//g, '__')}.bin`
-  writeFileSync(join(out, file), bytes)
-  meta.tensors[name] = { file, shape: loc.info.shape, dtype: loc.info.dtype, bytes: bytes.byteLength }
-  done += bytes.byteLength
-  process.stdout.write(`\r  fetched ${(done / 1e6).toFixed(1)}/${(total / 1e6).toFixed(1)} MB`)
+  const path = join(out, file)
+  const size = loc.end - loc.begin
+  const rec = { file, shape: loc.info.shape, dtype: loc.info.dtype, bytes: size }
+
+  if (existsSync(path) && statSync(path).size === size) {
+    meta.tensors[name] = rec
+    done += size
+    process.stdout.write(`\r  have ${(done / 1e6).toFixed(1)}/${(total / 1e6).toFixed(1)} MB`)
+    continue
+  }
+
+  const parts = []
+  for (let off = 0; off < size; off += CHUNK) {
+    const end = Math.min(off + CHUNK, size)
+    parts.push(await range(loc.file, loc.begin + off, loc.begin + end))
+    process.stdout.write(`\r  fetched ${((done + end) / 1e6).toFixed(1)}/${(total / 1e6).toFixed(1)} MB`)
+  }
+  // Written only once the whole tensor is in hand: a half-written .bin that
+  // happened to reach the right length would be resumed straight past.
+  const whole = new Uint8Array(size)
+  let at = 0
+  for (const part of parts) { whole.set(part, at); at += part.byteLength }
+  writeFileSync(path, whole)
+  meta.tensors[name] = rec
+  done += size
 }
 writeFileSync(join(out, 'meta.json'), `${JSON.stringify(meta, null, 1)}\n`)
 console.log(`\nwrote ${outDir}/ — ${locs.length} tensors + meta.json`)
