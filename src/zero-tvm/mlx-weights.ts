@@ -216,9 +216,18 @@ export function planLayer(spec: ModelSpec, L: number, prefix?: string): BufferPl
         ? [`${p}.mlp.switch_mlp.${proj}`, `${p}.mlp.shared_expert.${proj}`]
         : [`${p}.mlp.switch_mlp.${proj}`]))
     }
-    plans.push(...trio('router', shared
-      ? [`${p}.mlp.gate`, `${p}.mlp.shared_expert_gate`]
-      : [`${p}.mlp.gate`]))
+    // A router the quantizer skipped has no scales or biases to plan for, and
+    // the engine binds four buffers instead of six on that path. Asking q()
+    // for a trio here would look for `${p}.mlp.gate.scales`, a record that is
+    // simply not in the checkpoint.
+    if (spec.moe.routerBits === 16) {
+      const gates = shared ? [`${p}.mlp.gate`, `${p}.mlp.shared_expert_gate`] : [`${p}.mlp.gate`]
+      plans.push({ name: 'router_w', parts: gates.map((g) => ({ record: `${g}.weight`, convert: 'bf16->f16' as const })) })
+    } else {
+      plans.push(...trio('router', shared
+        ? [`${p}.mlp.gate`, `${p}.mlp.shared_expert_gate`]
+        : [`${p}.mlp.gate`]))
+    }
   } else {
     plans.push(...trio('ffn', [`${p}.mlp.gate_proj`, `${p}.mlp.up_proj`]))
     plans.push(...trio('ffn_down', [`${p}.mlp.down_proj`]))

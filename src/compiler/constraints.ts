@@ -358,14 +358,10 @@ export function checkModel(m: DetectedModel): CheckResult {
       fail('moe', `router scoring '${m.moe.scoringFunc}' (not softmax)`,
         'moe_router_topk.wgsl softmaxes the routed logits — a scoring branch there')
     }
-    // The KERNEL for an unquantized router exists (moe_router_logits_f16.wgsl)
-    // and the engine binds it. What does not exist is a loader plan for a
-    // router tensor with no scales beside it — planLayer emits a quantized
-    // trio for every weight — so this stays red, on the narrower ground.
-    if (m.moe.routerQuantized === false) {
-      fail('moe', 'the router is not quantized (mlp.gate has no scales/biases)',
-        'a loader plan for a bare f16 router — the kernel (moe_router_logits_f16) and the engine binding are in place')
-    }
+    // An unquantized router is GREEN: moe_router_logits_f16.wgsl reads the bare
+    // f16 rows, planLayer plans a single weight instead of a quantized trio,
+    // and the engine binds four buffers rather than six. routerBits carries
+    // which of the three it is — see the MoeDims note on why guessing is fatal.
     if (m.moe.sparseStep !== 1) {
       fail('moe', `only every ${m.moe.sparseStep}th layer is MoE (decoder_sparse_step)`,
         'a per-layer block kind in ModelSpec, like layer_types for the hybrids')
@@ -405,8 +401,8 @@ export function checkModel(m: DetectedModel): CheckResult {
       'a third tokenizer pipeline in src/zero-tvm/ (tokenizer.ts covers SPM, tokenizer-bpe.ts byte-level BPE)')
   }
   if (m.chatTemplate === 'unknown') {
-    fail('template', 'chat template is neither Phi-3, ChatML, nor Llama-3',
-      'a renderer branch in model-select.ts buildChatPromptFor (phi3, chatml non-thinking, and llama3 exist)')
+    fail('template', 'chat template is none of Phi-3, ChatML, Llama-3 or DeepSeek',
+      'a renderer branch in model-select.ts buildChatPromptFor (phi3, chatml non-thinking, llama3 and deepseek exist)')
   }
 
   // ── notes that gate flags, not support ─────────────────────

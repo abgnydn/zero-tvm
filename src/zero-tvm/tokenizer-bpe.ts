@@ -482,6 +482,37 @@ export function llama3DateString(d: Date = new Date()): string {
   return `${String(d.getDate()).padStart(2, '0')} ${LLAMA3_MONTHS[d.getMonth()]} ${d.getFullYear()}`
 }
 
+/**
+ * DeepSeek-V2's chat template. Plain prose turns rather than header tokens:
+ *
+ *   <bos>{system}\n\nUser: {content}\n\nAssistant: {content}<eos>Assistant:
+ *
+ * Two details that are easy to get wrong and impossible to see afterwards: a
+ * system message is emitted with NO label at all (the template writes only its
+ * content), and the trailing generation prompt is `Assistant:` with no space —
+ * the model has learned to produce the leading space itself, so adding one
+ * puts it off-distribution from its first token.
+ *
+ * Unlike the Llama-3 builder, content is NOT trimmed: the template interpolates
+ * `message['content']` verbatim.
+ */
+export function buildDeepSeekChatPrompt(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  opts?: { bosToken?: string; eosToken?: string },
+): number[] {
+  const bos = opts?.bosToken ?? '<｜begin▁of▁sentence｜>'
+  const eos = opts?.eosToken ?? '<｜end▁of▁sentence｜>'
+  let text = bos
+  for (const msg of messages) {
+    if (msg.role === 'user') text += `User: ${msg.content}\n\n`
+    else if (msg.role === 'assistant') text += `Assistant: ${msg.content}${eos}`
+    else if (msg.role === 'system') text += `${msg.content}\n\n`
+  }
+  text += 'Assistant:'
+  return tokenizer.encode(text)
+}
+
 export function buildLlama3ChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   tokenizer: Pick<ByteLevelTokenizer, 'encode'>,

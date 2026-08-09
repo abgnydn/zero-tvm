@@ -170,9 +170,13 @@ const templates = typeof tokCfg.chat_template === 'string' ? [tokCfg.chat_templa
   : Array.isArray(tokCfg.chat_template) ? tokCfg.chat_template.map((t) => t.template ?? '') : []
 let templateText = templates.join('\n')
 if (!templateText) templateText = (await text('chat_template.jinja')) ?? ''
+// Matched on the marker each template is BUILT from. DeepSeek's has no special
+// role tokens at all — it writes prose turns — so it is recognised by the two
+// literals it interpolates, which is as specific as that family gets.
 const chatTemplate = templateText.includes('<|im_start|>') ? 'chatml'
   : templateText.includes('<|start_header_id|>') ? 'llama3'
   : templateText.includes('<|user|>') && templateText.includes('<|end|>') ? 'phi3'
+  : templateText.includes("'User: '") && templateText.includes("'Assistant: '") ? 'deepseek'
   : 'unknown'
 
 // Tokenizer pipeline — from tokenizer.json's own structure.

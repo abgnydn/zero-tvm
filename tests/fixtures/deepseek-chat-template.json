@@ -1,0 +1,41 @@
+{
+ "bos": "<｜begin▁of▁sentence｜>",
+ "eos": "<｜end▁of▁sentence｜>",
+ "cases": {
+  "single_user": [
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "system_then_user": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "multi_turn": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello!"
+   },
+   {
+    "role": "user",
+    "content": "  padded  "
+   }
+  ]
+ },
+ "rendered": {
+  "single_user": "<｜begin▁of▁sentence｜>User: What is the capital of France?\n\nAssistant:",
+  "system_then_user": "<｜begin▁of▁sentence｜>You are terse.\n\nUser: Hi\n\nAssistant:",
+  "multi_turn": "<｜begin▁of▁sentence｜>User: Hi\n\nAssistant: Hello!<｜end▁of▁sentence｜>User:   padded  \n\nAssistant:"
+ }
+}

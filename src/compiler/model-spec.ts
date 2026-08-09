@@ -194,7 +194,7 @@ export interface ModelSpecBase {
   tiedEmbeddings: boolean  // lm_head reuses the quantized embedding matrix
   qkNorm: boolean          // per-head q_norm/k_norm RMSNorm before RoPE
   stops: readonly number[] // stop token ids for the decode loops
-  chatTemplateId: 'phi3' | 'chatml' | 'llama3'
+  chatTemplateId: 'phi3' | 'chatml' | 'llama3' | 'deepseek'
   tokenizerKind: 'spm' | 'byteLevel'  // which tokenizer pipeline tokenizer.json needs
   hfRepo: string           // HuggingFace repo with the MLC q4f16_1 layout
   /** Weight-manifest filename in the repo. Older MLC repos ship
