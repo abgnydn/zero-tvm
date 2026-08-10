@@ -1339,7 +1339,12 @@ order of magnitude optimistic — and they may well be.
 2. **Apple Silicon is unified memory.** Readback and `writeBuffer` are memcpy,
    with no PCIe hop. Neither number transfers to a discrete GPU, where restore
    would be bounded by the bus.
-3. **Rates climb across repetitions** (`writeBuffer`: 2416 → 4228 → 6660).
+3. **`maxContext` correction.** An earlier draft of this section said
+   Qwen3.5's `maxContext` is 7168. It is **32768** (`maxPages: 2048`,
+   `pageSize: 16`); 7168 belongs to `QWEN3_4B`. The 625 MiB reference workload
+   is a 20k prefix, which Qwen3.5 *can* hold — its full cache at 32k is
+   1.00 GiB. Nothing else in this section changes.
+4. **Rates climb across repetitions** (`writeBuffer`: 2416 → 4228 → 6660).
    That is warming, not the device getting faster. Every figure above is
    reported per-run for that reason, and the extrapolation deliberately uses
    the slowest.

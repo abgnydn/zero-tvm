@@ -157,7 +157,10 @@ Freeze a real transcript as a fixture. Real ones exist on this machine: `~/.pi/a
 >    would send is not identical.
 > 3. Windows are capped (`--max`, default 24k) because the full files run to
 >    millions of tokens and the comparison is O(n²) re-encodes. The cap is also
->    the workload — Qwen3.5's `maxContext` is 7168.
+>    **Correction 2026-08-10:** an earlier version of this line said
+>    Qwen3.5's `maxContext` is 7168. It is **32768** (`maxPages: 2048`); 7168
+>    is QWEN3_4B's. A 24k window is inside what Qwen3.5 actually holds, so the
+>    cap is a limit of this script, not of the engine.
 >
 > **Consequence for the plan:** the `{role, ids}` rewrite of
 > `buildChatPromptFor` named above as a hard prerequisite **is not needed** for
