@@ -30,7 +30,7 @@
 // MLC q4f16_1 repos are hand-specced — they arrive a couple per year, each
 // with format quirks worth human eyes.
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, openSync, readSync, closeSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve, join } from 'node:path'
@@ -93,8 +93,19 @@ async function whole(file) {
 }
 async function range(file, begin, end) {
   if (localDir) {
-    const buf = readFileSync(join(localDir, file))   // probe files are small; shards are never read here
-    return new Uint8Array(buf.buffer, buf.byteOffset + begin, end - begin)
+    // READ THE RANGE, not the file. The old comment here claimed "shards are
+    // never read" — but this is exactly how the safetensors header is read, and
+    // a single-file MLX checkpoint IS the shard: readFileSync threw
+    // "File size (5288196018) is greater than 2 GiB" on Qwen3.6, which is the
+    // documented fallback path failing on most models worth probing.
+    let fd
+    try { fd = openSync(join(localDir, file), 'r') }
+    catch (e) { throw e.code === 'ENOENT' ? new Missing(file) : e }
+    try {
+      const out = new Uint8Array(end - begin)
+      readSync(fd, out, 0, out.length, begin)
+      return out
+    } finally { closeSync(fd) }
   }
   const res = await fetch(`${base}/${file}`, {
     headers: { Range: `bytes=${begin}-${end - 1}` }, signal: AbortSignal.timeout(60_000),
@@ -146,6 +157,26 @@ const records = checkpoint ? checkpoint.records : []
 // text_config winning, and remember which root the records use.
 const tc = { ...cfg, ...(cfg.text_config ?? {}) }
 const mlxPrefix = records.some((r) => r.startsWith('language_model.')) ? 'language_model.' : ''
+
+// `rope_parameters` is the newer transformers spelling, and it is a MERGE, not
+// a rename: it absorbs rope_theta and partial_rotary_factor along with the
+// scaling dict. Qwen3.6's config (already on disk here) has NO rope_theta
+// under either root — it lives only in text_config.rope_parameters, so the old
+// reads returned null. A null theta is not a crash: it is a different RoPE
+// table, and the model still generates fluent text.
+// (partial_rotary_factor happens to be duplicated at the text_config root in
+// that checkpoint, so it survived. A yarn model in the new format would not:
+// its whole scaling dict is in here.)
+// Normalised into the old shape so every read below stays as it was.
+const ropeParams = tc.rope_parameters
+if (ropeParams && typeof ropeParams === 'object') {
+  if (tc.rope_theta == null) tc.rope_theta = ropeParams.rope_theta
+  if (tc.partial_rotary_factor == null) tc.partial_rotary_factor = ropeParams.partial_rotary_factor
+  // 'default' means plain RoPE — the dict is present only to carry theta.
+  if (tc.rope_scaling == null && ropeParams.rope_type && ropeParams.rope_type !== 'default') {
+    tc.rope_scaling = ropeParams
+  }
+}
 
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const heads = num(tc.num_attention_heads)
@@ -309,6 +340,13 @@ console.log(`\n  family ${detected.family || '?'}${detected.multimodal ? ' (mult
 console.log(`  quant ${detected.quant ? `${detected.quant.bits}-bit g${detected.quant.groupSize} (${Object.keys(overrides).length} overrides)` : 'NONE'}`
   + ` | ${detected.tied ? 'tied' : 'untied'} lm_head | qkNorm ${detected.qkNorm} | ${records.length} records`
   + `${detected.moe ? ` | MoE ${detected.moe.experts}×top${detected.moe.topK}` : ''}${detected.gdn ? ' | GDN hybrid' : ''}`)
+// RoPE printed explicitly because its failure mode is silence: a theta read
+// from a key the config does not use comes back null, and a spec with no
+// scaling is a different model that still generates text.
+console.log(`  rope theta ${detected.ropeTheta ?? 'MISSING'}`
+  + ` | ${detected.ropeScalingType ?? 'no scaling'}`
+  + ` | rotary ${detected.partialRotaryFactor ?? 1}× headDim`
+  + (ropeParams ? '  (from rope_parameters)' : ''))
 console.log(`  tokenizer ${tokKind} | template ${chatTemplate} | stops [${stops.join(', ')}]`)
 
 for (const n of notes) console.log(`  note: ${n}`)

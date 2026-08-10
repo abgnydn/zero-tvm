@@ -170,7 +170,10 @@ export const CONFIG_KEYS_READ: ReadonlySet<string> = new Set([
   'model_type', 'text_config', 'hidden_size', 'num_hidden_layers', 'num_attention_heads',
   'num_key_value_heads', 'head_dim', 'vocab_size', 'intermediate_size', 'moe_intermediate_size',
   'num_experts', 'num_experts_per_tok', 'shared_expert_intermediate_size', 'norm_topk_prob',
-  'rope_theta', 'rope_scaling', 'rms_norm_eps', 'max_position_embeddings', 'tie_word_embeddings',
+  // rope_parameters is the newer transformers spelling and absorbs rope_theta
+  // and partial_rotary_factor; add-model.mjs normalises it back into these.
+  'rope_theta', 'rope_scaling', 'rope_parameters',
+  'rms_norm_eps', 'max_position_embeddings', 'tie_word_embeddings',
   'attention_bias', 'sliding_window', 'use_sliding_window', 'hidden_act', 'hidden_activation',
   'quantization', 'quantization_config', 'partial_rotary_factor', 'layer_types',
   'linear_num_key_heads', 'linear_num_value_heads', 'linear_key_head_dim', 'linear_value_head_dim',
