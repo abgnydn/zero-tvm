@@ -196,8 +196,14 @@ structured, long identifier runs), not a claim about the model.
 - **No 4-bit vs 3-bit comparison for the 35B**, which is the question that
   prompted all of this. `scripts/quality-ab.py` is written and validated for
   it and both checkpoints are on disk — but it needs a quiet machine. An
-  earlier attempt hit 23.3 GB of 23.5 GB swap in uninterruptible wait. Run it
-  when nothing else is using the GPU. **Assume no number until it is run**;
+  earlier attempt hit 23.3 GB of 23.5 GB swap in uninterruptible wait.
+  **Or run it on Colab: `docs/colab/quality-ab.ipynb`.** MLX ships a CUDA
+  backend now (`pip install "mlx[cuda]"`), the 4-bit build is public on HF so
+  Colab pulls it at datacenter speed, and the 3-bit build is *regenerated
+  there* by `scripts/convert-q3-experts.py` — nothing is uploaded and the
+  local connection is never in the path. Needs an A100/high-RAM runtime, and
+  the notebook probes `gather_qmm` on CUDA in seconds before committing to a
+  19.7 GB download. **Assume no number until it is run**;
   the Llama-1B result above is a sensitivity check on the harness, not a
   prediction for a 256-expert MoE where only the experts are 3-bit.
 - **The prose fixture is only 1,199 tokens**, which caps `quality-eval.mjs`

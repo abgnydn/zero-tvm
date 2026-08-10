@@ -1390,7 +1390,10 @@ score. Both checkpoints are on disk (19.7 GB and 15.7 GB), it needs no
 download, and it takes ~20 minutes on a quiet machine.
 
 **It has not been run.** An attempt hit 23.3 GB of 23.5 GB swap in
-uninterruptible wait. **Treat 3-bit-vs-4-bit quality on this model as
+uninterruptible wait. `docs/colab/quality-ab.ipynb` is the way around that —
+MLX's CUDA backend runs `mlx_lm` on an A100, the 4-bit build is public so
+Colab downloads it directly, and the 3-bit build is regenerated there by the
+repo's own converter, so nothing is uploaded. **Treat 3-bit-vs-4-bit quality on this model as
 unknown**, not as measured — the 0.936 does not carry the weight the surrounding
 prose gave it.
 
