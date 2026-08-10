@@ -41,7 +41,8 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
   second spec for the GQA port. `shaderPrelude(spec)` injects the WGSL
   const block; `compile()`, `buildDecodeEngine()`, and `loadWeights()`
   all take an optional spec (default PHI3 — Phi-3 behavior unchanged).
-  `npm run test:kernels:qwen` is a compile-only gate under QWEN3_4B dims.
+  `npm run test:kernels:qwen` runs under QWEN3_4B dims — it compiles every
+  shader AND asserts numerics (maxRel < 0.02), so it needs a GPU.
   `src/compiler/shaders/` holds the 37 WGSL files
   (10 roles + tiled/subgroup/int8/f32 variants; the int4_matmul generator
   emits 18 more). The WebLLM/TVM
@@ -98,7 +99,7 @@ see BENCH.md's Qwen sections for the measured WebLLM gap.
 node scripts/download-weights.mjs --model qwen3   # ~2.3 GB → .weights-local/
 npm run dev                                       # then zero-tvm.html?model=qwen3
                                                   #  or validate.html?model=qwen3
-npm run test:kernels:qwen                         # 21/21 compile+shape gate (no GPU)
+npm run test:kernels:qwen                         # 21/21 compile + numerics (needs a GPU)
 npm run test:e2e                                  # includes tests/e2e/qwen.test.ts —
                                                   # skips loudly if the mirror isn't primed
 BENCH_QUERY="?model=qwen3" npm run bench          # same-session A/B vs WebLLM's

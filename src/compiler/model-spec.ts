@@ -960,8 +960,23 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
  * WHY IT EXISTS: the 4-bit build is 19.7 GB resident and a 32 GB Mac kills the
  * GPU process the moment the working set exceeds physical RAM (measured
  * 2026-08-05, mid-prefill, 0.1 GB free). 3-bit experts bring resident to
- * ~15.7 GB — real headroom. The cost is measured, not guessed: block-output
- * cosine 0.936 vs the 4-bit block (2-bit measured 0.79 and is not offered).
+ * ~15.7 GB — real headroom.
+ *
+ * THE COST IS NOT PROPERLY MEASURED. The number this decision was made on is a
+ * block-output cosine of 0.936 against the 4-bit block (2-bit scored ~0.79 and
+ * is not offered). That is a FIDELITY measurement — how closely the 3-bit block
+ * reproduces the 4-bit block on one input — and fidelity cannot see model
+ * quality. This repo's own embedding port proves the point below: CLS pooling
+ * has the HIGHEST gold cosine of any variant, 0.9379, and gets 0 of 6 retrieval
+ * queries right.
+ *
+ * 0.936 was also never reproducible: no committed script computes it, and the
+ * 2-bit figure is 0.79 here and 0.785 in index.html and CHANGELOG.md.
+ *
+ * scripts/quality-ab.py answers the real question — perplexity of this build
+ * against the 4-bit one, same windows, with error bars. Both checkpoints are on
+ * disk. UNRUN as of 2026-08-10 (it needs a quiet machine; an attempt hit 23.3
+ * of 23.5 GB swap). Until it is run, treat 3-bit-vs-4-bit quality as UNKNOWN.
  *
  * The checkpoint is produced locally by scripts/convert-q3-experts.py; the
  * hfRepo below is where an upload WOULD live and what names the dev-mirror

@@ -1359,3 +1359,50 @@ An earlier note in `scripts/paging-measure.mjs` said the engine's KV buffers do
 not carry `COPY_SRC` and that Phase 1 would need an allocation change. False:
 `engine-core.ts:36` defines `STORAGE = STORAGE | COPY_SRC | COPY_DST`, and every
 KV buffer is allocated through it. Phase 1 needs no allocation change at all.
+
+---
+
+## 3-bit experts: the number the decision was made on (2026-08-10)
+
+`index.html` promises that *"every claim — including the withdrawn ones — is in
+BENCH.md."* The 3-bit-expert justification was not. It is now.
+
+**The claim.** `qwen36q3` ships 3-bit expert stacks instead of 4-bit, chosen on
+a **block-output cosine of 0.936** against the 4-bit block. 2-bit scored ~0.79
+and was not offered.
+
+**Three defects, all confirmed 2026-08-10:**
+
+1. **It is a fidelity number, not a quality one.** It measures how closely a
+   3-bit block reproduces the *4-bit block's* output on one input. That cannot
+   see whether the resulting model is any good. This repo already has the
+   counterexample in its own history: `model-spec.ts` records that CLS pooling
+   on the embedding model has the **highest** gold cosine of any variant
+   (0.9379) and gets **0 of 6** retrieval queries right.
+2. **It is not reproducible.** No committed script computes it. `git show
+   --stat a69d749` lists ten files and no harness that would produce it.
+3. **It disagrees with itself.** The 2-bit figure is `0.79` in
+   `model-spec.ts` and `0.785` in `index.html` and `CHANGELOG.md`.
+
+**What would settle it** is `scripts/quality-ab.py`: perplexity of the 3-bit
+build against the 4-bit build over identical windows, with error bars and a z
+score. Both checkpoints are on disk (19.7 GB and 15.7 GB), it needs no
+download, and it takes ~20 minutes on a quiet machine.
+
+**It has not been run.** An attempt hit 23.3 GB of 23.5 GB swap in
+uninterruptible wait. **Treat 3-bit-vs-4-bit quality on this model as
+unknown**, not as measured — the 0.936 does not carry the weight the surrounding
+prose gave it.
+
+The harness itself is validated: an all-3-bit requant of Llama-3.2-1B against
+the shipped 4-bit, 16 independent windows of 512 tokens, bf16, 9 s total —
+
+| build | perplexity | ±1σ |
+|---|---:|---|
+| `Llama-3.2-1B-Instruct-4bit` | 109.612 | [97.047, 123.803] |
+| all-3-bit requant | 330.299 | [287.322, 379.706] |
+
+`+201.3%, z = 6.0, DO NOT SHIP`. That is a sensitivity check on the tool, and
+an upper bound on plausible damage — a dense 1B at 3 bits is far more fragile
+than a 256-expert MoE with only its experts at 3 bits. It predicts nothing
+about `qwen36q3`.

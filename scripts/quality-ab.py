@@ -53,6 +53,19 @@ p.add_argument("--text", default=None, help="a file, or a glob; default = this r
 p.add_argument("--window", type=int, default=512, help="tokens per independent window")
 p.add_argument("--windows", type=int, default=24, help="how many windows to score")
 p.add_argument("--out", default=None, help="write JSON here")
+p.add_argument(
+    "--dtype",
+    default="bfloat16",
+    choices=["bfloat16", "float32"],
+    help=(
+        "activation dtype. bfloat16 (default) because BOTH sides get the same "
+        "treatment and only their difference is read — f32 buys nothing for a "
+        "comparison and doubles resident memory, which is what made the 35B "
+        "pair hit 23.3 of 23.5 GB swap. Use float32 when grading the ENGINE "
+        "against a reference (scripts/mlx-ref.py), where activation error is "
+        "the thing being measured."
+    ),
+)
 args = p.parse_args()
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -77,7 +90,8 @@ def corpus_text() -> str:
 def score(model_path: str, windows: list[list[int]]) -> dict:
     """Mean NLL per window. Teacher-forced, no cache, one forward per window."""
     model, _ = load(model_path)
-    model.set_dtype(mx.float32)
+    if args.dtype == "float32":
+        model.set_dtype(mx.float32)
     per_window = []
     t0 = time.time()
     for i, w in enumerate(windows):
@@ -125,7 +139,7 @@ if len(ids) < need:
     print(f"scoring {avail} windows instead")
     args.windows = avail
 windows = [ids[i * args.window : (i + 1) * args.window] for i in range(args.windows)]
-print(f"corpus {len(ids)} tokens -> {args.windows} independent windows of {args.window}\n")
+print(f"corpus {len(ids)} tokens -> {args.windows} independent windows of {args.window} ({args.dtype})\n")
 
 print(f"A  {args.a}")
 ra = score(args.a, windows)

@@ -93,6 +93,13 @@ const BRANDINGS: Record<string, ModelBrand> = {
   [QWEN36_35B_A3B_Q3.id]: {
     // ~55 t/s measured by the machine owner on a quiet 32 GB M2 Max
     // (2026-08-05, single session — not yet a protocol round).
+    //
+    // NO ACCURACY EVIDENCE. Every other entry below names a validation record;
+    // this one cannot. The 3-bit choice rests on a block-output cosine (0.936),
+    // which is fidelity and cannot see quality, and there is no e2e test file
+    // for either MoE build — so nothing anywhere has ever checked this model's
+    // output. scripts/quality-ab.py against the 4-bit build is the missing run.
+    // See docs/QUALITY.md.
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · 3-bit experts',
     sizeLabel: '~16.4 GB', rateLabel: '~55 t/s',
     ramNote: 'needs ~20 GB free RAM',

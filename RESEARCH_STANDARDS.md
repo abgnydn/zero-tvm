@@ -153,7 +153,9 @@ sophistication / decreasing strength:
    softmax mass = 1 across attention, KV-cache append idempotence,
    tokenizer round-trip identity on UTF-8 corpora.
 2. **CPU pre-screen**: every WGSL kernel has a TypeScript CPU
-   reference (`src/cpu/*.ts`) that runs on the same inputs. The CPU
+   reference (plain-JS reimplementations inside `tests/kernels/run.mjs`;
+   the `src/cpu/` directory this used to name never existed) that runs on
+   the same inputs. The CPU
    path catches algorithmic bugs *before* the WGSL even reaches the
    GPU — this is `zero-tvm`'s back-port-worthy contribution to the
    sibling discipline.
@@ -174,6 +176,11 @@ sophistication / decreasing strength:
 4. **Experiment**: human-readable output equivalence on a fixed
    prompt corpus, scored against WebLLM's output for "did this
    answer the question equally well."
+   **UNIMPLEMENTED as of 2026-08-10.** Nothing in the repo does this.
+   The nearest thing that exists is the five-prompt lexical battery in
+   `tests/e2e/zero-tvm.test.ts:160-167`, which checks for "paris", "42",
+   "len", "yes" and two colour words on 4 of 9 shipped models, and which
+   CI cannot run. See `docs/QUALITY.md`.
 
 Multiple independent reference frames > one. Each artifact should
 state which it's checking against in `meta.hypothesis`.
@@ -394,7 +401,8 @@ Patch releases (doc-only, refactor, etc.) skip the Zenodo step.
 - Each kernel has paired test coverage by **intent**, not by metric:
   - **Closed-form invariant** (norm preservation, softmax mass = 1,
     tokenizer round-trip) where it exists.
-  - **CPU pre-screen** (TypeScript reference under `src/cpu/`) on
+  - **CPU pre-screen** (plain-JS references inside `tests/kernels/run.mjs`;
+    there is no `src/cpu/` directory) on
     every kernel — falsify on CPU before shipping the WGSL.
   - **Peer-package** (HuggingFace Phi-3-mini fp16 logits, MLC
     quantized weights, WebLLM throughput) on a fixed prompt.
