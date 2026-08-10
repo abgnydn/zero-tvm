@@ -149,6 +149,14 @@ export interface BatchedBenchResult {
 
 export interface DecodeEngine {
   /**
+   * Change sampling without rebuilding the engine. `null` (or temperature <= 0)
+   * returns to greedy — which is argmax.wgsl again, not a degenerate sampler,
+   * because every reference comparison in this repo pins greedy to that kernel.
+   * Takes effect on the next token. Without this, a settings control would have
+   * to reload the page and re-download the weights to move a slider.
+   */
+  setSampling(next: DecodeEngineOptions['sampling'] | null): void
+  /**
    * Blocking generate: one submit + one readback per token, deterministic
    * per-token positions, KV reuse via `startPos`. The validation harness path.
    */
@@ -585,19 +593,30 @@ export function buildDecodeEngine(
   const normU  = uniformBuf(device, [u32(1)])
   const ffnU   = uniformBuf(device, [u32(S.ffn)])
   const argmaxU = uniformBuf(device, [u32(S.vocab)])
-  // Sampling. Temperature 0 resolves to null here, which is what keeps the
-  // greedy path dispatch-for-dispatch what it was.
-  const sampling = opts.sampling && opts.sampling.temperature > 0 ? opts.sampling : null
+  // Sampling. Temperature 0 resolves to null, which is what keeps the greedy
+  // path dispatch-for-dispatch what it was.
+  //
+  // MUTABLE, and both paths are built: a settings control that changed
+  // temperature would otherwise have to rebuild the engine, i.e. reload the
+  // page and re-download the weights on every slider move. The choice is made
+  // per token in recordForward (a fresh encoder each time), so switching is
+  // free and greedy still dispatches argmax.wgsl rather than becoming "the
+  // sampler at temperature 0" — every reference comparison in this repo pins
+  // greedy decoding to that kernel.
+  let sampling = opts.sampling && opts.sampling.temperature > 0 ? opts.sampling : null
   // Partitions in the sampler's reduce pass — a width, not a tuning knob: 64
   // workgroups fill a GPU for every shipped vocabulary (32064 → 501 logits per
   // partition, 248320 → 3880) and the select pass merges them serially.
   const SAMPLE_PARTS = 64
-  const samplerU = sampling ? uniformBuf(device, [
-    u32(S.vocab), u32(SAMPLE_PARTS), f32(sampling.temperature),
-    f32(sampling.topP ?? 1), f32(sampling.minP ?? 0), u32(sampling.seed ?? 0), u32(0),
+  // Allocated whether or not sampling is on right now — 32 bytes of uniform and
+  // a 512-byte partials buffer, against being able to turn it on without a
+  // reload.
+  const samplerU = L1 === S.layers ? uniformBuf(device, [
+    u32(S.vocab), u32(SAMPLE_PARTS), f32(sampling?.temperature ?? 0),
+    f32(sampling?.topP ?? 1), f32(sampling?.minP ?? 0), u32(sampling?.seed ?? 0), u32(0),
   ]) : null
   // (max, denominator) per partition — sampler.wgsl's PARTIAL_STRIDE.
-  const samplePartials = sampling ? makeBuf(device, SAMPLE_PARTS * 2 * 4, 'samplePartials') : null
+  const samplePartials = L1 === S.layers ? makeBuf(device, SAMPLE_PARTS * 2 * 4, 'samplePartials') : null
   if (sampling) {
     console.log(
       `[engine] sampling: temperature=${sampling.temperature} topP=${sampling.topP ?? 1} ` +
@@ -880,16 +899,16 @@ export function buildDecodeEngine(
   const bgLmHead = L1 !== S.layers ? null : bg(device, R.matmulF32, withBias(
     [B.logits, B.hidden1, weights.lmHeadScales, weights.lmHeadWeights, lmHdU],
     weights.lmHeadBiases, 'lm_head'))
-  const bgArgmax = L1 !== S.layers || sampling ? null : bg(device, R.argmax, [
+  const bgArgmax = L1 !== S.layers ? null : bg(device, R.argmax, [
     B.logits, B.tokenOut, argmaxU,
   ])
   // Sampler bind groups. Both passes bind the same four buffers, which is why
   // sample_reduce also writes `result` (see the sentinel note in sampler.wgsl)
   // — a binding a pass never touches would be dropped from its layout:'auto'
   // layout and the shared entry list would then fail validation on one of them.
-  const bgSampleReduce = sampling && L1 === S.layers
+  const bgSampleReduce = L1 === S.layers
     ? bg(device, P.sampleReduce, [B.logits, samplePartials!, B.tokenOut, samplerU!]) : null
-  const bgSampleSelect = sampling && L1 === S.layers
+  const bgSampleSelect = L1 === S.layers
     ? bg(device, P.sampleSelect, [B.logits, samplePartials!, B.tokenOut, samplerU!]) : null
   // Split-K combine reads the shared partials scratch and writes attnOut —
   // identical for every layer, so one bind group serves every layer.
@@ -1331,7 +1350,7 @@ export function buildDecodeEngine(
     // reduction before anything can be thresholded — see sampler.wgsl. This is
     // the only place a token is produced, so pipelineStep's last stage samples
     // here too, and the on-GPU tokenOut → inputIds chain is unchanged.
-    if (bgSampleSelect) {
+    if (sampling && bgSampleSelect) {
       dispatch(enc, P.sampleReduce, bgSampleReduce!, SAMPLE_PARTS, 1, 1, 'sampleReduce')
       dispatch(enc, P.sampleSelect, bgSampleSelect, 1, 1, 1, 'sampleSelect')
     } else {
@@ -2316,11 +2335,33 @@ export function buildDecodeEngine(
     return { msBatched, msTiledTotal, msPerMBatched, msPerMTiled, speedup }
   }
 
+  /**
+   * Change sampling without rebuilding the engine — the whole reason both the
+   * argmax and sampler paths are bound. `null` (or temperature <= 0) returns to
+   * greedy, which really is argmax.wgsl again and not a degenerate sampler.
+   *
+   * Takes effect on the NEXT token: recordForward reads `sampling` per call.
+   * The uniform's counter field (offset 24) is rewritten per token elsewhere,
+   * so only the four knobs are written here.
+   */
+  function setSampling(next: DecodeEngineOptions['sampling'] | null): void {
+    sampling = next && next.temperature > 0 ? next : null
+    if (!samplerU) return
+    const u = new ArrayBuffer(16)
+    const dv = new DataView(u)
+    dv.setFloat32(0, sampling?.temperature ?? 0, true)
+    dv.setFloat32(4, sampling?.topP ?? 1, true)
+    dv.setFloat32(8, sampling?.minP ?? 0, true)
+    dv.setUint32(12, sampling?.seed ?? 0, true)
+    device.queue.writeBuffer(samplerU, 8, u)
+  }
+
   return {
     generate,
     generatePipelined,
     forwardLogits,
     pipelineStep,
+    setSampling,
     resetKVTracking,
     debugCompareReuse,
     getLastPrefill,

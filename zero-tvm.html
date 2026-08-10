@@ -111,6 +111,41 @@
       text-overflow: ellipsis;
     }
     .header-spacer { flex: 1; }
+    /* Sampling popover. Mirrors .model-menu's anchoring; wider because these
+       are labelled sliders rather than a list of names. */
+    .samp-wrap { position: relative; }
+    .header-btn.active { color: var(--accent); border-color: var(--accent); }
+    .samp-menu {
+      position: absolute; top: calc(100% + 6px); right: 0; z-index: 40;
+      width: 300px; padding: 12px; display: flex; flex-direction: column; gap: 12px;
+      background: var(--panel); border: 1px solid var(--border-2); border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.35); font-size: 12px;
+    }
+    .samp-menu[hidden] { display: none; }
+    .samp-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .samp-head span { color: var(--muted); font-size: 11px; }
+    .samp-row { display: flex; flex-direction: column; gap: 4px; }
+    .samp-label { display: flex; justify-content: space-between; color: var(--text); }
+    .samp-label b { color: var(--accent); font-weight: 600; }
+    .samp-note { color: var(--muted); font-size: 10.5px; line-height: 1.35; }
+    .samp-row input[type=range] { width: 100%; accent-color: var(--accent); }
+    .samp-seed-row { display: flex; gap: 6px; }
+    .samp-seed-row input {
+      flex: 1; min-width: 0; padding: 4px 6px; font: inherit; color: var(--text);
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    }
+    .samp-btn {
+      padding: 4px 8px; font: inherit; color: var(--text); cursor: pointer;
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    }
+    .samp-btn:hover { border-color: var(--border-2); }
+    .samp-reset { align-self: flex-start; }
+    /* At temperature 0 the other two knobs do nothing — dimming them beats
+       letting someone move a slider and conclude the feature is broken. */
+    .samp-menu.samp-greedy #samp-topp-val,
+    .samp-menu.samp-greedy #samp-minp-val { color: var(--muted); }
+    .samp-menu.samp-greedy .samp-row:nth-child(3),
+    .samp-menu.samp-greedy .samp-row:nth-child(4) { opacity: .45; }
     .badge {
       display: inline-flex;
       align-items: center;
@@ -555,6 +590,15 @@
       </div>
       <div class="header-spacer"></div>
       <span class="stats" id="stats"></span>
+      <div class="samp-wrap">
+        <button class="header-btn" id="sampling-btn" type="button" title="Sampling: off (greedy)" aria-haspopup="dialog" aria-expanded="false">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/>
+            <circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>
+          </svg>
+        </button>
+        <div class="samp-menu" id="sampling-menu" role="dialog" aria-label="Sampling settings" hidden></div>
+      </div>
       <button class="header-btn" id="new-chat-btn" type="button" title="New chat" disabled>
         <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
         <span>New chat</span>
@@ -568,8 +612,8 @@
           <div class="welcome-logo">Z</div>
           <div class="welcome-title">Chat with Phi-3-mini</div>
           <div class="welcome-pills">
-            <span class="welcome-pill">q4f16_1 · 3.8 B</span>
-            <span class="welcome-pill">4 K context</span>
+            <span class="welcome-pill" id="welcome-quant">q4f16_1 · 3.8 B</span>
+            <span class="welcome-pill" id="welcome-ctx">4 K context</span>
             <span class="welcome-pill">Runs on your GPU · WebGPU</span>
             <span class="welcome-pill">On-device only</span>
           </div>

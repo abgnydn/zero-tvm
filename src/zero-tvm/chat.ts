@@ -14,6 +14,7 @@
 import { opfsDirFor } from './weight-loader.js'
 import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
 import { initModelSwitcher } from './model-switcher.js'
+import { initSamplingControls } from './sampling-ui.js'
 import {
   allocKVPages,
   allocKVPagesInt8,
@@ -281,6 +282,9 @@ async function main(): Promise<void> {
     return
   }
   const { tokenizer, engine } = boot
+  // The sampling popover is mounted before this (the header is interactive
+  // during the download), so hand it the engine once there is one.
+  liveEngine = engine
   hideLoadingOverlay()
 
   // ─────────── Wire chat UI ───────────
@@ -573,12 +577,19 @@ async function main(): Promise<void> {
 /** Rewrite the static Phi-3 markup (gate dialog, header, welcome) for the
  * active model. The HTML ships with Phi-3 copy, so this is a no-op there. */
 function applyModelBranding(): void {
-  if (SPEC.id === 'phi3-mini') return
-  document.title = `Zero-TVM Chat — ${BRAND.name}`
   const set = (sel: string, text: string) => {
     const el = document.querySelector(sel) as HTMLElement | null
     if (el) el.textContent = text
   }
+  // The welcome pills are written for EVERY model including Phi-3, unlike the
+  // rest of this function. They were static markup, so the page told a
+  // Llama-3.2-1B visitor it was running "q4f16_1 · 3.8 B" with "4 K context" —
+  // Phi-3's numbers, on a 1B MLX model with 8x the context. Deriving them even
+  // when they happen to be right is the only way they cannot drift again.
+  set('#welcome-quant', `${quantTagFor(SPEC)} · ${BRAND.params}`)
+  set('#welcome-ctx', `${Math.round(SPEC.maxContext / 1024)} K context`)
+  if (SPEC.id === 'phi3-mini') return
+  document.title = `Zero-TVM Chat — ${BRAND.name}`
   set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
   const statVals = document.querySelectorAll('#start-dialog .dialog-stats .dstat .val')
   if (statVals[0]) statVals[0].textContent = BRAND.sizeLabel   // download size
@@ -587,9 +598,15 @@ function applyModelBranding(): void {
   set('#welcome .welcome-title', `Chat with ${BRAND.name}`)
 }
 
+/** Set once the engine exists. The sampling controls read it lazily, so the
+ *  popover works during the weight download and simply applies to whatever
+ *  engine is there when the next token is produced. */
+let liveEngine: import('./engine-core.js').DecodeEngine | null = null
+
 async function boot(): Promise<void> {
   applyModelBranding()
   initModelSwitcher(SPEC)
+  initSamplingControls(() => liveEngine)
   // Register the weight-cache SW first so it intercepts the very first
   // network fetch (from bootEngine's loadWeights call) — and any future
   // fetch from WebLLM in compiler-chat / webllm-bench.
