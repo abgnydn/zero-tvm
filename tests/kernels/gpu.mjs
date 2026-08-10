@@ -9,7 +9,14 @@
 // On a Linux CI runner, install lavapipe and point the loader at it:
 //
 //   apt-get install -y mesa-vulkan-drivers
-//   export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+//   export VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
+//
+// GLOB, not lvp_icd.json. Ubuntu 22.04 installs ARCH-SUFFIXED ICD manifests —
+// lvp_icd.x86_64.json — so the unsuffixed path this comment used to give does
+// not exist there and the loader answers ERROR_INCOMPATIBLE_DRIVER, which reads
+// like "no software rasterizer available" rather than "wrong filename".
+// Measured on Colab (Ubuntu 22.04.5, mesa 23.2.1) 2026-08-10, where the fixed
+// path runs this suite green: 32/32 correct, 20 skipped for an 8-lane subgroup.
 //
 // lavapipe is slow, so this suite checks CORRECTNESS, never throughput.
 //
