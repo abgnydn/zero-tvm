@@ -145,6 +145,15 @@ export interface BatchedBenchResult {
   msPerMBatched: number
   msPerMTiled: number
   speedup: number
+  /** Weight bytes ONE dispatch of this matmul must read. Decode is
+   *  memory-bound, so this over the measured time is the number that says
+   *  whether a kernel has headroom left. */
+  weightBytes: number
+  /** Achieved bandwidth for the M=1 tiled kernel — the one decode dispatches. */
+  gbPerSecTiled: number
+  /** Same for the M=4 batched kernel, which reads the same weights for 4x the
+   *  work; above the tiled figure means the amortization is real. */
+  gbPerSecBatched: number
 }
 
 export interface DecodeEngine {
@@ -2256,6 +2265,26 @@ export function buildDecodeEngine(
     const tiledBG = bg(device, tiledPipeline,
       [tiledOutBuf, inBuf, scalesBuf, weightsBuf, uniformBufForTarget])
 
+    // ── one bind group per LAYER, cycled ────────────────────────────────────
+    // Hammering a single weight buffer measures CACHE, not memory. Measured
+    // 2026-08-10 on an M2 Max: llama32's 9.4 MB ffn_down re-read 300 times
+    // reported 658 GB/s — above the machine's ~400 GB/s of actual memory
+    // bandwidth, which is the tell. Decode walks every layer once per token, so
+    // nothing it reads is resident.
+    //
+    // Cycling every layer's buffer makes the working set the model, not one
+    // matrix. Falls back to the single-layer set when a spec has only one
+    // (and then the number is a cache figure and says so).
+    const layerBGs: GPUBindGroup[] = []
+    for (const lw of weights.layers) {
+      const sc = isFfnDown ? lw.ffnDownScales : lw.oProjScales
+      const w = isFfnDown ? lw.ffnDownWeights : lw.oProjWeights
+      if (!sc || !w) continue
+      layerBGs.push(bg(device, tiledPipeline, [tiledOutBuf, inBuf, sc, w, uniformBufForTarget]))
+    }
+    const cycled = layerBGs.length > 1 ? layerBGs : [tiledBG]
+    const workingSetMB = (cycled.length * ((N * K) / 2 + (N * K / QGROUP) * 2 * (AFFINE ? 2 : 1))) / 1e6
+
     const batchedWGs = N / 4
     const tiledWGs   = N / R.matmulRowsPerWG
 
@@ -2291,7 +2320,7 @@ export function buildDecodeEngine(
       const enc = device.createCommandEncoder()
       for (let i = 0; i < iters * M; i++) {
         const pass = enc.beginComputePass()
-        pass.setPipeline(tiledPipeline); pass.setBindGroup(0, tiledBG)
+        pass.setPipeline(tiledPipeline); pass.setBindGroup(0, cycled[i % cycled.length])
         pass.dispatchWorkgroups(tiledWGs); pass.end()
       }
       device.queue.submit([enc.finish()])
@@ -2302,6 +2331,45 @@ export function buildDecodeEngine(
     const msPerMBatched = msBatched / iters
     const msPerMTiled   = msTiledTotal / iters
     const speedup = msPerMTiled / msPerMBatched
+
+    // ── achieved bandwidth — READ THE CAVEAT BEFORE QUOTING THIS ────────────
+    // Decode is memory-bound: a matvec reads a whole weight matrix to produce
+    // one token, so tok/s is bounded by (weight bytes) / (memory bandwidth).
+    // The hope was that comparing this figure against that bound would settle
+    // whether decode is kernel-limited or per-dispatch-overhead-limited.
+    //
+    // IT DOES NOT, and the number says so itself. Measured 2026-08-10 on an
+    // M2 Max (~400 GB/s of real memory bandwidth): 658 GB/s re-reading one
+    // buffer, and 884 GB/s cycling all 16 layers for a 151 MB working set.
+    // Both are above the hardware, so neither is measuring memory.
+    //
+    // Two confounds stack. Cache: even 151 MB gets substantial reuse. And,
+    // worse, these dispatches are INDEPENDENT — nothing reads tiledOutBuf, and
+    // they all sit in one command buffer, so the driver overlaps them freely.
+    // Real decode is a dependency chain: layer N+1 cannot start until layer N
+    // has written its residual.
+    //
+    // So what this reports is peak overlapped read throughput — a real ceiling
+    // for the kernel, and an upper bound rather than a model of decode.
+    // Settling the original question needs dependent dispatches, and note
+    // gpu.mjs's finding that onSubmittedWorkDone here resolves on a fixed
+    // ~100 ms tick, which is why per-dispatch timing is not simply available.
+    //
+    // Packed 4-bit rows plus their scales, and biases too on the affine path.
+    // The activation (M*K*2) is left out deliberately: at K=8192 it is 16 KB
+    // against 14 MB of weights, and including it would flatter the result.
+    const scaleBytes = (N * K / QGROUP) * 2
+    const weightBytes = (N * K) / 2 + scaleBytes * (AFFINE ? 2 : 1)
+    const gbPerSecTiled = weightBytes / (msPerMTiled / 1000) / 1e9
+    // The batched kernel reads those same bytes once for M rows of work.
+    const gbPerSecBatched = weightBytes / (msPerMBatched / 1000) / 1e9
+    console.log(
+      `[batched-bench] ${target} K=${K} N=${N}: ${(weightBytes / 1e6).toFixed(2)} MB of weights per dispatch\n` +
+      `  working set ${workingSetMB.toFixed(0)} MB across ${cycled.length} layer(s)` +
+      `${cycled.length > 1 ? '' : ' — SINGLE BUFFER, this is a cache figure'}\n` +
+      `  M=1 tiled   ${msPerMTiled.toFixed(3)} ms  ->  ${gbPerSecTiled.toFixed(1)} GB/s  (what decode actually dispatches)\n` +
+      `  M=4 batched ${msPerMBatched.toFixed(3)} ms  ->  ${gbPerSecBatched.toFixed(1)} GB/s effective for 4x the work`,
+    )
 
     // Correctness: dispatch once, read back first 32 f16 of outBuf, compute a
     // byte-sum. If the shader returns early or fails silently, sum will be 0.
@@ -2332,7 +2400,10 @@ export function buildDecodeEngine(
 
     sampleReadBuf.destroy()
     inBuf.destroy(); outBuf.destroy(); tiledOutBuf.destroy()
-    return { msBatched, msTiledTotal, msPerMBatched, msPerMTiled, speedup }
+    return {
+      msBatched, msTiledTotal, msPerMBatched, msPerMTiled, speedup,
+      weightBytes, gbPerSecTiled, gbPerSecBatched,
+    }
   }
 
   /**
