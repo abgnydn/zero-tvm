@@ -80,21 +80,50 @@ Independent windows, identical for both sides, with error bars and a z score.
 Verdicts: within +10% with separated bars → ship; +10–25% → a task benchmark
 decides, not this; >+25% → don't.
 
-**Validated by making it fail, at three severities.** `scripts/requantize.py`
-builds a deliberately-degraded copy of a checkpoint already on disk; the A/B
-then has to separate it. Llama-3.2-1B-Instruct-4bit as the baseline, 16
-independent windows of 512 tokens, bf16, ~10 s per arm:
+**Validated by making it fail, at four severities — including a real MoE.**
+`scripts/requantize.py` builds a deliberately-degraded copy of a checkpoint
+already on disk; the A/B then has to separate it. 24 independent windows of 512
+tokens, bf16, ~10 s per arm.
 
-| B | perplexity | vs A | z | verdict |
-|---|---:|---:|---:|---|
-| baseline (A) | 109.612 | — | — | — |
-| `--scope mlp --bits 3` | 193.552 | **+76.6%** | 3.2 | DO NOT SHIP |
-| `--scope all --bits 3` | 330.299 | **+201.3%** | 6.0 | DO NOT SHIP |
-| a no-op requant | *refused* | — | — | see below |
+| baseline | candidate | ppl | vs base | paired z | B worse on | verdict |
+|---|---|---:|---:|---:|---:|---|
+| Llama-3.2-1B-4bit | `--scope mlp --bits 3` | 193.6 | +75.8% | 35.5 | 24/24 | DO NOT SHIP |
+| Llama-3.2-1B-4bit | `--scope all --bits 3` | 322.9 | +193.7% | 31.8 | 24/24 | DO NOT SHIP |
+| **OLMoE-1B-7B-4bit** | **`--scope experts --bits 3`** | **52.3** | **+8.4%** | **14.7** | **24/24** | **SHIP** |
+| any | a no-op requant | — | — | — | — | *refused* |
 
-Two things this establishes that a single pass/fail could not: the harness
-separates *degrees* of damage, not just broken from working, and it does it at
-z ≥ 3 with 16 windows in seconds.
+The OLMoE row is the one that matters: **64 experts, top-8, and only the expert
+stacks requantized — exactly what `qwen36q3` does**, on a 3.6 GB model that runs
+in seconds instead of a 19.7 GB one that does not fit.
+
+And it is informative. Expert-only 3-bit costs **+8.4%**, against +75.8% for
+dense-MLP-only 3-bit on a comparable-sized model. Roughly an order of magnitude
+gentler — which is the mechanism working as designed: experts are sparsely
+activated (8 of 64), so each one's error is diluted, and attention, the router
+and the embeddings all stay at 4 bits.
+
+**This is an analogue for `qwen36q3`, not a prediction.** OLMoE is 64 experts
+with 1B active; Qwen3.6-35B-A3B is 256 experts with 3B active. It establishes
+that expert-only 3-bit is a mild intervention on *a* real MoE and that the
+harness can resolve an 8% effect. It does not license a number for the 35B.
+
+### The paired test, which is what makes an 8% effect visible
+
+Both arms score the **identical** windows, so the comparison must be paired.
+Between-window variance dominates — some passages are simply harder, and that
+difficulty is common to both checkpoints — so an unpaired test spends nearly
+all its power measuring the corpus rather than the quantization. On the OLMoE
+run, the same 24 windows give:
+
+```
+unpaired z = 0.8    NOT DISTINGUISHABLE at this window count
+paired   z = 14.7   SHIP: within +10% with separated error bars
+```
+
+Same data, same +8.4%. The tool reported the first version and correctly
+refused to conclude; differencing per window resolved it. Both are printed now,
+and the verdict uses the paired one. The `B worse on N/N windows` count is a
+distribution-free cross-check — 24/24 is p ≈ 6e-8 on a sign test alone.
 
 A harness that has only ever passed proves nothing, so this one was pointed at
 known-broken weights first.

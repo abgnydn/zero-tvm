@@ -1397,15 +1397,24 @@ repo's own converter, so nothing is uploaded. **Treat 3-bit-vs-4-bit quality on 
 unknown**, not as measured — the 0.936 does not carry the weight the surrounding
 prose gave it.
 
-The harness itself is validated: an all-3-bit requant of Llama-3.2-1B against
-the shipped 4-bit, 16 independent windows of 512 tokens, bf16, 9 s total —
+The harness is validated on four builds, 24 independent windows of 512 tokens,
+bf16, ~10 s per arm:
 
-| build | perplexity | ±1σ |
-|---|---:|---|
-| `Llama-3.2-1B-Instruct-4bit` | 109.612 | [97.047, 123.803] |
-| all-3-bit requant | 330.299 | [287.322, 379.706] |
+| baseline | candidate | ppl | vs base | paired z | B worse on |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B-4bit | 4-bit (itself) | 109.6 | — | — | — |
+| Llama-3.2-1B-4bit | MLP-only 3-bit | 193.6 | +75.8% | 35.5 | 24/24 |
+| Llama-3.2-1B-4bit | all 3-bit | 322.9 | +193.7% | 31.8 | 24/24 |
+| **OLMoE-1B-7B-4bit** | **experts-only 3-bit** | **52.3** | **+8.4%** | **14.7** | **24/24** |
 
-`+201.3%, z = 6.0, DO NOT SHIP`. That is a sensitivity check on the tool, and
-an upper bound on plausible damage — a dense 1B at 3 bits is far more fragile
-than a 256-expert MoE with only its experts at 3 bits. It predicts nothing
-about `qwen36q3`.
+**The OLMoE row is the closest evidence that exists for `qwen36q3`.** 64
+experts, top-8, only the expert stacks requantized — the same intervention, on
+a 3.6 GB model. Expert-only 3-bit costs **+8.4%**, about an order of magnitude
+less than dense 3-bit on a comparable model, which is the sparsity working as
+intended: 8 experts of 64 fire per token, and attention, router and embeddings
+stay at 4 bits.
+
+**It is an analogue, not a prediction.** OLMoE is 64 experts / 1B active;
+Qwen3.6-35B-A3B is 256 experts / 3B active. This says expert-only 3-bit is a
+mild intervention on *a* real MoE and that the harness resolves an 8% effect.
+It does not give `qwen36q3` a number.

@@ -120,6 +120,7 @@ def score(model_path: str, windows: list[list[int]]) -> dict:
         "ppl_hi": math.exp(mean + sem),
         "sem_nll": sem,
         "windows": n,
+        "per_window": per_window,
         "seconds": time.time() - t0,
     }
 
@@ -156,13 +157,29 @@ if args.b:
     result["b"] = {"path": args.b, **rb}
 
     delta = (rb["perplexity"] / ra["perplexity"] - 1) * 100
-    # Paired z on mean NLL. The windows are identical for both, so this is a
-    # paired comparison in spirit; treating it as unpaired is conservative.
-    z = abs(rb["mean_nll"] - ra["mean_nll"]) / math.sqrt(ra["sem_nll"] ** 2 + rb["sem_nll"] ** 2)
+
+    # PAIRED, because both arms scored the IDENTICAL windows. Between-window
+    # variance is the dominant term — some passages are simply harder than
+    # others, and that difficulty is common to both checkpoints — so an
+    # unpaired test spends nearly all its power measuring the corpus instead
+    # of the quantization. Differencing per window cancels it.
+    # Measured on OLMoE expert-3-bit: unpaired z = 0.8 ("not distinguishable"),
+    # paired z on the same 24 windows resolves the same +8.4% cleanly.
+    d = [b - a for a, b in zip(ra["per_window"], rb["per_window"])]
+    n = len(d)
+    dm = sum(d) / n
+    dvar = sum((x - dm) ** 2 for x in d) / max(1, n - 1)
+    dsem = math.sqrt(dvar / n)
+    z = abs(dm) / dsem if dsem > 0 else float("inf")
+    # Kept for reference: the unpaired form, which is what this used to report.
+    z_unpaired = abs(rb["mean_nll"] - ra["mean_nll"]) / math.sqrt(ra["sem_nll"] ** 2 + rb["sem_nll"] ** 2)
     result["delta_pct"] = delta
     result["z"] = z
+    result["z_unpaired"] = z_unpaired
+    result["windows_b_worse"] = sum(1 for x in d if x > 0)
 
-    print(f"  B is {delta:+.1f}% perplexity vs A, z = {z:.1f}")
+    print(f"  B is {delta:+.1f}% perplexity vs A, paired z = {z:.1f}"
+          f"  (unpaired {z_unpaired:.1f}; B worse on {result['windows_b_worse']}/{n} windows)")
     if z < 2:
         print("  NOT DISTINGUISHABLE at this window count — raise --windows before concluding")
     elif delta <= 10:
