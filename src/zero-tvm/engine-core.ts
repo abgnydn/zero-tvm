@@ -87,13 +87,23 @@ interface ProfileState {
 // ============================================================
 
 export function allocKVPages(device: GPUDevice, spec: ModelSpec = PHI3): GPUBuffer[] {
+  const attnLayerCount = spec.layerKinds.filter((k) => k === 'attn').length
+  // MLA caches ONE latent plus ONE shared RoPE key per token — no head axis, no
+  // separate V — so it needs a differently shaped buffer, not a differently
+  // sized one. The branch lives HERE rather than at the call sites (chat.ts,
+  // loading-ui.ts, share.ts x2, lib/index.ts) so all five are right by
+  // construction; a forgotten one allocates 7x the memory and still produces
+  // correct tokens, which is the kind of wrong nobody notices.
+  if (spec.mla) {
+    return Array.from({ length: attnLayerCount }, (_, i) =>
+      makeBuf(device, spec.mlaCacheBytes, `mlaKV_${i}`))
+  }
   const bytesPerPage = spec.kvPageStride * 2  // kvHeads * pageSize slots * headDim * 2 (K+V) * 2 bytes
   const pages = spec.maxPages * bytesPerPage  // Phi-3: 257 * 196608 ≈ 50MB
   // One pages buffer per ATTENTION layer: hybrid specs (Qwen3.5) have KV only
   // on their 'attn' layers and the engine indexes by attention-layer ordinal.
   // Pure-attention specs have layerKinds all 'attn' → one per layer, as before.
-  const attnLayers = spec.layerKinds.filter((k) => k === 'attn').length
-  return Array.from({ length: attnLayers }, (_, i) =>
+  return Array.from({ length: attnLayerCount }, (_, i) =>
     makeBuf(device, pages, `kvPages_${i}`)
   )
 }
@@ -491,6 +501,15 @@ export function buildDecodeEngine(
     gdnRecurOut: null as GPUBuffer | null, // recurrence readout [GDN_V_DIM f32]
     gdnNormed:  null as GPUBuffer | null,  // gated-norm output [GDN_V_DIM f16]
     // Sparse MoE scratch — shared across layers, the block is stateless.
+    // ── MLA scratch (null on every other spec) ──
+    mlaQ: null as GPUBuffer | null,       // [heads*(nope+rope)] f16 — q_proj out
+    mlaKva: null as GPUBuffer | null,     // [kvLora+rope] f16 — kv_a_proj out
+    mlaQNope: null as GPUBuffer | null,   // [heads, nope] f16
+    mlaQPe: null as GPUBuffer | null,     // [heads, rope] f16, rotated
+    mlaQLat: null as GPUBuffer | null,    // [heads, kvLora] f16 — query in latent space
+    mlaScores: null as GPUBuffer | null,  // [heads, maxContext] f32
+    mlaOLat: null as GPUBuffer | null,    // [heads, kvLora] f32 — combine writes f32
+    mlaOLat16: null as GPUBuffer | null,  // the same, narrowed for mla_proj
     routerLogits: null as GPUBuffer | null,  // [experts+1] f32
     moeIds:       null as GPUBuffer | null,  // [slots] u32 — expert per slot
     moeScores:    null as GPUBuffer | null,  // [slots] f32
@@ -547,6 +566,26 @@ export function buildDecodeEngine(
   // moeH and moeDown are allocated fresh rather than reusing B.ffnOut (ffn*2 =
   // 1 KB, but 9 slots need 9 KB) or B.hidden2 (d*2 = 4 KB against 36 KB): a
   // stray dense dispatch should fail loudly, not corrupt slot 0.
+  // ── MLA scratch, all SHARED across layers ───────────────────────────────
+  // MLA carries no per-layer state (the cache is per-layer, these are not), so
+  // one set serves the whole stack — the same arrangement as the MoE scratch
+  // below.
+  if (S.mla) {
+    const M = S.mla
+    B.mlaQ = makeBuf(device, S.mlaQProjRows * 2, 'mlaQ')
+    B.mlaKva = makeBuf(device, S.mlaKvaRows * 2, 'mlaKva')
+    B.mlaQNope = makeBuf(device, S.heads * M.qkNopeHeadDim * 2, 'mlaQNope')
+    B.mlaQPe = makeBuf(device, S.heads * M.qkRopeHeadDim * 2, 'mlaQPe')
+    B.mlaQLat = makeBuf(device, S.heads * M.kvLoraRank * 2, 'mlaQLat')
+    // maxContext, NOT the current T. Bind groups are hoisted out of the token
+    // loop and cannot be resized per token; undersized, WGSL clamps the
+    // out-of-bounds store and the tail of every long conversation silently
+    // attends to zeros.
+    B.mlaScores = makeBuf(device, S.heads * S.maxContext * 4, 'mlaScores')
+    B.mlaOLat = makeBuf(device, S.heads * M.kvLoraRank * 4, 'mlaOLat')
+    B.mlaOLat16 = makeBuf(device, S.heads * M.kvLoraRank * 2, 'mlaOLat16')
+  }
+
   if (S.moe) {
     const M = S.moe
     // Router rows: one per routed expert, plus the shared expert's gate when
@@ -599,6 +638,7 @@ export function buildDecodeEngine(
     : null
   const moeCombU = S.moe ? uniformBuf(device, [u32(S.d), u32(S.moeSlots)]) : null
   const ffnDnU = uniformBuf(device, [u32(FFN_DN_K_PACKED), u32(FFN_DN_SCALES), u32(S.d)])
+
   // Affine dense gate_up: a K=d matmul instance over 2·ffn rows (same shape
   // family as qkvU), plus silu_mul pinned to a single slot.
   const ffnGateUpU = ffnGateUp ? uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(2 * S.ffn)]) : null
@@ -698,7 +738,40 @@ export function buildDecodeEngine(
   // is right without it is still a model that is wrong at every position.
   // ropeAttnScale() returns 1 for every non-yarn spec, so this is identity for
   // everything shipped today.
-  const SM_SCALE = ropeAttnScale(S) / Math.sqrt(S.headDim)
+  // MLA's score is a dot over [nope | rope] = 192, not over headDim = 128.
+  // Left unbranched this is a uniform 1.2247x on every logit — finite, no NaN,
+  // no test failure outside the reference bundle. mla-spec.test.ts pins the
+  // result against the bundle's own softmax_scale, which is what makes it
+  // impossible to ship.
+  const SM_SCALE = S.mla
+    ? ropeAttnScale(S) / Math.sqrt(S.mla.qkNopeHeadDim + S.mla.qkRopeHeadDim)
+    : ropeAttnScale(S) / Math.sqrt(S.headDim)
+
+  // ── MLA uniforms ────────────────────────────────────────────────────────
+  // The two projections are ordinary affine-matmul triples. The two mla_proj
+  // uniforms differ ONLY in {N, K}, which is the whole reason one pipeline
+  // serves both directions.
+  const MLA = S.mla
+  const mlaQU = MLA ? uniformBuf(device, [u32(S.d / PACK), u32(S.d / QGROUP), u32(S.mlaQProjRows)]) : null
+  const mlaKvaU = MLA ? uniformBuf(device, [u32(S.d / PACK), u32(S.d / QGROUP), u32(S.mlaKvaRows)]) : null
+  const mlaSplitU = MLA ? uniformBuf(device, [u32(MLA.qkNopeHeadDim), u32(MLA.qkRopeHeadDim)]) : null
+  const mlaWriteU = MLA ? uniformBuf(device, [u32(MLA.kvLoraRank), u32(MLA.qkRopeHeadDim)]) : null
+  const mlaProjKU = MLA ? uniformBuf(device, [u32(MLA.kvLoraRank), u32(MLA.qkNopeHeadDim)]) : null
+  const mlaProjVU = MLA ? uniformBuf(device, [u32(MLA.vHeadDim), u32(MLA.kvLoraRank)]) : null
+  const mlaNarrowU = MLA ? uniformBuf(device, [u32(S.heads * MLA.kvLoraRank)]) : null
+  // {L, R, T, scale} — T is rewritten per token at byte offset 8, beside the
+  // existing nnzPages write, because the cache grows by one row per position.
+  const mlaScoresU = MLA ? (() => {
+    const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'mlaScoresU' })
+    const init = new ArrayBuffer(16); const dv = new DataView(init)
+    dv.setUint32(0, MLA.kvLoraRank, true); dv.setUint32(4, MLA.qkRopeHeadDim, true)
+    dv.setUint32(8, 0, true); dv.setFloat32(12, SM_SCALE, true)
+    device.queue.writeBuffer(b, 0, init)
+    return b
+  })() : null
+  // {L, T} — T at offset 4, same per-token patch.
+  const mlaCombineU = MLA ? uniformBuf(device, [u32(MLA.kvLoraRank), u32(0)]) : null
+  const mlaTScratch = new Uint32Array(1)
 
   // Hard KV ceiling — writing a slot at or past this position would run off
   // the last page and silently corrupt the cache.
@@ -954,6 +1027,19 @@ export function buildDecodeEngine(
     ffn?: GPUBindGroup          // dense FFN; absent on a MoE spec. Affine: the 2·ffn-row gate_up matmul
     ffnSilu?: GPUBindGroup      // affine dense only: silu_mul(ffnGateUp) → ffnOut (fused_ffn has no affine sibling)
     ffnDown?: GPUBindGroup      // prologue mode: writes hidden3 (hidden2 must survive for add3_norm)
+    /** The MLA chain's bind groups, present iff spec.mla. Replaces qkv/attn
+     *  entirely — there is no per-head K/V and no kv_append. */
+    mla?: {
+      qProj: GPUBindGroup       // q_proj (pe rows already permuted at load)
+      kvaProj: GPUBindGroup     // kv_a_proj_with_mqa
+      qSplit: GPUBindGroup      // → q_nope + half-split-RoPE'd q_pe
+      kvWrite: GPUBindGroup     // RMSNorm'd latent + RoPE'd shared key, into the cache
+      qLat: GPUBindGroup        // q_nope through kv_b's K half → latent space
+      scores: GPUBindGroup      // score against the cache
+      combine: GPUBindGroup     // softmax + weighted sum of the latent
+      narrow: GPUBindGroup      // f32 → f16 for the trip back out
+      oHead: GPUBindGroup       // latent context through kv_b's V half
+    }
     /** The MoE block's seven bind groups, present iff spec.moe. Replaces
      *  ffn/ffnDown between addNorm1 and addNorm2 — the surrounding residual
      *  chain is identical, which is why the block is a drop-in. */
@@ -983,6 +1069,7 @@ export function buildDecodeEngine(
   for (let L = L0; L < L1; L++) {
     const lw = weights.layers[L]
     const isGdn = S.layerKinds[L] === 'gdn'
+    const isMla = !!S.mla
     // addNorm2 folds the NEXT layer's pre-norm into this layer's epilogue. At
     // the end of a partial stage there is no next layer here, and the value is
     // discarded anyway (the receiving stage re-norms from the residual), so it
@@ -1001,6 +1088,7 @@ export function buildDecodeEngine(
     let kvAppBG: GPUBindGroup | undefined
     let kvQuantizeBG: GPUBindGroup | undefined
     let gdnBG: LayerBG['gdn']
+    let mlaBG: LayerBG['mla']
     let oProjBG: GPUBindGroup
     // KV pages for this layer's attention-layer ordinal (== L for
     // pure-attention specs).
@@ -1043,6 +1131,44 @@ export function buildDecodeEngine(
       }
       oProjBG = bg(device, matmulGdnOut!, withBias(
         [B.hidden2, B.gdnNormed!, gw.outScales, gw.outWeights, gdnOutU!], gw.outBiases, 'gdn out_proj'))
+    } else if (isMla) {
+      // Without this branch an MLA spec is neither hybrid nor fused, so it
+      // falls to the ordinary qkv/rope/kv_append/attention chain below with
+      // q_proj bound as qkvWeights — a bind group that VALIDATES and a forward
+      // pass that produces tokens. Wrong ones.
+      const mw = lw.mla
+      if (!mw) throw new Error(`buildDecodeEngine: spec ${S.id} is MLA but the loader has no MLA weights for layer ${L}`)
+      const M = S.mla!
+      // The cache buffer holds the latent region then the shared-key region;
+      // the offset is 256-aligned by a makeModelSpec assertion.
+      const cacheBuf = kvL()
+      const latent = { buffer: cacheBuf, offset: 0, size: S.maxContext * M.kvLoraRank * 2 }
+      const kpe = { buffer: cacheBuf, offset: S.mlaLatentBytes, size: S.maxContext * M.qkRopeHeadDim * 2 }
+      // kv_b_proj arrives dequantized as [K^T | V]; each half is a region with
+      // its own {N, K}. K first, V second — the loader's order.
+      const kvbK = { buffer: mw.kvbF16, offset: 0, size: S.heads * M.kvLoraRank * M.qkNopeHeadDim * 2 }
+      const kvbV = { buffer: mw.kvbF16, offset: S.heads * M.kvLoraRank * M.qkNopeHeadDim * 2,
+                     size: S.heads * M.vHeadDim * M.kvLoraRank * 2 }
+      mlaBG = {
+        qProj: bg(device, R.matmul, withBias(
+          [B.mlaQ!, B.hidden1, mw.qScales, mw.qWeights, mlaQU!], mw.qBiases, 'mla q_proj')),
+        kvaProj: bg(device, R.matmul, withBias(
+          [B.mlaKva!, B.hidden1, mw.kvaScales, mw.kvaWeights, mlaKvaU!], mw.kvaBiases, 'mla kv_a_proj')),
+        qSplit: bg(device, P.mlaQSplit, [B.mlaQ!, ropeFreqs!, B.posMap, B.mlaQNope!, B.mlaQPe!, mlaSplitU!]),
+        kvWrite: bg(device, P.mlaKvWrite,
+          [B.mlaKva!, mw.kvaNormGamma, ropeFreqs!, B.posMap, latent, kpe, mlaWriteU!]),
+        qLat: bg(device, P.mlaProj, [B.mlaQLat!, B.mlaQNope!, kvbK, mlaProjKU!]),
+        scores: bg(device, P.mlaScores, [B.mlaScores!, B.mlaQLat!, B.mlaQPe!, latent, kpe, mlaScoresU!]),
+        combine: bg(device, P.mlaCombine, [B.mlaOLat!, B.mlaScores!, latent, mlaCombineU!]),
+        narrow: bg(device, P.mlaNarrow, [B.mlaOLat16!, B.mlaOLat!, mlaNarrowU!]),
+        // attnOut is exactly heads*vHeadDim*2 bytes here, which is S.qDim*2 —
+        // the same buffer o_proj already reads from on every other spec.
+        oHead: bg(device, P.mlaProj, [B.attnOut, B.mlaOLat16!, kvbV, mlaProjVU!]),
+      }
+      // o_proj is the ordinary one: attnOut -> hidden2, exactly as every
+      // attention spec does. MLA changes what FILLS attnOut, not what reads it.
+      oProjBG = bg(device, R.matmulOProj, withBias(
+        [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
     } else if (hybrid) {
       // Gated attention layer: c_attn packs per-head [Q|gate] before K‖V.
       qkvBG = bg(device, R.matmul, withBias(
@@ -1161,6 +1287,7 @@ export function buildDecodeEngine(
       kvQuantize: kvQuantizeBG,
       attn: attnBG,
       gdn: gdnBG,
+      mla: mlaBG,
       oProj: oProjBG,
       addNorm1: bg(device, P.addNorm, [B.hidden2, B.residual, lw.normGamma2, B.hidden1, B.residual2, normU]),
       // Affine dense: gate_up as one 2·ffn-row K=d affine matmul (fused_ffn is
@@ -1217,7 +1344,11 @@ export function buildDecodeEngine(
    * into `enc`. Both generate styles and profileStep share this recorder, so
    * dispatch order is identical everywhere.
    */
-  function recordForward(enc: GPUCommandEncoder): void {
+  /** `position` is a PARAMETER, not a closure read: mla_scores' grid is the
+   *  one dispatch whose size depends on how much cache exists, and a stale
+   *  closure value would score against the wrong number of positions while
+   *  still filling the buffer. */
+  function recordForward(enc: GPUCommandEncoder, position: number): void {
     // --- EMBEDDING → B.residual (ping) ---
     // Pipeline stages past the first have no embedding table and no token to
     // look up: B.residual already holds the state handed over by the previous
@@ -1248,7 +1379,27 @@ export function buildDecodeEngine(
         }
       }
 
-      if (blk.gdn) {
+      if (blk.mla) {
+        // Ten dispatches, then the shared addNorm1 -> FFN -> addNorm2 tail with
+        // no change. Grid y is the HEAD COUNT on qLat/scores/oHead: swapping x
+        // and y still runs, still fills the buffer, and computes the wrong
+        // (t, head) pairs.
+        const M = S.mla!
+        const m = blk.mla
+        dispatch(enc, R.matmul, m.qProj, S.mlaQProjRows / R.matmulRowsPerWG, 1, 1, 'mlaQProj')
+        dispatch(enc, R.matmul, m.kvaProj, S.mlaKvaRows / R.matmulRowsPerWG, 1, 1, 'mlaKvaProj')
+        dispatch(enc, P.mlaQSplit, m.qSplit, S.heads, 1, 1, 'mlaQSplit')
+        dispatch(enc, P.mlaKvWrite, m.kvWrite, 1, 1, 1, 'mlaKvWrite')
+        dispatch(enc, P.mlaProj, m.qLat, Math.ceil(M.kvLoraRank / 64), S.heads, 1, 'mlaQLat')
+        // The only position-dependent grid in the recorder. A static
+        // maxContext x heads grid is also correct — mla_scores guards t >= T —
+        // but launches ~540k workgroups per layer per token at full context.
+        dispatch(enc, P.mlaScores, m.scores, position + 1, S.heads, 1, 'mlaScores')
+        dispatch(enc, P.mlaCombine, m.combine, S.heads, 1, 1, 'mlaCombine')
+        dispatch(enc, P.mlaNarrow, m.narrow, Math.ceil((S.heads * M.kvLoraRank) / 256), 1, 1, 'mlaNarrow')
+        dispatch(enc, P.mlaProj, m.oHead, Math.ceil(M.vHeadDim / 64), S.heads, 1, 'mlaOHead')
+        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+      } else if (blk.gdn) {
         // GatedDeltaNet layer (Qwen3.5 linear_attn): ONE fused input
         // projection (qkv‖z‖a‖b rows packed at load time — replaces the 4
         // separate matmul dispatches), then conv → gates → recurrence →
@@ -1393,6 +1544,14 @@ export function buildDecodeEngine(
     device.queue.writeBuffer(int8Mode ? attnI8U! : attnU, 8, nnzPagesScratch)
     // The split-K partial-pass uniform mirrors the same layout (offset 8).
     if (attnSkU) device.queue.writeBuffer(attnSkU, 8, nnzPagesScratch)
+    // MLA's cache grows by one row per position, so both kernels that walk it
+    // need T = position + 1. mlaScoresU is {L, R, T, scale} (T at 8),
+    // mlaCombineU is {L, T} (T at 4).
+    if (mlaScoresU) {
+      mlaTScratch[0] = position + 1
+      device.queue.writeBuffer(mlaScoresU, 8, mlaTScratch)
+      device.queue.writeBuffer(mlaCombineU!, 4, mlaTScratch)
+    }
     // gdn_conv selects its ring slots from the absolute position (pos at
     // byte offset 0 of its PODArgs).
     if (gdnConvU) {
@@ -1454,7 +1613,7 @@ export function buildDecodeEngine(
 
     const enc = device.createCommandEncoder()
     if (position === 0) clearGdnState(enc)
-    recordForward(enc)
+    recordForward(enc, position)
     const last = L1 === S.layers
     if (last) enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     else enc.copyBufferToBuffer(B.residual, 0, residualReadBuf!, 0, S.d * 2)
@@ -1487,7 +1646,7 @@ export function buildDecodeEngine(
 
     const enc = device.createCommandEncoder()
     if (position === 0) clearGdnState(enc)
-    recordForward(enc)
+    recordForward(enc, position)
     // Fold the argmax readback into the same command encoder → one submit per token.
     enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     device.queue.submit([enc.finish()])
@@ -2046,7 +2205,7 @@ export function buildDecodeEngine(
 
     const enc = device.createCommandEncoder()
     if (position === 0) clearGdnState(enc)
-    recordForward(enc)
+    recordForward(enc, position)
     // GPU chain: next decode step reads inputIds[0] without a CPU round-trip.
     enc.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
 
@@ -2226,7 +2385,11 @@ export function buildDecodeEngine(
     // 2 slots per pass; worst case is the hybrid gated-attention path
     // (12/layer; GDN layers are 10 with the fused input projection) plus
     // embedding, init norm, LM head, argmax and a little headroom.
-    const CAPACITY = 2 * (S.layers * 14 + 8)
+    // 14 was the widest layer before MLA; an MLA+MoE layer is ~19 dispatches.
+    // Past capacity, dispatch() silently omits its timestamp writes and the
+    // profile TRUNCATES rather than erroring — so it reads as "the tail is
+    // free" instead of "you ran out of query slots".
+    const CAPACITY = 2 * (S.layers * (S.mla ? 20 : 14) + 8)
     const querySet = device.createQuerySet({ type: 'timestamp', count: CAPACITY })
     const resolveBuf = device.createBuffer({
       size: CAPACITY * 8,
@@ -2242,7 +2405,7 @@ export function buildDecodeEngine(
       writeStepState(null, nextPos)
 
       const enc = device.createCommandEncoder()
-      recordForward(enc)
+      recordForward(enc, nextPos)
       const usedSlots = profile.nextSlot
       enc.resolveQuerySet(querySet, 0, usedSlots, resolveBuf, 0)
       enc.copyBufferToBuffer(resolveBuf, 0, profReadBuf, 0, usedSlots * 8)
