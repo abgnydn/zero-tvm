@@ -60,7 +60,12 @@ import numpy as np
 p = argparse.ArgumentParser()
 p.add_argument("--bundle", required=True)
 p.add_argument("--layer", default="model.layers.0")
-p.add_argument("--tokens", type=int, default=6)
+# 20, not 6. Position 0 is RoPE-identity (cos 1, sin 0), so a short cache
+# barely exercises the rotation, and a position-vs-slot bug in the KV append
+# shows up as error GROWING with t — which six positions cannot distinguish
+# from noise. Costs nothing: the script generates x from a seed and re-reads
+# tensors already on disk, so a longer bundle needs no re-pull.
+p.add_argument("--tokens", type=int, default=20)
 p.add_argument("--seed", type=int, default=11)
 # DeepSeek-V2-Lite's rope_scaling, from config.json.
 p.add_argument("--rope-theta", type=float, default=10000.0)
