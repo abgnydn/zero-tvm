@@ -127,6 +127,9 @@ try{
     return Array.from(await e.generate(ids, 0, n, () => {}))
   }
   window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
+  // Embedding models stop one dispatch earlier: the pooled, L2-normalised
+  // hidden state instead of logits. scripts/embed-ref.py is the reference.
+  window.__embed = async (ids) => Array.from(await engine.forwardEmbedding(ids))
   window.__generate = async (ids, n) => {
     const out = await engine.generate(ids, 0, n, () => {})
     return Array.from(out)

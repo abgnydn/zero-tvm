@@ -80,6 +80,8 @@ export interface DetectedMla {
 
 export interface DetectedModel {
   mla?: DetectedMla | null
+  /** Detected as an embedding model — no LM head is dispatched. */
+  embeddingOnly?: boolean
   /** yarn parameters when ropeScalingType is 'yarn'. */
   ropeYarn?: {
     factor: number | null
@@ -305,7 +307,12 @@ export function checkModel(m: DetectedModel): CheckResult {
     if (d % 256 !== 0) fail('dims', `d ${d} % 256 != 0`, 'add_norm/embedding grids are d/256 workgroups with no tail')
     if (qkvDim % 256 !== 0) fail('dims', `qkvDim ${qkvDim} % 256 != 0`, 'rope grid is qkvDim/256 workgroups with no tail')
     if (kvDim % 256 !== 0) fail('dims', `kvDim ${kvDim} % 256 != 0`, 'kv_append grid is kvDim/256 workgroups with no tail')
-    if (vocab % 4 !== 0) fail('dims', `vocab ${vocab} % 4 != 0`, 'lm_head runs rowsPerWG=4 — the remainder rows would silently drop')
+    // Only when an LM head actually runs. An embedding model's output is the
+    // pooled hidden state; its lm_head is never dispatched, so refusing it here
+    // would be the checker wrong in the expensive direction.
+    if (vocab % 4 !== 0 && !m.embeddingOnly) {
+      fail('dims', `vocab ${vocab} % 4 != 0`, 'lm_head runs rowsPerWG=4 — the remainder rows would silently drop')
+    }
     // Every K the matmuls reduce over: unfused projections (K=d), o_proj
     // (K=qDim), ffn down (K=ffn), GDN out (K=vHeads*headV).
     const ks: [string, number][] = [['d', d], ['qDim', qDim], ['ffn', ffn]]

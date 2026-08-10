@@ -260,6 +260,17 @@ export interface ModelSpecBase {
   /** Multi-head latent attention. Absent = ordinary per-head K/V. */
   mla?: MlaDims
   /**
+   * The model is an EMBEDDING model: its output is the pooled hidden state, and
+   * the LM head is never dispatched. Qwen3-Embedding ships one (tied to the
+   * embedding table) but nothing runs it.
+   *
+   * The consequence that matters: `vocab % 4` is a constraint on the LM head's
+   * rowsPerWG=4 matmul, and Qwen3-Embedding-0.6B has vocab 151669. Refusing the
+   * model over a kernel it never dispatches would be the checker being wrong in
+   * the expensive direction — telling you something cannot run when it can.
+   */
+  embeddingOnly?: boolean
+  /**
    * On-disk weight layout. 'mlc' is the ndarray/tensor-cache shard format with
    * symmetric q4f16_1 (group 32); 'mlx-safetensors' is a HuggingFace
    * safetensors checkpoint quantised MLX-affine (group 64, with biases).
@@ -968,6 +979,45 @@ export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
 // Generated specs — scripts/add-model.mjs appends below this marker after its
 // constraint check passes. Hand-edits above survive; below, expect churn.
 // ADD-MODEL:SPECS
+
+// mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ — a plain causal decoder whose
+// output is the pooled hidden state rather than logits. Dims are Qwen3's; the
+// only structural difference from a chat model is that nothing dispatches the
+// LM head, which is why `embeddingOnly` exists (vocab 151669 is not a multiple
+// of 4, and that rule is about the head's rowsPerWG=4 matmul).
+//
+// Pooling is NOT free-choice — it comes from the model's own metadata:
+// 1_Pooling/config.json says last-token, modules.json says L2-normalise, and
+// tokenizer.json's post_processor appends <|endoftext|> (151643) to every
+// sequence, so the pooled position is that marker rather than the last word.
+// Measured: CLS pooling has the HIGHEST gold cosine of any variant (0.9379)
+// and gets 0/6 retrieval queries right. Magnitude checks cannot catch it.
+export const QWEN3_EMBEDDING_06B: ModelSpec = makeModelSpec({
+  id: 'qwen3-embedding-0-6b-4bit-dwq',
+  d: 1024,
+  layers: 28,
+  heads: 16,
+  kvHeads: 8,
+  headDim: 128,
+  ffn: 3072,
+  vocab: 151669,
+  pageSize: 16,
+  maxPages: 512,
+  maxSeq: 32768,
+  ropeTheta: 1000000,
+  rmsEps: 0.000001,
+  tiedEmbeddings: true,
+  qkNorm: true,
+  stops: [151643],
+  chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  embeddingOnly: true,
+  paramNaming: mlxParamNaming(""),
+})
+
 
 // mlx-community/DeepSeek-V2-Lite-Chat-4bit-mlx — hand-written, because the
 // checker still refuses MLA and add-model may not generate what cannot run.
