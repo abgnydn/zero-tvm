@@ -78,6 +78,22 @@ def main() -> None:
         del tensors, out
         mx.clear_cache()
 
+    # GUARD. EXPERT_MARKS are the FUSED expert layout (".mlp.switch_mlp.").
+    # A checkpoint whose experts are named ".mlp.experts.<N>." matches none of
+    # them, and everything above still succeeds: every tensor is copied
+    # through, a valid checkpoint is written, and the metadata claims
+    # "requantized: experts->3bit from 4bit". The result is a byte-identical
+    # copy that a perplexity A/B reports as "no significant difference" —
+    # which reads as "3-bit is fine" rather than "nothing happened". Both
+    # layouts are live in one family: mlx-community's OLMoE-1B-7B-0125-4bit is
+    # switch_mlp, its Instruct sibling is .mlp.experts.
+    # scripts/requantize.py handles both; this script stays 35B-specific.
+    if not overrides:
+        raise SystemExit(
+            f"REFUSING: no tensor in {SRC} matched {EXPERT_MARKS}.\n"
+            "  Nothing was requantized. Use scripts/requantize.py, which knows\n"
+            "  the .mlp.experts.<N>. layout too and counts what it converts.")
+
     # Rebuild the index from the written shards (offsets changed).
     new_map = {}
     for shard in shards:

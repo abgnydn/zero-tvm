@@ -80,19 +80,42 @@ Independent windows, identical for both sides, with error bars and a z score.
 Verdicts: within +10% with separated bars → ship; +10–25% → a task benchmark
 decides, not this; >+25% → don't.
 
-**Validated by making it fail.** A deliberately-degraded all-3-bit requant of
-Llama-3.2-1B against the shipped 4-bit, 16 windows of 512 tokens, 9 seconds
-total:
+**Validated by making it fail, at three severities.** `scripts/requantize.py`
+builds a deliberately-degraded copy of a checkpoint already on disk; the A/B
+then has to separate it. Llama-3.2-1B-Instruct-4bit as the baseline, 16
+independent windows of 512 tokens, bf16, ~10 s per arm:
 
-```
-A  Llama-3.2-1B-Instruct-4bit   perplexity 109.622  [97.055, 123.816]
-B  /tmp/llama-3bit              perplexity 330.315  [287.352, 379.700]
-   B is +201.3% perplexity vs A, z = 6.0
-   DO NOT SHIP on this evidence: >+25%
-```
+| B | perplexity | vs A | z | verdict |
+|---|---:|---:|---:|---|
+| baseline (A) | 109.612 | — | — | — |
+| `--scope mlp --bits 3` | 193.552 | **+76.6%** | 3.2 | DO NOT SHIP |
+| `--scope all --bits 3` | 330.299 | **+201.3%** | 6.0 | DO NOT SHIP |
+| a no-op requant | *refused* | — | — | see below |
+
+Two things this establishes that a single pass/fail could not: the harness
+separates *degrees* of damage, not just broken from working, and it does it at
+z ≥ 3 with 16 windows in seconds.
 
 A harness that has only ever passed proves nothing, so this one was pointed at
 known-broken weights first.
+
+### The no-op trap, and the guard for it
+
+`scripts/convert-q3-experts.py` selects experts by the literal strings
+`.mlp.switch_mlp.` and `.mlp.shared_expert.` — MLX's **fused** expert layout.
+Checkpoints converted another way name them `.mlp.experts.<N>.` instead, and on
+one of those the script matched **zero** tensors, copied every weight through,
+wrote a valid checkpoint, stamped it `requantized: experts->3bit from 4bit`,
+and exited 0.
+
+The A/B would then report "NOT DISTINGUISHABLE" — true, and read as *"3-bit is
+fine"* rather than *"nothing was quantized"*. That is the whole failure mode
+this document is about, one level down.
+
+Both layouts are live **in the same model family**: `mlx-community/
+OLMoE-1B-7B-0125-4bit` is `switch_mlp` (144 tensors), its Instruct sibling is
+`.mlp.experts.` (9216). Now both scripts count what they convert and a zero is
+a hard failure that deletes its own output.
 
 ### For the engine — `scripts/quality-eval.mjs`
 
