@@ -77,6 +77,29 @@ export interface ParamNaming {
   biasFor?: (weightRecord: string) => string
 }
 
+/**
+ * Multi-head Latent Attention (DeepSeek V2/V3, and the labs that adopted that
+ * architecture — Moonshot's Moonlight ships identical dims). Absent = ordinary
+ * per-head K/V attention.
+ *
+ * The cache holds ONE `kvLoraRank`-wide latent per token plus ONE
+ * `qkRopeHeadDim` RoPE key shared by every head, instead of K and V per head.
+ * For DeepSeek-V2-Lite that is 576 values a token against 4096 — the reason to
+ * carry a second attention path at all.
+ *
+ * Field-for-field identical to DetectedMla in constraints.ts, so add-model can
+ * hand its detection over verbatim rather than translating it.
+ */
+export interface MlaDims {
+  kvLoraRank: number
+  /** null = q is one plain projection (V2-Lite). V2-full/V3 split it into
+   *  q_a_proj/q_b_proj, a record set nothing here produces yet — asserted. */
+  qLoraRank: number | null
+  qkNopeHeadDim: number
+  qkRopeHeadDim: number
+  vHeadDim: number
+}
+
 /** Sparse-MoE FFN (Qwen3.6, Qwen3-MoE). Absent = the dense gate_up/down FFN.
  *
  *  Router width and the presence of a shared expert are both PARAMETERS here
@@ -234,6 +257,8 @@ export interface ModelSpecBase {
    *  per-expert width — and every layer runs the MoE block instead of the dense
    *  gate_up/down pair. */
   moe?: MoeDims
+  /** Multi-head latent attention. Absent = ordinary per-head K/V. */
+  mla?: MlaDims
   /**
    * On-disk weight layout. 'mlc' is the ndarray/tensor-cache shard format with
    * symmetric q4f16_1 (group 32); 'mlx-safetensors' is a HuggingFace
@@ -273,6 +298,26 @@ export interface ModelSpec extends ModelSpecBase {
    *  shared page budget is never the right answer. `maxContext ×
    *  kvBytesPerToken` is the total KV allocation (halved by ?kv8=1). */
   kvBytesPerToken: number
+  // ── MLA derivations (0 for every non-MLA spec, so consumers can branch on
+  // `spec.mla` and still read these unconditionally). Deliberately SEPARATE
+  // from kvPageStride/headPageStride/vPageOffset/qkvDim: compile() builds the
+  // kv_append/attention/qkv_fused pipelines for EVERY spec off the prelude
+  // consts those feed, so overloading them to mean something else under MLA
+  // would make shaders that are merely unused today into shaders that are
+  // wrong.
+  /** Cached values per token per layer: latent + the shared RoPE key. */
+  mlaCachePerToken: number
+  /** q_proj rows: heads * (nope + rope). */
+  mlaQProjRows: number
+  /** kv_a_proj_with_mqa rows: latent + rope. */
+  mlaKvaRows: number
+  /** kv_b_proj rows: heads * (nope + v). */
+  mlaKvbRows: number
+  /** Byte offset of the shared-RoPE-key region within a layer's cache — the
+   *  latent region's size. Must be 256-aligned to bind as its own region. */
+  mlaLatentBytes: number
+  /** Whole per-layer cache buffer, in bytes. */
+  mlaCacheBytes: number
   // int8-KV layout products
   kvI8RowWords: number     // headDim / 4 (u32 words per (head,slot,side) row)
   kvI8SlotWords: number    // 2 * kvI8RowWords (K+V)
@@ -417,7 +462,38 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
       base.moe && !denseSet.has(i) ? 'moe' : 'dense',
     ),
   )
-  const rotaryDim = Math.round(base.headDim * (base.partialRotaryFactor ?? 1))
+  // MLA rotates only the decoupled pe slice, whose width is its own dim rather
+  // than a fraction of headDim. partial_rotary_factor 0.5 happens to give 64
+  // here, but only because vHeadDim == 2 * qkRopeHeadDim, and DeepSeek's config
+  // carries no partial_rotary_factor at all — so a generated spec would take
+  // the default 1 and build a 64-entry yarn table for a 128-wide rotation.
+  const attnLayerCount = layerKinds.filter((k) => k === 'attn').length
+  const M = base.mla
+  if (M) {
+    // headDim IS vHeadDim. o_proj contracts over heads*vHeadDim, and the engine
+    // derives its packed-row count from qDim = heads*headDim — so a spec that
+    // sets headDim to the QUERY width (nope+rope = 192) makes o_proj read a
+    // 384-word row against a 256-word one. Finite numbers, wrong model, no
+    // error anywhere. A build error is the only place to catch this.
+    if (M.vHeadDim !== base.headDim) {
+      throw new Error(`${base.id}: mla.vHeadDim ${M.vHeadDim} must equal headDim ${base.headDim} `
+        + '(o_proj contracts over heads*vHeadDim, and qDim is derived from headDim)')
+    }
+    if (M.qLoraRank !== null) {
+      throw new Error(`${base.id}: mla.qLoraRank ${M.qLoraRank} — a q_a_proj/q_b_proj split `
+        + 'checkpoint (V2-full, V3). The loader plans a single q_proj; nothing here produces those records.')
+    }
+  }
+  const mlaCachePerToken = M ? M.kvLoraRank + M.qkRopeHeadDim : 0
+  const mlaLatentBytes = M ? base.maxPages * base.pageSize * M.kvLoraRank * 2 : 0
+  if (M && mlaLatentBytes % 256 !== 0) {
+    // The shared-key region is bound at this offset; WebGPU requires 256-byte
+    // alignment for a storage binding offset.
+    throw new Error(`${base.id}: MLA latent region is ${mlaLatentBytes} B, not a multiple of 256`)
+  }
+  const rotaryDim = base.mla
+    ? base.mla.qkRopeHeadDim
+    : Math.round(base.headDim * (base.partialRotaryFactor ?? 1))
   if (rotaryDim % 2 !== 0) throw new Error(`${base.id}: rotaryDim must be even (RoPE pairs)`)
   return Object.freeze({
     ...base,
@@ -451,8 +527,18 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
     kvPageStride: 2 * base.kvHeads * base.pageSize * base.headDim,
     vPageOffset: base.kvHeads * base.pageSize * base.headDim,
     maxContext: base.maxPages * base.pageSize,
-    kvBytesPerToken: 2 * base.kvHeads * base.headDim * 2
-      * layerKinds.filter((k) => k === 'attn').length,
+    // MLA caches one latent + one shared key per token, NOT K and V per head.
+    // Left unbranched this over-reports ~7x, which decides maxPages, the
+    // "fits in your GPU" copy, and the context-overflow message.
+    kvBytesPerToken: M
+      ? mlaCachePerToken * 2 * attnLayerCount
+      : 2 * base.kvHeads * base.headDim * 2 * attnLayerCount,
+    mlaCachePerToken,
+    mlaQProjRows: M ? base.heads * (M.qkNopeHeadDim + M.qkRopeHeadDim) : 0,
+    mlaKvaRows: M ? M.kvLoraRank + M.qkRopeHeadDim : 0,
+    mlaKvbRows: M ? base.heads * (M.qkNopeHeadDim + M.vHeadDim) : 0,
+    mlaLatentBytes,
+    mlaCacheBytes: M ? base.maxPages * base.pageSize * mlaCachePerToken * 2 : 0,
     kvI8RowWords,
     kvI8SlotWords: 2 * kvI8RowWords,
     kvI8HeadWords: base.pageSize * 2 * kvI8RowWords,
@@ -882,6 +968,57 @@ export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
 // Generated specs — scripts/add-model.mjs appends below this marker after its
 // constraint check passes. Hand-edits above survive; below, expect churn.
 // ADD-MODEL:SPECS
+
+// mlx-community/DeepSeek-V2-Lite-Chat-4bit-mlx — hand-written, because the
+// checker still refuses MLA and add-model may not generate what cannot run.
+// Every dimension below is from the checkpoint's own config.json or from the
+// layer-0 kernel-ref bundle, not from any plan.
+//
+// NOT in SHIPPED_MODELS yet: registering it would put a `?model=` URL in front
+// of an engine that cannot serve it. The registry row goes in when checkModel
+// goes green, which is what makes that promise true.
+export const DEEPSEEK_V2_LITE: ModelSpec = makeModelSpec({
+  id: 'deepseek-v2-lite-chat-4bit',
+  d: 2048,
+  layers: 27,
+  heads: 16,
+  // config says num_key_value_heads 16, and MLA does not use it for a cache —
+  // it is carried so o_proj and the dims checks stay consistent.
+  kvHeads: 16,
+  headDim: 128,          // == mla.vHeadDim; o_proj contracts over heads*this
+  ffn: 1408,             // moe_intermediate_size (per routed expert)
+  vocab: 102400,
+  pageSize: 16,
+  // kvBytesPerToken is 576*2*27 = 31,104 B. The documented rule —
+  // min(1 GiB / (kvBytesPerToken * pageSize), maxSeq/pageSize), floored to a
+  // multiple of 64 — gives floor(2^30 / (31104*16)) = 2157 -> 2112 pages, so
+  // 33,792 tokens for ~1002 MiB. Under MHA the same budget would buy 4,736.
+  maxPages: 2112,
+  maxSeq: 163840,
+  ropeTheta: 10000,
+  rmsEps: 0.000001,
+  tiedEmbeddings: false,
+  qkNorm: false,
+  stops: [100001],
+  chatTemplateId: 'deepseek',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'mlx-community/DeepSeek-V2-Lite-Chat-4bit-mlx',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  mla: { kvLoraRank: 512, qLoraRank: null, qkNopeHeadDim: 128, qkRopeHeadDim: 64, vHeadDim: 128 },
+  // Layer 0 is an ordinary FFN at intermediate_size 10944 while layers 1-26 are
+  // MoE at 1408 — two widths in one stack (first_k_dense_replace 1).
+  moe: {
+    experts: 64, topK: 6, normTopkProb: false, sharedExpert: true,
+    routerBits: 16, denseLayers: [0], denseFfn: 10944,
+  },
+  ropeScaling: {
+    ropeType: 'yarn', factor: 40, betaFast: 32, betaSlow: 1,
+    originalMaxPositionEmbeddings: 4096, mscale: 0.707, mscaleAllDim: 0.707,
+  },
+  paramNaming: mlxParamNaming(""),
+})
+
 
 // mlx-community/Qwen3-30B-A3B-4bit — generated by scripts/add-model.mjs (2026-08-07)
 export const QWEN3_30B_A3B_4BIT: ModelSpec = makeModelSpec({

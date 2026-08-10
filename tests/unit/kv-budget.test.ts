@@ -16,7 +16,7 @@
  */
 
 import { describe, test, expect } from 'vitest'
-import { PHI3, QWEN3_4B, QWEN35_4B, type ModelSpec } from '../../src/compiler/model-spec.js'
+import { DEEPSEEK_V2_LITE, PHI3, QWEN3_4B, QWEN35_4B, type ModelSpec } from '../../src/compiler/model-spec.js'
 
 const MiB = 1024 * 1024
 
@@ -35,6 +35,11 @@ const EXPECTED: Array<{
   // Hybrid: KV lives on 8 of 32 layers (the 24 GDN layers hold a fixed-size
   // recurrent state instead), 2 × 4 × 256 × 2 B = 4 KiB/layer.
   { spec: QWEN35_4B, attnLayers: 8, kibPerToken: 32, maxContext: 32768, totalMiB: 1024 },
+  // MLA: one 512 latent + one shared 64 RoPE key per token across all 27
+  // layers = 576 * 2 * 27 = 31,104 B. The MHA equivalent (2 * 16 * 128 * 2 * 27)
+  // would be 221,184 — 7.11x more, which is the entire point of the feature and
+  // is asserted as a ratio in mla-spec.test.ts.
+  { spec: DEEPSEEK_V2_LITE, attnLayers: 27, kibPerToken: 30.375, maxContext: 33792, totalMiB: 1002 },
 ]
 
 describe('per-model KV budget', () => {
@@ -42,7 +47,12 @@ describe('per-model KV budget', () => {
     '$spec.id: KV cost, context ceiling and VRAM budget',
     ({ spec, attnLayers, kibPerToken, maxContext, totalMiB }) => {
       expect(spec.layerKinds.filter((k) => k === 'attn').length).toBe(attnLayers)
-      expect(spec.kvBytesPerToken).toBe(2 * spec.kvHeads * spec.headDim * 2 * attnLayers)
+      // MLA caches a latent plus one shared RoPE key per token, NOT K and V per
+      // head, so the MHA formula is simply a different model of the cache. Left
+      // unbranched here it would "prove" a number the engine does not allocate.
+      expect(spec.kvBytesPerToken).toBe(spec.mla
+        ? spec.mlaCachePerToken * 2 * attnLayers
+        : 2 * spec.kvHeads * spec.headDim * 2 * attnLayers)
       expect(spec.kvBytesPerToken / 1024).toBe(kibPerToken)
 
       // The ceiling the engine enforces, and the allocation it implies.
@@ -60,7 +70,11 @@ describe('per-model KV budget', () => {
 
       // Each per-layer page buffer must stay inside the WebGPU floor for
       // maxStorageBufferBindingSize (128 MiB) so the allocation is portable.
-      expect(spec.maxPages * spec.kvPageStride * 2).toBeLessThanOrEqual(128 * MiB)
+      // kvPageStride describes a per-head K/V page, which an MLA spec never
+      // allocates — its per-layer buffer is mlaCacheBytes. Checking the unused
+      // stride would fail at 268 MB while the real allocation is 37 MiB.
+      const perLayerBytes = spec.mla ? spec.mlaCacheBytes : spec.maxPages * spec.kvPageStride * 2
+      expect(perLayerBytes).toBeLessThanOrEqual(128 * MiB)
     },
   )
 })
