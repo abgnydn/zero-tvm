@@ -1,0 +1,90 @@
+HELD-OUT PROSE FOR PERPLEXITY MEASUREMENT
+
+Written for this repository on 2026-08-10 rather than taken from wikitext or
+Project Gutenberg. Those corpora sit in the training set of every model this
+engine runs, which deflates perplexity by an unknown amount and turns the
+absolute number into a fiction. Original text is not a guarantee of novelty —
+nothing written in English is truly out of distribution — but it removes the
+worst of the contamination, and the number is only ever used comparatively.
+
+---
+
+The harbour at Kaleköy silts up a little more each winter. Fishermen who have
+worked the channel for thirty years describe the change as a narrowing rather
+than a shallowing: the water still reaches the same depth at the mouth, but
+the usable lane between the sandbar and the eastern rocks has drawn in from
+roughly forty metres to something closer to twenty-five. Nobody has surveyed
+it. The estimate circulates among the boats as a shared piece of practical
+knowledge, revised each season, and it is accurate enough that a captain who
+ignores it will ground his keel within a year.
+
+There is a particular kind of engineering problem that resembles this. The
+constraint is real, everyone working near it has a serviceable estimate, and
+the estimate is never written down because writing it down would require
+committing to a precision nobody has. So it propagates by apprenticeship. A
+new engineer learns that a certain buffer should be about a gigabyte, or that
+a certain retry count should be three, and the reason erodes until only the
+number survives. Years later somebody asks where the number came from and
+discovers that the last person who knew has left.
+
+The failure mode is not that the number is wrong. Often it is approximately
+right, for the same reason the fishermen's estimate is approximately right:
+it was calibrated against reality by people who paid for being wrong. The
+failure mode is that the number stops tracking the reality it was calibrated
+against. The channel keeps silting. The hardware gets larger. The workload
+changes shape. And a constant that was a reasonable summary of the world in
+one year becomes, silently and without any error message, a bad summary of
+the world in the next.
+
+What makes this hard to catch is that nothing breaks. A buffer that is too
+small for its workload does not crash; it simply fails to hold what it could
+have held, and the cost appears somewhere else entirely, as latency or as a
+capability the team assumed was impossible. There is no test that fires. The
+system reports success. Somebody looking at the code sees a plausible number
+next to a plausible comment and moves on, and the comment is often the problem
+— an explanation of what the number does is not an explanation of why it is
+that number, and the two are almost impossible to tell apart when reading
+quickly.
+
+Ellen Toussaint, who spent eleven years maintaining a scheduling system for a
+regional rail operator, used to keep a file she called the ledger. It listed
+every magic number in the codebase, who chose it, what measurement or argument
+produced it, and — this was the part she considered essential — what would
+have to change in the world for the number to become wrong. Most entries were
+short. Some said only "guessed, never measured, replace when it matters."
+She maintained that the honest entries were the valuable ones, because they
+told you where to look first when something started behaving strangely.
+
+The rail operator's system carried a delay threshold of four minutes, below
+which a train was considered on time and above which it triggered a cascade
+of rebooking logic. The number came from a regulatory definition written in
+the 1980s. By the time Toussaint inherited the system, the regulation had
+changed twice, the rolling stock had been replaced, and the average journey
+had shortened by about a fifth — but the threshold had not moved, because it
+was not obviously broken, and because moving it would have required somebody
+to argue for a specific alternative in a meeting. Her ledger entry for it read:
+"1980s regulation, superseded 1997 and 2011. Almost certainly too generous.
+Nobody wants to own the new value."
+
+She was, she said later, never able to get it changed. What the ledger
+achieved instead was smaller and more durable: when the rebooking logic began
+misfiring during a timetable revision, the team found the entry in an
+afternoon rather than reverse-engineering the threshold's provenance over a
+fortnight. The number stayed wrong. The cost of its wrongness became visible.
+
+There is an argument, which Toussaint made often and which is worth taking
+seriously, that most of what passes for technical debt is really this: not bad
+code, but unattributed decisions. Bad code announces itself. It is ugly, it is
+slow, it fails under load, and somebody eventually rewrites it. An
+unattributed decision looks exactly like a good decision. It sits in the
+codebase wearing the same clothes. The only way to distinguish them is to ask
+where the number came from, and by the time anybody thinks to ask, the answer
+is usually gone.
+
+The fishermen at Kaleköy have an advantage here that software teams do not.
+Their estimate is re-derived every season, by everyone, under conditions where
+being wrong is immediate and expensive. Nobody inherits the number; they
+inherit the practice of measuring it. That is a more robust arrangement than
+any ledger, and it is available to engineering teams far less often than one
+would like, because most of the constants in a system are never tested against
+anything that would push back.

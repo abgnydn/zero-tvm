@@ -184,6 +184,14 @@ export interface DecodeEngine {
    */
   setPageTable(pageVals: Int32Array<ArrayBuffer>): void
   /**
+   * Per-token NLL over a sequence — the perplexity primitive. `nll[p]` is
+   * `-log P(ids[p+1] | ids[0..p])`, so the result has `ids.length - 1` entries.
+   * This is the only measurement here that can detect a model quantized into
+   * uselessness; every other gate compares against the same quantized
+   * checkpoint and would stay green. See scripts/quality-eval.mjs.
+   */
+  scoreSequence(ids: number[], onProgress?: (done: number, total: number) => void): Promise<Float32Array>
+  /**
    * Blocking generate: one submit + one readback per token, deterministic
    * per-token positions, KV reuse via `startPos`. The validation harness path.
    */
@@ -1814,6 +1822,51 @@ export function buildDecodeEngine(
     return readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
   }
 
+  /**
+   * Per-token negative log-likelihood over a sequence — the primitive a
+   * perplexity harness needs, and the only measurement in this engine that can
+   * see a model quantized into uselessness.
+   *
+   * Everything else here is a FIDELITY check: it compares the engine against
+   * mlx_lm running THE SAME quantized checkpoint (scripts/mlx-ref.py:29 is
+   * `mlx_lm.load(args.model)`), so a checkpoint quantized into nonsense scores
+   * cosine 0.9999 against an equally nonsensical reference and every gate goes
+   * green. Perplexity is absolute: it needs no reference model, only held-out
+   * text.
+   *
+   * Returns `ids.length - 1` values; `nll[p]` is `-log P(ids[p+1] | ids[0..p])`.
+   *
+   * Cost is one decode step and one full-vocab readback per position, so it
+   * runs at roughly decode speed, not prefill speed — 512 positions on a
+   * 128k-vocab model is ~256 MB of readback. Deliberately not fused into a GPU
+   * reduction: a scoring kernel that is subtly wrong would corrupt the one
+   * number nothing else can cross-check.
+   */
+  async function scoreSequence(
+    ids: number[],
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<Float32Array> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep')
+    if (ids.length < 2) throw new Error('scoreSequence: need at least 2 tokens')
+    if (ids.length > MAX_CONTEXT) {
+      throw new Error(`scoreSequence: ${ids.length} tokens exceeds the ${MAX_CONTEXT}-token context`)
+    }
+    const nll = new Float32Array(ids.length - 1)
+    for (let p = 0; p < ids.length - 1; p++) {
+      const logits = await readLogits(ids[p], p)
+      // log_softmax at the TRUE next token, max-subtracted. Done in f64 on the
+      // CPU: the sum runs over the whole vocabulary (248,320 on Qwen3.5) and
+      // an f32 accumulation there loses the tail that perplexity is measuring.
+      let max = -Infinity
+      for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i]
+      let sum = 0
+      for (let i = 0; i < logits.length; i++) sum += Math.exp(logits[i] - max)
+      nll[p] = -(logits[ids[p + 1]] - max - Math.log(sum))
+      onProgress?.(p + 1, ids.length - 1)
+    }
+    return nll
+  }
+
   // ── Embedding tail ────────────────────────────────────────────────────────
   // Hidden-state readback buffer, allocated lazily like logitsReadBuf.
   let hiddenReadBuf: GPUBuffer | null = null
@@ -2702,6 +2755,7 @@ export function buildDecodeEngine(
     generatePipelined,
     forwardLogits,
     forwardEmbedding,
+    scoreSequence,
     pipelineStep,
     setSampling,
     setPageTable,

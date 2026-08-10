@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Perplexity A/B between two MLX checkpoints, with error bars.
+
+    cd ~/dev/ml-research && uv run python ~/dev/zero-tvm/scripts/quality-ab.py \
+        --a ~/dev/zero-tvm/.weights-local/Qwen3.6-35B-A3B-MLX-4bit \
+        --b ~/dev/zero-tvm/.weights-local/Qwen3.6-35B-A3B-MLX-q3exp
+
+THE QUESTION THIS ANSWERS: did quantizing further cost anything?
+
+It is a question about the WEIGHTS, not about the engine. The engine's
+fidelity to whatever weights it is given is already pinned to ~1e-4 by
+tests/kernels/real-weights.mjs and, over 512 scored positions, by
+scripts/quality-eval.mjs. So measure quality on the reference, where it costs
+seconds instead of minutes, and let the existing fidelity apparatus carry the
+result across to the browser.
+
+WHY NOT scripts/quality-eval.mjs FOR THIS. That harness scores ONE contiguous
+prefix, so early positions — which have almost no context and therefore huge
+NLL — dominate. Measured on Llama-3.2-1B over the same text:
+
+      128 positions   ppl 151.15  (+/- 31.7%)
+      256 positions   ppl  65.57  (+/- 20.8%)
+      512 positions   ppl  41.31  (+/- 13.4%)
+     1198 positions   ppl  32.18  (+/-  8.3%)
+
+The number moves 5x with the window length. Two runs at different --tokens are
+not comparable at all, and at the 256 default you need a ~59% change to clear
+2 sigma — fine for a model quantized into gibberish, useless for the 10-20%
+regression an expert-quantization change would actually produce.
+
+This scores many INDEPENDENT windows and reports the standard error, which is
+what makes a modest regression visible. Same windows for both checkpoints.
+
+Corpus is local text, never a download: this repo's own markdown and source by
+default. --text points it anywhere.
+"""
+
+import argparse
+import glob
+import json
+import math
+import os
+import time
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm import load
+
+p = argparse.ArgumentParser(description="perplexity A/B between two checkpoints")
+p.add_argument("--a", required=True, help="baseline checkpoint (the parent build)")
+p.add_argument("--b", help="candidate checkpoint; omit to just measure --a")
+p.add_argument("--text", default=None, help="a file, or a glob; default = this repo's docs+src")
+p.add_argument("--window", type=int, default=512, help="tokens per independent window")
+p.add_argument("--windows", type=int, default=24, help="how many windows to score")
+p.add_argument("--out", default=None, help="write JSON here")
+args = p.parse_args()
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def corpus_text() -> str:
+    if args.text:
+        files = sorted(glob.glob(args.text)) or [args.text]
+    else:
+        files = sorted(glob.glob(os.path.join(REPO, "docs", "*.md")))
+        files += sorted(glob.glob(os.path.join(REPO, "src", "zero-tvm", "*.ts")))
+        files += [os.path.join(REPO, "BENCH.md"), os.path.join(REPO, "CLAUDE.md")]
+    out = []
+    for f in files:
+        try:
+            out.append(open(f, encoding="utf-8").read())
+        except OSError:
+            pass
+    return "\n\n".join(out)
+
+
+def score(model_path: str, windows: list[list[int]]) -> dict:
+    """Mean NLL per window. Teacher-forced, no cache, one forward per window."""
+    model, _ = load(model_path)
+    model.set_dtype(mx.float32)
+    per_window = []
+    t0 = time.time()
+    for i, w in enumerate(windows):
+        arr = mx.array(w)[None]
+        logits = model(arr[:, :-1])
+        lp = nn.log_softmax(logits.astype(mx.float32), axis=-1)
+        tgt = mx.array(w[1:])
+        picked = mx.take_along_axis(lp[0], tgt[:, None], axis=-1)[:, 0]
+        mx.eval(picked)
+        per_window.append(float(-picked.mean()))
+        if (i + 1) % 8 == 0:
+            print(f"    {i + 1}/{len(windows)} windows ({time.time() - t0:.0f}s)", flush=True)
+    del model
+    mx.clear_cache()
+    n = len(per_window)
+    mean = sum(per_window) / n
+    var = sum((x - mean) ** 2 for x in per_window) / max(1, n - 1)
+    sem = math.sqrt(var / n)
+    return {
+        "mean_nll": mean,
+        "perplexity": math.exp(mean),
+        # Error bars on perplexity are asymmetric because exp() is convex; both
+        # ends are reported rather than a single +/- that would be wrong on one
+        # side. This is the number that decides whether a difference is real.
+        "ppl_lo": math.exp(mean - sem),
+        "ppl_hi": math.exp(mean + sem),
+        "sem_nll": sem,
+        "windows": n,
+        "seconds": time.time() - t0,
+    }
+
+
+# Tokenize once, with A's tokenizer, and score BOTH on the identical windows.
+# Two checkpoints of the same family share a tokenizer; if they did not, the
+# comparison would be meaningless no matter how the windows were chosen.
+_, tokenizer = load(args.a)
+text = corpus_text()
+ids = tokenizer.encode(text)
+need = args.windows * args.window
+if len(ids) < need:
+    avail = len(ids) // args.window
+    print(f"corpus has {len(ids)} tokens; {args.windows} x {args.window} needs {need}")
+    if avail < 2:
+        raise SystemExit("need at least 2 full windows — pass a bigger --text")
+    print(f"scoring {avail} windows instead")
+    args.windows = avail
+windows = [ids[i * args.window : (i + 1) * args.window] for i in range(args.windows)]
+print(f"corpus {len(ids)} tokens -> {args.windows} independent windows of {args.window}\n")
+
+print(f"A  {args.a}")
+ra = score(args.a, windows)
+print(f"   perplexity {ra['perplexity']:.3f}  [{ra['ppl_lo']:.3f}, {ra['ppl_hi']:.3f}]"
+      f"  over {ra['windows']} windows, {ra['seconds']:.0f}s\n")
+
+result = {"a": {"path": args.a, **ra}, "window": args.window, "windows": args.windows}
+
+if args.b:
+    print(f"B  {args.b}")
+    rb = score(args.b, windows)
+    print(f"   perplexity {rb['perplexity']:.3f}  [{rb['ppl_lo']:.3f}, {rb['ppl_hi']:.3f}]"
+          f"  over {rb['windows']} windows, {rb['seconds']:.0f}s\n")
+    result["b"] = {"path": args.b, **rb}
+
+    delta = (rb["perplexity"] / ra["perplexity"] - 1) * 100
+    # Paired z on mean NLL. The windows are identical for both, so this is a
+    # paired comparison in spirit; treating it as unpaired is conservative.
+    z = abs(rb["mean_nll"] - ra["mean_nll"]) / math.sqrt(ra["sem_nll"] ** 2 + rb["sem_nll"] ** 2)
+    result["delta_pct"] = delta
+    result["z"] = z
+
+    print(f"  B is {delta:+.1f}% perplexity vs A, z = {z:.1f}")
+    if z < 2:
+        print("  NOT DISTINGUISHABLE at this window count — raise --windows before concluding")
+    elif delta <= 10:
+        print("  SHIP: within +10% with separated error bars")
+    elif delta <= 25:
+        print("  MARGINAL: +10-25%. Real, and a task benchmark should decide, not this")
+    else:
+        print("  DO NOT SHIP on this evidence: >+25%")
+    print("\n  Perplexity understates reasoning damage — published work puts the")
+    print("  math-accuracy drop at 3-bit around 3x the perplexity drop. A pass")
+    print("  here is necessary, not sufficient.")
+
+if args.out:
+    json.dump(result, open(args.out, "w"), indent=1)
+    print(f"\n  -> {args.out}")

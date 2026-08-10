@@ -145,6 +145,12 @@ try{
   }
   window.__maxPages = () => S.maxPages
 
+  // Per-token NLL — the perplexity primitive scripts/quality-eval.mjs drives.
+  // The only measurement here that can see a model quantized into uselessness;
+  // every other gate compares against the same quantized checkpoint.
+  window.__score = async (ids) => Array.from(await engine.scoreSequence(ids,
+    (d, t) => { if (d % 64 === 0) say(`scored ${d}/${t}`) }))
+
   window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
   // Embedding models stop one dispatch earlier: the pooled, L2-normalised
   // hidden state instead of logits. scripts/embed-ref.py is the reference.
