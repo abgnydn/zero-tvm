@@ -113,6 +113,57 @@ Freeze a real transcript as a fixture. Real ones exist on this machine: `~/.pi/a
 *Verify:* a headless test asserting turn N+1's prompt id array has turn N's as an **exact prefix**, and reporting the position of the first divergence when it does not. Plus `encode(decode(ids)) === ids` over the assistant outputs, listing failures rather than asserting none.
 *Why this is the gate:* if the id prefix breaks 3k tokens into a 20k transcript, the pool caps at 3k and **the entire feature is worth almost nothing** — and it will still pass every synthetic test. Today a break costs a full prefill and correct output, visible only as a small `reused` in the `[engine] prefill:` log (`:2274-2280`). If this test goes red, widening `buildChatPromptFor` to accept `{role, ids}` segments becomes a hard prerequisite and moves ahead of everything else. Also record here: `llama3DateString` (`tokenizer-bpe.ts:481-482`, used at `:523, 533`) injects today's date into the Llama-3 system block — any Llama-3 pooled prefix expires at midnight ~15 tokens in. Any clock, session id or nonce near the front of an agent system prompt has the same total, silent effect.
 
+> #### RESULT, 2026-08-10 — **GREEN. The gate is passed.**
+>
+> `scripts/prefix-stability-test.mjs`, over **nine real agent sessions** from
+> this machine (Claude Code JSONL, 8–147 MB each), rendered through the repo's
+> own template builders and tokenizers:
+>
+> | | |
+> |---|---|
+> | transitions compared | **~340** |
+> | breaks | **0** |
+> | tool calls inside the compared windows | 200+ |
+> | `decode(encode(x)) === x` on assistant turns | clean — 1122 turns in the largest |
+> | templates | `chatml`, `llama3`, `deepseek` — all clean on the same transcript |
+>
+> Tool traffic is kept, not stripped: `tool_use` renders as
+> `<tool_call>{json}</tool_call>` and `tool_result` as
+> `<tool_response>…</tool_response>`, so the JSON punctuation runs, file paths
+> and digit runs that would make BPE re-segment are all inside the compared
+> text. The script prints the tool-call count for the window and warns when it
+> is zero — a PASS over a transcript with the tool traffic stripped is a PASS
+> over a plain chat, which was already known to work.
+>
+> **The falsifier ran first, and it caught a real defect in itself.** `--mutate`
+> rewrites turn 1 from turn 3 onward, the way a clock in a system prompt would,
+> and must turn the test red. Its first version used a regex that matched
+> nothing, so the falsifier *passed* — the exact outcome §0.4 warns about, one
+> section below, in this same document. Made unconditional it now reports
+> `FAIL 1/5 transitions … first break at turn 3: shared 3 of 133 tokens` with
+> the decoded text at the boundary, exits 1 where the control exits 0, and
+> refuses to run at all when the mutation did not apply.
+>
+> **Three limits, and the first is the one that matters.**
+>
+> 1. **Phi-3 is untested, and it is the template already known to break** —
+>    BENCH.md records 1086/1105 with a boundary merge at `<|assistant|>\n`. Its
+>    template is SPM and lives in `tokenizer.ts`, which imports `weight-loader`
+>    and reads `GPUBufferUsage` at module scope, so this script cannot reach it.
+>    A pool keyed per-spec is unaffected; a blanket claim that "prompts are
+>    append-only" is not.
+> 2. The transcripts are Claude Code's, re-rendered into these templates. The
+>    content is genuine agentic content; the exact byte sequence a pi/Qwen agent
+>    would send is not identical.
+> 3. Windows are capped (`--max`, default 24k) because the full files run to
+>    millions of tokens and the comparison is O(n²) re-encodes. The cap is also
+>    the workload — Qwen3.5's `maxContext` is 7168.
+>
+> **Consequence for the plan:** the `{role, ids}` rewrite of
+> `buildChatPromptFor` named above as a hard prerequisite **is not needed** for
+> byte-level-BPE specs. Phases 0–1 proceed as written.
+
+
 **0.3 — Three measurements, written into BENCH.md before any threshold is written into code.**
 (a) `adapter.limits.maxStorageBufferBindingSize` and `maxBufferSize` on the target machine. The machinery exists (`loading-ui.ts:191-194`) but nobody has recorded what it returns; the number decides whether Phase 3 can hold two sequences in the existing per-layer buffer.
 (b) OPFS write and read throughput for 625 MiB through `createSyncAccessHandle` in a worker. Every "seconds vs 99 seconds" claim in all four angles rests on a guessed ~300 MB/s.
@@ -254,7 +305,7 @@ Plus an overlap test: two conversations sharing 56 full pages plus a partial —
 1. **`adapter.limits.maxStorageBufferBindingSize` / `maxBufferSize` on the target machine.** Needs a browser. `loading-ui.ts:191-194` and `lib/index.ts:183-186` already request the adapter's own value, so the machinery exists, but the returned number is unrecorded. Decides whether Phase 3 fits in the existing per-layer buffer. Step 0.3(a).
 2. **OPFS write/read throughput for 625 MiB.** Every "seconds vs 99 seconds" claim in all four angles is derived from a guessed ~300 MB/s. Step 0.3(b).
 3. **GPU→CPU readback throughput and its memory-pressure effect.** The engine has never read the KV cache back. Step 0.3(c).
-4. **Whether the real agentic transcript is id-stable across turns.** Step 0.2 — the gate. I confirmed the mechanism (`buildChatPromptFor` re-encodes rendered text; `chat.ts:305-308` says re-encoding is not guaranteed to reproduce the ids) and confirmed the two measured data points in BENCH.md (Qwen3.5 922/950 clean, Phi-3 1086/1105 with a documented boundary break), but I have not run the test on a 20k tool-call-heavy transcript.
+4. ~~**Whether the real agentic transcript is id-stable across turns.**~~ **RESOLVED 2026-08-10 — GREEN** for byte-level-BPE templates: nine real sessions, ~340 transitions, 0 breaks, tool traffic included (see the RESULT block in §0.2). Still open for **Phi-3**, whose SPM template this script cannot import and which BENCH.md already records breaking at a turn boundary.
 5. **Qwen3.6-35B-A3B's actual prefill rate.** Chunked prefill is off for MoE by two independent gates (`engine-core.ts:2173-2174`: `!S.moe` and `!AFFINE`), so it prefills per token at ~340 dispatches. Unmeasured. It is moot for the 20k target (maxContext 6144, `model-spec.ts:887`) but it is the model the user measured as right for agentic coding, and its ceiling is deliberately small for a documented RAM-headroom reason (`model-spec.ts:866-873`: GPU process killed at 0.1 GB free). Whether that ceiling can move at all is a genuine open conflict with this feature, not a tuning detail.
 6. **Whether WGSL codegen is bit-stable across Chrome/driver updates on one adapter.** This decides whether `reuse`'s block-0 canary (recompute block 0 through the same path, byte-compare against the stored payload, poison the namespace on mismatch) is belt-and-braces or the load-bearing correctness mechanism, and whether `adapter.info` in the fingerprint is sufficient or an epoch counter is also needed. I have not tested it; the canary costs ~16 token-prefills plus one block readback on a hit and I would include it in Phase 1.5 rather than argue about it.
 7. **Whether an entry should persist as f16 or int8.** `?kv8=1` halves tier-2 (`allocKVPagesInt8:116-129`), but int8 is opt-in and explicitly unvalidated on target hardware by its own comment (`:113-115`), has no split-K variant, and a pool keyed on `kvLayout` means f16 and int8 entries never share. Quantizing on the way *out* only (f16 in VRAM, int8 on disk) is tempting and would break the exactly-0 bar for restored entries — which is the repo's only proof mechanism. I would keep f16-only in Phase 1 and revisit with 0.3(b)'s number in hand.
