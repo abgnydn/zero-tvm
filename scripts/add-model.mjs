@@ -8,7 +8,11 @@
 //
 // Pipeline:
 //   PROBE    config.json + tokenizer(.config).json + safetensors index and
-//            shard headers — a few hundred KB of ranged reads against a
+//            shard headers. MEASURED 11-20 MB, not the 'few hundred KB' this
+//            said until 2026-08-10: the config and headers are ranged reads, but
+//            tokenizer.json is fetched WHOLE and is 11 MB on Qwen and 17 MB on
+//            Llama-3. It matters on a slow link, and it was wrong in the README
+//            too. Ranged reads against a
 //            multi-GB repo, the same trick weight-loader-mlx.ts uses.
 //   DETECT   normalise into constraints.DetectedModel (multimodal text_config
 //            handled; qk-norm/shared-expert/biases read from RECORD NAMES, not
