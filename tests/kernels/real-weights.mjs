@@ -22,7 +22,7 @@ import { getDevice, pipelineFor, buffer, runCompute, BU, MM } from './gpu.mjs'
 import { f16Array, f16BitsToF32 } from './half.mjs'
 import { int4MatmulWGSL, int4MatmulEntry } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import { withPrelude } from '../../src/compiler/shader-prelude.ts'
-import { QWEN35_4B, QWEN36_35B_A3B, ropeInvFreqTable } from '../../src/compiler/model-spec.ts'
+import { DEEPSEEK_V2_LITE, QWEN35_4B, QWEN36_35B_A3B, ropeInvFreqTable } from '../../src/compiler/model-spec.ts'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const REFS = join(ROOT, '.weights-local/kernel-refs')
@@ -955,15 +955,102 @@ async function dsv2Layer(device, dir, meta) {
   const attn = await matvec('self_attn.o_proj', null, D, heads * V, oHeads)
   const errAttn = relErr(attn, rd('ref_attn_out', Float32Array))
 
+  const prep = await dsv2Prep(device, dir, meta)
   const parts = [['q_proj', errQ], ['kv_a_proj', errKv], ['q->latent', errQlat],
                  ['softmax', errProb], ['latent ctx', errOlat], ['->head', errOheads],
                  ['o_proj', errAttn]]
   // See the note in mlaAttention: 2e-2 was ~50x the observed error and would
   // not have noticed an f32 accumulator becoming f16.
   return {
-    pass: parts.every(([, e]) => e < 1e-3),
+    pass: parts.every(([, e]) => e < 1e-3) && prep.pass,
     detail: parts.map(([n, e]) => `${n} ${e.toExponential(2)}`).join(' | ')
-      + ` (pe rows permuted at load, yarn scale ${scale.toFixed(4)})`,
+      + ` (pe rows permuted at load, yarn scale ${scale.toFixed(4)})\n      prep: ${prep.detail}`,
+  }
+}
+
+/** The three PREP kernels, on the GPU, one dispatch at a time.
+ *
+ *  dsv2Layer proves nothing about these: it feeds ref_qnope, ref_qpe, ref_c and
+ *  ref_kpe straight from numpy, so the RoPE convention, the kv_a RMSNorm and
+ *  every cache address are simply assumed there. kv_a_layernorm.weight is in
+ *  the bundle and, until this ran, was read by no GPU test in this repo.
+ *
+ *  Position 19 is not arbitrary: position 0 is rotation-identity (cos 1,
+ *  sin 0), so a stale or wrong RoPE table passes there for free. */
+async function dsv2Prep(device, dir, meta) {
+  const rd = (n, T) => read(dir, n, T)
+  const { heads, nope: N, rope: R, kv_lora: L, tokens: T, query_at: qi } = meta
+  const shader = (f, e) => pipelineFor(device, withPrelude(readFileSync(join(SHADERS, f), 'utf8'),
+    { ...DEEPSEEK_V2_LITE }), e)
+  const stg = (n) => device.createBuffer({ size: n, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+  const f16in = (n) => buffer(device, f16Array(rd(n, Float32Array)), BU.STORAGE | BU.COPY_DST)
+  const u32u = (a) => buffer(device, new Uint32Array(a), BU.UNIFORM | BU.COPY_DST)
+  // The engine hands position through a STORAGE i32 array, exactly as
+  // kv_append does, so the bind groups stay hoisted across tokens.
+  const posMap = buffer(device, new Int32Array([qi]), BU.STORAGE | BU.COPY_DST)
+  // kv_a_layernorm.weight ships as F16 in the checkpoint, so it is bound
+  // verbatim rather than via the f32 ref dumps. Until this test it was read by
+  // no GPU test in the repo.
+  const rawF16 = (name) => {
+    const rec = meta.tensors[`${meta.layer}.${name}`]
+    const b = readFileSync(join(dir, rec.file))
+    return buffer(device, new Uint8Array(b.buffer, b.byteOffset, b.byteLength), BU.STORAGE | BU.COPY_DST)
+  }
+  // The table the ENGINE would build — not one recomputed by the test — so a
+  // wrong yarn table is a failure here rather than a shared assumption.
+  const invFreq = buffer(device, ropeInvFreqTable(DEEPSEEK_V2_LITE), BU.STORAGE | BU.COPY_DST)
+
+  const run = (pipe, bufs, x, y = 1) => {
+    const enc = device.createCommandEncoder()
+    const pass = enc.beginComputePass()
+    pass.setPipeline(pipe)
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })),
+    }))
+    pass.dispatchWorkgroups(x, y, 1)
+    pass.end()
+    device.queue.submit([enc.finish()])
+  }
+
+  // ── mla_q_split: q_proj's [heads, N+R] output into q_nope and rotated q_pe
+  const qNope = stg(heads * N * 2)
+  const qPe = stg(heads * R * 2)
+  run(shader('mla_q_split.wgsl', 'mla_q_split'),
+    [f16in('ref_qperm'), invFreq, posMap, qNope, qPe, u32u([N, R, 0, 0])], heads)
+
+  // ── mla_kv_write: kv_a's [L+R] output into the cache at position qi
+  const cacheC = stg(T * L * 2)
+  const cacheKpe = stg(T * R * 2)
+  run(shader('mla_kv_write.wgsl', 'mla_kv_write'),
+    [f16in('ref_kvaperm'), rawF16('self_attn.kv_a_layernorm.weight'), invFreq, posMap, cacheC, cacheKpe,
+     u32u([L, R, 0, 0])], 1)
+
+  // ── mla_narrow: the f32 latent context down to f16 for mla_proj
+  const narrowed = stg(heads * L * 2)
+  run(shader('mla_narrow.wgsl', 'mla_narrow'),
+    [narrowed, buffer(device, rd('ref_olat', Float32Array), BU.STORAGE | BU.COPY_DST),
+     u32u([heads * L, 0, 0, 0])], Math.ceil((heads * L) / 256))
+
+  const [a, b, c, d, e] = await readBack(device, [
+    [qNope, heads * N * 2], [qPe, heads * R * 2],
+    [cacheC, T * L * 2], [cacheKpe, T * R * 2], [narrowed, heads * L * 2],
+  ])
+  const f16 = (bytes) => Array.from(new Uint16Array(bytes), f16BitsToF32)
+  // Only the query row of the cache was written; compare that row.
+  const rowC = f16(c).slice(qi * L, (qi + 1) * L)
+  const rowK = f16(d).slice(qi * R, (qi + 1) * R)
+  const parts = [
+    ['q_nope', relErr(f16(a), rd('ref_qnope', Float32Array))],
+    ['q_pe(rope)', relErr(f16(b), rd('ref_qpe', Float32Array))],
+    ['latent+rmsnorm', relErr(rowC, rd('ref_c', Float32Array).slice(qi * L, (qi + 1) * L))],
+    ['k_pe(rope)', relErr(rowK, rd('ref_kpe', Float32Array).slice(qi * R, (qi + 1) * R))],
+    ['narrow f32->f16', relErr(f16(e), rd('ref_olat', Float32Array))],
+  ]
+  return {
+    pass: parts.every(([, v]) => v < 1e-3),
+    detail: parts.map(([n, v]) => `${n} ${v.toExponential(2)}`).join(' | ')
+      + ` (position ${qi}, rope table from the spec)`,
   }
 }
 
