@@ -46,6 +46,7 @@
     "bench:sync": "node bench/sync-docs.mjs",
     "check": "npm run typecheck && npm run test",
     "test:kernels:real": "node tests/kernels/real-weights.mjs",
+    "test:mla-engine": "node scripts/mla-engine-test.mjs",
     "add-model": "node scripts/add-model.mjs",
     "test:kernels:spec": "node tests/kernels/compile-spec.mjs"
   },
