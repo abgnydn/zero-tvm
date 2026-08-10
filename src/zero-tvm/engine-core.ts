@@ -24,6 +24,7 @@ import { LoadedWeights } from './weight-loader.js'
 import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
+import { reuseStart, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
 
 // ============================================================
 // GPU helpers
@@ -175,6 +176,13 @@ export interface DecodeEngine {
    * to reload the page and re-download the weights to move a slider.
    */
   setSampling(next: DecodeEngineOptions['sampling'] | null): void
+  /**
+   * TEST SEAM — overwrite the KV page table with a permutation.
+   * The table is the identity everywhere in the shipping engine; this exists so
+   * scripts/paging-test.mjs can prove the readers honour it and the writers
+   * currently do not (docs/PAGING_PLAN.md §0.4). Do not call from app code.
+   */
+  setPageTable(pageVals: Int32Array<ArrayBuffer>): void
   /**
    * Blocking generate: one submit + one readback per token, deterministic
    * per-token positions, KV reuse via `startPos`. The validation harness path.
@@ -899,33 +907,26 @@ export function buildDecodeEngine(
   const prefixReuse = opts.prefixReuse ?? true
   let lastPrefill: { promptLen: number; reused: number; chunks: number } | null = null
 
-  function noteAbsorbed(position: number, id: number): void {
-    if (position > absorbed.length) { absorbedValid = false; return }
-    absorbed.length = position
-    absorbed.push(id)
+  // The rules themselves live in prefix-reuse.ts, pinned by
+  // tests/unit/prefix-reuse.test.ts against a table hand-derived from the
+  // stated rule. They were closures here, and their only assertion was
+  // checkReuse() in bench-console.ts — a browser, a loaded model, 48 decoded
+  // tokens and ?chunk=0. These two wrappers keep the local `let`s as the
+  // single source of truth: gdnStatePos is written from six places in this
+  // file, so it is read at call time rather than mirrored.
+  function reuseState(): ReuseState {
+    return { absorbed, absorbedValid, prefixReuse, hybrid, gdnStatePos }
   }
 
-  /**
-   * Longest reusable prefix of `promptIds` given the absorbed record.
-   * Pure attention: min(LCP, len-1) — KV slots are idempotent, stale slots
-   * past the LCP are overwritten by the delta prefill in order, and at least
-   * the final prompt token always runs (to produce the first argmax).
-   * Hybrid: the GDN recurrence is non-rewindable, so reuse requires the new
-   * prompt to extend EVERY absorbed token (LCP == absorbed.length — in normal
-   * chat the ≤1-token stop overrun is the <|im_end|> stop id, which IS the
-   * next prompt token) with the state boundary exactly there; else 0 (full
-   * re-prefill, which re-zeroes the GDN state at position 0).
-   */
+  function noteAbsorbed(position: number, id: number): void {
+    const s = reuseState()
+    pureNoteAbsorbed(s, position, id)
+    absorbed = s.absorbed
+    absorbedValid = s.absorbedValid
+  }
+
   function computeReuseStart(promptIds: number[]): number {
-    if (!prefixReuse || !absorbedValid || promptIds.length === 0) return 0
-    const max = Math.min(absorbed.length, promptIds.length)
-    let lcp = 0
-    while (lcp < max && absorbed[lcp] === promptIds[lcp]) lcp++
-    if (!hybrid) return Math.min(lcp, promptIds.length - 1)
-    if (gdnStatePos === absorbed.length && lcp === absorbed.length && lcp <= promptIds.length - 1) {
-      return lcp
-    }
-    return 0
+    return reuseStart(reuseState(), promptIds)
   }
 
   // Logit readback buffer — used by forwardLogits() for the validation harness only.
@@ -936,6 +937,29 @@ export function buildDecodeEngine(
   {
     const pageVals = new Int32Array(S.maxPages)
     for (let i = 0; i < S.maxPages; i++) pageVals[i] = i
+    device.queue.writeBuffer(B.pageValues, 0, pageVals)
+  }
+
+  /**
+   * TEST SEAM. Overwrite the page table with an arbitrary permutation.
+   *
+   * The table has been the identity since the day it was written, so nothing
+   * in this repo has ever run with a non-identity one end to end — and the
+   * kernels that WRITE the cache (`kv_append`, `qkv_fused`,
+   * `qk_norm_rope_append`, `kv_quantize_int8`, `mla_kv_write`) do not take the
+   * table at all; they compute `position / PAGE_SIZE` directly. So today a
+   * permutation is expected to produce WRONG output, and
+   * scripts/paging-test.mjs asserts exactly that before any of them is taught
+   * the table (docs/PAGING_PLAN.md §0.4). Once they are, the same script
+   * flips to asserting bit-identical logits.
+   *
+   * Not part of any shipping path. `B` is closed over, so without this seam
+   * the falsifier cannot be written at all.
+   */
+  function setPageTable(pageVals: Int32Array<ArrayBuffer>): void {
+    if (pageVals.length !== S.maxPages) {
+      throw new Error(`setPageTable: expected ${S.maxPages} entries, got ${pageVals.length}`)
+    }
     device.queue.writeBuffer(B.pageValues, 0, pageVals)
   }
 
@@ -2680,6 +2704,7 @@ export function buildDecodeEngine(
     forwardEmbedding,
     pipelineStep,
     setSampling,
+    setPageTable,
     resetKVTracking,
     debugCompareReuse,
     getLastPrefill,

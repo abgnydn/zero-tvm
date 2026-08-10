@@ -126,6 +126,25 @@ try{
     })
     return Array.from(await e.generate(ids, 0, n, () => {}))
   }
+  // PAGE TABLE falsifier (docs/PAGING_PLAN.md §0.4). Runs the same ids twice on
+  // a FRESH engine each time — identity table, then `perm` — and returns both
+  // logit vectors. The readers (attention*.wgsl) go through the table; the
+  // writers do not, so today the permuted run must differ. When the writers are
+  // taught the table the two must become bit-identical.
+  //
+  // A fresh engine per arm is load-bearing: the KV cache written under one
+  // table would otherwise still be sitting there under the next.
+  window.__pageTableCheck = async (ids, perm, v) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
+    const run = async (table) => {
+      const e = buildDecodeEngine(dev, weights, allocKVPages(dev, S), { spec: S, variants: V })
+      if (table) e.setPageTable(Int32Array.from(table))
+      return Array.from(await e.forwardLogits(ids))
+    }
+    return { identity: await run(null), permuted: await run(perm) }
+  }
+  window.__maxPages = () => S.maxPages
+
   window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
   // Embedding models stop one dispatch earlier: the pooled, L2-normalised
   // hidden state instead of logits. scripts/embed-ref.py is the reference.

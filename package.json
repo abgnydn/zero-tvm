@@ -49,6 +49,7 @@
     "test:mla-engine": "node scripts/mla-engine-test.mjs",
     "test:prefix-stability": "node scripts/prefix-stability-test.mjs",
     "paging:measure": "node scripts/paging-measure.mjs",
+    "paging:test": "node scripts/paging-test.mjs",
     "add-model": "node scripts/add-model.mjs",
     "test:kernels:spec": "node tests/kernels/compile-spec.mjs"
   },
