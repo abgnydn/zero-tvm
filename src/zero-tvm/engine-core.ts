@@ -189,6 +189,12 @@ export interface DecodeEngine {
   /** Run a forward pass through prefill of `promptIds` and return f32 logits at the final position. */
   forwardLogits(promptIds: number[]): Promise<Float32Array>
   /**
+   * Same prefill as forwardLogits, but returns the L2-normalised f32 HIDDEN
+   * state at the final position instead of logits — a sentence embedding.
+   * Last-token pooling; the caller owns every other pooling convention.
+   */
+  forwardEmbedding(promptIds: number[]): Promise<Float32Array>
+  /**
    * One token through ONE pipeline stage (see DecodeEngineOptions.layerRange).
    * First stage: token id in, residual out. Last: residual in, token out.
    * A whole-model engine accepts a token id and returns the token, which is
@@ -1625,6 +1631,83 @@ export function buildDecodeEngine(
     return readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
   }
 
+  // ── Embedding tail ────────────────────────────────────────────────────────
+  // Hidden-state readback buffer, allocated lazily like logitsReadBuf.
+  let hiddenReadBuf: GPUBuffer | null = null
+  const halfScratchF32 = new Float32Array(1)
+  const halfScratchU32 = new Uint32Array(halfScratchF32.buffer)
+  /** u16 IEEE-754 half bit pattern → f32. Float16Array postdates WebGPU in
+   *  Chrome (113 shipped WebGPU, 135 shipped Float16Array), so decode by hand. */
+  function halfToF32(h: number): number {
+    const sign = (h & 0x8000) << 16
+    const exp = (h >>> 10) & 0x1f
+    const mant = h & 0x3ff
+    let bits: number
+    if (exp === 0) {
+      if (mant === 0) bits = sign
+      else {
+        let e = -1
+        let m = mant
+        do { e++; m <<= 1 } while (!(m & 0x400))
+        bits = sign | ((127 - 15 - e) << 23) | ((m & 0x3ff) << 13)
+      }
+    } else if (exp === 0x1f) bits = sign | 0x7f800000 | (mant << 13)
+    else bits = sign | ((exp - 15 + 127) << 23) | (mant << 13)
+    halfScratchU32[0] = bits >>> 0
+    return halfScratchF32[0]
+  }
+
+  /**
+   * Prefill `promptIds` and return the L2-normalised f32 hidden state at the
+   * FINAL prompt position — a sentence embedding.
+   *
+   * This is forwardLogits one dispatch earlier. B.hidden1 is what the LM head
+   * reads, and the last layer's addNorm2 binds `finalNormGamma` as its
+   * next-layer gamma (see the layerBGs loop), so B.hidden1 after recordForward
+   * holds RMSNorm(residual, model.norm) — exactly HF's `last_hidden_state`.
+   * No new kernel, no change to any dispatch; the LM head and argmax still run
+   * and their output is ignored, the same deal readLogits already accepts.
+   *
+   * POOLING IS THE CALLER'S JOB beyond "last token". The decoder is causal, so
+   * position len-1 sees the whole sequence and this equals last-token pooling
+   * for an unpadded sequence — the rule Qwen3-Embedding's own
+   * 1_Pooling/config.json states (pooling_mode_lasttoken: true) ahead of its
+   * 2_Normalize module. That family's tokenizer also appends <|endoftext|> to
+   * every sequence via a TemplateProcessing post-processor, and its queries
+   * carry an "Instruct: …\nQuery:" prefix; both change which token lands last
+   * and neither is something this function can see. A mean-pooled model needs
+   * a different hook, not a different argument.
+   */
+  async function forwardEmbedding(promptIds: number[]): Promise<Float32Array> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    if (promptIds.length === 0) throw new Error('forwardEmbedding: empty prompt')
+    for (let i = 0; i < promptIds.length; i++) await decodeToken(promptIds[i], i)
+
+    if (!hiddenReadBuf) {
+      hiddenReadBuf = device.createBuffer({
+        size: S.d * 2,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        label: 'hiddenReadback',
+      })
+    }
+    const enc = device.createCommandEncoder()
+    enc.copyBufferToBuffer(B.hidden1, 0, hiddenReadBuf, 0, S.d * 2)
+    device.queue.submit([enc.finish()])
+
+    await hiddenReadBuf.mapAsync(GPUMapMode.READ)
+    const half = new Uint16Array(hiddenReadBuf.getMappedRange().slice(0))
+    hiddenReadBuf.unmap()
+
+    // Pool (already done — this IS the last position) then L2-normalise, so
+    // cosine similarity is a plain dot product downstream.
+    const out = new Float32Array(S.d)
+    let sumSq = 0
+    for (let i = 0; i < S.d; i++) { const v = halfToF32(half[i]); out[i] = v; sumSq += v * v }
+    const inv = 1 / Math.sqrt(sumSq)
+    for (let i = 0; i < S.d; i++) out[i] *= inv
+    return out
+  }
+
   /**
    * Opt-in debug assertion for prefix reuse (?checkreuse=1 / window.checkReuse):
    * runs the REUSED-prefix prefill of `promptIds` and reads the final-position
@@ -2431,6 +2514,7 @@ export function buildDecodeEngine(
     generate,
     generatePipelined,
     forwardLogits,
+    forwardEmbedding,
     pipelineStep,
     setSampling,
     resetKVTracking,
