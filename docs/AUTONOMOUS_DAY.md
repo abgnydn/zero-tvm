@@ -8,6 +8,23 @@ an item whose gate cannot run is **blocked, not skipped**.
 
 Read `CLAUDE.md` first. Nothing here overrides it.
 
+> **STATUS 2026-08-10.** Item 1 (MLA into the engine) is **DONE** — the gate it
+> asked for is `scripts/mla-engine-test.mjs`, which runs `buildDecodeEngine`
+> itself against the real layer-0 bundle and reaches max rel err 7.76e-4.
+> Item 3 (BENCH protocol round) and item 5 (the MoE layer bundle, needs Colab)
+> and item 6 (whole-model DeepSeek, needs the 9 GB checkpoint) are untouched.
+> Item 2's dense half is exercised by the layer-0 bundle; its MoE half still
+> waits on item 5.
+>
+> Two of the "while a long run is going" items are done: the `rope_parameters`
+> rename (it is a MERGE, not a rename — it absorbs `rope_theta`, and Qwen3.6
+> carries no `rope_theta` under either root, so the detector read null), and
+> `qwen36 --check-only`, which was RED on vision-tower `.bias` records for a
+> kernel the text model does not need.
+>
+> The queue has since been superseded as the main line by
+> `docs/PAGING_PLAN.md` (Phase 0 complete) and `docs/QUALITY.md`.
+
 ---
 
 ## The goal

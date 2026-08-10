@@ -7,6 +7,13 @@ absolute number into a fiction. Original text is not a guarantee of novelty —
 nothing written in English is truly out of distribution — but it removes the
 worst of the contamination, and the number is only ever used comparatively.
 
+Length is a measurement property, not an editorial one. The file is sized past
+four thousand tokens because the block standard error of a perplexity run falls
+with the number of roughly independent 64-token blocks in it, and a corpus that
+runs out caps the precision of every run no matter how large --tokens gets. The
+registers below vary on purpose — essay, narrative, specification, transcript,
+checklist — because a single voice measures a model's fit to that voice.
+
 ---
 
 The harbour at Kaleköy silts up a little more each winter. Fishermen who have
@@ -88,3 +95,303 @@ inherit the practice of measuring it. That is a more robust arrangement than
 any ledger, and it is available to engineering teams far less often than one
 would like, because most of the constants in a system are never tested against
 anything that would push back.
+
+---
+
+NARRATIVE
+
+The proofing cabinet at Halvorsen's went cold on a Tuesday in February, which
+was the worst possible morning for it, because Tuesday was the day the hotel
+took its standing order of ninety rolls and the hotel had never once tolerated
+a late delivery. Ida found the cabinet at four in the morning, opened the door
+out of habit rather than suspicion, and felt the wrong kind of air come out —
+still, room-temperature, faintly sour. Six trays of dough sat there in a state
+she could only describe afterwards as sulking. They had risen perhaps a third
+of the way and then stopped, and the surfaces had gone slack and shiny, the way
+dough does when it has been left to think about things for too long.
+
+Her first instinct was to call Marek, who owned the bakery and who would be
+asleep, and her second instinct — the one she followed — was to look at the
+thermometer. It read nineteen degrees. The dial on the front of the cabinet
+read twenty-eight, which was where it always read, because the dial was a
+setting and not a measurement, a distinction Ida had understood in principle
+for two years and understood properly for the first time at four in the
+morning with ninety rolls to make.
+
+She moved the trays to the top of the oven, which was still warm from the
+previous night's bake and which was, she guessed, somewhere around twenty-four
+degrees at the surface. Then she made a second batch from scratch, because she
+did not trust the first one to recover, and because making a second batch was
+something she could do with her hands while the rest of the problem sat there
+being insoluble. Flour, water, salt, the tin of yeast from the cold room. She
+worked fast and without much thought and got the second batch mixed by five.
+
+The cabinet, it turned out, had not failed. Its heating element was fine. What
+had failed was a small plastic clip inside the door, which had cracked at some
+point in the previous week and which held the door magnet a few millimetres
+proud of its seat, so that the door looked shut, felt shut, latched with the
+familiar sound of a door shutting, and stood open by a gap you could not see
+unless you crouched and put your eye level with the frame. The element had run
+all night. The heat had gone out of the gap all night. The thermostat, which
+measured the air inside and had no opinion about doors, had reported a room
+that was doing its best.
+
+Marek arrived at six and found two batches of dough, one recovering on the
+oven top and one rising properly in the cold room, and Ida sitting on an
+upturned crate with the broken clip in her palm. He looked at the clip for a
+while. Then he said the thing she remembered for years afterwards, which was
+that the cabinet had been telling the truth the entire time, and the trouble
+was that nobody had asked it a question it was capable of answering.
+
+They made the hotel delivery at half past seven, twenty minutes late, using the
+recovered dough for sixty of the rolls and the fresh batch for the rest. Nobody
+at the hotel noticed, or if they noticed they did not say. Ida replaced the
+clip that afternoon with one she cut out of an old chopping board, and she also
+did something that Marek thought was excessive at the time and endorsed later:
+she taped a cheap glass thermometer to the inside of the cabinet door, at eye
+level, where anyone opening it in the dark would see the number before they saw
+the dough. It cost almost nothing. It answered a different question than the
+thermostat did, and it answered it to a person instead of to a control loop.
+
+Nine years later the bakery had four cabinets and a proper monitoring system
+with alarms that went to Marek's phone, and every one of the four still had a
+glass thermometer taped to the inside of the door.
+
+---
+
+TECHNICAL DESCRIPTION
+
+The Vessen tide-gauge network, as it was rebuilt between the second and third
+surveys, consists of forty-one stations distributed along roughly three hundred
+kilometres of coastline, each reporting a water-level sample once every sixty
+seconds. A station is a stilling well — a vertical pipe about two metres long,
+open to the sea through a constriction at the base — with a float inside it and
+a shaft encoder on the float's line. The constriction is the whole trick: it
+admits the slow rise and fall of the tide almost unimpeded while damping the
+faster oscillation of surface waves, so the float reports mean water level
+rather than the height of whatever swell happens to be passing.
+
+The choice of constriction diameter sets the time constant of that damping. A
+narrow orifice damps aggressively and gives a very clean signal, at the cost of
+lagging the true level during rapid changes — which matters during storm surge,
+which is precisely when the network is most worth having. Vessen's stations use
+a nominal twelve-millimetre orifice against a well diameter of one hundred and
+sixty millimetres, giving a settling time on the order of forty seconds for a
+step of one metre. Six stations in the northern group use eight millimetres
+instead. Those six sit in exposed positions where the wave field is severe
+enough that the cleaner damping was judged worth the additional lag, and the
+processing chain corrects for the difference by station identifier rather than
+by measurement, which is a compromise the survey documentation is explicit
+about and mildly unhappy with.
+
+Each encoder produces a 14-bit absolute position, which over the well's
+two-metre travel yields a resolution of about 0.12 millimetres. This is far
+finer than the accuracy of the instrument, which is limited by well dynamics,
+thermal expansion of the float line, and the slow biological fouling of the
+orifice, and which the survey characterises as plus or minus eight millimetres
+under ordinary conditions. Reporting a value to a tenth of a millimetre when
+the true uncertainty is eight is not dishonest so long as the uncertainty
+travels with the value, and the record format requires it to: every sample
+carries a quality byte, and the ingest rejects any sample whose quality byte is
+absent rather than assuming a default.
+
+Samples travel over a two-wire loop shared by all stations in a group, at 1200
+baud, using a polling scheme in which the collector addresses each station in
+turn and waits up to 250 milliseconds for a reply. A group of seven stations
+therefore completes a full poll in under two seconds in the ordinary case and
+in under four seconds in the worst case where every station has gone silent.
+The 1200-baud figure is inherited from the original 1974 installation and is
+absurd by any modern standard; it survives because the loop is nine kilometres
+of buried copper of unknown provenance, because two attempts to characterise
+its bandwidth produced contradictory results, and because nothing in the
+requirement asks for more than one sample per station per minute. The survey's
+own note on this reads: "Slow, proven, and not the bottleneck. Replace the
+copper before replacing the modulation."
+
+Fouling is the dominant maintenance cost. A stilling well in temperate water
+accumulates growth at the orifice at a rate that varies enormously by season
+and site, and a partially occluded orifice does not fail — it lengthens the
+time constant. The station keeps reporting. The values remain plausible. What
+changes is the phase of the reported tide relative to the true tide, by an
+amount that grows from negligible to several minutes over a period of months.
+This is detected, when it is detected, by comparing each station's phase
+against the harmonic prediction for its location and flagging drift beyond four
+minutes. The threshold is not derived from anything; it was chosen in 2011 by a
+technician who observed that real fouling events crossed it and ordinary noise
+did not, and it has been left alone since because it continues to behave that
+way. It is a good example of a number that is defensible without being
+principled.
+
+---
+
+TRANSCRIPT
+
+The following is an excerpt from an internal review conducted after the loss of
+a survey buoy. Speaker A is the review lead; speaker B is the deck officer who
+performed the deployment; speaker C is the equipment technician.
+
+A: I want to be clear at the start that this is not about assigning fault. The
+buoy is gone, it cost what it cost, and the useful thing now is understanding
+the sequence. Can you walk me through the deployment from the point where you
+came onto the aft deck?
+
+B: Sure. We were about forty minutes behind schedule because the winch had
+tripped its overload on the previous cast, so there was some pressure to get on
+with it. I came aft at about half two. The buoy was already on the rail with
+the strop rigged. I checked the strop, checked the shackle, checked the release
+was cocked, and gave the signal.
+
+A: You checked the release was cocked. How?
+
+B: Visually. There's a window on the housing, and when it's cocked you can see
+a green band through it.
+
+C: Can I come in there? The green band tells you the actuator has returned to
+its home position. It doesn't tell you the pin has engaged. Those are two
+different things and they're usually the same thing.
+
+A: Usually.
+
+C: Usually. The pin engages off a spring. If the spring is weak, or if there's
+salt in the channel, the actuator can home and the pin can sit proud. You get
+green in the window either way.
+
+A: Was that documented anywhere?
+
+C: It's in the manufacturer's service bulletin from — I want to say four years
+ago. It's not in our deployment checklist.
+
+A: Why not?
+
+C: Honestly? Because the checklist was written before the bulletin, and nobody
+owns the checklist. It gets copied from the last cruise's version. I've added
+things to it twice by just editing the copy and hoping it propagates.
+
+A: Did it propagate?
+
+C: Once, yes. Once, no.
+
+B: I'd like to say something about the forty minutes, if that's all right. I
+don't think it changed what I checked. I think it changed how long I looked at
+what I checked. There's a difference between running through a list and
+actually seeing each item, and when you're behind, the list still gets run
+through.
+
+A: That's a useful distinction. Do you have a sense of how much time the full
+check takes when you are actually seeing each item?
+
+B: Ninety seconds, maybe two minutes. It's not long. That's what's frustrating.
+It's not that I skipped a two-minute check to save two minutes, it's that
+under pressure the check compresses on its own and you don't notice it
+compressing.
+
+A: Right. And the release fired when?
+
+B: About eleven seconds after the buoy went over. Well before the depth trigger.
+
+C: Which is consistent with the pin sitting proud and the load doing the rest.
+It wouldn't have taken much.
+
+A: Is there a way to check the pin rather than the actuator?
+
+C: There is. You put a load on the release before deployment — a hand pull on
+the strop, ten or fifteen kilos, which the pin holds easily if it's engaged and
+which drops the strop immediately if it isn't. It takes about four seconds and
+it tests the thing you actually care about instead of the thing that's easy to
+see.
+
+A: Then that goes in the checklist. And somebody owns the checklist.
+
+C: I'll own it.
+
+A: Write down that you own it, or in six months it will be nobody again.
+
+---
+
+CHECKLIST AND PROCEDURE
+
+The revised pre-deployment sequence, in the order it is to be performed. Each
+step is either an observation or an action; steps that are observations record a
+value, and a step with no recorded value counts as not performed.
+
+  1. Confirm the sea state against the deployment limit. Record the observed
+     significant wave height and the limit in force. Do not proceed on a
+     judgement that conditions are "about the same as yesterday."
+  2. Inspect the strop along its full length. Look for glazing, for broken
+     yarns at the eye, and for any stiffness that suggests a core failure.
+  3. Shackle: correct size, pin fully seated, mousing wire present and intact.
+  4. Release housing: green band visible through the window.
+  5. Release load test. Apply a steady hand load of ten to fifteen kilograms to
+     the strop for a slow count of four. The strop must not move. If it moves,
+     the deployment stops here and the release is replaced, not adjusted.
+  6. Confirm the depth trigger setting against the station plan. Record both.
+  7. Confirm that the recovery beacon is transmitting, by receiving it, not by
+     observing that its indicator light is on.
+  8. Clear the deck of loose gear within two metres of the rail.
+  9. Confirm that everyone on the aft deck is wearing a harness and that both
+     tethers are clipped to hard points, not to the rail.
+ 10. Signal, deploy, and hold station until the first depth report arrives.
+
+Items that must be aboard before the vessel sails, verified against this list by
+two people independently:
+
+  - Two complete release assemblies per planned deployment, plus one spare for
+    the cruise as a whole.
+  - Spring kits and channel grease for the release, sufficient for full service
+    of every assembly aboard.
+  - Strops: one per deployment plus two spares, each with its certificate.
+  - Shackles and mousing wire, in the sizes the station plans call for and not
+    merely in the sizes that were left over from the previous cruise.
+  - The current deployment checklist, printed, laminated, and dated. A version
+    on somebody's laptop does not satisfy this item.
+  - The service bulletin file, complete to date.
+  - A calibrated spring balance for step 5, so that "ten to fifteen kilograms"
+    can be verified at least once per cruise rather than estimated by feel every
+    time.
+
+Three failure modes this sequence is specifically intended to catch, listed so
+that a future reader can judge whether it still catches them:
+
+  - A release that reports ready and is not, which is what was lost.
+  - A strop that has been degraded by ultraviolet exposure on deck, which does
+    not look degraded and loses a large fraction of its strength.
+  - A depth trigger left at the previous station's setting, which produces a
+    deployment that succeeds visibly and fails invisibly, returning data from
+    the wrong depth.
+
+---
+
+CLOSING
+
+What connects a bakery, a stilling well and a lost buoy is not that somebody was
+careless. In each case a competent person looked at an indicator that was
+working correctly and drew a conclusion the indicator did not support. The dial
+reported a setting. The window reported an actuator. The thermostat reported the
+temperature of air in a box whose door was open. None of these instruments lied.
+They answered narrower questions than the questions being asked of them, and the
+gap between the two questions was invisible precisely because the instrument was
+in good order.
+
+The remedy in each case was small and slightly redundant: a glass thermometer
+taped where a person would see it, a four-second pull on a strop, a phase
+comparison against a harmonic prediction. None of these replaced the existing
+instrument. Each of them measured the same underlying thing by a different
+route, so that the two could disagree. A single measurement, however precise,
+cannot tell you that it is measuring the wrong quantity. Two measurements that
+should agree can.
+
+This is an expensive habit, and it is worth being honest that it does not scale
+without limit. Every redundant check has a cost in time, in equipment, and in
+the attention it takes from something else. The reason to build one is not that
+redundancy is virtuous; it is that a specific failure has been identified whose
+signature is agreement between an instrument and reality that has quietly
+stopped being true. Where no such failure is plausible, the second measurement
+is ceremony, and ceremony erodes the credibility of the checks that matter.
+
+Which brings the argument back to the ledger. What Toussaint was really
+recording, in the entries she considered honest, was the conditions under which
+a number would stop being right. That is the same discipline as taping a
+thermometer to a door: it is an admission that the thing you are relying on is
+a proxy, plus a note about when the proxy might fail. Neither practice prevents
+the failure. Both of them shorten, sometimes from a fortnight to an afternoon,
+the interval between the failure happening and somebody being able to see it.

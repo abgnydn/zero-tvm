@@ -230,7 +230,21 @@ export interface ModelSpecBase {
   tiedEmbeddings: boolean  // lm_head reuses the quantized embedding matrix
   qkNorm: boolean          // per-head q_norm/k_norm RMSNorm before RoPE
   stops: readonly number[] // stop token ids for the decode loops
-  chatTemplateId: 'phi3' | 'chatml' | 'llama3' | 'deepseek'
+  /** Which builder buildChatPromptFor routes to. Adding a value here is the
+   *  whole act of making a template reachable — the builders and their
+   *  hand-derived tests already exist in tokenizer-bpe.ts. Every one below is
+   *  pinned byte-exact against that family's own tokenizer_config.json jinja.
+   *  `template` is docs/PORTING.md's top blocker: 29 of 51 RED repos. */
+  chatTemplateId:
+    | 'phi3' | 'chatml' | 'llama3' | 'deepseek'
+    // [INST] family — three spacings that differ across one vendor's own line.
+    | 'mistral' | 'mistral-nemo' | 'ministral'
+    // Tulu-3 shape. NOT 'olmoe': it renders through the same builder, but its
+    // eos is `|||IP_ADDRESS|||` and ModelSpec carries no template-token
+    // strings, so registering the id without that plumbing would fall through
+    // to the phi3 default and silently render the wrong prompt. The builder
+    // and its test exist; the spec field does not yet.
+    | 'olmo2' | 'falcon3'
   tokenizerKind: 'spm' | 'byteLevel'  // which tokenizer pipeline tokenizer.json needs
   hfRepo: string           // HuggingFace repo with the MLC q4f16_1 layout
   /** Weight-manifest filename in the repo. Older MLC repos ship

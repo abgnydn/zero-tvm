@@ -32,7 +32,6 @@
     "build:lib": "vite build --config vite.lib.config.ts && tsc --emitDeclarationOnly --outDir dist-lib/types",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
-    "lint": "npm run typecheck",
     "test": "npm run test:unit",
     "test:unit": "vitest run tests/tokenizer tests/unit",
     "test:e2e": "vitest run tests/e2e",

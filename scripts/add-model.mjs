@@ -34,7 +34,7 @@ import { readFileSync, writeFileSync, existsSync, openSync, readSync, closeSync 
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve, join } from 'node:path'
-import { checkModel, SUPPORT_MATRIX, CONFIG_KEYS_READ, CONFIG_KEYS_IGNORED } from '../src/compiler/constraints.ts'
+import { checkModel, SUPPORT_MATRIX, CONFIG_KEYS_READ, CONFIG_KEYS_IGNORED, detectChatTemplate } from '../src/compiler/constraints.ts'
 import { makeModelSpec, mlxParamNaming } from '../src/compiler/model-spec.ts'
 import { openMlxCheckpoint, planModel } from '../src/zero-tvm/weight-loader-mlx.ts'
 import { planBytes } from '../src/zero-tvm/mlx-weights.ts'
@@ -218,11 +218,14 @@ if (!templateText) templateText = (await text('chat_template.jinja')) ?? ''
 // Matched on the marker each template is BUILT from. DeepSeek's has no special
 // role tokens at all — it writes prose turns — so it is recognised by the two
 // literals it interpolates, which is as specific as that family gets.
-const chatTemplate = templateText.includes('<|im_start|>') ? 'chatml'
-  : templateText.includes('<|start_header_id|>') ? 'llama3'
-  : templateText.includes('<|user|>') && templateText.includes('<|end|>') ? 'phi3'
-  : templateText.includes("'User: '") && templateText.includes("'Assistant: '") ? 'deepseek'
-  : 'unknown'
+// bos_token is a bare string in some configs and an AddedToken object in
+// others; both spellings are live across the repos this probes.
+// bos_token is a bare string in some configs and an AddedToken object in
+// others; both spellings are live across the repos this probes.
+const bosTokenStr = typeof tokCfg.bos_token === 'string' ? tokCfg.bos_token
+  : tokCfg.bos_token && typeof tokCfg.bos_token === 'object' ? (tokCfg.bos_token.content ?? null)
+  : null
+const chatTemplate = detectChatTemplate(templateText, bosTokenStr)
 
 // Tokenizer pipeline — from tokenizer.json's own structure.
 const preTok = JSON.stringify(tok?.pre_tokenizer ?? '')

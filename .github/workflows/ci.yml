@@ -28,7 +28,9 @@ jobs:
         env:
           # No browser needed in this job — skip Puppeteer's ~150MB Chrome download.
           PUPPETEER_SKIP_DOWNLOAD: '1'
-      - run: npm run lint   # tsc --noEmit for src + tests/config (tsconfig.tests.json)
+      # `lint` was an alias for `typecheck` — there is no ESLint config in this
+      # repo. Calling typecheck directly says what actually runs.
+      - run: npm run typecheck   # tsc --noEmit for src + tests/config (tsconfig.tests.json)
       # Tokenizer unit tests are fully offline: fixtures.json + tokenizer.json
       # are committed under tests/tokenizer/.
       - run: npm run test:unit

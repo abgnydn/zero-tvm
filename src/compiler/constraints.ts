@@ -199,13 +199,37 @@ export const CONFIG_KEYS_READ: ReadonlySet<string> = new Set([
 ])
 
 /** Bookkeeping, training-time, or serialization fields — no effect on a
- *  forward pass, so ignoring them is safe rather than merely convenient. */
+ *  forward pass, so ignoring them is safe rather than merely convenient.
+ *  Plus a few that DO describe machinery, admitted one block at a time with
+ *  the reason the text forward pass is unchanged without it. */
 export const CONFIG_KEYS_IGNORED: ReadonlySet<string> = new Set([
   'architectures', 'auto_map', 'torch_dtype', 'dtype', 'transformers_version', 'use_cache',
   'initializer_range', 'attention_dropout', 'hidden_dropout', 'pretraining_tp', 'pad_token_id',
   'unk_token_id', '_name_or_path', 'output_router_logits', 'router_aux_loss_coef',
   'aux_loss_alpha', 'seq_aux', 'output_attentions', 'output_hidden_states', 'return_dict',
   'tokenizer_class', 'is_causal', 'attn_implementation', 'label2id', 'id2label',
+  // The VISION TOWER of a multimodal checkpoint. Qwen3.6-35B really ships one:
+  // 333 of its 2090 records are `vision_tower.*`, against `language_model.*`
+  // for everything the engine loads. Text-only is a whole-tower decision, not a
+  // field-by-field one — dims come from text_config, the loader plans only the
+  // language_model records, and these ids mark where patch embeddings would be
+  // spliced into a sequence that, with a text prompt, never contains them. So
+  // images and video are unsupported, which is a different thing from wrong.
+  'vision_config', 'vision_start_token_id', 'vision_end_token_id',
+  'image_token_id', 'video_token_id',
+  // Precision the recurrent (SSM/GDN) state is carried in. gdn_recur.wgsl
+  // declares `array<f32>` and engine-core sizes that buffer at 4 bytes a value,
+  // so float32 is already what we do; a checkpoint asking for a NARROWER state
+  // still gets f32, which errs toward precision rather than away from it.
+  'mamba_ssm_dtype',
+  // Multi-token prediction: extra head layers that PROPOSE draft tokens for
+  // speculative decoding. What comes out is still the base model's own verified
+  // distribution, so declining them costs decode speed and changes no token —
+  // the one kind of architecture that is safe to drop in silence. Here it isn't
+  // even a choice: this checkpoint's index has zero records matching /mtp/i and
+  // its layer indices stop at 39 against num_hidden_layers 40, so the head the
+  // config declares was never published with the weights.
+  'mtp_num_hidden_layers', 'mtp_use_dedicated_embeddings',
 ])
 
 export function checkModel(m: DetectedModel): CheckResult {
@@ -464,3 +488,44 @@ export const SUPPORT_MATRIX: MatrixRow[] = [
   { area: 'Chat template', supported: 'Phi-3, ChatML (non-thinking), Llama-3 header template, DeepSeek prose turns', not: 'Gemma turns, Mistral [INST], thinking-mode rendering', needs: 'renderer branch in model-select.ts — the single highest-leverage gap in the survey (docs/PORTING.md): it blocks 29 of 51 refused repos and is the SOLE blocker on 5' },
   { area: 'Decoding', supported: 'greedy argmax (default), seeded temperature / top-p / min-p sampling, streaming, cross-turn prefix reuse', not: 'top-k, repetition/presence penalties, beam search, batch > 1', needs: 'a rank selection pass beside sampler.wgsl\'s mass threshold; a per-sequence token-count buffer for penalties' },
 ]
+
+/**
+ * Which chat-template builder a checkpoint needs, from its own
+ * `tokenizer_config.json`. Lives here rather than inline in add-model.mjs so
+ * tests/unit/chat-template-detect.test.ts can pin it against recorded vendor
+ * templates without a network call.
+ *
+ * Every branch below was verified against the real file (2026-08-10); the
+ * fixture is tests/fixtures/chat-template-detect.json. A wrong answer here does
+ * NOT error — the model answers slightly off distribution forever — so an
+ * unrecognised template must return 'unknown' rather than inherit a shape.
+ */
+export function detectChatTemplate(templateText: string, bosTokenStr: string | null): string {
+  return templateText.includes('<|im_start|>') ? 'chatml'
+  : templateText.includes('<|start_header_id|>') ? 'llama3'
+  : templateText.includes('<|user|>') && templateText.includes('<|end|>') ? 'phi3'
+  : templateText.includes("'User: '") && templateText.includes("'Assistant: '") ? 'deepseek'
+  // [INST] family. All three are '[INST]' templates and NONE of them says
+  // which; they differ only in SPACING, and a wrong guess does not error — the
+  // model answers slightly off distribution forever. Discriminators verified
+  // against the three vendor tokenizer_config.json files (2026-08-10):
+  //   Ministral  declares a tools block   ({%- if not tools is defined %})
+  //   Nemo       raises "After the optional system message ..." and has no tools
+  //   v0.3       raises the bare "Conversation roles must alternate ..."
+  // An [INST] template matching none of these stays 'unknown' rather than
+  // inheriting a spacing at random.
+  : templateText.includes('[INST]')
+    ? (templateText.includes('not tools is defined') ? 'ministral'
+      : templateText.includes('After the optional system message') ? 'mistral-nemo'
+      : templateText.includes('Conversation roles must alternate') ? 'mistral'
+      : 'unknown')
+  // Tulu-3 shape. OLMo-2 and OLMoE ship BYTE-IDENTICAL templates; the only
+  // difference is the bos token, and OLMoE's is `|||IP_ADDRESS|||`. Keying on
+  // "is bos null" mapped OLMoE onto olmo2 and would have rendered <|endoftext|>
+  // as its bos forever — silently, which is this rule's whole failure mode. So
+  // match the bos STRING, and let anything else on this shape fall to unknown
+  // until ModelSpec can carry a template token.
+  : templateText.includes('<|assistant|>') && templateText.includes('<|user|>')
+    ? (bosTokenStr === null ? 'falcon3' : bosTokenStr === '<|endoftext|>' ? 'olmo2' : 'unknown')
+  : 'unknown'
+}

@@ -292,6 +292,69 @@ and ~23 tok/s generating otherwise. DataChannel backpressure must re-CHECK
 `bufferedAmount` in a loop; waiting on a single `bufferedamountlow` event
 deadlocks when the queue drains between the check and the listener.
 
+## Quality vs fidelity (`docs/QUALITY.md`)
+
+Everything the repo verified before 2026-08-10 was **fidelity** — does the
+engine compute what the reference computes? `scripts/mlx-ref.py:29` is
+`mlx_lm.load(args.model)`, the SAME quantized checkpoint, so a model quantized
+into gibberish passes every gate (verified by requantizing Llama-1B to 2-bit:
+the reference itself emits `-a-a-m-mowcarecare…` and `validate-model.mjs`
+prints "model validates against mlx_lm"). The one pre-existing quality gate is
+the five-prompt lexical battery in `tests/e2e/*.test.ts` — 4 of 9 models,
+neither MoE build, and CI cannot run it.
+
+```bash
+# compare two CHECKPOINTS — the tool to reach for. Runs on the reference.
+cd ~/dev/ml-research && uv run python ~/dev/zero-tvm/scripts/quality-ab.py \
+    --a <baseline> --b <candidate> --windows 24 --window 512
+# build a known-degraded build to prove the harness can see damage
+uv run python ~/dev/zero-tvm/scripts/requantize.py --src <4bit> --dst <out> \
+    --bits 3 --scope experts|mlp|all
+# the ENGINE's own perplexity (browser), plus a fidelity check vs mlx_lm
+npm run quality -- llama32 --tokens 256 --dump-ids /tmp/ids.json   # no GPU
+npm run quality -- llama32 --tokens 256 --ref /tmp/ppl.json
+```
+
+`quality-ab.py` is **paired** — both arms score identical windows, so
+differencing per window cancels between-window difficulty. On the OLMoE run
+the same data gave unpaired z = 0.8 ("not distinguishable") and paired
+z = 14.7. Validated on four builds; expert-only 3-bit on a real 64-expert MoE
+costs **+8.4%**, dense 3-bit costs +76% to +194%.
+
+`requantize.py` and `convert-q3-experts.py` both REFUSE a zero-conversion run.
+The expert markers are layout-specific (`.mlp.switch_mlp.` fused vs
+`.mlp.experts.<N>.` per-expert, both live in one model family), and a
+converter that matches nothing writes a valid byte-identical copy that the A/B
+then reports as "no significant difference".
+
+`?model=` fixtures for this live in `.weights-local/`; `OLMoE-1B-7B-0125-4bit`
+(3.6 GB) is the MoE fixture, `Llama-3.2-1B-Instruct-4bit` the dense one.
+
+## KV paging + prefix pool (`docs/PAGING_PLAN.md`)
+
+The page table has been the IDENTITY since it was written — `attention*.wgsl`
+resolve every page through `page_table_values`, but the writers (`kv_append`,
+`qkv_fused`, `qk_norm_rope_append`, `kv_quantize_int8`, `mla_kv_write`) do not
+take it at all and compute `position / PAGE_SIZE` directly.
+
+```bash
+node scripts/paging-test.mjs llama32     # falsifier; --expect-fail is the DEFAULT
+node scripts/paging-measure.mjs --full   # the four transfer rates
+node scripts/prefix-stability-test.mjs --list
+```
+
+Phase 0 is complete and its four results are load-bearing:
+- **K is RoPE'd BEFORE the cache write on every path**, so a cached page is
+  valid only at the positions it was written at. This is a *prefix* pool and
+  can never be a vLLM-style relocatable block pool.
+- Agent prompts ARE append-only in token ids — nine real transcripts, ~340
+  transitions, 0 breaks, tool traffic included. Phi-3 (SPM) untested and is
+  the one template BENCH.md already records breaking.
+- Save 0.29 s / restore 0.36 s for 625 MiB, 56x under the threshold.
+  `writeBuffer` is the slowest link, not the disk.
+- A permuted table changes the logits on HEAD, as it must. `paging-test.mjs`
+  asserts that today and flips to `--expect-pass` when Phase 2 lands.
+
 ## Cross-site context
 
 `sites.json` is synced from `~/sites-shared/sites.ts`. Edit URLs,
@@ -299,10 +362,9 @@ taglines, and the `sameAs` identity list there.
 
 ## Known gaps
 
-- **No ESLint.** `.github/workflows/ci.yml` calls `npm run lint`, which
-  `package.json` aliases to `typecheck` (`tsc --noEmit`) — that alias shipped
-  and CI is green. Cosmetic follow-up: point ci.yml at `npm run typecheck`
-  directly and drop the alias. ESLint config is still a future addition.
+- **No ESLint.** Fixed 2026-08-10: ci.yml calls `npm run typecheck` directly
+  and the misleading `lint` alias is gone. An actual ESLint config is still a
+  future addition — `biome` is the house choice per the global setup.
 - The "More by Ahmet" footer is repeated (and has drifted out of sync)
   across ~5 HTML pages. The JSON-LD `Person` block and "Related work" grid
   live only in `index.html`. Will migrate to sites-shared HTML partials.

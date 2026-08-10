@@ -538,3 +538,140 @@ export function buildLlama3ChatPrompt(
   text += '<|start_header_id|>assistant<|end_header_id|>\n\n'
   return tokenizer.encode(text)
 }
+
+// ============================================================
+// Chat template for the Mistral / Llama-2 `[INST]` family
+//
+// ONE family, THREE published spacings. Copying any of them onto the others
+// moves a space at every turn boundary — invisible in the transcript, and the
+// model answers slightly off distribution forever:
+//
+//   Mistral-7B-Instruct-v0.3   <s> [INST] u [/INST] a </s> [INST] ...
+//   Mistral-Nemo-2407          <s>[INST] u[/INST] a</s>[INST] ...
+//   Ministral-8B-2410          <s>[INST]u[/INST] a</s>[INST] ...
+//
+// Ground truth: the chat_template in each repo's own tokenizer_config.json
+// (mlx-community/{Mistral-7B-Instruct-v0.3,Mistral-Nemo-Instruct-2407,
+// Ministral-8B-Instruct-2410}-4bit; v0.3 ships a NAMED list and the "default"
+// entry is the one without tools). Every case is pinned in
+// tests/unit/chat-template-mistral.test.ts.
+//
+// None of the three emits a generation prompt: the rendered string ends after
+// `[/INST]` and the model continues from there. `add_generation_prompt` does
+// not appear anywhere in these templates — there is no assistant header to
+// append, unlike every other builder in this file.
+//
+// A system message is not a turn here; it is folded into ONE user turn's
+// content, joined with "\n\n". WHICH turn differs, and it decides whether
+// cross-turn KV reuse works at all:
+//
+//   - v1 folds into the FIRST user turn, so past turns re-render identically
+//     and each prompt extends the last (the property tokenizer-bpe.ts:446
+//     claims for ChatML).
+//   - 2407/2410 fold into the LAST, so every new turn MOVES the system prompt
+//     and the re-rendered transcript stops being a prefix of the previous one:
+//     the shared prefix collapses to `<s>[INST] `. That is the vendor's own
+//     template, so it is what gets emitted, and chat.ts always sends a system
+//     message — those two models pay full prefill every turn. Measured in the
+//     test rather than left as a comment.
+//
+// v0.3's jinja has no system branch at all — it calls raise_exception. The
+// fold-into-first comes from Mistral's own tokenizer instead: mistral_common
+// InstructTokenizerV1.encode_user_message does
+// `if is_first and system_prompt: content = system_prompt + "\n\n" + content`.
+//
+// The alternation guard (raise_exception when roles do not alternate) is not
+// ported — chat.ts cannot produce a non-alternating history.
+// ============================================================
+
+export type MistralTemplateVariant = 'v1' | 'nemo' | 'ministral'
+
+export function buildMistralChatPrompt(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  opts?: { variant?: MistralTemplateVariant; bosToken?: string; eosToken?: string },
+): number[] {
+  const variant = opts?.variant ?? 'v1'
+  const bos = opts?.bosToken ?? '<s>'
+  const eos = opts?.eosToken ?? '</s>'
+
+  let rest = messages
+  let system = ''
+  if (rest[0]?.role === 'system') {
+    system = rest[0].content
+    rest = rest.slice(1)
+  }
+  // jinja's `is_first` (v1) vs `loop.last` (2407/2410). The index is resolved
+  // once here; the fold only lands if that message is a user turn, which is
+  // also what the templates do (the branch sits inside their user case).
+  const foldAt = system === '' ? -1
+    : variant === 'v1' ? rest.findIndex((m) => m.role === 'user')
+    : rest.length - 1
+
+  let text = bos
+  for (let i = 0; i < rest.length; i++) {
+    const msg = rest[i]
+    if (msg.role === 'assistant') {
+      // 2410 is the only one that trims the assistant content; and only v1
+      // puts a space between it and the eos token.
+      const reply = variant === 'ministral' ? msg.content.trim() : msg.content
+      text += variant === 'v1' ? ` ${reply} ${eos}` : ` ${reply}${eos}`
+      continue
+    }
+    const content = i === foldAt ? `${system}\n\n${msg.content}` : msg.content
+    text += variant === 'v1' ? ` [INST] ${content} [/INST]`
+      : variant === 'nemo' ? `[INST] ${content}[/INST]`
+      : `[INST]${content}[/INST]`
+  }
+  return tokenizer.encode(text)
+}
+
+// ============================================================
+// Chat template for the Tulu-3 lineage (OLMo-2, OLMoE, Falcon3)
+//
+//   {bos}<|system|>\n{system}\n<|user|>\n{user}\n<|assistant|>\n
+//
+// Ground truth: the chat_template in mlx-community/OLMo-2-1124-7B-Instruct-4bit
+// and mlx-community/Falcon3-7B-Instruct-4bit tokenizer_config.json. The two are
+// character-identical except that OLMo-2 (and OLMoE) open with
+// `{{ bos_token }}` and Falcon3 does not — its bos_token is null — which is
+// why `bosToken` exists and defaults to none. Pinned in
+// tests/unit/chat-template-tulu.test.ts.
+//
+// Details the template hides:
+//
+//   - the eos token is INSIDE the transcript, after each assistant turn, and a
+//     newline follows it — except when that turn is the LAST message, where
+//     the template drops the newline (`{% if not loop.last %}`).
+//   - the generation prompt is emitted from INSIDE the loop
+//     (`loop.last and add_generation_prompt`), so an empty message list renders
+//     as bare bos with no `<|assistant|>` at all. Mirrored by emitting it on
+//     the last iteration rather than after the loop.
+//   - content is never trimmed (Llama-3's template trims; this one does not).
+//   - eos is not constant across the family: OLMo-2 and Falcon3 use
+//     `<|endoftext|>`, but OLMoE-1B-7B-0125 uses `|||IP_ADDRESS|||` — the OLMo
+//     tokenizer's PII placeholder, doubling as bos and eos. Hardcoding
+//     `<|endoftext|>` would put a literal, unrelated token in every OLMoE
+//     transcript.
+//
+// Unlike the Mistral family this one is append-only with or without a system
+// message: the system turn is rendered in place and never moves.
+// ============================================================
+
+export function buildTuluChatPrompt(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  opts?: { bosToken?: string; eosToken?: string },
+): number[] {
+  const eos = opts?.eosToken ?? '<|endoftext|>'
+  let text = opts?.bosToken ?? ''
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    const last = i === messages.length - 1
+    text += msg.role === 'assistant'
+      ? `<|assistant|>\n${msg.content}${eos}${last ? '' : '\n'}`
+      : `<|${msg.role}|>\n${msg.content}\n`
+    if (last) text += '<|assistant|>\n'
+  }
+  return tokenizer.encode(text)
+}

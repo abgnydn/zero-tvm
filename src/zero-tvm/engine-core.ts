@@ -248,6 +248,19 @@ export interface DecodeEngine {
   }>
   /** Stats from the most recent generatePipelined prefill (reuse + chunking). */
   getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null
+  /**
+   * Free every GPU buffer this engine ALLOCATED — activations, GDN state,
+   * uniforms, readbacks, chunk-prefill scratch. Deliberately not the two things
+   * that arrived as arguments: `weights` and the KV pages are the CALLER's, and
+   * both are routinely shared between live engines (model-smoke.html builds a
+   * chain of them over one set of weights; a pipeline split runs two stages off
+   * the same one), so this engine cannot know it is the last reader. Free those
+   * yourself once every engine over them is destroyed.
+   *
+   * Every method above throws after this — an engine's buffers being gone is
+   * worth an error at the call, not a validation failure inside Dawn.
+   */
+  destroy(): void
   /** Hard KV ceiling in tokens: spec.maxPages × spec.pageSize. */
   maxContext: number
   /** The ModelSpec this engine was built for. */
@@ -2029,7 +2042,13 @@ export function buildDecodeEngine(
   const CHUNK_CAP = 64   // chunk capacity in tokens (buffer sizing)
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
-  interface ChunkPrefill { record(promptIds: number[], start: number, seqLen: number): void }
+  interface ChunkPrefill {
+    record(promptIds: number[], start: number, seqLen: number): void
+    /** These buffers are CHUNK_CAP times the width of the decode ones, so on a
+     *  hybrid spec they are the largest thing the engine allocates for itself —
+     *  worth freeing, and only reachable from inside this closure. */
+    destroy(): void
+  }
 
   function buildChunkPrefill(): ChunkPrefill {
     const C = CHUNK_CAP
@@ -2236,7 +2255,12 @@ export function buildDecodeEngine(
       for (let t = 0; t < n; t++) noteAbsorbed(start + t, promptIds[start + t])
     }
 
-    return { record }
+    return {
+      record,
+      destroy() {
+        for (const b of [...Object.values(CB), ...Object.values(cU)]) b.destroy()
+      },
+    }
   }
 
   // MoE specs opt OUT of chunked prefill, deliberately and for two independent
@@ -2750,21 +2774,73 @@ export function buildDecodeEngine(
     device.queue.writeBuffer(samplerU, 8, u)
   }
 
+  // ============================================================
+  // Teardown
+  // ============================================================
+
+  // THE OWNERSHIP LINE, and the reason destroy() is a list rather than "free
+  // everything reachable": `weights` and `kvPages`/`kvScales` came in as
+  // arguments and are the caller's. They are also routinely SHARED —
+  // model-smoke.html builds engine after engine over one `weights`, and a
+  // pipeline split runs two stages off it — so an engine cannot tell whether it
+  // is the last reader. Freeing a shared weight buffer here would leave a live
+  // sibling dispatching against destroyed memory, which is not an error the
+  // caller sees, it is wrong logits. Everything below this line was allocated
+  // by THIS call and by nothing else.
+  //
+  // Pipelines, shader modules and bind groups take no part: WebGPU gives them
+  // no destroy(), and they go when the engine object becomes unreachable.
+  //
+  // Destroying with a generate() still in flight is the caller's bug — its
+  // pending mapAsync rejects. The guard below only stops the NEXT call.
+  let destroyed = false
+  function destroy(): void {
+    if (destroyed) return
+    destroyed = true
+    // Add a buffer above, add it here. `B` and the chunk-prefill closure carry
+    // their own members by construction; the uniforms have to be named.
+    const owned: (GPUBuffer | null)[] = [
+      ...Object.values(B), ...gdnStateBufs, ...readRing, ffnGateUp,
+      qkvU, oProjU, ffnDnU, ffnGateUpU, ffnSiluU, lmHdU, embU, normU, ffnU, argmaxU,
+      samplerU, samplePartials, ropeU, ropeFreqs, kvAppU, qkNormU, qkFuseU,
+      qkvFusedU, qkvFusedScratchU, kvQuantU,
+      moeRouterU, moeTopkU, moeGateU, moeDownU, moeSiluU, moeCombU,
+      gdnProjU, gdnOutU, cAttnU, gdnConvU, gdnGatesU, gdnRecurU, gdnNormU,
+      gatedSplitU, attnGateU,
+      mlaQU, mlaKvaU, mlaSplitU, mlaWriteU, mlaProjKU, mlaProjVU, mlaNarrowU,
+      mlaScoresU, mlaCombineU,
+      attnU, attnSkU, combineU, attnI8U,
+      residualReadBuf, readBuf, logitsReadBuf, hiddenReadBuf,
+    ]
+    for (const b of owned) b?.destroy()
+    chunkPrefill?.destroy()
+  }
+
+  // A dispatch against destroyed buffers is a Dawn validation error raised
+  // asynchronously on the device, half a stack away from whoever caused it.
+  // Naming the method at the call site is the whole point.
+  const guard = <A extends unknown[], R>(name: string, fn: (...args: A) => R) =>
+    (...args: A): R => {
+      if (destroyed) throw new Error(`DecodeEngine.${name}: this engine was destroyed — build a new one`)
+      return fn(...args)
+    }
+
   return {
-    generate,
-    generatePipelined,
-    forwardLogits,
-    forwardEmbedding,
-    scoreSequence,
-    pipelineStep,
-    setSampling,
-    setPageTable,
-    resetKVTracking,
-    debugCompareReuse,
-    getLastPrefill,
+    generate: guard('generate', generate),
+    generatePipelined: guard('generatePipelined', generatePipelined),
+    forwardLogits: guard('forwardLogits', forwardLogits),
+    forwardEmbedding: guard('forwardEmbedding', forwardEmbedding),
+    scoreSequence: guard('scoreSequence', scoreSequence),
+    pipelineStep: guard('pipelineStep', pipelineStep),
+    setSampling: guard('setSampling', setSampling),
+    setPageTable: guard('setPageTable', setPageTable),
+    resetKVTracking: guard('resetKVTracking', resetKVTracking),
+    debugCompareReuse: guard('debugCompareReuse', debugCompareReuse),
+    getLastPrefill: guard('getLastPrefill', getLastPrefill),
+    destroy,
     maxContext: MAX_CONTEXT,
     spec: S,
-    profileStep,
-    benchBatchedFfnDown,
+    profileStep: guard('profileStep', profileStep),
+    benchBatchedFfnDown: guard('benchBatchedFfnDown', benchBatchedFfnDown),
   }
 }
