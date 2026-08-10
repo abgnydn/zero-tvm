@@ -65,6 +65,12 @@ pages — a regression in Phi-3's cache costs more than a second code path.
 has bitten this repo twice; a six-buffer bind group against a four-binding
 layout is rejected outright.
 
+**Follow `docs/MLA_ENGINE_PLAN.md`** — eight ordered steps with their own gates,
+and a Part 0 that resolves four contradictions between plausible designs. Two of
+its claims were re-verified by hand: `headDim` is 128 (192 makes the engine read
+a 384-word o_proj row against a 256-word one), and widening `layerKinds` to
+carry `'mla'` compiles with zero errors while silently zeroing the KV budget.
+
 ### 2. Mixed dense/MoE stack — engine half
 
 **Do:** `spec.ffnKinds` / `ffnWidthAt` already exist and the loader already
