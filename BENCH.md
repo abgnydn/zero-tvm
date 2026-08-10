@@ -1193,7 +1193,7 @@ Phi-3 greedy generations:
 | code    |   11.6% |      3.2% |   0.55× |   27.3% |      7.6% |   0.77× |
 | summary |    1.3% |      0.2% |   0.50× |    7.6% |      1.0% |   0.68× |
 
-Acceptance stays under 8% in the best case — nowhere near the 50–67% floor
+Acceptance stays under 8% in the best case — nowhere near the 25–33% floor
 needed to overcome batched-forward's 2× cost. With speedup = 2·(1+α·K)/(K+1),
 α=0 bottoms out at 2/(K+1), so PLD is a **guaranteed net regression** on
 these workloads regardless of K tuning. Phi-3 greedy prose doesn't repeat

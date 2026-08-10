@@ -16,8 +16,21 @@
  * Effective speedup at mean acceptance rate α over K speculated tokens:
  *   speedup = (1 + α·K) / ((K+1) / 2) = 2·(1 + α·K) / (K+1)
  *
- * For K=3: speedup > 1 requires α > 0.67. For K=2: α > 0.5. For K=1: α > 0.5.
- * So we need ≥50-67% acceptance on realistic prompts to win.
+ * Break-even is where that equals 1: 2(1 + αK) = K + 1, so α = (K-1) / (2K).
+ *   K=3 → α > 0.333    K=2 → α > 0.25    K=1 → α > 0     (K=1 always pays,
+ *                                                         at this model's
+ *                                                         assumptions)
+ *
+ * The comment here previously said 0.67 / 0.5 / 0.5, which does not follow from
+ * the formula directly above it and was repeated in BENCH.md as a settled
+ * floor. Corrected 2026-08-10. The VERDICT is unchanged — measured acceptance
+ * peaks under 8%, still far under 0.25 — but a wrong derivation propping up a
+ * published negative is exactly the thing this repo withdraws numbers over.
+ *
+ * Note K=1's break-even of 0 is a statement about this cost model, not a free
+ * lunch: it assumes the M=2 forward costs exactly 1.0 units (the 2x weight
+ * amortization ceiling) and charges nothing for the draft. It was never
+ * measured.
  */
 
 export interface SimResult {
