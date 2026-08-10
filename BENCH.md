@@ -1271,3 +1271,86 @@ Opt-in experiments (measured 2026-07-25 on M2 Max — see the A/B table above):
   `?splitk=0` to disable
 - `?fuseprologue=1` — add_norm folded into the FFN prologue: −13.7% on Apple
   (falsified there; kept for A/B on other GPUs)
+
+---
+
+## KV paging feasibility (2026-08-10, Apple M2 Max, 32 GB) — §0.3 of `docs/PAGING_PLAN.md`
+
+Not a throughput benchmark. Four numbers the paging plan requires **before** any
+threshold is written into code, so that "cold restore takes seconds, not
+minutes" stops being a guess. Reproduce with:
+
+```bash
+node scripts/paging-measure.mjs --full     # 625 MiB, 3 runs each
+node scripts/paging-measure.mjs --size 128 # smaller working set
+```
+
+625 MiB is Qwen3.5's KV for a 20k-token prefix (32 KiB/token, per
+`tests/unit/kv-budget.test.ts`).
+
+### (a) Adapter limits — previously unrecorded
+
+| limit | value |
+|---|---|
+| `maxStorageBufferBindingSize` | **4096 MiB** |
+| `maxBufferSize` | **4096 MiB** |
+| adapter | `apple / metal-3`, subgroups available |
+
+Consequence for Phase 3: a 20k Qwen3.5 prefix is ~78 MiB per attention layer
+(625 MiB over 8 attention layers). Two resident sequences per layer fit inside
+the existing per-layer buffer with three orders of magnitude to spare. The
+"does Phase 3 need split bindings" question is answered: no.
+
+### (b)–(d) The four transfer rates, 625 MiB, three runs each
+
+| | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| OPFS write (`createSyncAccessHandle`, worker) | 7692 | 7821 | 7710 |
+| OPFS read | 8223 | 7576 | 8669 |
+| GPU→CPU readback, 16 MiB chunks | 4360 | 5800 | 5764 |
+| GPU→CPU readback, 64 MiB chunks | 6805 | 8141 | 8275 |
+| GPU→CPU readback, one 625 MiB chunk | 3166 | 7550 | 8856 |
+| CPU→GPU `writeBuffer` | 2416 | 4228 | 6660 |
+
+All MB/s. **64 MiB is the readback sweet spot** — 16 MiB chunks cost ~30%, and
+one whole-buffer copy is the most variable. `peer-weights`' 240 KB piece size is
+tuned for a DataChannel and is the wrong unit here.
+
+**`writeBuffer` is the slowest link**, not the disk — which inverts the
+assumption the plan was written under.
+
+### What it means, from the SLOWEST run of each
+
+| operation | cost for 625 MiB |
+|---|---|
+| save = GPU readback + OPFS write | **0.29 s** |
+| restore = OPFS read + `writeBuffer` | **0.36 s** |
+| the threshold it had to beat (1/5 of a ~99 s cold re-prefill) | 20 s |
+
+**56× under the threshold.** The conclusion survives these numbers being an
+order of magnitude optimistic — and they may well be.
+
+### Caveats, and they are the point
+
+1. **The OPFS numbers are measured through the page cache.** 7.7 GB/s exceeds
+   what this SSD sustains; `h.flush()` does not guarantee a write to media on
+   macOS, and 625 MiB fits trivially in 32 GB of RAM. Treat them as an upper
+   bound. A real restore in a fresh tab is a *cold* read; this is warm.
+2. **Apple Silicon is unified memory.** Readback and `writeBuffer` are memcpy,
+   with no PCIe hop. Neither number transfers to a discrete GPU, where restore
+   would be bounded by the bus.
+3. **Rates climb across repetitions** (`writeBuffer`: 2416 → 4228 → 6660).
+   That is warming, not the device getting faster. Every figure above is
+   reported per-run for that reason, and the extrapolation deliberately uses
+   the slowest.
+
+This is why the margin matters more than the number: at 56×, none of the three
+caveats changes the decision. They would each have to be wrong by more than an
+order of magnitude, together, to make cold restore not worth shipping.
+
+### One claim checked and withdrawn
+
+An earlier note in `scripts/paging-measure.mjs` said the engine's KV buffers do
+not carry `COPY_SRC` and that Phase 1 would need an allocation change. False:
+`engine-core.ts:36` defines `STORAGE = STORAGE | COPY_SRC | COPY_DST`, and every
+KV buffer is allocated through it. Phase 1 needs no allocation change at all.
