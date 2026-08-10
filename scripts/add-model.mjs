@@ -158,6 +158,16 @@ const records = checkpoint ? checkpoint.records : []
 const tc = { ...cfg, ...(cfg.text_config ?? {}) }
 const mlxPrefix = records.some((r) => r.startsWith('language_model.')) ? 'language_model.' : ''
 
+// The records the engine would actually load. Multimodal checkpoints ship a
+// whole second network — patch embeds, vision blocks, a merger — and asking
+// "does this model have X" over ALL records answers for the tower we throw
+// away. Under a language_model. root the split is exact; without one, drop the
+// known tower roots by name.
+const TOWER = /^(vision_tower|visual|vision_model|audio_tower|audio_model|multi_modal_projector)\./
+const textRecords = mlxPrefix
+  ? records.filter((r) => r.startsWith(mlxPrefix))
+  : records.filter((r) => !TOWER.test(r))
+
 // `rope_parameters` is the newer transformers spelling, and it is a MERGE, not
 // a rename: it absorbs rope_theta and partial_rotary_factor along with the
 // scaling dict. Qwen3.6's config (already on disk here) has NO rope_theta
@@ -267,7 +277,17 @@ const detected = {
   tied: tc.tie_word_embeddings === true
     || (records.length > 0 && !records.some((r) => r.startsWith(`${mlxPrefix}lm_head.`))),
   qkNorm: records.some((r) => r.endsWith('self_attn.q_norm.weight')),
-  attnBias: tc.attention_bias === true || records.some((r) => r.endsWith('.bias')),
+  // Only the TEXT tower's biases. The engine never loads a vision or audio
+  // tower, so a bias there costs it nothing — and counting them made
+  // Qwen3.6-35B RED on a kernel it does not need. That model SHIPS here and
+  // runs; all 166 of its `.bias` records live under vision_tower.* and its
+  // language model has exactly zero. `bias` led the blocker ranking in
+  // docs/PORTING.md partly on records like those.
+  attnBias: tc.attention_bias === true || textRecords.some((r) => r.endsWith('.bias')),
+  // Named in the report. "linear-layer biases" read the same for a q_proj.bias
+  // (which really does need the epilogue) and a mamba conv1d.bias (which needs
+  // a mamba block, and the model is red for that anyway).
+  biasRecords: textRecords.filter((r) => r.endsWith('.bias')).slice(0, 3),
   slidingWindow: num(tc.sliding_window) !== null && tc.use_sliding_window !== false,
   hiddenAct: tc.hidden_act ?? tc.hidden_activation ?? null,
   quant: quantCfg ? { bits: quantCfg.bits ?? 0, groupSize: quantCfg.group_size ?? 0, overrides } : null,

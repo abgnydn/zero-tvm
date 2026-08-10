@@ -119,7 +119,11 @@ export interface DetectedModel {
   maxSeq: number | null
   tied: boolean
   qkNorm: boolean             // q_norm/k_norm records present in the index
-  attnBias: boolean           // config attention_bias / any *.bias records
+  attnBias: boolean           // config attention_bias / *.bias records in the TEXT tower
+  /** Up to a few of the records that set attnBias, so the report names them.
+   *  Without this the rule said "linear-layer biases" for a mamba conv1d bias
+   *  and for a vision tower this engine never loads. */
+  biasRecords?: readonly string[]
   mlpBias?: boolean           // config mlp_bias — an additive bias on the FFN projections
   slidingWindow: boolean
   hiddenAct: string | null    // 'silu' expected
@@ -270,7 +274,8 @@ export function checkModel(m: DetectedModel): CheckResult {
     fail('bias', 'FFN biases (mlp_bias)', 'the matmul kernels have no additive-bias epilogue')
   }
   if (m.attnBias) {
-    fail('bias', 'linear-layer biases (attention_bias / *.bias records)',
+    const eg = m.biasRecords?.length ? `: ${m.biasRecords.join(', ')}` : ''
+    fail('bias', `linear-layer biases (attention_bias / *.bias records)${eg}`,
       'the matmul kernels have no additive-bias epilogue (the affine "biases" tensors are per-GROUP dequant offsets, not per-row biases)')
   }
   if (m.slidingWindow) {
