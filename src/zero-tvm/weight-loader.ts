@@ -832,6 +832,23 @@ export interface LoadedWeights {
       outScales: GPUBuffer
       outBiases?: GPUBuffer
     }
+    /** Multi-head latent attention — present iff spec.mla (DeepSeek-V2). The
+     *  pe rows of both projections are ALREADY de-interleaved by the loader, so
+     *  the runtime rotates them with the ordinary half-split RoPE. */
+    mla?: {
+      qWeights: GPUBuffer       // int4 affine [heads*(nope+rope), d], pe rows permuted
+      qScales: GPUBuffer
+      qBiases: GPUBuffer
+      kvaWeights: GPUBuffer     // int4 affine [kvLora+rope, d], pe rows permuted
+      kvaScales: GPUBuffer
+      kvaBiases: GPUBuffer
+      kvaNormGamma: GPUBuffer   // kv_a_layernorm gamma f16 [kvLora]
+      /** kv_b_proj DEQUANTIZED to f16: heads blocks of [kvLora][nope] (K
+       *  transposed) followed by heads blocks of [vHeadDim][kvLora]. One buffer,
+       *  bound as two regions — the V region starts at heads*kvLora*nope*2 B,
+       *  which must be computed from spec.mla and never hardcoded. */
+      kvbF16: GPUBuffer
+    }
     /** Sparse-MoE FFN — present iff spec.moe. Every stacked tensor carries the
      *  SHARED expert at index spec.sharedExpertIndex, and the router carries
      *  its gate as row E, so the block has no special case for it. */

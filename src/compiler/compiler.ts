@@ -49,6 +49,12 @@ import attentionSgSrc from './shaders/attention_sg.wgsl?raw'
 import attentionSplitkSrc from './shaders/attention_splitk.wgsl?raw'
 import attentionSplitkSgSrc from './shaders/attention_splitk_sg.wgsl?raw'
 import attentionCombineSrc from './shaders/attention_combine.wgsl?raw'
+import mlaQSplitSrc from './shaders/mla_q_split.wgsl?raw'
+import mlaKvWriteSrc from './shaders/mla_kv_write.wgsl?raw'
+import mlaProjSrc from './shaders/mla_proj.wgsl?raw'
+import mlaScoresSrc from './shaders/mla_scores.wgsl?raw'
+import mlaCombineSrc from './shaders/mla_combine.wgsl?raw'
+import mlaNarrowSrc from './shaders/mla_narrow.wgsl?raw'
 import fusedFfnSrc from './shaders/fused_ffn.wgsl?raw'
 import fusedFfnTiledSgSrc from './shaders/fused_ffn_tiled_sg.wgsl?raw'
 import fusedFfnPrologueSrc from './shaders/fused_ffn_prologue.wgsl?raw'
@@ -179,6 +185,27 @@ export interface Pipelines {
    *  MoeDims.bits is 3. Same bindings, different unpack. */
   moeMatmulQ3: GPUComputePipeline | null
   moeCombine: GPUComputePipeline
+  // ── Multi-head latent attention (DeepSeek-V2). Six dispatches replacing the
+  // rope/kv_append/attention chain, and the only attention family in the repo
+  // that caches something other than K and V: one 512-wide latent plus one
+  // 64-wide shared RoPE key per token, 7x less than MHA at these dims.
+  //
+  // Every dim arrives in a uniform, none from the prelude, so these compile
+  // under every spec exactly like the GDN family and only an MLA spec
+  // dispatches them.
+  mlaQSplit: GPUComputePipeline    // q_proj out → q_nope + half-split-RoPE'd q_pe
+  mlaKvWrite: GPUComputePipeline   // kv_a out → RMSNorm'd latent + RoPE'd shared key
+  /** ONE pipeline object, dispatched twice per layer with different uniforms:
+   *  q_nope → q_lat through kv_b's K half, and o_lat → o_head through its V
+   *  half. Two structurally identical pipelines would own two DISTINCT
+   *  layout:'auto' layout objects, so a bind group built against one and
+   *  dispatched on the other is a validation error — the same reason moeMM is
+   *  resolved once in engine-core.ts. The two directions differ only in
+   *  {N, K} and in which region of the kv_b buffer is bound. */
+  mlaProj: GPUComputePipeline
+  mlaScores: GPUComputePipeline    // (q_lat·c_t + q_pe·k_pe_t) * scale, per (position, head)
+  mlaCombine: GPUComputePipeline   // softmax in place, then the latent-weighted sum
+  mlaNarrow: GPUComputePipeline    // f32 → f16 between mlaCombine's output and mlaProj's input
 }
 
 /** Per-layer weight buffers */
@@ -313,6 +340,12 @@ export function compile(
     moeMatmul: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4 }) : null,
     moeMatmulQ3: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: true }) : null,
     moeCombine: createPipeline(device, moeCombineSrc, 'moe_combine'),
+    mlaQSplit: createPipeline(device, mlaQSplitSrc, 'mla_q_split'),
+    mlaKvWrite: createPipeline(device, mlaKvWriteSrc, 'mla_kv_write'),
+    mlaProj: createPipeline(device, mlaProjSrc, 'mla_proj'),
+    mlaScores: createPipeline(device, mlaScoresSrc, 'mla_scores'),
+    mlaCombine: createPipeline(device, mlaCombineSrc, 'mla_combine'),
+    mlaNarrow: createPipeline(device, mlaNarrowSrc, 'mla_narrow'),
   }
 
   console.log(`[compiler] Done: ${Object.keys(pipelines).length} pipelines`)

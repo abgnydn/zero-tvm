@@ -5,7 +5,7 @@
  * This is the format side of the Qwen3.6 port. Every existing spec loads the
  * MLC shard format (symmetric q4f16_1, group 32, no bias, one record per
  * fused tensor); MLX ships `weight` / `scales` / `biases` triples at group 64
- * with the projections UNFUSED, so the loader has to do three things the MLC
+ * with the projections UNFUSED, so the loader has to do four things the MLC
  * path never did:
  *
  *   1. Concatenate. c_attn is q_proj ++ k_proj ++ v_proj; the GDN input
@@ -20,6 +20,10 @@
  *      DIFFERENT layouts — 8 exponent bits against 5 — so this is a
  *      conversion, not a reinterpret, and it can overflow. `bf16ToF16` counts
  *      overflows rather than quietly writing Infinity.
+ *   4. PREPARE (MLA only). Two `PlanOp`s run at LOAD rather than at runtime —
+ *      the pe-row de-interleave that makes DeepSeek's interleaved RoPE free,
+ *      and the kv_b dequant that emits [K^T ‖ V] as f16 — because the built
+ *      buffer is what gets cached.
  *
  * Kept dependency-free and erasable-TS so tests/kernels/*.mjs can import it
  * under Node type stripping, the same constraint model-spec.ts carries.
@@ -131,6 +135,74 @@ export function bf16ToF32(src: Uint16Array): Float32Array {
 }
 
 // ============================================================
+// f16 (only the loader ops below need it — the conversions above all end at
+// bit patterns they never have to interpret as numbers)
+// ============================================================
+
+const _f32 = new Float32Array(1)
+const _u32 = new Uint32Array(_f32.buffer)
+
+/**
+ * JS number → the f16 bit pattern, rounded f64 → f32 → f16.
+ *
+ * THE INTERMEDIATE f32 IS THE POINT, not an implementation detail. Every
+ * reference this loader is checked against computes `q*s + b` in float32 and
+ * then casts to float16 (make-dsv2-layer-ref.py's dequant_from, which is
+ * bit-identical to mx.dequantize). JS arithmetic is f64, and rounding f64
+ * straight to f16 is a DIFFERENT function on ties: it would scatter one-bit
+ * differences through millions of weights, which reads like a layout bug and is
+ * not one. Storing through the Float32Array below reproduces the reference's
+ * rounding exactly. Same routine as tests/kernels/half.mjs's f32ToF16Bits.
+ */
+export function f32ToF16Bits(val: number): number {
+  _f32[0] = val
+  const x = _u32[0]
+  const sign = (x >>> 16) & 0x8000
+  let exp = (x >>> 23) & 0xff
+  const mant = x & 0x7fffff
+  if (exp === 0xff) return sign | 0x7c00 | (mant ? 0x200 : 0)   // inf / nan
+  exp = exp - 127 + 15
+  if (exp >= 0x1f) return sign | 0x7c00                          // overflow -> inf
+  if (exp <= 0) {
+    if (exp < -10) return sign                                   // underflow -> signed zero
+    const m = mant | 0x800000
+    const sh = 14 - exp
+    let h = m >>> sh
+    const rem = m & ((1 << sh) - 1)
+    const half = 1 << (sh - 1)
+    if (rem > half || (rem === half && (h & 1))) h++             // round to nearest even
+    return sign | h
+  }
+  let h = (exp << 10) | (mant >>> 13)
+  const rem = mant & 0x1fff
+  if (rem > 0x1000 || (rem === 0x1000 && (h & 1))) h++           // round to nearest even
+  return sign | h
+}
+
+/** f16 bit pattern → JS number. Subnormals included: MLX scales land there. */
+export function f16BitsToF32(h: number): number {
+  const sign = (h & 0x8000) << 16
+  const exp = (h >>> 10) & 0x1f
+  const mant = h & 0x3ff
+  let bits: number
+  if (exp === 0) {
+    if (mant === 0) bits = sign
+    else {
+      let e = -1
+      let m = mant
+      do { e++; m <<= 1 } while (!(m & 0x400))
+      bits = sign | ((127 - 15 - e) << 23) | ((m & 0x3ff) << 13)
+    }
+  } else if (exp === 0x1f) {
+    bits = sign | 0x7f800000 | (mant << 13)
+  } else {
+    bits = sign | ((exp - 15 + 127) << 23) | (mant << 13)
+  }
+  _u32[0] = bits >>> 0
+  return _f32[0]
+}
+
+// ============================================================
 // layer plan
 // ============================================================
 
@@ -142,11 +214,48 @@ export interface BufferPart {
   convert: Convert
 }
 
-/** One GPU buffer, built by concatenating `parts` in order. */
+/**
+ * What `buildBuffer` does with `parts` INSTEAD OF / AFTER concatenating them.
+ *
+ * Deliberately not more `Convert` values: `convert` is PER PART and carries no
+ * parameters, and `planBytes` maps it at a fixed byte ratio. A row permutation
+ * needs the concatenated row count (and its map), and the kv_b dequant FUSES
+ * three parts that each already have their own `convert`. Neither is
+ * expressible as a Convert.
+ *
+ * These run inside `buildBuffer` because `assembleMlx` caches the BUILT buffer
+ * keyed by plan: prep here is paid once and served from OPFS afterwards, where
+ * prep anywhere later would re-dequantize 2M elements per layer on every load,
+ * including every dev-server page load (which deliberately passes no cacheWrite).
+ */
+export type PlanOp =
+  /**
+   * Reorder whole rows of the concatenated bytes: destination row `j` takes
+   * source row `src[j]`. Size-preserving, and applied identically to a
+   * quantized trio's weight / scales / biases because MLX affine scale groups
+   * run along the INPUT axis, which makes rows independent.
+   *
+   * `src` is a FULL map of length `rows` (identity where nothing moves), not
+   * just the rows that move — a whole-tensor permutation is easy to write and
+   * destroys a projection whose head layout it does not respect.
+   */
+  | { kind: 'permuteRows'; rows: number; src: number[] }
+  /**
+   * Dequantize an MLX-affine [heads*(nope+v), k] tensor and emit f16 as
+   * `heads` blocks of [k][nope] (K TRANSPOSED) followed by `heads` blocks of
+   * [v][k]. `parts` must be exactly [weight, scales, biases] and are fused
+   * ELEMENT-WISE, not concatenated.
+   */
+  | { kind: 'dequantAffineSplit'; bits: 4; group: 64; k: number; heads: number; nope: number; v: number }
+
+/** One GPU buffer, built by concatenating `parts` in order — unless `op` says
+ *  otherwise. */
 export interface BufferPlan {
   /** Stable id the engine binds by. */
   name: string
   parts: BufferPart[]
+  /** Loader-side preparation this buffer needs. Absent = plain concatenation. */
+  op?: PlanOp
 }
 
 /**
@@ -182,7 +291,53 @@ export function planLayer(spec: ModelSpec, L: number, prefix?: string): BufferPl
     { name: 'norm2', parts: [{ record: `${p}.post_attention_layernorm.weight`, convert: 'bf16->f16' }] },
   ]
 
-  if (spec.layerKinds[L] === 'attn') {
+  if (spec.layerKinds[L] === 'attn' && spec.mla) {
+    // ── MLA (DeepSeek-V2): no fused QKV, and two loader ops ──────────────
+    // Deliberately NOT named c_attn_*: those names land in
+    // LoadedWeights.qkvWeights, where the ordinary unfused attention branch
+    // finds them and builds a GQA layer against a 3072-row q_proj. The bind
+    // group validates, the matmul runs, the output is nonsense.
+    const M = spec.mla
+    const R = M.qkRopeHeadDim
+    // THE DE-INTERLEAVE, moved off the runtime path. DeepSeek stores q_pe/k_pe
+    // interleaved ([a0,b0,a1,b1,…]) and de-interleaves before rotating, where
+    // rope.wgsl pairs (j, j+half). Permuting the PROJECTION'S ROWS once at load
+    // commutes with permuting its output, so the runtime needs no new rotation
+    // — verified in make-dsv2-layer-ref.py, which refuses to write a reference
+    // whose permuted form does not reproduce the interleaved one.
+    // Row j takes original row deint(j): the even indices, then the odd ones.
+    // The INVERSE map is just as plausible a matrix and a different model.
+    const deint = (j: number) => (j < R / 2 ? 2 * j : 2 * (j - R / 2) + 1)
+    const qSrc = Array.from({ length: spec.mlaQProjRows }, (_, i) => i)
+    for (let h = 0; h < spec.heads; h++) {
+      const peBase = h * (M.qkNopeHeadDim + R) + M.qkNopeHeadDim
+      for (let j = 0; j < R; j++) qSrc[peBase + j] = peBase + deint(j)
+    }
+    const kvSrc = Array.from({ length: spec.mlaKvaRows }, (_, i) => i)
+    for (let j = 0; j < R; j++) kvSrc[M.kvLoraRank + j] = M.kvLoraRank + deint(j)
+
+    const withOp = (ps: BufferPlan[], op: PlanOp): BufferPlan[] => ps.map((pl) => ({ ...pl, op }))
+    plans.push(...withOp(trio('mla_q', [`${p}.self_attn.q_proj`]),
+      { kind: 'permuteRows', rows: spec.mlaQProjRows, src: qSrc }))
+    plans.push(...withOp(trio('mla_kva', [`${p}.self_attn.kv_a_proj_with_mqa`]),
+      { kind: 'permuteRows', rows: spec.mlaKvaRows, src: kvSrc }))
+    // F16 in this checkpoint, which reaches buildBuffer's pass-through only
+    // because the plan says 'bf16->f16' (i.e. "the kernels read f16"). Planning
+    // it 'raw' works today by accident and breaks on a bf16 sibling.
+    plans.push({ name: 'mla_kva_norm', parts: [{ record: `${p}.self_attn.kv_a_layernorm.weight`, convert: 'bf16->f16' }] })
+    // ONE buffer holding [K^T ‖ V], bound as two regions. Two plans would fetch
+    // the same trio and dequantize the same 2M values twice per layer, on every
+    // cold load. Order is load-bearing: K^T first, V second.
+    plans.push({
+      name: 'mla_kvb',
+      parts: q(`${p}.self_attn.kv_b_proj`),
+      op: {
+        kind: 'dequantAffineSplit', bits: 4, group: 64,
+        k: M.kvLoraRank, heads: spec.heads, nope: M.qkNopeHeadDim, v: M.vHeadDim,
+      },
+    })
+    plans.push(...trio('o_proj', [`${p}.self_attn.o_proj`]))
+  } else if (spec.layerKinds[L] === 'attn') {
     // c_attn: q_proj already emits per-head [Q|gate], which is the interleave
     // gated_qkv_split expects, so K and V simply follow it.
     plans.push(...trio('c_attn', [`${p}.self_attn.q_proj`, `${p}.self_attn.k_proj`, `${p}.self_attn.v_proj`]))
@@ -287,14 +442,23 @@ export function planGlobal(
  *  NOT the sum of the source ranges: `bf16->f32` doubles. A_log and dt_bias are
  *  64 B in the file and 128 B on the GPU, and a half-length A_log buffer poisons
  *  every GDN decay gate without crashing anything.
+ *
+ *  OP-AWARE for the same reason. `dequantAffineSplit` emits 3.556x its source
+ *  bytes (4 MiB per DeepSeek layer against 1.125 MiB of int4 trio). Op-blind,
+ *  `modelBytes`, the residency check and the loading UI all under-report — and
+ *  the failure mode of under-reporting is telling a user a model fits when it
+ *  does not.
  */
 export function planBytes(plan: BufferPlan, sourceBytes: (record: string) => number): number {
+  const op = plan.op
+  // Fused, not concatenated: the source trio's byte count says nothing here.
+  if (op?.kind === 'dequantAffineSplit') return op.heads * (op.nope + op.v) * op.k * 2
   let n = 0
   for (const part of plan.parts) {
     const b = sourceBytes(part.record)
     n += part.convert === 'bf16->f32' ? b * 2 : b
   }
-  return n
+  return n   // permuteRows is size-preserving
 }
 
 /**
@@ -343,10 +507,17 @@ export function buildBuffer(
       }
     }
   }
-  const total = pieces.reduce((a, b) => a + b.byteLength, 0)
-  const data = new Uint8Array(new ArrayBuffer(total))
-  let o = 0
-  for (const piece of pieces) { data.set(piece, o); o += piece.byteLength }
+  // dequantAffineSplit FUSES the parts element-wise, so it never concatenates.
+  let data: Uint8Array<ArrayBuffer>
+  if (plan.op?.kind === 'dequantAffineSplit') {
+    data = dequantAffineSplit(plan.name, plan.op, pieces)
+  } else {
+    const total = pieces.reduce((a, b) => a + b.byteLength, 0)
+    data = new Uint8Array(new ArrayBuffer(total))
+    let o = 0
+    for (const piece of pieces) { data.set(piece, o); o += piece.byteLength }
+    if (plan.op?.kind === 'permuteRows') data = permuteRows(plan.name, plan.op, data)
+  }
   // A clamped scale is not a rounding error, it is a wrong weight, and it
   // surfaces as NaN logits thousands of dispatches downstream. This checkpoint
   // produces none; if a future one does, the loader should stop, not warn.
@@ -357,4 +528,128 @@ export function buildBuffer(
     )
   }
   return { data, overflow }
+}
+
+// ============================================================
+// loader ops
+// ============================================================
+
+/**
+ * Reorder whole rows: destination row `j` gets source row `src[j]`.
+ *
+ * `rowBytes` is derived from the actual bytes, so this is dtype-agnostic and
+ * runs unchanged over a trio's u32 weights (1024 B/row here), its f16 scales
+ * and its f16 biases (64 B each) — what makes the permutation free is that MLX
+ * affine scale groups run along the INPUT axis, so a row of each component
+ * belongs to the same output row.
+ */
+function permuteRows(name: string, op: { rows: number; src: number[] }, data: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+  if (op.src.length !== op.rows) {
+    throw new Error(`${name}: permuteRows has ${op.src.length} source indices for ${op.rows} rows`)
+  }
+  // Not divisible = these bytes are not the tensor this permutation describes,
+  // and a rounded rowBytes would shuffle fragments of neighbouring rows into a
+  // matrix that still has the right size.
+  if (data.byteLength % op.rows !== 0) {
+    throw new Error(`${name}: ${data.byteLength} B does not divide into ${op.rows} rows`)
+  }
+  const rowBytes = data.byteLength / op.rows
+  const out = new Uint8Array(new ArrayBuffer(data.byteLength))
+  for (let j = 0; j < op.rows; j++) {
+    const s = op.src[j]
+    if (s < 0 || s >= op.rows) throw new Error(`${name}: permuteRows src[${j}] = ${s} is out of range`)
+    out.set(data.subarray(s * rowBytes, (s + 1) * rowBytes), j * rowBytes)
+  }
+  return out
+}
+
+/**
+ * Dequantize kv_b_proj and emit the two matrices the MLA kernels bind.
+ *
+ * Source is MLX-affine `[heads*(nope+v), k]`: row `h*(nope+v)+i` is Wk head h
+ * row i for `i < nope`, else Wv head h row `i-nope`. Output is f16,
+ *
+ *     heads blocks of [k][nope]   — Wk TRANSPOSED, then
+ *     heads blocks of [v][k]      — Wv verbatim,
+ *
+ * which is exactly `mla_proj`'s `wBase = (h*N + n)*K` for (N=k, K=nope) and
+ * (N=v, K=k) respectively, so one buffer serves both directions as two bind
+ * regions. The K half is a multiple of 256 B, so V's offset clears
+ * minStorageBufferOffsetAlignment.
+ *
+ * Dequantized ROW BY ROW and scattered (V a row copy, K a strided column
+ * write) so no [heads*(nope+v), k] f32 intermediate is materialised.
+ *
+ * The arithmetic is `q*s + b` in f32 then rounded to f16 — the reference's
+ * exact expression, and the reason f32ToF16Bits rounds through f32.
+ */
+function dequantAffineSplit(
+  name: string,
+  op: { bits: 4; group: 64; k: number; heads: number; nope: number; v: number },
+  pieces: Uint8Array[],
+): Uint8Array<ArrayBuffer> {
+  if (pieces.length !== 3) {
+    throw new Error(`${name}: dequantAffineSplit needs exactly [weight, scales, biases], got ${pieces.length} parts`)
+  }
+  const { k, heads, nope, v, group, bits } = op
+  const perWord = 32 / bits
+  const rows = heads * (nope + v)
+  const wordsPerRow = k / perWord
+  const groupsPerRow = k / group
+  const [pw, ps, pb] = pieces
+  const want = (n: number, got: number, what: string) => {
+    if (n !== got) throw new Error(`${name}: ${what} is ${got} B, expected ${n} B for [${rows}, ${k}] at ${bits} bits`)
+  }
+  want(rows * wordsPerRow * 4, pw.byteLength, 'weight')
+  want(rows * groupsPerRow * 2, ps.byteLength, 'scales')
+  want(rows * groupsPerRow * 2, pb.byteLength, 'biases')
+
+  // DataViews, not typed-array views: a record handed over by a caller may sit
+  // at any byte offset in its backing buffer, and a u32 view would throw (or,
+  // worse, a future caller would silently copy to align it).
+  const wv = new DataView(pw.buffer, pw.byteOffset, pw.byteLength)
+  const sv = new DataView(ps.buffer, ps.byteOffset, ps.byteLength)
+  const bv = new DataView(pb.buffer, pb.byteOffset, pb.byteLength)
+
+  const out = new Uint16Array(rows * k)
+  const kBlock = heads * k * nope        // elements in the K^T half
+  // f32 storage, so `q*s + b` is rounded to f32 before f16 exactly as numpy's
+  // (vals*s + b).astype(float16) does.
+  const row = new Float32Array(k)
+  let overflow = 0
+  const mask = (1 << bits) - 1
+  for (let h = 0; h < heads; h++) {
+    for (let i = 0; i < nope + v; i++) {
+      const r = h * (nope + v) + i
+      for (let g = 0; g < groupsPerRow; g++) {
+        const s = f16BitsToF32(sv.getUint16((r * groupsPerRow + g) * 2, true))
+        const b = f16BitsToF32(bv.getUint16((r * groupsPerRow + g) * 2, true))
+        for (let c = g * group; c < (g + 1) * group; c++) {
+          const word = wv.getUint32((r * wordsPerRow + (c / perWord | 0)) * 4, true)
+          row[c] = ((word >>> ((c % perWord) * bits)) & mask) * s + b
+        }
+      }
+      if (i < nope) {
+        const base = h * k * nope + i          // [k][nope]: stride nope down the column
+        for (let c = 0; c < k; c++) {
+          if (Math.abs(row[c]) > 65504) overflow++
+          out[base + c * nope] = f32ToF16Bits(row[c])
+        }
+      } else {
+        const base = kBlock + h * v * k + (i - nope) * k   // [v][k]: a row copy
+        for (let c = 0; c < k; c++) {
+          if (Math.abs(row[c]) > 65504) overflow++
+          out[base + c] = f32ToF16Bits(row[c])
+        }
+      }
+    }
+  }
+  // Same rule as the bf16 conversion above: a weight that does not fit f16 is
+  // not a rounding error, and Infinity here becomes NaN logits thousands of
+  // dispatches away with nothing pointing back.
+  if (overflow > 0) {
+    throw new Error(`${name}: ${overflow} dequantized value(s) exceed f16 range — `
+      + 'these weights cannot be represented at f16 and the model would run wrong')
+  }
+  return new Uint8Array(out.buffer) as Uint8Array<ArrayBuffer>
 }

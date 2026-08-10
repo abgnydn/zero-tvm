@@ -20,9 +20,12 @@ import { resolve, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseSafetensorsHeader, planLayer, planGlobal, planBytes, buildBuffer, bf16ToF16, bf16ToF32 }
   from '../../src/zero-tvm/mlx-weights.ts'
-import { QWEN36_35B_A3B } from '../../src/compiler/model-spec.ts'
+import { QWEN36_35B_A3B, DEEPSEEK_V2_LITE } from '../../src/compiler/model-spec.ts'
 import { openMlxCheckpoint, planModel, planKey, buildPlan, modelBytes }
   from '../../src/zero-tvm/weight-loader-mlx.ts'
+// The test side's own f16, deliberately: decoding the loader's output with the
+// loader's own decoder would only prove it is self-consistent.
+import { f16BitsToF32, toF16 } from './half.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const CKPT = join(ROOT, '.weights-local/Qwen3.6-35B-A3B-MLX-4bit')
@@ -123,6 +126,167 @@ const check = (name, detail, pass) => results.push({ name, detail, pass })
   check('bf16 convert', `f32 ${bad32 < 0 ? 'exact' : `WRONG at ${bad32}`}, `
     + `f16 ${bad16.length ? `${bad16.length} WRONG` : 'exact incl. subnormals'}, `
     + `${overflow} overflow clamped`, bad32 < 0 && bad16.length === 0 && overflow === 1)
+}
+
+// ── DeepSeek-V2 layer 0: the MLA loader prep, against the numpy bundle ───────
+// The whole verification of the loader step, and it needs neither a GPU nor the
+// 9 GB checkpoint. The kernel-ref bundle is a FLAT PER-TENSOR DIRECTORY and
+// buildBuffer takes readRecord/dtypeOf as callbacks, so the real loader runs
+// over it unmodified — this is not a reimplementation of the prep.
+//
+// kv_b is checked BYTE-EXACTLY, zero tolerance: make-dsv2-layer-ref.py rounds
+// through float16 before widening for the dump, so every value in wk_t.bin /
+// wv.bin is exactly f16-representable and any difference at all is a real one.
+// It is also the ONLY check that can catch a wrong transpose — an untransposed
+// Wk is still a well-formed [heads, kvLora, nope]-sized matrix that mla_proj
+// runs to completion on and that every tolerance-based check downstream
+// accepts.
+{
+  const dir = join(REFS, 'dsv2layer0')
+  if (!existsSync(join(dir, 'meta.json'))) {
+    check('dsv2 loader prep', `no bundle at ${dir} — run scripts/make-dsv2-layer-ref.py`, null)
+  } else {
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'))
+    const S = DEEPSEEK_V2_LITE
+    const { heads: HEADS, nope: NOPE, rope: R, v: V, kv_lora: KVL, d: D, query_at: QI } = meta
+    const bad = []
+    const rec = (name) => {
+      const r = meta.tensors[name]
+      if (!r) throw new Error(`record not in bundle: ${name}`)
+      return r
+    }
+    // Copies, not views: readFileSync returns a POOLED Buffer for small files,
+    // so its byteOffset is not necessarily a multiple of 4 and a Float32Array
+    // view over it can throw.
+    const bytesOf = (file) => {
+      const b = readFileSync(join(dir, file))
+      return new Uint8Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.length))
+    }
+    const readRecord = (name) => bytesOf(rec(name).file)
+    const dtypeOf = (name) => rec(name).dtype
+    const refF32 = (name) => new Float32Array(bytesOf(`${name}.bin`).buffer)
+    const plans = Object.fromEntries(planLayer(S, 0).map((p) => [p.name, p]))
+    const built = (name) => buildBuffer(plans[name], readRecord, dtypeOf).data
+    const relErr = (got, ref) => {
+      let scale = 0
+      for (let i = 0; i < ref.length; i++) scale = Math.max(scale, Math.abs(ref[i]))
+      let m = 0
+      for (let i = 0; i < ref.length; i++) m = Math.max(m, Math.abs(got[i] - ref[i]) / scale)
+      return m
+    }
+
+    // ── kv_b, byte-exact ────────────────────────────────────────────────────
+    const kvb = built('mla_kvb')
+    const got = new Uint16Array(kvb.buffer, kvb.byteOffset, kvb.byteLength / 2)
+    const wkT = refF32('wk_t')     // [heads, kvLora, nope] — Wk ALREADY transposed
+    const wV = refF32('wv')        // [heads, vHeadDim, kvLora]
+    let diffs = 0
+    let firstDiff = ''
+    for (let i = 0; i < got.length; i++) {
+      const want = i < wkT.length ? wkT[i] : wV[i - wkT.length]
+      const have = f16BitsToF32(got[i])
+      if (have !== want) {
+        diffs++
+        if (!firstDiff) {
+          firstDiff = i < wkT.length
+            ? `K^T[h=${(i / (KVL * NOPE)) | 0}][${((i / NOPE) | 0) % KVL}][${i % NOPE}] ${have} vs ${want}`
+            : `V[${i - wkT.length}] ${have} vs ${want}`
+        }
+      }
+    }
+    const wantBytes = HEADS * (NOPE + V) * KVL * 2
+    if (kvb.byteLength !== wantBytes) bad.push(`mla_kvb is ${kvb.byteLength} B, expected ${wantBytes} B`)
+    if (diffs) bad.push(`mla_kvb: ${diffs} of ${got.length} values differ (first ${firstDiff})`)
+    const pb = planBytes(plans.mla_kvb, (n) => rec(n).bytes)
+    if (pb !== 4194304) bad.push(`planBytes(mla_kvb) = ${pb}, expected 4194304 — residency would be under-reported`)
+
+    // ── the permutation, check (a): whole rows, all three components ────────
+    // Byte-level so it also covers scales and biases: permuting the weights and
+    // leaving the scales behind is a real failure mode, and dequantizing first
+    // would hide which of the three moved.
+    const deint = (j) => (j < R / 2 ? 2 * j : 2 * (j - R / 2) + 1)
+    const qSrc = (j) => { const i = j % (NOPE + R); return i < NOPE ? j : j - i + NOPE + deint(i - NOPE) }
+    const kvaSrc = (j) => (j < KVL ? j : KVL + deint(j - KVL))
+    const rowsMatch = (name, rows, src) => {
+      const b2 = built(name)
+      const raw = readRecord(plans[name].parts[0].record)
+      if (b2.byteLength !== raw.byteLength) { bad.push(`${name}: ${b2.byteLength} B built vs ${raw.byteLength} B source`); return }
+      const rb = b2.byteLength / rows
+      for (let j = 0; j < rows; j++) {
+        const s = src(j)
+        for (let o = 0; o < rb; o++) {
+          if (b2[j * rb + o] !== raw[s * rb + o]) {
+            bad.push(`${name}: row ${j} is not source row ${s} (differs at byte ${o} of ${rb})`)
+            return
+          }
+        }
+      }
+    }
+    for (const c of ['w', 's', 'b']) {
+      rowsMatch(`mla_q_${c}`, S.mlaQProjRows, qSrc)
+      rowsMatch(`mla_kva_${c}`, S.mlaKvaRows, kvaSrc)
+    }
+
+    // ── the permutation, check (b): through the bundle's own evidence ───────
+    // (a) is circular — it checks the loader against the same map the loader
+    // used, and passes just as happily on the INVERSE map. ref_qperm /
+    // ref_kvaperm are the only independent evidence in the repo: the reference
+    // script refuses to write them unless permuting the rows reproduces
+    // DeepSeek's interleaved rotation to 1e-6.
+    const h1 = refF32('ref_h1').subarray(QI * D, (QI + 1) * D)
+    const affineMatvec = (w, s, b, rows, K) => {
+      const wpr = K / 8, gpr = K / 64
+      const wd = new DataView(w.buffer, w.byteOffset, w.byteLength)
+      const sd = new DataView(s.buffer, s.byteOffset, s.byteLength)
+      const bd = new DataView(b.buffer, b.byteOffset, b.byteLength)
+      const out = new Float32Array(rows)
+      for (let r = 0; r < rows; r++) {
+        let acc = 0
+        for (let g = 0; g < gpr; g++) {
+          const sc = f16BitsToF32(sd.getUint16((r * gpr + g) * 2, true))
+          const bi = f16BitsToF32(bd.getUint16((r * gpr + g) * 2, true))
+          for (let c = g * 64; c < (g + 1) * 64; c++) {
+            const word = wd.getUint32((r * wpr + (c >> 3)) * 4, true)
+            acc += toF16(((word >>> ((c & 7) * 4)) & 15) * sc + bi) * h1[c]
+          }
+        }
+        out[r] = acc
+      }
+      return out
+    }
+    const errQ = relErr(affineMatvec(built('mla_q_w'), built('mla_q_s'), built('mla_q_b'), S.mlaQProjRows, D),
+                        refF32('ref_qperm'))
+    const errKva = relErr(affineMatvec(built('mla_kva_w'), built('mla_kva_s'), built('mla_kva_b'), S.mlaKvaRows, D),
+                          refF32('ref_kvaperm'))
+    if (!(errQ < 1e-3)) bad.push(`permuted q_proj vs ref_qperm: ${errQ.toExponential(2)}`)
+    if (!(errKva < 1e-3)) bad.push(`permuted kv_a_proj vs ref_kvaperm: ${errKva.toExponential(2)}`)
+
+    // ── kv_a_layernorm: an F16 record reaching the kernels unchanged ────────
+    // It is planned 'bf16->f16' ("the kernels read f16"), NOT 'raw', and only
+    // buildBuffer's dtype guard turns that into a pass-through for this
+    // checkpoint. Planning it 'raw' produces the same bytes today and silently
+    // stops converting on any sibling that ships bf16.
+    const gamma = built('mla_kva_norm')
+    const gammaSrc = readRecord(plans.mla_kva_norm.parts[0].record)
+    if (gamma.byteLength !== KVL * 2) bad.push(`mla_kva_norm is ${gamma.byteLength} B, expected ${KVL * 2} B`)
+    else if (same(gamma, gammaSrc)) bad.push(`mla_kva_norm: ${same(gamma, gammaSrc)}`)
+
+    // ── the OPFS key: a content hash for op-bearing plans ONLY ──────────────
+    const kvbKey = planKey(plans.mla_kvb, 0)
+    if (!/^l0\.mla_kvb\.[0-9a-f]{4}$/.test(kvbKey)) bad.push(`planKey(mla_kvb) = ${kvbKey}, expected an op hash suffix`)
+    if (planKey(plans.norm1, 0) !== 'l0.norm1') {
+      bad.push(`planKey(norm1) = ${planKey(plans.norm1, 0)} — every cached buffer on disk would be invalidated`)
+    }
+
+    for (const b of bad) console.error(`      ${b}`)
+    check('dsv2 loader prep',
+      `kv_b ${diffs === 0 ? 'BYTE-EXACT' : `${diffs} VALUES DIFFER`} vs wk_t‖wv `
+      + `(${(kvb.byteLength / 1048576).toFixed(0)} MiB f16 from ${(1179648 / 1048576).toFixed(2)} MiB of int4, `
+      + `planBytes ${pb}); pe rows permuted in weight+scales+biases; `
+      + `q ${errQ.toExponential(1)} / kv_a ${errKva.toExponential(1)} vs ref_qperm/ref_kvaperm at token ${QI}; `
+      + `key ${kvbKey}`,
+      bad.length === 0)
+  }
 }
 
 if (!existsSync(CKPT)) {
@@ -298,7 +462,7 @@ if (!existsSync(CKPT)) {
     const all = planModel(S)
     const keys = new Set()
     for (const { plan, layer } of all) {
-      const k = planKey(plan.name, layer)
+      const k = planKey(plan, layer)
       if (keys.has(k)) bad.push(`duplicate plan key ${k}`)
       keys.add(k)
       for (const part of plan.parts) {

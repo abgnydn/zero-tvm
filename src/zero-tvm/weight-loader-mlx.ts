@@ -105,9 +105,42 @@ export function planModel(
   return out
 }
 
-/** Stable OPFS / GPU-label key for a plan. Layer plans repeat their names. */
-export function planKey(name: string, layer: number | null): string {
-  return layer === null ? `g.${name}` : `l${layer}.${name}`
+/**
+ * Stable OPFS / GPU-label key for a plan. Layer plans repeat their names.
+ *
+ * An OP-BEARING plan additionally carries a short hash of its op — today
+ * DeepSeek's kv_b prep keys as `l0.mla_kvb.fd87`.
+ * Every other plan is a pure function of the checkpoint, so its bytes cannot
+ * change without the checkpoint changing; an op's bytes depend on code that is
+ * still being written. A stale OPFS entry survives the fix silently, and
+ * peer-weights.ts then replicates it to other machines by filename with a
+ * SHA-256 that proves transport, not correctness.
+ *
+ * Only op-bearing plans get the suffix, so every existing key stays
+ * byte-identical and the gigabytes of Qwen3.6 caches already on disk are not
+ * invalidated by this feature.
+ */
+export function planKey(plan: BufferPlan, layer: number | null): string {
+  const base = layer === null ? `g.${plan.name}` : `l${layer}.${plan.name}`
+  return plan.op ? `${base}.${opHash(plan)}` : base
+}
+
+/** FNV-1a over the op's parameters AND its part record names, folded to 16
+ *  bits — 4 hex characters, which `opfsKey` passes through unescaped. The
+ *  permutation MAP is hashed, not just its length: shipping a permutation and
+ *  then correcting it is exactly the case this exists for. */
+function opHash(plan: BufferPlan): string {
+  const op = plan.op!
+  const params = op.kind === 'permuteRows'
+    ? `rows=${op.rows};src=${op.src.join(',')}`
+    : `bits=${op.bits};group=${op.group};k=${op.k};heads=${op.heads};nope=${op.nope};v=${op.v}`
+  const text = `${op.kind};${params};${plan.parts.map((p) => `${p.record}:${p.convert}`).join(',')}`
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (((h >>> 16) ^ h) & 0xffff).toString(16).padStart(4, '0')
 }
 
 export interface BuiltBuffer {
@@ -153,7 +186,7 @@ export function modelBytes(spec: ModelSpec, locate: (record: string) => RecordLo
 // ============================================================
 
 /** Where a plan's buffer lands in LoadedWeights. */
-type Slot = [group: 'root' | 'layer' | 'gdn' | 'moe', field: string]
+type Slot = [group: 'root' | 'layer' | 'gdn' | 'moe' | 'mla', field: string]
 
 /**
  * plan name -> LoadedWeights field. Exhaustive on purpose: `assembleMlx`
@@ -169,6 +202,11 @@ const SLOTS: Record<string, Slot> = {
   c_attn_w: ['layer', 'qkvWeights'], c_attn_s: ['layer', 'qkvScales'], c_attn_b: ['layer', 'qkvBiases'],
   o_proj_w: ['layer', 'oProjWeights'], o_proj_s: ['layer', 'oProjScales'], o_proj_b: ['layer', 'oProjBiases'],
   q_norm: ['layer', 'qNormGamma'], k_norm: ['layer', 'kNormGamma'],
+  // MLA (DeepSeek-V2). NOT under the c_attn_* names: those are the fused QKV a
+  // GQA layer binds, and MLA's q_proj is not a q++k++v concatenation.
+  mla_q_w: ['mla', 'qWeights'], mla_q_s: ['mla', 'qScales'], mla_q_b: ['mla', 'qBiases'],
+  mla_kva_w: ['mla', 'kvaWeights'], mla_kva_s: ['mla', 'kvaScales'], mla_kva_b: ['mla', 'kvaBiases'],
+  mla_kva_norm: ['mla', 'kvaNormGamma'], mla_kvb: ['mla', 'kvbF16'],
   gdn_proj_w: ['gdn', 'projWeights'], gdn_proj_s: ['gdn', 'projScales'], gdn_proj_b: ['gdn', 'projBiases'],
   gdn_out_w: ['gdn', 'outWeights'], gdn_out_s: ['gdn', 'outScales'], gdn_out_b: ['gdn', 'outBiases'],
   gdn_conv: ['gdn', 'convWeight'], gdn_norm: ['gdn', 'normGamma'],
@@ -218,7 +256,7 @@ export async function assembleMlx(
   for (const { plan, layer } of plans) {
     const slot = SLOTS[plan.name]
     if (!slot) throw new Error(`assembleMlx: no LoadedWeights slot for plan '${plan.name}'`)
-    const key = planKey(plan.name, layer)
+    const key = planKey(plan, layer)
 
     let data: Uint8Array<ArrayBuffer>
     const cached = await hooks.cacheRead?.(key)
