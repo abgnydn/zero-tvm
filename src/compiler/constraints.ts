@@ -179,6 +179,9 @@ export const CONFIG_KEYS_READ: ReadonlySet<string> = new Set([
   'rope_theta', 'rope_scaling', 'rope_parameters',
   'rms_norm_eps', 'max_position_embeddings', 'tie_word_embeddings',
   'attention_bias', 'sliding_window', 'use_sliding_window', 'hidden_act', 'hidden_activation',
+  // Gated attention, which the engine RUNS (Qwen3.5/3.6). Unread, it made a
+  // supported feature read as an unknown field.
+  'attn_output_gate',
   'quantization', 'quantization_config', 'partial_rotary_factor', 'layer_types',
   'linear_num_key_heads', 'linear_num_value_heads', 'linear_key_head_dim', 'linear_value_head_dim',
   'linear_conv_kernel_dim', 'full_attention_interval',

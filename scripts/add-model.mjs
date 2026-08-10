@@ -333,7 +333,12 @@ const detected = {
     convK: num(tc.linear_conv_kernel_dim) ?? 0,
     fullAttnInterval: num(tc.full_attention_interval) ?? 0,
   } : null,
-  attnGate: isGdn,   // both shipped GDN families (Qwen3.5/3.6) gate attention
+  // `attn_output_gate` states it outright, and the engine SUPPORTS it — but the
+  // checker never read the key, so a config that carries it went RED on
+  // "fields this checker does not read" for a feature that already ships.
+  // isGdn stays as the fallback for configs that omit the key; it is a proxy
+  // (both shipped GDN families happen to gate attention), not a definition.
+  attnGate: tc.attn_output_gate != null ? tc.attn_output_gate === true : isGdn,
   partialRotaryFactor: num(tc.partial_rotary_factor),
   // Verbatim per-layer block claim — the checker refuses unknown kinds (LFM2's
   // 'conv' would otherwise detect as plain attention and fake-green).
