@@ -1578,3 +1578,24 @@ f16-fragment arithmetic is decided and a quiet-machine run measures it
 in-engine. The feature itself is experimental Chrome
 (`chromium-experimental-subgroup-matrix`), so the engine must feature-detect
 regardless.
+
+### sgmat wired and DEFAULT where the hardware allows (2026-08-12, later)
+
+The precision policy resolved itself on precedent: chunked prefill was never
+bit-equal to per-token (`checkReuse` needs `?chunk=0` for exactly this
+reason) — every chunk kernel holds an EMPIRICAL token-identity bar, and sgmat
+now passes it on every chunking spec:
+
+```
+llama32   tokens identical   gemm sgmat   chunked 1.02s
+qwen3mlx  tokens identical   gemm sgmat   chunked 3.24s   (matvec, same
+qwen35    tokens identical   gemm sgmat   chunked 3.10s    sequence: 4.95s)
+```
+
+GEMM ladder in the engine: **sgmat** (when the device was created with
+`chromium-experimental-subgroup-matrix`) → tiled-v2 (`chunkGemm:'tiled'`) →
+matvec. chat and agent-host request the feature when the adapter offers it;
+on any other browser the ladder degrades silently. The in-sequence matvec
+pair (3.24 vs 4.95 s) is thermally soft — the microbench's same-run 2.2×
+GEMM ratio is the number to trust; 3.24 s is also the best qwen3mlx chunked
+prefill ever recorded here, on a warm machine.

@@ -190,7 +190,12 @@ async function main(): Promise<void> {
     spec: SPEC,
     // Subgroups (when the adapter has them) for the _sg shader variants;
     // timestamp-query for profileStep / `await bench(0, 0, true)`.
-    optionalFeatures: ['subgroups' as GPUFeatureName, 'timestamp-query' as GPUFeatureName],
+    // subgroup-matrix: requested when the adapter offers it (experimental
+    // Chrome). compile() creates the sgmat GEMM only on such devices, and the
+    // chunk path prefers it — gated by token-identity on every chunking spec
+    // (chunk-prefill-test.mjs), the same empirical bar chunking itself holds.
+    optionalFeatures: ['subgroups' as GPUFeatureName, 'timestamp-query' as GPUFeatureName,
+      'chromium-experimental-subgroup-matrix' as GPUFeatureName],
     probeSubgroups: true,
     // Chat also surfaces device loss in the loading overlay's error panel.
     onDeviceLost: (info) => {

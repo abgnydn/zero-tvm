@@ -15,7 +15,7 @@
 // generated (see shaders/int4_matmul.gen.ts). Every source is piped through
 // withPrelude() so model-shape constants come from one place (shader-prelude.ts).
 import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
-import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledStWGSL } from './shaders/int4_matmul.gen'
+import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledStWGSL, int4MatmulSgMatWGSL } from './shaders/int4_matmul.gen'
 import embeddingAffineSrc from './shaders/embedding_affine.wgsl?raw'
 import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
 import moeRouterLogitsF16Src from './shaders/moe_router_logits_f16.wgsl?raw'
@@ -105,6 +105,12 @@ export interface Pipelines {
    *  chunk capacity is a multiple of 32; see the generator's header. */
   int4MatmulTiledM: GPUComputePipeline
   int4MatmulTiledMAffine: GPUComputePipeline
+  /** Subgroup-matrix GEMM — Metal's matrix unit. Present only when the DEVICE
+   *  was created with chromium-experimental-subgroup-matrix; the shader's
+   *  `enable` fails to compile otherwise. Same empirical token-identity bar
+   *  as every other chunk-path kernel. */
+  int4MatmulSgMat: GPUComputePipeline | null
+  int4MatmulSgMatAffine: GPUComputePipeline | null
   // vec4-load variants — default ON since 2026-07-25 (+7.1% with the qkv
   // sibling on M2 Max, BENCH.md); ?vec4=0 opts out:
   int4MatmulSgVec4: GPUComputePipeline | null       // vec4-load _sg variant
@@ -289,6 +295,10 @@ export function compile(
     // matvec it was meant to replace. gemm-bench.mjs is the scoreboard.
     int4MatmulTiledM: createPipeline(device, int4MatmulTiledStWGSL(false), 'int4_matmul_tiled_st'),
     int4MatmulTiledMAffine: createPipeline(device, int4MatmulTiledStWGSL(true), 'int4_matmul_tiled_st_affine'),
+    int4MatmulSgMat: device.features.has('chromium-experimental-subgroup-matrix')
+      ? createPipeline(device, int4MatmulSgMatWGSL(false), 'int4_matmul_sgmat') : null,
+    int4MatmulSgMatAffine: device.features.has('chromium-experimental-subgroup-matrix')
+      ? createPipeline(device, int4MatmulSgMatWGSL(true), 'int4_matmul_sgmat_affine') : null,
     int4MatmulSgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4') : null,
     int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
     int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,

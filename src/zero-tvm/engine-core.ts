@@ -342,6 +342,10 @@ export interface DecodeEngineOptions {
    *  the tiledOK note in buildChunkPrefill: correct, but not yet measured
    *  faster on a quiet machine). */
   chunkTiled?: boolean
+  /** Chunk GEMM selection: 'sgmat' (matrix unit, needs the experimental
+   *  feature), 'tiled', 'matvec'. Default: sgmat when its pipelines exist,
+   *  else matvec. */
+  chunkGemm?: 'sgmat' | 'tiled' | 'matvec'
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -2153,6 +2157,7 @@ export function buildDecodeEngine(
     destroy(): void
   }
 
+  let chunkGemmUsed = 'matvec'
   function buildChunkPrefill(): ChunkPrefill {
     const C = CHUNK_CAP
     // MLC symmetric and MLX affine are different kernels with different
@@ -2172,12 +2177,23 @@ export function buildDecodeEngine(
     // the clean-ish runs read parity with batched_dyn, not a win — at M<=64
     // Apple's L2 apparently covers most of the matvec's activation re-reads.
     // It becomes the default when a quiet-machine A/B says so, not before.
-    const tiledOK = opts.chunkTiled === true
-      && CHUNK_CAP % 32 === 0
+    const dimsOK = CHUNK_CAP % 32 === 0
       && [S.d, S.qDim, S.ffn, ...(hybrid ? [S.gdnVDim] : [])].every((k) => k % 64 === 0)
-    const gemm = tiledOK
-      ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
+    // GEMM ladder: sgmat (the matrix unit) > tiled-v2 > matvec. sgmat is
+    // 'auto' when its pipelines exist — the device advertised the feature —
+    // and holds the SAME bar every chunk kernel holds: chunked prefill was
+    // never bit-equal to per-token (that is why checkReuse needs ?chunk=0);
+    // the gate is empirical token identity in chunk-prefill-test.mjs, and
+    // sgmat passes it on every chunking spec before it may default here.
+    const sgmatPipes = AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat
+    const wantGemm = opts.chunkGemm ?? (sgmatPipes ? 'sgmat' : 'matvec')
+    const sgmatOK = wantGemm === 'sgmat' && dimsOK && sgmatPipes != null
+    const tiledOK = !sgmatOK && (wantGemm === 'tiled' || opts.chunkTiled === true) && dimsOK
+    const gemm = sgmatOK ? sgmatPipes!
+      : tiledOK ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
       : (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
+    const gemmTiledGrid = sgmatOK || tiledOK
+    chunkGemmUsed = sgmatOK ? 'sgmat' : tiledOK ? 'tiled' : 'matvec'
     const dyn = gemm
     /** A batched-GEMM bind group. bg() maps array position to binding index, so
      *  the bias buffer must come LAST and only when the affine kernel is in
@@ -2382,7 +2398,7 @@ export function buildDecodeEngine(
 
       // Tiled: 2-D grid over (N/32, n/32). Fallback matvec: N/4 on x alone.
       const gemmDispatch = (enc2: GPUCommandEncoder, bgx: GPUBindGroup, rows: number, label: string) =>
-        tiledOK
+        gemmTiledGrid
           ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 32), 1, label)
           : dispatch(enc2, gemm, bgx, Math.ceil(rows / 4), 1, 1, label)
       const enc = device.createCommandEncoder()
@@ -2460,7 +2476,7 @@ export function buildDecodeEngine(
       ? buildChunkPrefill()
       : null
   {
-    const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''})`
+    const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed})`
       : S.moe ? 'off (per-token — MoE: ids[] has no token dimension)'
       : !dynReady ? 'off (per-token — no subgroups, so no batched GEMM)'
       : 'off (per-token)'

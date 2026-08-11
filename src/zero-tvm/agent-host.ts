@@ -79,7 +79,7 @@ async function main(): Promise<void> {
   let flags: VariantFlags | null = null
   const boot = await bootEngine({
     spec,
-    optionalFeatures: ['subgroups'],
+    optionalFeatures: ['subgroups', 'chromium-experimental-subgroup-matrix' as GPUFeatureName],
     probeSubgroups: true,
     // The default boot is the SCALAR composition — no subgroups, no chunked
     // prefill. This surface exists for agents, where prefill dominates, so it

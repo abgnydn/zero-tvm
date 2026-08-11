@@ -14,6 +14,7 @@
 import { startHarness, stopHarness, newPage } from '../tests/e2e/harness.ts'
 
 const param = process.argv.slice(2).find((a) => !a.startsWith('--')) ?? 'qwen3mlx'
+const GEMM = process.env.GEMM || ''
 const TOKENS = Number(process.env.TOKENS) || 24
 // Long enough to span several chunks (CHUNK_CAP is 64) and to make the batched
 // GEMM's ragged final block non-trivial.
@@ -29,7 +30,7 @@ const check = (name, ok, detail) => {
 
 await startHarness()
 try {
-  const page = await newPage(`/model-smoke.html?model=${param}`)
+  const page = await newPage(`/model-smoke.html?model=${param}${GEMM ? `&gemm=${GEMM}` : ''}`)
   await page.waitForFunction(() => window.__phase === 'loaded' || window.__phase === 'error',
     { timeout: 8 * 60_000, polling: 1000 })
   if (await page.evaluate(() => window.__phase) === 'error') {

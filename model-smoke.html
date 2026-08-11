@@ -19,7 +19,7 @@ try{
   say('spec:', S.id, '| format:', S.weightFormat ?? 'mlc')
 
   const ad = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' })
-  const feats = [...ad.features].filter(f=>/shader-f16|subgroups/.test(f))
+  const feats = [...ad.features].filter(f=>/shader-f16|subgroups|subgroup-matrix/.test(f))
   const dev = await ad.requestDevice({ requiredFeatures: feats, requiredLimits: {
     maxBufferSize: ad.limits.maxBufferSize,
     maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize,
@@ -135,6 +135,8 @@ try{
     const mk = (chunkedPrefill) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: V, chunkedPrefill, ...(cap ? { chunkCap: cap } : {}),
       chunkTiled: new URLSearchParams(location.search).get('tiled') === '1',
+      ...(new URLSearchParams(location.search).get('gemm')
+        ? { chunkGemm: new URLSearchParams(location.search).get('gemm') } : {}),
     })
     const run = async (e) => {
       const t0 = performance.now()
