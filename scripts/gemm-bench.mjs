@@ -153,6 +153,261 @@ ${direct
     })
     // enable f16 is already in the generated source; no prelude needed (these
     // kernels read every dim from PODArgs).
+    // E1 — the convergent shape (docs/PREFILL_RESEARCH.md): every fast
+    // implementation (ORT, llama.cpp Metal, llama.cpp WGSL, MLX) independently
+    // arrived at ~this kernel. The pieces interlock and none works alone:
+    //   - diagnostic(off, chromium.subgroup_matrix_uniformity): the
+    //     "workgroup-uniform offsets" wall was Tint being conservative, not
+    //     the platform — ORT and llama.cpp both disable it and index by
+    //     subgroup. THIS is what unblocks >1 subgroup per workgroup.
+    //   - 128 threads / 4 subgroups over a 32(M)x64(N) tile, TILE_K 32;
+    //     each subgroup owns 16x32 = 2 A-frags x 4 B-frags = 8 NAMED
+    //     accumulators (an array of fragments trips an MSL stack blowout —
+    //     crbug 443794633; our old 16-frag array sat in the danger zone).
+    //   - both operands staged in shared with stride padded to 40 (=TILE_K+8,
+    //     the MLX/ORT anti-bank-conflict pad); staging pays now because 128
+    //     threads share it across 4 subgroups.
+    //   - vectorized dequant: two masks + two unpack4xU8 + FMA instead of a
+    //     shift chain (values interleave: low nibbles are even k, high odd).
+    const SG_E1_WGSL = `
+diagnostic(off, chromium.subgroup_matrix_uniformity);
+enable f16;
+enable subgroups;
+enable chromium_experimental_subgroup_matrix;
+
+@group(0) @binding(0) var<storage, read_write> output_buf : array<f16>;
+@group(0) @binding(1) var<storage, read> input_buf : array<f16>;
+@group(0) @binding(2) var<storage, read> scales : array<f16>;
+@group(0) @binding(3) var<storage, read> weights : array<u32>;
+@group(0) @binding(5) var<storage, read> biases : array<f16>;
+struct PODArgs { K_PACKED: u32, SCALES_PER_ROW: u32, packGridDimX: u32, M_ROWS: u32 }
+@group(0) @binding(4) var<uniform> podArgs : PODArgs;
+
+const TK : u32 = 32u;      // K-tile
+const STRIDE : u32 = 40u;  // TK + 8 pad
+
+var<workgroup> Ash : array<f16, 1280>;   // 32 m-rows x STRIDE
+var<workgroup> Bsh : array<f16, 2560>;   // 64 n-rows x STRIDE, dequantized
+var<workgroup> Osh : array<f32, 2048>;   // 32 x 64 staging for ragged tiles
+
+@compute @workgroup_size(128, 1, 1)
+fn sg_e1(
+  @builtin(workgroup_id) wid : vec3<u32>,
+  @builtin(local_invocation_id) lid : vec3<u32>,
+  @builtin(subgroup_size) sgSize : u32
+) {
+  let K_PACKED = podArgs.K_PACKED;
+  let SPR = podArgs.SCALES_PER_ROW;
+  let N = podArgs.packGridDimX;
+  let M = podArgs.M_ROWS;
+  let K = K_PACKED * 8u;
+  let nBase = wid.x * 64u;
+  let mBase = wid.y * 32u;
+  let tid = lid.x;
+  let sg = tid / sgSize;          // 0..3 at sgSize 32
+  let sgRow = sg / 2u;            // 16-row M slice
+  let sgCol = sg % 2u;            // 32-col N slice
+
+  var c00 : subgroup_matrix_result<f32, 8, 8>; var c01 : subgroup_matrix_result<f32, 8, 8>;
+  var c02 : subgroup_matrix_result<f32, 8, 8>; var c03 : subgroup_matrix_result<f32, 8, 8>;
+  var c10 : subgroup_matrix_result<f32, 8, 8>; var c11 : subgroup_matrix_result<f32, 8, 8>;
+  var c12 : subgroup_matrix_result<f32, 8, 8>; var c13 : subgroup_matrix_result<f32, 8, 8>;
+
+  for (var k0 : u32 = 0u; k0 < K; k0 = k0 + TK) {
+    // Stage A: 32 x 32 halves, 8 per thread.
+    for (var i : u32 = 0u; i < 8u; i = i + 1u) {
+      let idx = tid * 8u + i;
+      let r = idx / TK;
+      let c = idx % TK;
+      Ash[r * STRIDE + c] = input_buf[(mBase + r) * K + k0 + c];
+    }
+    // Stage B dequantized: 64 rows x 4 words, 2 words per thread.
+    for (var wq : u32 = 0u; wq < 2u; wq = wq + 1u) {
+      let widx = tid * 2u + wq;   // 0..255
+      let row = widx / 4u;
+      let wcol = widx % 4u;
+      let n2 = nBase + row;
+      let base = row * STRIDE + wcol * 8u;
+      if (n2 < N) {
+        let wordIdx = (k0 >> 3u) + wcol;
+        let p = weights[n2 * K_PACKED + wordIdx];
+        let sv = f16(scales[n2 * SPR + (wordIdx >> 3u)]);
+        let bv = f16(biases[n2 * SPR + (wordIdx >> 3u)]);
+        // value i sits in bits 4i: low-nibble bytes are k = 0,2,4,6; high are
+        // 1,3,5,7 — hence the interleaved stores.
+        let lo = vec4<f16>(unpack4xU8(p & 0x0F0F0F0Fu)) * sv + vec4<f16>(bv);
+        let hi = vec4<f16>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu)) * sv + vec4<f16>(bv);
+        Bsh[base + 0u] = lo.x; Bsh[base + 2u] = lo.y; Bsh[base + 4u] = lo.z; Bsh[base + 6u] = lo.w;
+        Bsh[base + 1u] = hi.x; Bsh[base + 3u] = hi.y; Bsh[base + 5u] = hi.z; Bsh[base + 7u] = hi.w;
+      } else {
+        for (var i : u32 = 0u; i < 8u; i = i + 1u) { Bsh[base + i] = 0.0h; }
+      }
+    }
+    workgroupBarrier();
+
+    for (var step : u32 = 0u; step < TK; step = step + 8u) {
+      let aOff = sgRow * 16u * STRIDE + step;
+      let a0 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&Ash, aOff, false, STRIDE);
+      let a1 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&Ash, aOff + 8u * STRIDE, false, STRIDE);
+      let bOff = sgCol * 32u * STRIDE + step;
+      let b0 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff, true, STRIDE);
+      let b1 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff + 8u * STRIDE, true, STRIDE);
+      let b2 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff + 16u * STRIDE, true, STRIDE);
+      let b3 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff + 24u * STRIDE, true, STRIDE);
+      c00 = subgroupMatrixMultiplyAccumulate(a0, b0, c00);
+      c01 = subgroupMatrixMultiplyAccumulate(a0, b1, c01);
+      c02 = subgroupMatrixMultiplyAccumulate(a0, b2, c02);
+      c03 = subgroupMatrixMultiplyAccumulate(a0, b3, c03);
+      c10 = subgroupMatrixMultiplyAccumulate(a1, b0, c10);
+      c11 = subgroupMatrixMultiplyAccumulate(a1, b1, c11);
+      c12 = subgroupMatrixMultiplyAccumulate(a1, b2, c12);
+      c13 = subgroupMatrixMultiplyAccumulate(a1, b3, c13);
+    }
+    workgroupBarrier();
+  }
+
+  // Store through Osh (f32), then guarded copy-out. The full-tile direct
+  // store is a later arm of the sweep; correctness first.
+  let oBase = sgRow * 16u * 64u + sgCol * 32u;
+  subgroupMatrixStore(&Osh, oBase, c00, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u, c01, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 16u, c02, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 24u, c03, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u, c10, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u + 8u, c11, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u + 16u, c12, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u + 24u, c13, false, 64u);
+  workgroupBarrier();
+  for (var i : u32 = 0u; i < 16u; i = i + 1u) {
+    let idx = tid * 16u + i;
+    let m = idx / 64u;
+    let n2 = idx % 64u;
+    if (mBase + m < M && nBase + n2 < N) {
+      output_buf[(mBase + m) * N + nBase + n2] = f16(Osh[idx]);
+    }
+  }
+}`
+
+    const SG_E3_WGSL = `
+diagnostic(off, chromium.subgroup_matrix_uniformity);
+enable f16;
+enable subgroups;
+enable chromium_experimental_subgroup_matrix;
+
+@group(0) @binding(0) var<storage, read_write> output_buf : array<f16>;
+@group(0) @binding(1) var<storage, read> input_buf : array<f16>;
+@group(0) @binding(2) var<storage, read> scales : array<f16>;
+@group(0) @binding(3) var<storage, read> weights : array<u32>;
+@group(0) @binding(5) var<storage, read> biases : array<f16>;
+struct PODArgs { K_PACKED: u32, SCALES_PER_ROW: u32, packGridDimX: u32, M_ROWS: u32 }
+@group(0) @binding(4) var<uniform> podArgs : PODArgs;
+
+const TK : u32 = 32u;      // K-tile
+const STRIDE : u32 = 40u;  // TK + 8 pad
+
+var<workgroup> Ash : array<f16, 2560>;   // 64 m-rows x STRIDE
+var<workgroup> Bsh : array<f16, 2560>;   // 64 n-rows x STRIDE, dequantized
+var<workgroup> Osh : array<f32, 4096>;   // 64 x 64 staging
+
+@compute @workgroup_size(256, 1, 1)
+fn sg_e3(
+  @builtin(workgroup_id) wid : vec3<u32>,
+  @builtin(local_invocation_id) lid : vec3<u32>,
+  @builtin(subgroup_size) sgSize : u32
+) {
+  let K_PACKED = podArgs.K_PACKED;
+  let SPR = podArgs.SCALES_PER_ROW;
+  let N = podArgs.packGridDimX;
+  let M = podArgs.M_ROWS;
+  let K = K_PACKED * 8u;
+  let nBase = wid.x * 64u;
+  let mBase = wid.y * 64u;
+  let tid = lid.x;
+  let sg = tid / sgSize;          // 0..3 at sgSize 32
+  let sgRow = sg % 4u;            // 16-row M slice (llama.cpp order)
+  let sgCol = sg / 4u;            // 32-col N slice
+
+  var c00 : subgroup_matrix_result<f32, 8, 8>; var c01 : subgroup_matrix_result<f32, 8, 8>;
+  var c02 : subgroup_matrix_result<f32, 8, 8>; var c03 : subgroup_matrix_result<f32, 8, 8>;
+  var c10 : subgroup_matrix_result<f32, 8, 8>; var c11 : subgroup_matrix_result<f32, 8, 8>;
+  var c12 : subgroup_matrix_result<f32, 8, 8>; var c13 : subgroup_matrix_result<f32, 8, 8>;
+
+  for (var k0 : u32 = 0u; k0 < K; k0 = k0 + TK) {
+    // Stage A: 64 x 32 halves, 8 per thread over 256 threads.
+    for (var i : u32 = 0u; i < 8u; i = i + 1u) {
+      let idx = tid * 8u + i;
+      let r = idx / TK;
+      let c = idx % TK;
+      Ash[r * STRIDE + c] = input_buf[(mBase + r) * K + k0 + c];
+    }
+    // Stage B dequantized: 64 rows x 4 words, ONE word per thread at 256.
+    for (var wq : u32 = 0u; wq < 1u; wq = wq + 1u) {
+      let widx = tid;             // 0..255
+      let row = widx / 4u;
+      let wcol = widx % 4u;
+      let n2 = nBase + row;
+      let base = row * STRIDE + wcol * 8u;
+      if (n2 < N) {
+        let wordIdx = (k0 >> 3u) + wcol;
+        let p = weights[n2 * K_PACKED + wordIdx];
+        let sv = f16(scales[n2 * SPR + (wordIdx >> 3u)]);
+        let bv = f16(biases[n2 * SPR + (wordIdx >> 3u)]);
+        // value i sits in bits 4i: low-nibble bytes are k = 0,2,4,6; high are
+        // 1,3,5,7 — hence the interleaved stores.
+        let lo = vec4<f16>(unpack4xU8(p & 0x0F0F0F0Fu)) * sv + vec4<f16>(bv);
+        let hi = vec4<f16>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu)) * sv + vec4<f16>(bv);
+        Bsh[base + 0u] = lo.x; Bsh[base + 2u] = lo.y; Bsh[base + 4u] = lo.z; Bsh[base + 6u] = lo.w;
+        Bsh[base + 1u] = hi.x; Bsh[base + 3u] = hi.y; Bsh[base + 5u] = hi.z; Bsh[base + 7u] = hi.w;
+      } else {
+        for (var i : u32 = 0u; i < 8u; i = i + 1u) { Bsh[base + i] = 0.0h; }
+      }
+    }
+    workgroupBarrier();
+
+    for (var step : u32 = 0u; step < TK; step = step + 8u) {
+      let aOff = sgRow * 16u * STRIDE + step;
+      let a0 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&Ash, aOff, false, STRIDE);
+      let a1 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&Ash, aOff + 8u * STRIDE, false, STRIDE);
+      let bOff = sgCol * 32u * STRIDE + step;
+      let b0 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff, true, STRIDE);
+      let b1 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff + 8u * STRIDE, true, STRIDE);
+      let b2 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff + 16u * STRIDE, true, STRIDE);
+      let b3 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, bOff + 24u * STRIDE, true, STRIDE);
+      c00 = subgroupMatrixMultiplyAccumulate(a0, b0, c00);
+      c01 = subgroupMatrixMultiplyAccumulate(a0, b1, c01);
+      c02 = subgroupMatrixMultiplyAccumulate(a0, b2, c02);
+      c03 = subgroupMatrixMultiplyAccumulate(a0, b3, c03);
+      c10 = subgroupMatrixMultiplyAccumulate(a1, b0, c10);
+      c11 = subgroupMatrixMultiplyAccumulate(a1, b1, c11);
+      c12 = subgroupMatrixMultiplyAccumulate(a1, b2, c12);
+      c13 = subgroupMatrixMultiplyAccumulate(a1, b3, c13);
+    }
+    workgroupBarrier();
+  }
+
+  // Store through Osh (f32), then guarded copy-out. The full-tile direct
+  // store is a later arm of the sweep; correctness first.
+  let oBase = sgRow * 16u * 64u + sgCol * 32u;
+  subgroupMatrixStore(&Osh, oBase, c00, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u, c01, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 16u, c02, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 24u, c03, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u, c10, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u + 8u, c11, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u + 16u, c12, false, 64u);
+  subgroupMatrixStore(&Osh, oBase + 8u * 64u + 24u, c13, false, 64u);
+  workgroupBarrier();
+  for (var i : u32 = 0u; i < 16u; i = i + 1u) {
+    let idx = tid * 16u + i;      // 4096 / 256
+    let m = idx / 64u;
+    let n2 = idx % 64u;
+    if (mBase + m < M && nBase + n2 < N) {
+      output_buf[(mBase + m) * N + nBase + n2] = f16(Osh[idx]);
+    }
+  }
+}`
+
+
     dev.pushErrorScope('validation')
     const KERNELS = [
       ['matvec', mk(G.int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true, affine: true }), 'int4_matmul_batched_dyn_affine'), 'x4'],
@@ -161,7 +416,7 @@ ${direct
     ]
     if (SGMAT) {
       const add = (name, code, f32in) => {
-        try { const pp = mk(code, name === 'sg-f16d' ? 'int4_matmul_sgmat_affine' : 'sgmat'); pp.__f32in = f32in; KERNELS.push([name, pp, 'tile']) }
+        try { const pp = mk(code, name === 'sg-f16d' ? 'int4_matmul_sgmat_affine' : name === 'sg-e1' ? 'int4_matmul_sg_e1_affine' : name === 'sg-e3' ? 'sg_e3' : 'sgmat'); pp.__f32in = f32in; KERNELS.push([name, pp, name === 'sg-e1' ? 'e1' : name === 'sg-e3' ? 'e3' : 'tile']) }
         catch (e) { lines.push(name + ' create threw: ' + e.message.slice(0, 120)) }
       }
       add('sg-f32', sgWGSL('f32', false), true)
@@ -169,6 +424,9 @@ ${direct
       // the GRADUATED kernel (gen.ts), not the inline experiment — the bench
       // pins what ships, the inline builder stays for f32/staging experiments.
       add('sg-f16d', G.int4MatmulSgMatWGSL(true), false)
+      // graduated source, not the inline draft — the bench pins what ships
+      add('sg-e1', G.int4MatmulSgE1WGSL(true), false)
+      add('sg-e3', SG_E3_WGSL, false)
     }
     const compileErr = await dev.popErrorScope()
     if (compileErr) lines.push('sgmat validation: ' + compileErr.message.split('\n').slice(0, 4).join(' | '))
@@ -215,7 +473,10 @@ ${direct
         { binding: 5, resource: { buffer: s2.biB } },
       ],
     })
-    const grids = (kind, M, N) => kind === 'x4' ? [Math.ceil(N / 4), 1] : [Math.ceil(N / 32), Math.ceil(M / 32)]
+    const grids = (kind, M, N) => kind === 'x4' ? [Math.ceil(N / 4), 1]
+      : kind === 'e1' ? [Math.ceil(N / 64), Math.ceil(M / 32)]
+      : kind === 'e3' ? [Math.ceil(N / 64), Math.ceil(M / 64)]
+      : [Math.ceil(N / 32), Math.ceil(M / 32)]
 
     const voided = new Set()
     // ---- correctness gate: small shape vs CPU, per kernel -----------------
@@ -256,7 +517,7 @@ ${direct
         }
         // f16-fragment kernels legitimately round the staged weights; grade
         // them against the arithmetic they claim, not the one they don't.
-        const tol = name.startsWith('sg-f16') ? 6e-2 : 2e-2
+        const tol = (name.startsWith('sg-f16') || name.startsWith('sg-e')) ? 6e-2 : 2e-2
         if (maxRel >= tol) voided.add(name)
         lines.push(`gate  ${name.padEnd(9)} max rel ${maxRel.toExponential(1)} ${maxRel < tol ? 'OK' : 'WRONG — its timings below are void'}${name.startsWith('sg-f16') ? ' (f16-fragment tolerance)' : ''}`)
       }

@@ -1618,3 +1618,29 @@ prefill numbers ever recorded in this repo, tokens identical.
 Running ratio vs LM Studio's 1,385 tok/s clean prefill: ours is now ~287
 tok/s on the same-family model — **0.17× → ~0.21×**. Still ~5× behind;
 the next levers are sgmat tile tuning and larger caps on long prompts.
+
+### E1 lands (2026-08-12, evening): the research plan's first experiment, delivered
+
+`docs/PREFILL_RESEARCH.md` (4-angle survey of ORT/llama.cpp/MLX/the field)
+overturned two "facts": the workgroup-uniform-offset wall was Tint's
+conservative diagnostic (`diagnostic(off, chromium.subgroup_matrix_uniformity)`
+— ORT and llama.cpp both disable it), and multi-subgroup workgroups are THE
+convergent shape. E1 = 128 threads / 4 subgroups, 32x64 tile, TILE_K 32,
+stride-40 staging, 8 named accumulators, vectorized nibble dequant.
+
+Microbench, same run, correctness-gated: **2.8–3.8 TF** (previous best
+2.3–2.6) — past the 3.5 TF plain-WGSL bar. llama.cpp's 256-thread/8-subgroup
+config was tried verbatim and lost on this hardware (2.1–3.0 TF).
+
+In-engine, clean thermal window, identity-gated on all three chunking specs:
+
+| | prefill (800 tok) | tok/s | this morning |
+|---|---:|---:|---:|
+| llama32 | **0.66 s** | 1,212 | 3.61 s (per-token) |
+| qwen3mlx | **2.03 s** | 394 | 3.53 s |
+| qwen35 | **2.13 s** | 376 | 3.32 s |
+
+Running ratio vs LM Studio's clean 1,385 tok/s: **0.17× → ~0.27×** in one
+day. Remaining arms: direct store, TILE_K/tile sweep, swizzle (E3/E5), the
+robustness-tax measurement (E2), split-K for small dispatches (E4). The
+research's ceiling estimate stands: 0.70–0.75× native ≈ 620–810 tok/s.

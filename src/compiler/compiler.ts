@@ -15,7 +15,7 @@
 // generated (see shaders/int4_matmul.gen.ts). Every source is piped through
 // withPrelude() so model-shape constants come from one place (shader-prelude.ts).
 import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
-import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledStWGSL, int4MatmulSgMatWGSL } from './shaders/int4_matmul.gen'
+import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledStWGSL, int4MatmulSgE1WGSL } from './shaders/int4_matmul.gen'
 import embeddingAffineSrc from './shaders/embedding_affine.wgsl?raw'
 import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
 import moeRouterLogitsF16Src from './shaders/moe_router_logits_f16.wgsl?raw'
@@ -296,9 +296,9 @@ export function compile(
     int4MatmulTiledM: createPipeline(device, int4MatmulTiledStWGSL(false), 'int4_matmul_tiled_st'),
     int4MatmulTiledMAffine: createPipeline(device, int4MatmulTiledStWGSL(true), 'int4_matmul_tiled_st_affine'),
     int4MatmulSgMat: device.features.has('chromium-experimental-subgroup-matrix')
-      ? createPipeline(device, int4MatmulSgMatWGSL(false), 'int4_matmul_sgmat') : null,
+      ? createPipeline(device, int4MatmulSgE1WGSL(false), 'int4_matmul_sg_e1') : null,
     int4MatmulSgMatAffine: device.features.has('chromium-experimental-subgroup-matrix')
-      ? createPipeline(device, int4MatmulSgMatWGSL(true), 'int4_matmul_sgmat_affine') : null,
+      ? createPipeline(device, int4MatmulSgE1WGSL(true), 'int4_matmul_sg_e1_affine') : null,
     int4MatmulSgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4') : null,
     int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
     int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,

@@ -2402,9 +2402,12 @@ export function buildDecodeEngine(
 
       // Tiled: 2-D grid over (N/32, n/32). Fallback matvec: N/4 on x alone.
       const gemmDispatch = (enc2: GPUCommandEncoder, bgx: GPUBindGroup, rows: number, label: string) =>
-        gemmTiledGrid
-          ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 32), 1, label)
-          : dispatch(enc2, gemm, bgx, Math.ceil(rows / 4), 1, 1, label)
+        sgmatOK
+          // E1 tiles are 32(M) x 64(N) — grid x is N/64, y is M/32.
+          ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 64), Math.ceil(n / 32), 1, label)
+          : gemmTiledGrid
+            ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 32), 1, label)
+            : dispatch(enc2, gemm, bgx, Math.ceil(rows / 4), 1, 1, label)
       const enc = device.createCommandEncoder()
       if (start === 0) clearGdnState(enc)
       dispatch(enc, AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
