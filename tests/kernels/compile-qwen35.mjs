@@ -874,6 +874,75 @@ async function testMatmulBatchedDyn(device) {
   }
 }
 
+// ── int4_matmul_batched_dyn_affine — the same GEMM for MLX-affine weights ───
+//
+// WHY IT EXISTS. Chunked prefill dispatches int4_matmul_batched_dyn for every
+// projection, and until now that kernel only understood MLC symmetric quant
+// (w = s·(q−7), group 32). Every MLX checkpoint here is affine (w = s·q + b,
+// group 64), so engine-core gated chunked prefill off for all of them and they
+// prefilled ONE TOKEN AT A TIME. Prefill is the bottleneck for agentic use, so
+// that gate was the expensive one.
+//
+// The reference below is deliberately written from the FORMULA (w = s·q + b),
+// not from the kernel's factored form — the kernel folds the bias as b·Σx per
+// group and this multiplies it out per element, so an error in that folding
+// shows up as a mismatch rather than cancelling.
+async function testMatmulBatchedDynAffine(device) {
+  if (!HAS_SG32) return skip('int4_matmul_batched_dyn_affine')
+  const r = rng(37)
+  const K = Q.d, N = 64, M = 6, CAP = 8      // M=6: a partial last row-block
+  const KP = K / 8, SPR = K / 64             // group 64, not 32
+  const weights = Uint32Array.from(arr(N * KP, () => (r() * 0xffffffff) >>> 0))
+  const scales = arr(N * SPR, () => toF16(r() * 0.05 + 0.01))
+  const biases = arr(N * SPR, () => toF16(r() * 0.1 - 0.05))
+  const input = arr(CAP * K, () => toF16(r() * 2 - 1))
+
+  const pipe = pipelineFor(
+    device,
+    withPrelude(int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true, affine: true }), Q),
+    'int4_matmul_batched_dyn_affine',
+  )
+  const inBuf = buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST)
+  const wBuf = buffer(device, weights, BU.STORAGE | BU.COPY_DST)
+  const sBuf = buffer(device, f16Array(Array.from(scales)), BU.STORAGE | BU.COPY_DST)
+  const bBuf = buffer(device, f16Array(Array.from(biases)), BU.STORAGE | BU.COPY_DST)
+  const run = async (m) => {
+    const out = device.createBuffer({ size: CAP * N * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+    device.queue.writeBuffer(out, 0, new Uint16Array(CAP * N))
+    const pod = buffer(device, new Uint32Array([KP, SPR, N, m]), BU.UNIFORM | BU.COPY_DST)
+    const bytes = await runCompute(device, pipe, [out, inBuf, sBuf, wBuf, pod, bBuf], [N / 4], 0, CAP * N * 2)
+    return new Uint16Array(bytes)
+  }
+  const got6 = await run(M)
+  const got8 = await run(8)
+
+  let maxRel = 0
+  for (let b = 0; b < M; b++) {
+    const x = input.slice(b * K, (b + 1) * K)
+    const ref = arr(N, (_, row) => {
+      let acc = 0
+      for (let i = 0; i < K; i++) {
+        const nib = (weights[row * KP + (i >> 3)] >>> ((i & 7) * 4)) & 15
+        const g = i >> 6
+        acc += (scales[row * SPR + g] * nib + biases[row * SPR + g]) * x[i]
+      }
+      return acc
+    })
+    const row = Array.from(got6.subarray(b * N, (b + 1) * N), f16BitsToF32)
+    maxRel = Math.max(maxRel, maxRelDiff(row, ref, 1e-2))
+  }
+  let tailBad = 0
+  for (let i = M * N; i < CAP * N; i++) if (got6[i] !== 0) tailBad++
+  let mBad = 0
+  for (let i = 0; i < M * N; i++) if (got6[i] !== got8[i]) mBad++
+  const pass = maxRel < 1e-2 && tailBad === 0 && mBad === 0
+  return {
+    name: 'int4_matmul_batched_dyn_affine',
+    pass,
+    detail: `max rel err ${maxRel.toExponential(2)} vs CPU, ${tailBad} rows-past-M writes, ${mBad} M-variance mismatches`,
+  }
+}
+
 // ── full chunked GDN chain — ONE chunk of 6 vs 6 single-token chunks (must be
 // BIT-EXACT, f32 state included) and vs the sequential CPU reference ─────────
 async function testGdnChunkChain(device) {
@@ -1114,6 +1183,7 @@ const TESTS = [
   { label: 'gdn_conv_seq', fn: testGdnConvSeq },
   { label: 'gdn_gates_seq', fn: testGdnGatesSeq },
   { label: 'matmul_batched_dyn', fn: testMatmulBatchedDyn },
+  { label: 'matmul_batched_dyn_affine', fn: testMatmulBatchedDynAffine },
   { label: 'gdn_chunk_chain', fn: testGdnChunkChain },
   { label: 'attention_prefill', fn: testAttentionPrefill },
   { label: 'silu_mul', fn: testSiluMul },
