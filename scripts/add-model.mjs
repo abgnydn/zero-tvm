@@ -163,7 +163,12 @@ const mlxPrefix = records.some((r) => r.startsWith('language_model.')) ? 'langua
 // "does this model have X" over ALL records answers for the tower we throw
 // away. Under a language_model. root the split is exact; without one, drop the
 // known tower roots by name.
-const TOWER = /^(vision_tower|visual|vision_model|audio_tower|audio_model|multi_modal_projector)\./
+// Anchored at a DOT boundary, not at the string start. Muse-Glimmer-30B nests
+// its tower as `model.vision_tower.*`, so a ^-anchored version let all 402 of
+// its vision biases count as text-tower ones and reported a kernel gap the text
+// model does not have — the exact false positive this filter exists to stop,
+// one nesting level down.
+const TOWER = /(^|\.)(vision_tower|visual|vision_model|vision_encoder|audio_tower|audio_model|multi_modal_projector|projector)\./
 const textRecords = mlxPrefix
   ? records.filter((r) => r.startsWith(mlxPrefix))
   : records.filter((r) => !TOWER.test(r))
