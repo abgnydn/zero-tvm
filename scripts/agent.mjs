@@ -30,9 +30,24 @@ import { specForParam, specWithCtx, SHIPPED_MODELS } from '../src/zero-tvm/model
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const args = process.argv.slice(2)
 const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
-const param = args.find((a) => !a.startsWith('--') && a !== flag('ctx') && a !== flag('pool')) ?? 'qwen3mlx'
-const ctx = Number(flag('ctx')) || 0
+// Presets, because "npm run agent -- qwen35 --ctx 65536" is not a UX.
+//   ztvm        -> qwen3mlx, the gated tool-caller
+//   ztvm big    -> qwen35 at 64k context
+//   ztvm max    -> qwen35 at its native 262k (8 GiB of KV — quiet machine)
+//   ztvm fast   -> llama32 (chat only; it does not call tools)
+//   ztvm code   -> like default, then DROPS YOU INTO pi when ready
+const PRESETS = {
+  big: { param: 'qwen35', ctx: 65536 },
+  max: { param: 'qwen35', ctx: 262144 },
+  fast: { param: 'llama32', ctx: 0 },
+  code: { param: 'qwen3mlx', ctx: 0, pi: true },
+}
+const word = args.find((a) => !a.startsWith('--') && a !== flag('ctx') && a !== flag('pool'))
+const preset = word ? PRESETS[word] : null
+const param = preset?.param ?? word ?? 'qwen3mlx'
+const ctx = Number(flag('ctx')) || preset?.ctx || 0
 const pool = flag('pool') !== '0'
+const intoPi = preset?.pi === true || args.includes('--pi')
 
 const known = SHIPPED_MODELS.map((m) => m.param).filter(Boolean)
 if (!known.includes(param)) {
@@ -123,3 +138,11 @@ READY — ${hosting} hosting on http://127.0.0.1:8017/v1
   keep the Chrome tab VISIBLE (background = ~3x slower)
   ${pool ? 'pool ON: kill the tab, relaunch, context restores in ~0.5s' : 'pool OFF (--pool 0)'}
   switch models: rerun with another name (${known.filter((k) => k !== param).slice(0, 4).join(', ')}…)`)
+
+if (intoPi) {
+  console.log('\ndropping into pi — Ctrl+C twice to leave\n')
+  spawn('pi', ['--model', 'ztvm'], {
+    stdio: 'inherit',
+    env: { ...process.env, PI_OFFLINE: '1' },
+  }).on('exit', (code) => process.exit(code ?? 0))
+}
