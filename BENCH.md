@@ -1660,3 +1660,22 @@ localhost page; `--safe` opts out). zerotvm.com stays on stock Chrome rules.
 Running prefill ratio vs LM Studio's 1,385: 0.17× (morning) → 0.27× → **0.35×
 (local agent)**. Next known steps: graduate the 8-subgroup config as the
 unsafe-mode kernel (5.1 TF vs e1's 4.8), then E3/E5 sweep arms.
+
+### Dawn-native probe: GO (2026-08-12)
+
+The `webgpu` npm package (official dawn.node prebuilt, dawn-gpu/node-webgpu)
+passes every gate the two earlier non-browser attempts failed:
+
+| | @kmamal/gpu (old) | Deno/wgpu | **dawn.node prebuilt** |
+|---|---|---|---|
+| empty submit-and-wait | ~100 ms | 13 ms (pipelines away) | **0.14 ms** |
+| subgroups / f16 | yes | no subgroups | **yes** |
+| subgroup-matrix | no | no | **YES** |
+| disable_robustness | — | — | **accepted** |
+| sg-e1 gate_up M=256 | — | — | **4,833 GF = unsafe-Chrome parity** |
+
+`scripts/dawn-probe.mjs` reproduces this in ~30 s. Consequence: the native
+host (PREFILL_RESEARCH L2) is unblocked — same WGSL kernels, no browser
+process, no tab throttling, robustness off by default. Remaining work is the
+engine shims (navigator.gpu global, OPFS→fs weights, the `build:lib` bundle)
+— the 1-2 day estimate stands, with the riskiest unknown now retired.
