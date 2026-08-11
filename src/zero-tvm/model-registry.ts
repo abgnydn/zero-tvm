@@ -25,6 +25,7 @@
  */
 
 import {
+  makeModelSpec,
   PHI3, QWEN3_4B, QWEN35_4B, QWEN36_35B_A3B, QWEN36_35B_A3B_Q3,
   type ModelSpec,
 } from '../compiler/model-spec.ts'
@@ -56,6 +57,35 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
 export function specForParam(model: string | null): ModelSpec {
   const hit = model && SHIPPED_MODELS.find((m) => m.param === model)
   return hit ? hit.spec : PHI3
+}
+
+/**
+ * `?ctx=N` — override the KV budget, in tokens. The compiled maxPages is a
+ * BUDGET CHOICE (a flat ~1 GiB constant from 2026-07-30), not a hardware or
+ * model limit: our KV cost/token is ~3x LM Studio's per-token working set on
+ * the same checkpoint, and maxSeq is far above the default on every spec but
+ * Phi-3. Rebuilding through makeModelSpec keeps every derived field
+ * (maxContext, cache byte sizes, page tables) coherent — a raw maxContext
+ * edit would desynchronise them silently.
+ *
+ * Clamped to maxSeq: past the trained window the model degrades without
+ * erroring, which is a worse failure than refusing. Floor is one page. KV is
+ * allocated EAGERLY, one buffer per attention layer — a ctx the machine
+ * cannot hold fails at boot (or, on unified memory, can kill the GPU process
+ * mid-run once physical RAM is actually exhausted: Metal commits lazily, so
+ * allocation success is not a promise). An expert knob, not a default.
+ *
+ * Lives HERE rather than in model-select.ts so it is testable headlessly —
+ * model-select imports weight-loader, which reads GPUBufferUsage at module
+ * scope and cannot load under Node.
+ */
+export function specWithCtx(base: ModelSpec, ctx: number): ModelSpec {
+  if (!Number.isFinite(ctx) || ctx <= 0) return base
+  const pages = Math.max(1, Math.min(
+    Math.ceil(ctx / base.pageSize),
+    Math.floor(base.maxSeq / base.pageSize)))
+  if (pages === base.maxPages) return base
+  return makeModelSpec({ ...base, maxPages: pages })
 }
 
 /** Root OPFS directory the weight cache lives under. */

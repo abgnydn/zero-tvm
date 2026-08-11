@@ -327,6 +327,9 @@ export interface DecodeEngineOptions {
    * projections + one gdn_recur dispatch per layer per chunk.
    */
   chunkedPrefill?: boolean
+  /** Chunk capacity in tokens (default 64). See the CHUNK_CAP note in
+   *  buildChunkPrefill; sweep results in BENCH.md. */
+  chunkCap?: number
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -2039,7 +2042,12 @@ export function buildDecodeEngine(
   // (queue-ordered). ~394 dispatches per 64-token chunk vs 340/token before.
   // ============================================================
 
-  const CHUNK_CAP = 64   // chunk capacity in tokens (buffer sizing)
+  // Chunk capacity in tokens (buffer sizing). 64 shipped with the 2026-07-29
+  // prefill round; opts.chunkCap exists because the right value is an empirical
+  // question — a bigger cap amortises per-chunk fixed costs (uniform writes,
+  // one submit, one attention ramp) against CHUNK_CAP-times-wider activation
+  // buffers. Measured sweep lives in BENCH.md.
+  const CHUNK_CAP = opts.chunkCap ?? 64
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
   interface ChunkPrefill {

@@ -18,6 +18,7 @@ const TOKENS = Number(process.env.TOKENS) || 24
 // Long enough to span several chunks (CHUNK_CAP is 64) and to make the batched
 // GEMM's ragged final block non-trivial.
 const PROMPT = Number(process.env.PROMPT) || 150
+const CAP = Number(process.env.CAP) || 0
 const IDS = Array.from({ length: PROMPT }, (_, i) => 1000 + ((i * 37) % 900))
 
 let failed = false
@@ -49,7 +50,7 @@ try {
 
   for (const [label, v] of [['scalar', {}], ['shipped', { subgroups: true, matmul: 'tiled', splitK: 8 }]]) {
     const { chunked, perToken, chunkedMs, perTokenMs } = await page.evaluate(
-      (ids, n, vv) => window.__chunkCheck(ids, n, vv), IDS, TOKENS, v)
+      (ids, n, vv, cap) => window.__chunkCheck(ids, n, vv, cap), IDS, TOKENS, v, CAP)
     if (chunkedMs && perTokenMs) {
       console.log(`      ${label}: chunked ${(chunkedMs / 1000).toFixed(2)}s vs per-token ${(perTokenMs / 1000).toFixed(2)}s`
         + `  (${(perTokenMs / chunkedMs).toFixed(2)}x, ${IDS.length}-token prompt + ${TOKENS} decode)`)

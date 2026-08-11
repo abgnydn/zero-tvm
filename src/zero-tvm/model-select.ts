@@ -17,7 +17,7 @@
  */
 
 import type { ModelSpec } from '../compiler/model-spec.js'
-import { specForParam } from './model-registry.js'
+import { specForParam, specWithCtx } from './model-registry.js'
 import { resolveModelBase } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
 import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt, buildDeepSeekChatPrompt, buildLlama3ChatPrompt, buildMistralChatPrompt, buildTuluChatPrompt } from './tokenizer-bpe.js'
@@ -27,7 +27,10 @@ export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: stri
 /** `?model=<param>` → spec, straight from SHIPPED_MODELS — registering a model
  *  there is what creates its URL. Default (and anything unknown) is Phi-3. */
 export function specFromSearch(search: string): ModelSpec {
-  return specForParam(new URLSearchParams(search).get('model'))
+  const q = new URLSearchParams(search)
+  // `?ctx=` is documented on specWithCtx (model-registry.ts) — the logic lives
+  // there so it can be unit-tested without this file's weight-loader import.
+  return specWithCtx(specForParam(q.get('model')), Number(q.get('ctx')))
 }
 
 export { modelBranding, SHIPPED_MODELS } from './model-registry.js'

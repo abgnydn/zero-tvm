@@ -130,10 +130,10 @@ try{
   // prefill — one batched GEMM over n tokens instead of n matvecs — so the only
   // honest check is that it yields the same tokens as the per-token path on the
   // same prompt. Two engines over the SAME weights, one with chunking off.
-  window.__chunkCheck = async (ids, n, v) => {
+  window.__chunkCheck = async (ids, n, v, cap) => {
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
     const mk = (chunkedPrefill) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
-      spec: S, variants: V, chunkedPrefill,
+      spec: S, variants: V, chunkedPrefill, ...(cap ? { chunkCap: cap } : {}),
     })
     const run = async (e) => {
       const t0 = performance.now()
@@ -171,10 +171,59 @@ try{
   window.__score = async (ids) => Array.from(await engine.scoreSequence(ids,
     (d, t) => { if (d % 64 === 0) say(`scored ${d}/${t}`) }))
 
+  // One raw step at an arbitrary position — the ctx test uses it to touch the
+  // LAST KV slot of a ?ctx= engine. Addressing probe only: the cache below the
+  // position is whatever the buffer held, so the returned token means nothing.
+  window.__pipelineStep = async (tokenId, pos) => (await engine.pipelineStep({ tokenId }, pos)).tokenId
+
   window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
   // Embedding models stop one dispatch earlier: the pooled, L2-normalised
   // hidden state instead of logits. scripts/embed-ref.py is the reference.
   window.__embed = async (ids) => Array.from(await engine.forwardEmbedding(ids))
+  // Timed pipelined generate — the chat path with instrumentation. TTFT is
+  // wall-clock to the FIRST onToken callback, which includes prefill; decode
+  // rate is the remaining tokens over the remaining time.
+  // The CHAT-SHAPED engine — variantsFromSearch(''), i.e. every default-on
+  // tuning flag (splitK, vec4h, sgFfn, fuseqk where legal, chunked prefill).
+  // The smoke engine above deliberately runs a plainer composition; timing THAT
+  // against another runtime sandbagged us 2.4x on decode (30.5 vs 73 tok/s).
+  let chatEngine = null
+  window.__timedGenerateChat = async (ids, n) => {
+    if (!chatEngine) {
+      const { parseVariantFlags } = await import('/src/zero-tvm/variants.ts')
+      // Same construction as chat.ts:200 — location.search so ?sg=0-style
+      // overrides still apply, and the subgroups feature gate from the device.
+      chatEngine = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+        spec: S,
+        variants: parseVariantFlags(location.search, {
+          hasSubgroupsFeature: dev.features.has('subgroups'),
+          sgSizeOk: true,
+        }),
+      })
+    }
+    const t0 = performance.now()
+    let tFirst = 0
+    const out = []
+    await chatEngine.generatePipelined(ids, n, (t) => { if (!out.length) tFirst = performance.now(); out.push(t) }, () => false)
+    const tEnd = performance.now()
+    return { promptTokens: ids.length, tokens: out.length,
+             ttftMs: tFirst - t0, totalMs: tEnd - t0,
+             decodeTokS: out.length > 1 ? (out.length - 1) / ((tEnd - tFirst) / 1000) : 0,
+             prefillTokS: (ids.length - 1) / ((tFirst - t0) / 1000) }
+  }
+
+  window.__timedGenerate = async (ids, n) => {
+    const t0 = performance.now()
+    let tFirst = 0
+    const out = []
+    await engine.generatePipelined(ids, n, (t) => { if (!out.length) tFirst = performance.now(); out.push(t) }, () => false)
+    const tEnd = performance.now()
+    return { promptTokens: ids.length, tokens: out.length,
+             ttftMs: tFirst - t0, totalMs: tEnd - t0,
+             decodeTokS: out.length > 1 ? (out.length - 1) / ((tEnd - tFirst) / 1000) : 0,
+             prefillTokS: (ids.length - 1) / ((tFirst - t0) / 1000) }
+  }
+
   window.__generate = async (ids, n) => {
     const out = await engine.generate(ids, 0, n, () => {})
     return Array.from(out)

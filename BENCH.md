@@ -1451,3 +1451,51 @@ unconditionally, dequantizing MLX-affine embeddings with the symmetric formula
 which zero chunks executed — its first version reported PASS at short prompt
 lengths where `CHUNK_MIN` kept chunking off in both arms and it compared the
 per-token path to itself.
+
+---
+
+## Head-to-head vs LM Studio (2026-08-12, M2 Max 32 GB) — same machine, same session, interleaved
+
+The first cross-runtime A/B in this file that is not against another browser
+stack. Qwen3.5-4B both sides — **different checkpoints** (ours MLC q4f16_1,
+theirs MLX 4-bit), same architecture and size, identical ~1k-token prompt of
+this repo's own docs, thinking off, temp 0, 3 interleaved runs after a warm-up,
+`scripts/lmstudio-ab.mjs`.
+
+| | zero-tvm (browser WebGPU) | LM Studio (MLX native) | ratio |
+|---|---:|---:|---:|
+| **context (tokens)** | **262,144** (`?ctx=`, native max) | 198,400 (fitted) | **1.32× us** |
+| decode tok/s | 72.4 | 89.0 | 0.81× |
+| prefill tok/s | 231 | 1,385 | 0.17× |
+
+Raw runs — ours decode: 72.4 / 72.4 / 72.4; theirs: 89.0 / 85.0 / 102.0†.
+Ours prefill: 212–234; theirs: 1,381–1,433.
+† the 102.0 was the first measured round; a later round settled at 85–89.
+
+**Context is won, and not narrowly.** Our KV cost/token on this model is ~3×
+lower than LM Studio's per-token working set (32 KiB vs ~101 KiB — KV on only
+8 of 32 layers), so the model's own 262,144 native window fits in 8 GiB of KV
+where their formula caps at 198,400. Verified live: boot at `?ctx=262144`,
+generate, tokens identical to the default engine, one step at position
+262,143 (the last slot) with zero GPU errors — an addressing check, not a
+long-range-quality claim. The old 32,768 ceiling was a flat ~1 GiB budget
+constant from one commit in July, not a limit.
+
+**Decode is close (0.81×)** for hand-written WGSL in a browser against
+native MLX — and the first version of this A/B read 30.5 tok/s (0.30×)
+because the smoke page's deliberately-plain engine was timed instead of the
+chat composition. The variant flags are 2.4× of decode; always time the
+config users run.
+
+**Prefill is decisively lost (0.17×), and the sweep says why.** CHUNK_CAP
+64→512 moves qwen3mlx only 3.4% (3.52→3.40 s) and makes qwen35 *worse*
+(3.32→3.93 s), so per-chunk overhead is not the cost — the batched GEMM
+itself is. `int4_matmul_batched_dyn` is a 4-row × 4-batch subgroup matvec,
+not a tiled GEMM; at M=64 it re-reads activations per row-block and cannot
+touch MLX's Metal GEMMs. Closing this needs a real tiled (workgroup-memory)
+batched GEMM — the single highest-value kernel left in the repo.
+
+A note my own records force: an earlier measurement had LM Studio prefill at
+465 tok/s — that number came from agentic-loop server logs (uncached tokens ÷
+prefill seconds under real load), not a clean benchmark, and today's clean
+1,385 supersedes it for hardware-capability claims.
