@@ -1551,3 +1551,30 @@ before it can be more than an experiment. Recorded, not shipped.
 Context for the ceiling: hand-written WGSL FMA tops out ~2.2–2.4 TF here;
 the remaining gap to MLX is the matrix unit, reachable only through the
 experimental feature above.
+
+### Subgroup-matrix GEMM graduated (2026-08-12): `int4_matmul_sgmat(_affine)`
+
+The winning variant from the bench iterations — one subgroup per workgroup
+(the validator requires WORKGROUP-uniform fragment offsets, so multi-subgroup
+tiles are impossible), f16 fragments with f32 accumulate, A loaded straight
+from storage (measured faster than staging it), W dequantized into shared
+with the bias folded. Same run, same throttled thermal state, ratios only:
+
+| vs (M=256) | tiled-v2 | shipped matvec (M=64) |
+|---|---:|---:|
+| gate_up | 1.15× | — |
+| ffn_down | 1.29× | 1.5× |
+| o_proj | 1.38× | 1.37× |
+| gate_up (M=64) | 1.37× | 2.2× |
+
+**f32 fragments were tried and are the wrong answer:** correct (4.7e-4) but
+~5× slower (~270 GF) — the matrix unit's fast path is f16, so the precision
+question is unavoidable: f16 fragments round the staged weights (3.4e-2 vs a
+from-the-formula reference under cancellation). That is the same arithmetic
+MLX runs on the same unit, but it is NOT bit-comparable to the per-token
+path, so the kernel is graduated into gen.ts and the bench — **not wired
+into the engine** — until the chunked-vs-per-token equivalence policy for
+f16-fragment arithmetic is decided and a quiet-machine run measures it
+in-engine. The feature itself is experimental Chrome
+(`chromium-experimental-subgroup-matrix`), so the engine must feature-detect
+regardless.
