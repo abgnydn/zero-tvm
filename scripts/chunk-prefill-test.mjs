@@ -48,8 +48,12 @@ try {
   })
 
   for (const [label, v] of [['scalar', {}], ['shipped', { subgroups: true, matmul: 'tiled', splitK: 8 }]]) {
-    const { chunked, perToken } = await page.evaluate(
+    const { chunked, perToken, chunkedMs, perTokenMs } = await page.evaluate(
       (ids, n, vv) => window.__chunkCheck(ids, n, vv), IDS, TOKENS, v)
+    if (chunkedMs && perTokenMs) {
+      console.log(`      ${label}: chunked ${(chunkedMs / 1000).toFixed(2)}s vs per-token ${(perTokenMs / 1000).toFixed(2)}s`
+        + `  (${(perTokenMs / chunkedMs).toFixed(2)}x, ${IDS.length}-token prompt + ${TOKENS} decode)`)
+    }
     const same = chunked.length === perToken.length && chunked.every((t, i) => t === perToken[i])
     const at = chunked.findIndex((t, i) => t !== perToken[i])
     check(`${label} tokens identical`, same,

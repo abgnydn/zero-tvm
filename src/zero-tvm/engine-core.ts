@@ -2124,7 +2124,19 @@ export function buildDecodeEngine(
     }
 
     // Bind groups (buffers are fixed; only uniform contents change per chunk).
-    const cbgEmb = bg(device, P.embedding, [CB.residual, CB.inputIds, weights.embdScales, weights.embdWeights, cU.emb])
+    //
+    // THE AFFINE EMBEDDING, not P.embedding. This line is why plain-attention
+    // chunking shipped broken on 2026-08-11: the per-token path picks
+    // `AFFINE ? P.embeddingAffine : P.embedding` (see embeddingPipeline above)
+    // and this one bound P.embedding unconditionally — dequantizing MLX-affine
+    // embedding weights with the SYMMETRIC formula, no bias, wrong by b per
+    // group. Every chunked token's residual was corrupted from position 0,
+    // which is exactly the observed failure: divergence at the FIRST generated
+    // token on any prompt long enough to chunk, while MLC-format qwen35 (whose
+    // embedding really is symmetric) stayed token-identical.
+    const cbgEmb = bg(device, AFFINE ? P.embeddingAffine : P.embedding, withBias(
+      [CB.residual, CB.inputIds, weights.embdScales, weights.embdWeights, cU.emb],
+      weights.embdBiases, 'embed_tokens'))
     const cbgInitNorm = bg(device, P.rmsNorm, [CB.hidden1, CB.residual, weights.layers[0].normGamma1, cU.norm])
 
     interface ChunkLayerBG {
@@ -2201,7 +2213,9 @@ export function buildDecodeEngine(
           gatedSplit: gated
             ? bg(device, P.gatedQkvSplit, [CB.qkvOut, CB.gateRaw, CB.cAttnOut, cU.gatedSplit])
             : undefined,
-          qkNorm: bg(device, P.qkNorm, [CB.qkvOut, lw.qNormGamma!, lw.kNormGamma!, cU.qkNorm]),
+          // Gated like its dispatch: llama32 has no q/k norm gammas at all, and
+          // bg() over an undefined buffer throws while BUILDING the engine.
+          qkNorm: S.qkNorm ? bg(device, P.qkNorm, [CB.qkvOut, lw.qNormGamma!, lw.kNormGamma!, cU.qkNorm]) : undefined,
           rope: bg(device, P.rope, [CB.qOut, CB.kOut, CB.vOut, CB.qkvOut, CB.posMap, cU.rope, ropeFreqs!]),
           kvApp: bg(device, P.kvAppend, [CB.kOut, CB.vOut, kvPages[kvIndex[L]], CB.posMap, cU.kvApp]),
           attn: bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
@@ -2246,7 +2260,7 @@ export function buildDecodeEngine(
       const dynGrid = (rows: number) => Math.ceil(rows / 4)
       const enc = device.createCommandEncoder()
       if (start === 0) clearGdnState(enc)
-      dispatch(enc, P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
+      dispatch(enc, AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
       dispatch(enc, P.rmsNorm, cbgInitNorm, n, 1, 1, 'cRmsNormInit')
       for (let L = 0; L < S.layers; L++) {
         const blk = cLayers[L]
@@ -2307,26 +2321,21 @@ export function buildDecodeEngine(
   // token dimension, so batching a chunk would apply one token's expert choice
   // to every token in it.
   const dynReady = (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn) != null
-  // `hybrid` is BACK, and it is not conservatism this time — it is a measured
-  // defect. With the gate open, scripts/chunk-prefill-test.mjs shows qwen3mlx
-  // (plain attention + affine) diverging from the per-token path at the very
-  // first generated token, on every prompt long enough to chunk. qwen35 stays
-  // token-identical, so the shared machinery is fine and the fault is in the
-  // plain-attention branch below or in how the engine drives the affine GEMM —
-  // the GEMM itself is pinned at 4.70e-4 with M-invariance at engine scale
-  // (N=256, M=31, CAP=64), so it is not the kernel.
-  // Everything needed is in place; what is missing is the diagnosis. Shipping
-  // it would trade correct prefill for a 2.98x speedup, which is the one trade
-  // this file refuses everywhere else.
+  // The `hybrid` arm came back for one day (2026-08-11): with the gate first
+  // opened, qwen3mlx diverged from per-token at the FIRST generated token. The
+  // cause was one line — the chunk path bound P.embedding unconditionally,
+  // dequantizing MLX-affine embeddings with the symmetric formula (see the
+  // cbgEmb comment in buildChunkPrefill). Fixed and re-opened; the equivalence
+  // gate is scripts/chunk-prefill-test.mjs, which now also refuses to pass a
+  // run in which no chunk actually executed.
   const chunkPrefill: ChunkPrefill | null =
-    hybrid && !S.moe && !partial && (opts.chunkedPrefill ?? true) && dynReady
+    !S.moe && !partial && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
   {
     const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''})`
       : S.moe ? 'off (per-token — MoE: ids[] has no token dimension)'
       : !dynReady ? 'off (per-token — no subgroups, so no batched GEMM)'
-      : !hybrid ? 'off (per-token — plain-attention chunking diverges, see chunk-prefill-test.mjs)'
       : 'off (per-token)'
     console.log(`[engine] chunked prefill: ${why}`)
   }

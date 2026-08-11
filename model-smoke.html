@@ -135,10 +135,15 @@ try{
     const mk = (chunkedPrefill) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: V, chunkedPrefill,
     })
-    const run = async (e) => { const out=[]; await e.generatePipelined(ids, n, (t)=>out.push(t), ()=>false); return out }
-    const chunked = await run(mk(true))
-    const perToken = await run(mk(false))
-    return { chunked, perToken }
+    const run = async (e) => {
+      const t0 = performance.now()
+      const out = []
+      await e.generatePipelined(ids, n, (t)=>out.push(t), ()=>false)
+      return { out, ms: performance.now() - t0 }
+    }
+    const a = await run(mk(true))
+    const b = await run(mk(false))
+    return { chunked: a.out, perToken: b.out, chunkedMs: a.ms, perTokenMs: b.ms }
   }
 
   // PAGE TABLE falsifier (docs/PAGING_PLAN.md §0.4). Runs the same ids twice on

@@ -1418,3 +1418,36 @@ stay at 4 bits.
 Qwen3.6-35B-A3B is 256 experts / 3B active. This says expert-only 3-bit is a
 mild intervention on *a* real MoE and that the harness resolves an 8% effect.
 It does not give `qwen36q3` a number.
+
+---
+
+## Chunked prefill for plain-attention + MLX-affine specs (2026-08-11, M2 Max)
+
+Until now chunked prefill was hybrid-and-MLC-only (`qwen35`), and the gate's
+`!AFFINE` arm was not a design decision but a missing kernel. Landed:
+`int4_matmul_batched_dyn_affine` (w = s·q + b, group 64, pinned vs CPU at
+4.70e-4 at engine scale N=256/M=31/CAP=64), the plain-attention chunk branch
+(no gatedQkvSplit/attnGate; `cAttnDim` collapses to `qkvDim`), and the affine
+embedding in the chunk path.
+
+Same-page A/B (`scripts/chunk-prefill-test.mjs`, 800-token prompt + 2 decode,
+one run per arm — **not a protocol round**): tokens are identical between the
+arms in every configuration, 26 chunks per run.
+
+| model | config | per-token | chunked | speedup |
+|---|---|---:|---:|---:|
+| qwen3mlx (Qwen3-4B MLX) | shipped (sg+tiled+splitK) | 11.48 s | **3.53 s** | **3.26×** |
+| qwen3mlx | scalar | 24.24 s | 3.60 s | 6.73× |
+| llama32 (Llama-3.2-1B) | shipped | 3.61 s | **1.01 s** | **3.57×** |
+| llama32 | scalar | 9.25 s | 1.06 s | 8.77× |
+
+MoE stays per-token (`ids[]` has no token dimension — one token's expert choice
+would apply to the whole chunk).
+
+**The bug this shipped over.** With the gate first opened, qwen3mlx diverged
+from per-token at the FIRST generated token: the chunk path bound `P.embedding`
+unconditionally, dequantizing MLX-affine embeddings with the symmetric formula
+(no bias). One line. The equivalence test now also refuses to pass a run in
+which zero chunks executed — its first version reported PASS at short prompt
+lengths where `CHUNK_MIN` kept chunking off in both arms and it compared the
+per-token path to itself.
