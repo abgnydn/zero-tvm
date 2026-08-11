@@ -1516,3 +1516,38 @@ The clean-ish runs read parity with the matvec, not a win: at M ≤ 64, L2
 evidently covers most of the matvec's activation re-reads. A quiet-machine
 same-session A/B (`CAP=64` tiled vs `CAP=68` matvec) decides the default;
 until then the claim is exactly "correct and available".
+
+### GEMM microbench (2026-08-12, `scripts/gemm-bench.mjs`) — the scoreboard that replaced guessing
+
+Isolated kernel timing on qwen3mlx's real chunk shapes, one Chrome boot, no
+model load, correctness-gated (a kernel that fails a from-the-formula CPU
+check gets its timings marked VOID — the gate fired twice today and both
+catches were real). Median-of-20, warm.
+
+| M=256 | matvec | tiled-v1 | **tiled-v2** | sgmat (experimental) |
+|---|---:|---:|---:|---:|
+| gate_up 2560→19456 | 1901 GF | 1689 | **2209** | 1851 |
+| ffn_down 9728→2560 | 1658 | 1697 | **2189** | 1864 |
+| o_proj 4096→2560 | 1610 | 1802 | **2256** | 1959 |
+
+At M=64: v2 ≈ matvec (the L2 covers the matvec's re-reads at small M).
+
+**tiled-v2** (dequantized weights staged in shared f32, bias folded into the
+stage, pure-FMA inner loop) is the winner and now backs the `chunkTiled`
+pipelines: +15–35% over the matvec at M=256, correct at 4.7e-4. **tiled-v1
+lost to the matvec it was meant to replace** — both amortize dequant over 4
+rows, so the roofline said parity and parity is what measured; it stays in
+gen.ts for the bench only.
+
+**`chromium-experimental-subgroup-matrix` EXISTS on this machine and the
+kernel runs** — Metal's simdgroup_float8x8 from WGSL, the primitive MLX's
+GEMMs are built on. First cut: compiles, executes, 1851–1959 GF (below v2 —
+naive fragment scheduling), and 3.4e-2 vs the CPU gate because f16 fragments
+round the staged weights, which is MLX-class arithmetic but fails this
+repo's strict gate. It is THE path to LM Studio-class prefill (their ~7–9 TF
+effective); needs fragment-layout tuning plus an explicit precision policy
+before it can be more than an experiment. Recorded, not shipped.
+
+Context for the ceiling: hand-written WGSL FMA tops out ~2.2–2.4 TF here;
+the remaining gap to MLX is the matrix unit, reachable only through the
+experimental feature above.

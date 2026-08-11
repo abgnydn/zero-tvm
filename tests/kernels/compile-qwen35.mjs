@@ -46,7 +46,7 @@ import {
   int4MatmulWGSL,
   int4MatmulEntry,
   INT4_MATMUL_VARIANTS,
-  int4MatmulTiledMWGSL,
+  int4MatmulTiledStWGSL,
 } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import {
   int4Matvec,
@@ -960,7 +960,7 @@ async function testMatmulBatchedDynAffine(device) {
 // References computed from the FORMULA per element, never from the kernel's
 // factored form — same discipline as the batched_dyn tests above.
 function makeTiledTest(affine) {
-  const name = affine ? 'int4_matmul_tiled_m_affine' : 'int4_matmul_tiled_m'
+  const name = affine ? 'int4_matmul_tiled_st_affine' : 'int4_matmul_tiled_st'
   return async function tiledTest(device) {
     const r = rng(affine ? 41 : 40)
     const K = Q.d, N = 200, M = 47, CAP = 64
@@ -971,7 +971,7 @@ function makeTiledTest(affine) {
     const biases = affine ? arr(N * SPR, () => toF16(r() * 0.1 - 0.05)) : null
     const input = arr(CAP * K, () => toF16(r() * 2 - 1))
 
-    const pipe = pipelineFor(device, withPrelude(int4MatmulTiledMWGSL(affine), Q), name)
+    const pipe = pipelineFor(device, withPrelude(int4MatmulTiledStWGSL(affine), Q), name)
     const inBuf = buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST)
     const wBuf = buffer(device, weights, BU.STORAGE | BU.COPY_DST)
     const sBuf = buffer(device, f16Array(Array.from(scales)), BU.STORAGE | BU.COPY_DST)
