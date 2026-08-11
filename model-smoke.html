@@ -147,6 +147,59 @@ try{
     return { chunked: a.out, perToken: b.out, chunkedMs: a.ms, perTokenMs: b.ms }
   }
 
+  // KV POOL (paging Phase 1). Fresh engine per arm — restore must work into a
+  // brand-new engine with zeroed buffers, because that is what a reload is.
+  // Per-token prefill in every arm: decode- and prefill-written KV are then the
+  // same kernel path, so the gate can demand IDENTICAL tokens. (With chunking,
+  // restored bytes mix chunk- and decode-written positions exactly like the
+  // existing cross-turn reuse does — same tolerance, weaker claim.)
+  window.__poolRun = async (promptIds, genTokens, extendIds, contTokens, tamper) => {
+    const { poolSave, poolTryRestore, poolClear } = await import('/src/zero-tvm/kv-pool.ts')
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }
+    const mk = () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: V, chunkedPrefill: false,
+    })
+    const cfg = (path) => ({
+      spec: S, weightRevision: S.hfRepo, variants: V, fused: false, int8KV: false,
+      prefillPath: path, adapter: { vendor: ad.info?.vendor ?? '?', architecture: ad.info?.architecture ?? '?' },
+    })
+    await poolClear()
+
+    // Arm A: live session — prefill + decode, then save.
+    const A = mk()
+    const gen = []
+    await A.generatePipelined(promptIds, genTokens, (t) => gen.push(t), () => false)
+    const saved = await poolSave(A, cfg('per-token'))
+    A.destroy()
+
+    const full = [...promptIds, ...gen, ...extendIds]
+
+    // Control: a fresh engine prefills the WHOLE extended prompt from zero.
+    const C = mk()
+    const control = []
+    await C.generatePipelined(full, contTokens, (t) => control.push(t), () => false)
+    C.destroy()
+
+    // Restored: a fresh engine attaches the saved prefix, prefills the delta.
+    const R = mk()
+    const res = await poolTryRestore(R, cfg('per-token'), full)
+    const t0 = performance.now()
+    const restored = []
+    await R.generatePipelined(full, contTokens, (t) => restored.push(t), () => false)
+    const restoredMs = performance.now() - t0
+    const reuse = R.getLastPrefill()
+    R.destroy()
+
+    // Negative: a fingerprint that differs in one field must refuse.
+    const T = mk()
+    const bad = await poolTryRestore(T, cfg(tamper ? 'chunked' : 'per-token'), full)
+    T.destroy()
+
+    return { saved, gen, control, restored, restoredMs,
+             restoredCount: res.restored, reuseInfo: reuse,
+             tamperRestored: tamper ? bad.restored : null, tamperReason: tamper ? (bad.reason ?? '') : null }
+  }
+
   // PAGE TABLE falsifier (docs/PAGING_PLAN.md §0.4). Runs the same ids twice on
   // a FRESH engine each time — identity table, then `perm` — and returns both
   // logit vectors. The readers (attention*.wgsl) go through the table; the

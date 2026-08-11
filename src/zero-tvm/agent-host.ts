@@ -25,6 +25,9 @@
  */
 
 import { bootEngine } from './loading-ui.js'
+import { buildDecodeEngine, allocKVPages } from './engine-core.js'
+import { parseVariantFlags, type VariantFlags } from './variants.js'
+import { poolSave, poolTryRestore, type PoolConfig } from './kv-pool.js'
 import { specFromSearch, buildChatPromptFor, modelBranding } from './model-select.js'
 import {
   withTools, parseToolCalls, renderAssistantCalls,
@@ -73,10 +76,22 @@ function dialectFor(id: string): ToolDialect {
 // hard error. Everything below the boot lives inside main(), started at the
 // bottom of the file — the same shape chat.ts uses.
 async function main(): Promise<void> {
+  let flags: VariantFlags | null = null
   const boot = await bootEngine({
     spec,
     optionalFeatures: ['subgroups'],
     probeSubgroups: true,
+    // The default boot is the SCALAR composition — no subgroups, no chunked
+    // prefill. This surface exists for agents, where prefill dominates, so it
+    // builds the chat-class engine the same way chat.ts does (and remembers
+    // the flags: the KV pool fingerprints them).
+    buildEngine: ({ device, weights, sgSizeOk, spec: sp }) => {
+      flags = parseVariantFlags(location.search, {
+        hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
+        sgSizeOk,
+      })
+      return buildDecodeEngine(device, weights, allocKVPages(device, sp), { spec: sp, variants: flags })
+    },
   })
   if (!boot.ok) {
     setStatus(`cannot boot: ${boot.reason}`, 'err')
@@ -84,6 +99,46 @@ async function main(): Promise<void> {
   }
   const { engine, tokenizer } = boot
   const dialect = dialectFor(spec.chatTemplateId)
+
+  // KV POOL (paging Phase 1): a saved prefix survives reload/crash/restart and
+  // restores in ~0.4s where re-prefill costs the whole prompt. ?pool=0 opts
+  // out. The gate behind this is scripts/kv-pool-test.mjs — cold restore is
+  // token-identical to full prefill under the per-token path, and shares the
+  // existing cross-turn-reuse tolerance under chunking.
+  const poolOn = new URL(location.href).searchParams.get('pool') !== '0'
+  const poolCfg = (): PoolConfig => ({
+    spec,
+    weightRevision: spec.hfRepo,
+    variants: flags!,
+    fused: false,
+    int8KV: false,
+    prefillPath: !spec.moe && flags!.subgroups ? 'chunked' : 'per-token',
+    adapter: { vendor: 'browser', architecture: 'webgpu' },
+  })
+  let poolTried = false
+  // Save on IDLE, not per-job: exportKV's readback takes ~100-300ms, and doing
+  // it between `done` and `busy=false` made every back-to-back request bounce
+  // off "busy" (the agent-server test caught it — a pipelined client saw its
+  // second request refused). A snapshot 1.5s after the last job is the same
+  // durability for a restart, and a new job cancels the pending save. `saving`
+  // serializes the one real hazard: a readback overlapping the next
+  // generation's writes would tear the snapshot.
+  let saveTimer: number | null = null
+  let saving: Promise<void> | null = null
+  const scheduleSave = () => {
+    if (!poolOn) return
+    if (saveTimer !== null) clearTimeout(saveTimer)
+    saveTimer = self.setTimeout(() => {
+      saveTimer = null
+      if (busy) return          // a job started; it will reschedule when done
+      saving = (async () => {
+        try {
+          const sv = await poolSave(engine, poolCfg())
+          if (sv.tokens) logLine(`pool: saved ${sv.tokens} tokens`)
+        } catch (e2) { logLine(`pool: save failed (${(e2 as Error).message})`) }
+      })().finally(() => { saving = null })
+    }, 1500)
+  }
   setStatus(`ready — ${spec.maxContext.toLocaleString()} token context, ${dialect}`, 'ok')
   logLine(`engine up: ${spec.id}, dialect ${dialect}`)
 
@@ -132,6 +187,8 @@ async function run(job: Job): Promise<void> {
     return
   }
   busy = true
+  if (saveTimer !== null) { clearTimeout(saveTimer); saveTimer = null }
+  if (saving) await saving          // never generate over a readback
   const t0 = performance.now()
   const emit = new Emitter(job.id)
   try {
@@ -152,6 +209,13 @@ async function run(job: Job): Promise<void> {
     if (job.tools?.length) messages = withTools(dialect, messages, job.tools)
 
     const promptIds = buildChatPromptFor(spec, messages as Parameters<typeof buildChatPromptFor>[1], tokenizer)
+    if (poolOn && !poolTried) {
+      // Once, on the first request after boot — a reload is the case the pool
+      // exists for. Later requests ride the in-session absorbed record.
+      poolTried = true
+      const r = await poolTryRestore(engine, poolCfg(), promptIds)
+      logLine(r.restored ? `pool: restored ${r.restored} tokens` : `pool: miss (${r.reason})`)
+    }
     if (promptIds.length >= spec.maxContext) {
       throw new Error(
         `prompt is ${promptIds.length} tokens, context is ${spec.maxContext}. `
@@ -223,6 +287,7 @@ async function run(job: Job): Promise<void> {
     await post({ type: 'error', id: job.id, message: (e as Error).message })
   } finally {
     busy = false
+    scheduleSave()
   }
 }
 

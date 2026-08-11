@@ -182,6 +182,18 @@ Freeze a real transcript as a fixture. Real ones exist on this machine: `~/.pi/a
 
 ### PHASE 1 — Persistence. Zero kernel changes. (~1 week) **This is the useful subset.**
 
+> **SHIPPED 2026-08-12** (`kv-pool.ts`, `engine-core.ts exportKV/importKV`,
+> wired into `agent-host` — the surface it exists for — with `?pool=0` out).
+> Gate: `scripts/kv-pool-test.mjs` on llama32 AND qwen35 (the GDN blob path):
+> save a live session → FRESH engine → restore → continue. **Tokens identical
+> to a full-prefill control (16/16 both models)**, tampered fingerprint
+> refused, restored continuation 0.4–0.9 s, 0 GPU errors. Deliberately
+> smaller than this section's full spec: one entry per fingerprint in OPFS,
+> latest-wins, no IndexedDB tier and no multi-entry index yet — those are the
+> Phase 3 sharing/eviction concerns, and `prefix-pool.ts`'s chain-hash index
+> is ready for them. Save is idle-debounced (1.5 s): a per-job save raced the
+> next request and the agent gate caught it as spurious "busy" refusals.
+
 The insight that makes this a week rather than a month: **a prefix always restores to its own positions, so it needs no page table at all.** Under the identity table, restoring k blocks is writing the first `k × bytesPerPage` bytes of each layer buffer — one contiguous `writeBuffer` per layer. Everything in Phase 2 and 3 is about *aliasing*, which persistence does not need.
 
 **1.1 — The fingerprint, as a pure function.**

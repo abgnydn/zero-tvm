@@ -183,6 +183,14 @@ export interface DecodeEngine {
    * currently do not (docs/PAGING_PLAN.md §0.4). Do not call from app code.
    */
   setPageTable(pageVals: Int32Array<ArrayBuffer>): void
+  /** Paging Phase 1 — read the absorbed prefix's KV (+ GDN state) out as
+   *  bytes, or null when this engine's state is not poolable (MLA, int8,
+   *  pipeline stage, invalid record, mid-chunk hybrid state). */
+  exportKV(): Promise<{ tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] } | null>
+  /** Write a saved prefix back and claim it in the absorbed record. The
+   *  CALLER guarantees fingerprint equality (kv-pool.ts); these bytes carry
+   *  no self-identification. */
+  importKV(snap: { tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] }): boolean
   /**
    * Per-token NLL over a sequence — the perplexity primitive. `nll[p]` is
    * `-log P(ids[p+1] | ids[0..p])`, so the result has `ids.length - 1` entries.
@@ -2005,6 +2013,89 @@ export function buildDecodeEngine(
     return lastPrefill
   }
 
+  /**
+   * PAGING PHASE 1 (docs/PAGING_PLAN.md) — export the KV state that encodes
+   * `absorbed`, as bytes a later engine can swallow.
+   *
+   * The whole trick is the plan's §1 insight: a prefix always restores to its
+   * OWN positions, so under the identity page table this is a contiguous slice
+   * off the front of each attention layer's buffer — no page table, no kernel
+   * change, no address translation. Chunked at 64 MiB, the measured readback
+   * sweet spot (BENCH.md, KV paging feasibility; 16 MiB costs ~30%).
+   *
+   * Hybrid specs carry the GDN recurrence too: fixed-size conv+recur blobs,
+   * valid ONLY at exactly `absorbed.length` tokens — the recurrence cannot be
+   * rewound, so a restored hybrid entry is exact-length attach only (the
+   * reuseStart rules already enforce that).
+   *
+   * Refused for MLA (flat position*L cache, unpooled in Phase 1), int8 KV
+   * (f16-only per the plan's §7 — a pool keyed on layout would split), and
+   * pipeline stages.
+   */
+  async function exportKV(): Promise<{ tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] } | null> {
+    if (partial || MLA || int8Mode) return null
+    if (!absorbedValid || absorbed.length === 0) return null
+    if (hybrid && gdnStatePos !== absorbed.length) return null   // mid-chunk state: not attachable
+    const tokens = absorbed.length
+    const bytesPerPage = S.kvPageStride * 2
+    const byteLen = Math.ceil(tokens / S.pageSize) * bytesPerPage
+    const CHUNK = 64 * 1024 * 1024
+    const readBack = async (src: GPUBuffer, len: number): Promise<ArrayBuffer> => {
+      const out = new Uint8Array(len)
+      for (let off = 0; off < len; off += CHUNK) {
+        const n = Math.min(CHUNK, len - off)
+        const staging = device.createBuffer({ size: n, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+        const enc = device.createCommandEncoder()
+        enc.copyBufferToBuffer(src, off, staging, 0, n)
+        device.queue.submit([enc.finish()])
+        await staging.mapAsync(GPUMapMode.READ)
+        out.set(new Uint8Array(staging.getMappedRange()), off)
+        staging.unmap()
+        staging.destroy()
+      }
+      return out.buffer
+    }
+    const layers: ArrayBuffer[] = []
+    for (const pages of kvPages) layers.push(await readBack(pages, byteLen))
+    const gdn: ArrayBuffer[] = []
+    if (hybrid) {
+      for (let L = 0; L < S.layers; L++) {
+        if (!gdnConvState[L]) continue
+        gdn.push(await readBack(gdnConvState[L]!, gdnConvState[L]!.size))
+        gdn.push(await readBack(gdnRecurState[L]!, gdnRecurState[L]!.size))
+      }
+    }
+    return { tokens, ids: [...absorbed], layers, gdn }
+  }
+
+  /**
+   * The other half: write a saved prefix back and CLAIM it in the absorbed
+   * record, so the next prefill's computeReuseStart sees `tokens` already in
+   * the cache and prefills only the delta. The caller (kv-pool.ts) is
+   * responsible for fingerprint equality — bytes from a different variant set
+   * or weight revision are a different model, and nothing here can tell.
+   */
+  function importKV(snap: { tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] }): boolean {
+    if (partial || MLA || int8Mode) return false
+    if (snap.layers.length !== kvPages.length) return false
+    if (snap.tokens > MAX_CONTEXT || snap.ids.length !== snap.tokens) return false
+    for (let i = 0; i < kvPages.length; i++) {
+      device.queue.writeBuffer(kvPages[i], 0, snap.layers[i])
+    }
+    if (hybrid) {
+      let g = 0
+      for (let L = 0; L < S.layers; L++) {
+        if (!gdnConvState[L]) continue
+        device.queue.writeBuffer(gdnConvState[L]!, 0, snap.gdn[g++])
+        device.queue.writeBuffer(gdnRecurState[L]!, 0, snap.gdn[g++])
+      }
+      gdnStatePos = snap.tokens
+    }
+    absorbed = [...snap.ids]
+    absorbedValid = true
+    return true
+  }
+
   function resetKVTracking(): void {
     // Drop the absorbed-token record so the next generatePipelined performs a
     // full prefill (the KV pages themselves need no clearing — stale slots
@@ -2926,6 +3017,8 @@ export function buildDecodeEngine(
     scoreSequence: guard('scoreSequence', scoreSequence),
     pipelineStep: guard('pipelineStep', pipelineStep),
     setSampling: guard('setSampling', setSampling),
+    exportKV: guard('exportKV', exportKV),
+    importKV: guard('importKV', importKV),
     setPageTable: guard('setPageTable', setPageTable),
     resetKVTracking: guard('resetKVTracking', resetKVTracking),
     debugCompareReuse: guard('debugCompareReuse', debugCompareReuse),
