@@ -54,6 +54,20 @@ p.add_argument("--window", type=int, default=512, help="tokens per independent w
 p.add_argument("--windows", type=int, default=24, help="how many windows to score")
 p.add_argument("--out", default=None, help="write JSON here")
 p.add_argument(
+    "--compare",
+    nargs=2,
+    metavar=("A.json", "B.json"),
+    help=(
+        "combine two single-arm runs instead of scoring. For a model too large "
+        "to load twice safely: run --a X --out a.json, then --a Y --out b.json, "
+        "then --compare a.json b.json. Each arm peaks at ONE checkpoint in its "
+        "own process, so memory is released by the OS rather than by "
+        "mx.clear_cache(). The windows are identical across runs because they "
+        "are the first N of a deterministic tokenization of the same corpus — "
+        "which this re-checks rather than assumes."
+    ),
+)
+p.add_argument(
     "--dtype",
     default="bfloat16",
     choices=["bfloat16", "float32"],
@@ -69,6 +83,61 @@ p.add_argument(
 args = p.parse_args()
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def report(ra: dict, rb: dict, window: int) -> dict:
+    """The paired comparison and the verdict. Shared by the one-process path
+    and --compare, so both cannot drift apart."""
+    if len(ra["per_window"]) != len(rb["per_window"]):
+        raise SystemExit(
+            f"arms scored different window counts ({len(ra['per_window'])} vs "
+            f"{len(rb['per_window'])}) — not comparable")
+    delta = (rb["perplexity"] / ra["perplexity"] - 1) * 100
+    d = [b - a for a, b in zip(ra["per_window"], rb["per_window"])]
+    n = len(d)
+    dm = sum(d) / n
+    dvar = sum((x - dm) ** 2 for x in d) / max(1, n - 1)
+    dsem = math.sqrt(dvar / n)
+    z = abs(dm) / dsem if dsem > 0 else float("inf")
+    z_unpaired = abs(rb["mean_nll"] - ra["mean_nll"]) / math.sqrt(ra["sem_nll"] ** 2 + rb["sem_nll"] ** 2)
+    worse = sum(1 for x in d if x > 0)
+    print(f"  A perplexity {ra['perplexity']:.3f}  [{ra['ppl_lo']:.3f}, {ra['ppl_hi']:.3f}]")
+    print(f"  B perplexity {rb['perplexity']:.3f}  [{rb['ppl_lo']:.3f}, {rb['ppl_hi']:.3f}]")
+    print(f"\n  B is {delta:+.1f}% perplexity vs A, paired z = {z:.1f}"
+          f"  (unpaired {z_unpaired:.1f}; B worse on {worse}/{n} windows)")
+    if z < 2:
+        print("  NOT DISTINGUISHABLE at this window count — raise --windows before concluding")
+    elif delta <= 10:
+        print("  SHIP: within +10% with separated error bars")
+    elif delta <= 25:
+        print("  MARGINAL: +10-25%. Real, and a task benchmark should decide, not this")
+    else:
+        print("  DO NOT SHIP on this evidence: >+25%")
+    print("\n  Perplexity understates reasoning damage — published work puts the")
+    print("  math-accuracy drop at 3-bit around 3x the perplexity drop. A pass")
+    print("  here is necessary, not sufficient.")
+    return {"delta_pct": delta, "z": z, "z_unpaired": z_unpaired,
+            "windows_b_worse": worse, "window": window}
+
+
+if args.compare:
+    a = json.load(open(args.compare[0]))
+    b = json.load(open(args.compare[1]))
+    ra, rb = a["a"], b["a"]
+    if a.get("window") != b.get("window") or a.get("windows") != b.get("windows"):
+        raise SystemExit("the two runs used different windowing — not comparable")
+    # The windows must be the SAME TEXT, not merely the same count. Both runs
+    # record the tokenization's fingerprint for exactly this check.
+    if a.get("ids_digest") != b.get("ids_digest"):
+        raise SystemExit(
+            f"the two runs scored DIFFERENT tokens "
+            f"({a.get('ids_digest')} vs {b.get('ids_digest')}) — not comparable")
+    print(f"A  {ra['path']}\nB  {rb['path']}\n")
+    out = report(ra, rb, a.get("window"))
+    if args.out:
+        json.dump({"a": ra, "b": rb, **out}, open(args.out, "w"), indent=1)
+        print(f"\n  -> {args.out}")
+    raise SystemExit(0)
 
 
 def corpus_text() -> str:

@@ -1,0 +1,46 @@
+<!doctype html><meta charset="utf-8"><title>zero-tvm · agent host</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/chat-ui.css">
+<style>
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 2rem;
+         background: #0b0d10; color: #d6dbe1; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; letter-spacing: .02em }
+  .sub { color: #7d8590; margin-bottom: 1.5rem }
+  .card { border: 1px solid #21262d; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1rem;
+          background: #0f1216 }
+  #status { font-weight: 600 }
+  #status.ok { color: #3fb950 } #status.err { color: #f85149 }
+  #log { white-space: pre-wrap; color: #8b949e; font-size: 12.5px; max-height: 22rem; overflow: auto;
+         margin: 0 }
+  code { background: #161b22; padding: .1rem .35rem; border-radius: 4px; color: #d6dbe1 }
+  .warn { color: #d29922 }
+</style>
+<h1>zero-tvm · agent host</h1>
+<div class="sub">This tab runs the model. <code>scripts/agent-server.mjs</code> gives it an OpenAI-shaped address.</div>
+
+<div class="card">
+  <div id="status">booting…</div>
+  <div class="sub" style="margin:.35rem 0 0" id="model"></div>
+</div>
+
+<div class="card">
+  <div style="margin-bottom:.5rem">Point a client at <code>http://127.0.0.1:8017/v1</code></div>
+  <div class="sub" style="margin:0">
+    <b>Cline</b> — API Provider “OpenAI Compatible”, Base URL above, any model id.<br>
+    <b>pi</b> — <code>~/.pi/agent/models.json</code>, <code>api: "openai-completions"</code>, that baseUrl.<br>
+    <b>curl</b> — <code>curl 127.0.0.1:8017/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}]}' -H 'content-type: application/json'</code>
+  </div>
+</div>
+
+<div class="card">
+  <div class="warn" style="margin-bottom:.5rem">Keep this tab visible.</div>
+  <div class="sub" style="margin:0">Chrome throttles background tabs hard — share.ts measured ~23 tok/s
+    backgrounded against ~65 focused. An agent run is long and unattended, which is exactly when a tab
+    stops being focused.</div>
+</div>
+
+<div class="card"><pre id="log"></pre></div>
+
+<div id="progress-wrap" hidden><div id="progress"></div><div id="progress-status"></div><div id="progress-detail"></div></div>
+<div id="badge" hidden></div>
+<script type="module" src="/src/zero-tvm/agent-host.ts"></script>
