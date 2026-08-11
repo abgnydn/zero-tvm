@@ -330,6 +330,10 @@ export interface DecodeEngineOptions {
   /** Chunk capacity in tokens (default 64). See the CHUNK_CAP note in
    *  buildChunkPrefill; sweep results in BENCH.md. */
   chunkCap?: number
+  /** Use the tiled batched GEMM for chunk projections (default false — see
+   *  the tiledOK note in buildChunkPrefill: correct, but not yet measured
+   *  faster on a quiet machine). */
+  chunkTiled?: boolean
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -2063,7 +2067,27 @@ export function buildDecodeEngine(
     // MLC symmetric and MLX affine are different kernels with different
     // bindings — affine takes a 6th buffer (biases at @binding(5)) and reads
     // its scales in groups of 64 rather than 32.
-    const dyn = (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
+    //
+    // TWO GEMM shapes exist. The TILED one (32x32 output tile, staged
+    // activations in workgroup memory, no subgroups needed) is the fast path —
+    // it is why prefill stopped being a 4-row matvec. It requires K%64 on
+    // every contraction this chunk path dispatches and a chunk capacity that
+    // tiles by 32; anything else falls back to batched_dyn, correct but slow.
+    // OPT-IN, not default — and that is a measurement decision, not caution.
+    // The tiled kernel is correct (22/22 at ragged edges, token-identical
+    // in-engine on llama32 and qwen35), but on the day it landed every timing
+    // was noise-dominated (the machine had just recovered from a memory
+    // freeze; per-token baselines drifted 11.5s -> 38.7s within hours), and
+    // the clean-ish runs read parity with batched_dyn, not a win — at M<=64
+    // Apple's L2 apparently covers most of the matvec's activation re-reads.
+    // It becomes the default when a quiet-machine A/B says so, not before.
+    const tiledOK = opts.chunkTiled === true
+      && CHUNK_CAP % 32 === 0
+      && [S.d, S.qDim, S.ffn, ...(hybrid ? [S.gdnVDim] : [])].every((k) => k % 64 === 0)
+    const gemm = tiledOK
+      ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
+      : (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
+    const dyn = gemm
     /** A batched-GEMM bind group. bg() maps array position to binding index, so
      *  the bias buffer must come LAST and only when the affine kernel is in
      *  use — a 6-buffer group against a 5-binding layout is rejected outright,
@@ -2265,7 +2289,11 @@ export function buildDecodeEngine(
       device.queue.writeBuffer(cU.normOut, 8, new Uint32Array([n * S.gdnVHeads]))
       device.queue.writeBuffer(cU.silu, 0, new Int32Array([n, n * FFN_WGS]))
 
-      const dynGrid = (rows: number) => Math.ceil(rows / 4)
+      // Tiled: 2-D grid over (N/32, n/32). Fallback matvec: N/4 on x alone.
+      const gemmDispatch = (enc2: GPUCommandEncoder, bgx: GPUBindGroup, rows: number, label: string) =>
+        tiledOK
+          ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 32), 1, label)
+          : dispatch(enc2, gemm, bgx, Math.ceil(rows / 4), 1, 1, label)
       const enc = device.createCommandEncoder()
       if (start === 0) clearGdnState(enc)
       dispatch(enc, AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
@@ -2273,27 +2301,27 @@ export function buildDecodeEngine(
       for (let L = 0; L < S.layers; L++) {
         const blk = cLayers[L]
         if (blk.gdnProj) {
-          dispatch(enc, dyn, blk.gdnProj, dynGrid(S.gdnProjRows), 1, 1, 'cGdnProj')
+          gemmDispatch(enc, blk.gdnProj, S.gdnProjRows, 'cGdnProj')
           dispatch(enc, P.gdnConvSeq, blk.conv!, n * GDN_CONV_WGS, 1, 1, 'cGdnConv')
           dispatch(enc, P.gdnConvCommit, blk.convCommit!, CONV_COMMIT_WGS, 1, 1, 'cGdnConvCommit')
           dispatch(enc, P.gdnGates, blk.gates!, n, 1, 1, 'cGdnGates')
           dispatch(enc, P.gdnRecur, blk.recur!, S.gdnVHeads, 1, 1, 'cGdnRecur')
           dispatch(enc, P.gdnNormOut, blk.normOut!, n * S.gdnVHeads, 1, 1, 'cGdnNormOut')
-          dispatch(enc, dyn, blk.oProj, dynGrid(S.d), 1, 1, 'cGdnOutProj')
+          gemmDispatch(enc, blk.oProj, S.d, 'cGdnOutProj')
         } else {
-          dispatch(enc, dyn, blk.cAttn!, dynGrid(S.cAttnDim), 1, 1, 'cCAttn')
+          gemmDispatch(enc, blk.cAttn!, S.cAttnDim, 'cCAttn')
           if (blk.gatedSplit) dispatch(enc, P.gatedQkvSplit, blk.gatedSplit, n * CATTN_WGS, 1, 1, 'cGatedSplit')
           if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, n * QK_NORM_WGS, 1, 1, 'cQkNorm')
           dispatch(enc, P.rope, blk.rope!, n * QKV_WGS, 1, 1, 'cRope')
           dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
           dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
           if (blk.attnGate) dispatch(enc, P.attnGate, blk.attnGate, n * ATTN_GATE_WGS, 1, 1, 'cAttnGate')
-          dispatch(enc, dyn, blk.oProj, dynGrid(S.d), 1, 1, 'cOProj')
+          gemmDispatch(enc, blk.oProj, S.d, 'cOProj')
         }
         dispatch(enc, P.addNorm, blk.addNorm1, n, 1, 1, 'cAddNorm1')
-        dispatch(enc, dyn, blk.gateUp, dynGrid(2 * S.ffn), 1, 1, 'cGateUp')
+        gemmDispatch(enc, blk.gateUp, 2 * S.ffn, 'cGateUp')
         dispatch(enc, P.siluMul, blk.silu, n * FFN_WGS, 1, 1, 'cSiluMul')
-        dispatch(enc, dyn, blk.ffnDown, dynGrid(S.d), 1, 1, 'cFfnDown')
+        gemmDispatch(enc, blk.ffnDown, S.d, 'cFfnDown')
         dispatch(enc, P.addNorm, blk.addNorm2, n, 1, 1, 'cAddNorm2')
       }
       device.queue.submit([enc.finish()])

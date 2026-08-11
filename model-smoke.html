@@ -134,6 +134,7 @@ try{
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
     const mk = (chunkedPrefill) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: V, chunkedPrefill, ...(cap ? { chunkCap: cap } : {}),
+      chunkTiled: new URLSearchParams(location.search).get('tiled') === '1',
     })
     const run = async (e) => {
       const t0 = performance.now()

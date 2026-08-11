@@ -46,6 +46,7 @@ import {
   int4MatmulWGSL,
   int4MatmulEntry,
   INT4_MATMUL_VARIANTS,
+  int4MatmulTiledMWGSL,
 } from '../../src/compiler/shaders/int4_matmul.gen.ts'
 import {
   int4Matvec,
@@ -950,6 +951,74 @@ async function testMatmulBatchedDynAffine(device) {
   }
 }
 
+// ── int4_matmul_tiled_m(+_affine) — the tiled prefill GEMM vs CPU reference ─
+//
+// The shapes are chosen to hit every edge the kernel guards:
+//   M=47, CAP=64  -> TWO y-tiles (ceil(47/32)=2), second one ragged in M
+//   N=200         -> SEVEN x-tiles, last one ragged in N (200 = 6*32 + 8)
+// so a wrong guard shows up as a mismatch or a write past M, not silence.
+// References computed from the FORMULA per element, never from the kernel's
+// factored form — same discipline as the batched_dyn tests above.
+function makeTiledTest(affine) {
+  const name = affine ? 'int4_matmul_tiled_m_affine' : 'int4_matmul_tiled_m'
+  return async function tiledTest(device) {
+    const r = rng(affine ? 41 : 40)
+    const K = Q.d, N = 200, M = 47, CAP = 64
+    const GROUP = affine ? 64 : 32
+    const KP = K / 8, SPR = K / GROUP
+    const weights = Uint32Array.from(arr(N * KP, () => (r() * 0xffffffff) >>> 0))
+    const scales = arr(N * SPR, () => toF16(r() * 0.05 + 0.01))
+    const biases = affine ? arr(N * SPR, () => toF16(r() * 0.1 - 0.05)) : null
+    const input = arr(CAP * K, () => toF16(r() * 2 - 1))
+
+    const pipe = pipelineFor(device, withPrelude(int4MatmulTiledMWGSL(affine), Q), name)
+    const inBuf = buffer(device, f16Array(input), BU.STORAGE | BU.COPY_DST)
+    const wBuf = buffer(device, weights, BU.STORAGE | BU.COPY_DST)
+    const sBuf = buffer(device, f16Array(Array.from(scales)), BU.STORAGE | BU.COPY_DST)
+    const bBuf = affine ? buffer(device, f16Array(Array.from(biases)), BU.STORAGE | BU.COPY_DST) : null
+    const run = async (m) => {
+      const out = device.createBuffer({ size: CAP * N * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+      device.queue.writeBuffer(out, 0, new Uint16Array(CAP * N))
+      const pod = buffer(device, new Uint32Array([KP, SPR, N, m]), BU.UNIFORM | BU.COPY_DST)
+      const bufs = affine ? [out, inBuf, sBuf, wBuf, pod, bBuf] : [out, inBuf, sBuf, wBuf, pod]
+      const bytes = await runCompute(device, pipe, bufs,
+        [Math.ceil(N / 32), Math.ceil(m / 32)], 0, CAP * N * 2)
+      return new Uint16Array(bytes)
+    }
+    const got = await run(M)
+    const gotCap = await run(CAP)
+
+    let maxRel = 0
+    for (let b = 0; b < M; b++) {
+      const x = input.slice(b * K, (b + 1) * K)
+      const ref = arr(N, (_, row) => {
+        let acc = 0
+        for (let i = 0; i < K; i++) {
+          const nib = (weights[row * KP + (i >> 3)] >>> ((i & 7) * 4)) & 15
+          const g = Math.floor(i / GROUP)
+          acc += affine
+            ? (scales[row * SPR + g] * nib + biases[row * SPR + g]) * x[i]
+            : scales[row * SPR + g] * (nib - 7) * x[i]
+        }
+        return acc
+      })
+      const gotRow = Array.from(got.subarray(b * N, (b + 1) * N), f16BitsToF32)
+      maxRel = Math.max(maxRel, maxRelDiff(gotRow, ref, 1e-2))
+    }
+    let tailBad = 0
+    for (let i = M * N; i < CAP * N; i++) if (got[i] !== 0) tailBad++
+    let mBad = 0
+    for (let i = 0; i < M * N; i++) if (got[i] !== gotCap[i]) mBad++
+    const pass = maxRel < 1e-2 && tailBad === 0 && mBad === 0
+    return {
+      name, pass,
+      detail: `max rel err ${maxRel.toExponential(2)} vs CPU, ${tailBad} rows-past-M writes, ${mBad} M-variance mismatches (M=47 CAP=64 N=200)`,
+    }
+  }
+}
+const testMatmulTiledM = makeTiledTest(false)
+const testMatmulTiledMAffine = makeTiledTest(true)
+
 // ── full chunked GDN chain — ONE chunk of 6 vs 6 single-token chunks (must be
 // BIT-EXACT, f32 state included) and vs the sequential CPU reference ─────────
 async function testGdnChunkChain(device) {
@@ -1191,6 +1260,8 @@ const TESTS = [
   { label: 'gdn_gates_seq', fn: testGdnGatesSeq },
   { label: 'matmul_batched_dyn', fn: testMatmulBatchedDyn },
   { label: 'matmul_batched_dyn_affine', fn: testMatmulBatchedDynAffine },
+  { label: 'matmul_tiled_m', fn: testMatmulTiledM },
+  { label: 'matmul_tiled_m_affine', fn: testMatmulTiledMAffine },
   { label: 'gdn_chunk_chain', fn: testGdnChunkChain },
   { label: 'attention_prefill', fn: testAttentionPrefill },
   { label: 'silu_mul', fn: testSiluMul },

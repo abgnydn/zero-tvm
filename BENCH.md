@@ -1499,3 +1499,20 @@ A note my own records force: an earlier measurement had LM Studio prefill at
 465 tok/s — that number came from agentic-loop server logs (uncached tokens ÷
 prefill seconds under real load), not a clean benchmark, and today's clean
 1,385 supersedes it for hardware-capability claims.
+
+### Tiled batched GEMM (2026-08-12): correct, NOT yet default — no clean measurement exists
+
+`int4_matmul_tiled_m(_affine)` landed: 32×32 output tile, activations staged in
+workgroup memory, no subgroups required, same bindings/uniforms as batched_dyn.
+Correct at every ragged edge (M=47/CAP=64 → two y-tiles, N=200 → ragged x-tile;
+4.84e-4 / 8.42e-4 vs CPU, M-invariant, no writes past M) and token-identical
+in-engine on llama32 and qwen35.
+
+**It is opt-in (`chunkTiled` / `?tiled=1`), because no honest speed number
+exists.** Every timing on landing day was noise-dominated — the machine had
+just recovered from a memory freeze (a 19.5 GB LM Studio model loaded during
+GPU tests) and the per-token baseline drifted 11.5 s → 38.7 s within hours.
+The clean-ish runs read parity with the matvec, not a win: at M ≤ 64, L2
+evidently covers most of the matvec's activation re-reads. A quiet-machine
+same-session A/B (`CAP=64` tiled vs `CAP=68` matvec) decides the default;
+until then the claim is exactly "correct and available".

@@ -15,7 +15,7 @@
 // generated (see shaders/int4_matmul.gen.ts). Every source is piped through
 // withPrelude() so model-shape constants come from one place (shader-prelude.ts).
 import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
-import { int4MatmulWGSL, int4MatmulEntry } from './shaders/int4_matmul.gen'
+import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledMWGSL } from './shaders/int4_matmul.gen'
 import embeddingAffineSrc from './shaders/embedding_affine.wgsl?raw'
 import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
 import moeRouterLogitsF16Src from './shaders/moe_router_logits_f16.wgsl?raw'
@@ -100,6 +100,11 @@ export interface Pipelines {
   /** The same GEMM for MLX-affine weights (w = s*q + b, group 64). Without it
    *  every affine checkpoint prefills one token at a time. */
   int4MatmulBatchedDynAffine: GPUComputePipeline | null
+  /** Tiled batched GEMM (32x32 tile, workgroup memory, NO subgroups needed) —
+   *  the prefill kernel. Engine picks it over batched_dyn when K%64==0 and the
+   *  chunk capacity is a multiple of 32; see the generator's header. */
+  int4MatmulTiledM: GPUComputePipeline
+  int4MatmulTiledMAffine: GPUComputePipeline
   // vec4-load variants — default ON since 2026-07-25 (+7.1% with the qkv
   // sibling on M2 Max, BENCH.md); ?vec4=0 opts out:
   int4MatmulSgVec4: GPUComputePipeline | null       // vec4-load _sg variant
@@ -280,6 +285,8 @@ export function compile(
     int4MatmulBatchedM4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, m: 4 }), 'int4_matmul_batched_m4') : null,
     int4MatmulBatchedDyn: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true }), 'int4_matmul_batched_dyn') : null,
     int4MatmulBatchedDynAffine: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true, affine: true }), 'int4_matmul_batched_dyn_affine') : null,
+    int4MatmulTiledM: createPipeline(device, int4MatmulTiledMWGSL(false), 'int4_matmul_tiled_m'),
+    int4MatmulTiledMAffine: createPipeline(device, int4MatmulTiledMWGSL(true), 'int4_matmul_tiled_m_affine'),
     int4MatmulSgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4') : null,
     int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
     int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,
