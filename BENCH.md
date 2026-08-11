@@ -1644,3 +1644,19 @@ Running ratio vs LM Studio's clean 1,385 tok/s: **0.17× → ~0.27×** in one
 day. Remaining arms: direct store, TILE_K/tile sweep, swizzle (E3/E5), the
 robustness-tax measurement (E2), split-K for small dispatches (E4). The
 research's ceiling estimate stands: 0.70–0.75× native ≈ 620–810 tok/s.
+
+### E2: the Chrome tax, measured and (locally) reclaimed (2026-08-12, late)
+
+`--enable-dawn-features=disable_robustness` — Chrome's mandatory GPU
+bounds-checking, off. Kernel-level (same run): sg-e1 3,832 → 4,839 GF; and
+llama.cpp's 8-subgroup config FLIPS to the winner at **5,095 GF = 5.1 TF**,
+inside the research's 5.0–6.5 TF native-ceiling band. End-to-end qwen3mlx
+prefill: 2.03 → **1.66 s** (394 → **482 tok/s**), tokens identical.
+
+Not web-shippable — but `ztvm` launches its own Chrome, so the LOCAL agent
+surface claims it by default (separate profile that only ever loads our
+localhost page; `--safe` opts out). zerotvm.com stays on stock Chrome rules.
+
+Running prefill ratio vs LM Studio's 1,385: 0.17× (morning) → 0.27× → **0.35×
+(local agent)**. Next known steps: graduate the 8-subgroup config as the
+unsafe-mode kernel (5.1 TF vs e1's 4.8), then E3/E5 sweep arms.

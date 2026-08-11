@@ -78,11 +78,32 @@ for (let i = 0; i < 40; i++) {
   await new Promise((r) => setTimeout(r, 500))
 }
 
-// 2. the hosting tab.
+// 2. the hosting tab — in ZTVM'S OWN Chrome instance, not the user's browser.
+// A Chrome we launch can take Dawn flags the public web never gets, and one of
+// them is worth +22% prefill end-to-end: disable_robustness removes the
+// mandatory bounds-check on every GPU buffer access (measured here: 482 vs
+// 394 tok/s on qwen3mlx, tokens identical; kernel-level +26-56%, E2 in
+// docs/PREFILL_RESEARCH.md). Safe for THIS surface because the separate
+// profile only ever loads our localhost page — do not browse in that window.
+// --safe opts back into a stock browser tab.
 const url = `http://localhost:5173/agent-host.html?model=${param}`
   + (ctx ? `&ctx=${ctx}` : '') + (pool ? '' : '&pool=0')
-spawn('open', ['-a', 'Google Chrome', url], { stdio: 'ignore' }).on('error', () => spawn('open', [url]))
-console.log(`opening ${url}`)
+const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+if (!args.includes('--safe') && existsSync(CHROME)) {
+  const profile = join(homedir(), '.zerotvm', 'chrome-profile')
+  const c = spawn(CHROME, [
+    `--user-data-dir=${profile}`,
+    '--enable-unsafe-webgpu',
+    '--enable-dawn-features=allow_unsafe_apis,disable_robustness',
+    '--no-first-run', '--no-default-browser-check',
+    `--app=${url}`,
+  ], { detached: true, stdio: 'ignore' })
+  c.unref()
+  console.log(`opening ${url} (ztvm Chrome, robustness off: +22% prefill)`)
+} else {
+  spawn('open', ['-a', 'Google Chrome', url], { stdio: 'ignore' }).on('error', () => spawn('open', [url]))
+  console.log(`opening ${url}${args.includes('--safe') ? ' (stock browser, --safe)' : ''}`)
+}
 
 // 3. pi config. Touches ONLY providers.zerotvm; everything else verbatim.
 const piPath = join(homedir(), '.pi/agent/models.json')

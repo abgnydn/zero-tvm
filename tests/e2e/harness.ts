@@ -99,7 +99,12 @@ export async function startHarness(): Promise<void> {
     args: [
       '--enable-unsafe-webgpu',
       '--enable-features=Vulkan',
-      '--enable-dawn-features=allow_unsafe_apis',
+      // ZTVM_UNSAFE=1 adds disable_robustness: Chrome's mandatory
+      // bounds-checking on every buffer access, measured at 14-23% of prefill
+      // by LlamaWeb (arXiv 2605.20706). NOT web-shippable — but ztvm launches
+      // its own Chrome, so the LOCAL agent surface may claim it. E2 in
+      // docs/PREFILL_RESEARCH.md is the measurement.
+      `--enable-dawn-features=allow_unsafe_apis${process.env.ZTVM_UNSAFE === '1' ? ',disable_robustness' : ''}`,
     ],
     defaultViewport: { width: 1100, height: 820 },
     // Default puppeteer protocolTimeout is 180s. The first cold run downloads
