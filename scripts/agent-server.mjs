@@ -188,6 +188,16 @@ const server = createServer(async (req, res) => {
     }
     const messages = normalizeMessages(body.messages)
     if (!messages.length) return fail(res, 400, 'messages must contain at least one entry')
+    // THE LM STUDIO TRAP, closed: their server answers with whatever model is
+    // resident no matter what `model` the request names — requests for
+    // nonexistent ids got HTTP 200 from the wrong model. Here a named model
+    // that is not the hosted one is a hard 400 that says how to switch.
+    if (body.model && hostModel
+        && body.model !== hostModel && body.model !== 'ztvm' && body.model !== 'zero-tvm') {
+      return fail(res, 400,
+        `this tab hosts "${hostModel}", the request asked for "${body.model}" — `
+        + `relaunch with: npm run agent -- <model>`)
+    }
 
     const id = randomUUID()
     const created = Math.floor(Date.now() / 1000)

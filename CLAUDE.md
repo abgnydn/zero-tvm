@@ -304,11 +304,18 @@ comes to the model: SSE jobs down to the tab, POSTed token batches back, no
 WebSocket dependency.
 
 ```bash
-npm run dev                 # terminal 1
-npm run agent-server        # terminal 2 → http://127.0.0.1:8017/v1
-open http://localhost:5173/agent-host.html?model=qwen3mlx
+npm run agent -- qwen3mlx   # ONE command: vite + server + Chrome tab + pi
+                            # config patched (providers.zerotvm -> id "ztvm",
+                            # contextWindow matched to the real engine ctx),
+                            # waits for hosting, prints the pi/Cline/curl lines.
+                            # --ctx 65536 raises the window; --pool 0 opts out.
 npm run test:agent-server   # e2e: real Chrome, real weights, tool round trip
 ```
+
+`pi --model ztvm` always means "whatever the launcher started" — relaunching
+with a different model rewrites the entry, and the server 400s any OTHER model
+name instead of silently serving the resident one (the LM Studio failure mode,
+deliberately closed).
 
 Native tool calling is mandatory — Cline removed its XML fallback in v4.0.0
 and pi has no text fallback at all. tool-calls.ts renders/parses three

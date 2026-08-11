@@ -50,6 +50,7 @@
     "paging:measure": "node scripts/paging-measure.mjs",
     "paging:test": "node scripts/paging-test.mjs",
     "quality": "node scripts/quality-eval.mjs",
+    "agent": "node scripts/agent.mjs",
     "agent-server": "node scripts/agent-server.mjs",
     "test:agent-server": "node scripts/agent-server-test.mjs",
     "add-model": "node scripts/add-model.mjs",
