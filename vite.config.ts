@@ -369,6 +369,11 @@ export default defineConfig({
         index:         resolve(__dirname, 'index.html'),
         'zero-tvm':    resolve(__dirname, 'zero-tvm.html'),
         share:         resolve(__dirname, 'share.html'),
+        // The agent host ships: it talks to a LOCAL agent-server on
+        // 127.0.0.1:8017 (localhost is exempt from mixed-content blocking), so
+        // the deployed page works with weights from the HF CDN. model-smoke
+        // stays dev-only; this one is a user-facing surface.
+        'agent-host':  resolve(__dirname, 'agent-host.html'),
         'compiler-chat': resolve(__dirname, 'compiler-chat.html'),
         demo:          resolve(__dirname, 'demo.html'),
         validate:      resolve(__dirname, 'validate.html'),

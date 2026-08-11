@@ -154,8 +154,11 @@ resident, needs ~24 GB free RAM) and `?model=qwen36q3` → `QWEN36_35B_A3B_Q3`
 Engine notes: the MoE block is 7 dispatches (router_logits → router_topk →
 gate/up/silu/down → combine) with the expert index in grid `z` and the shared
 expert stacked as index E of every expert tensor (its gate is router row E) —
-no special cases anywhere. Chunked prefill is OFF for MoE (affine has no
-batched_dyn and `ids[]` has no token dimension); prefill is per-token. MoE
+no special cases anywhere. Chunked prefill is OFF for MoE (`ids[]` has no
+token dimension, so a chunk would apply one token's expert choice to every
+token in it); MoE prefill is per-token. Since 2026-08-11 that is the ONLY
+remaining gate: dense affine specs chunk via `int4_matmul_batched_dyn_affine`
+(qwen3mlx 3.26x, llama32 3.57x prefill, token-identical — BENCH.md). MoE
 specs require subgroups — there is no scalar router/expert path and
 `buildDecodeEngine` throws rather than running the dense FFN.
 
@@ -291,6 +294,31 @@ tab awake" checkbox when backgrounded — Chrome throttles it to ~1 MB/s serving
 and ~23 tok/s generating otherwise. DataChannel backpressure must re-CHECK
 `bufferedAmount` in a loop; waiting on a single `bufferedamountlow` event
 deadlocks when the queue drains between the check and the listener.
+
+## Agent server (`scripts/agent-server.mjs`, `agent-host.html`)
+
+An OpenAI-shaped front door for the model running in a browser tab, so pi and
+Cline can drive the engine. The engine cannot leave the browser (weight-loader
+reads `GPUBufferUsage` at module scope; weights live in OPFS), so the server
+comes to the model: SSE jobs down to the tab, POSTed token batches back, no
+WebSocket dependency.
+
+```bash
+npm run dev                 # terminal 1
+npm run agent-server        # terminal 2 → http://127.0.0.1:8017/v1
+open http://localhost:5173/agent-host.html?model=qwen3mlx
+npm run test:agent-server   # e2e: real Chrome, real weights, tool round trip
+```
+
+Native tool calling is mandatory — Cline removed its XML fallback in v4.0.0
+and pi has no text fallback at all. tool-calls.ts renders/parses three
+dialects (pinned byte-exact against vendor jinja). Verified end to end:
+streaming with finish_reason on the last chunk (pi hard-fails without it),
+multi-part content arrays, `developer`/`tool` role folding, a full
+get_weather round trip, and 4xx (never 5xx) for unrecoverable errors — pi
+retries 5xx with backoff and hangs ~2 min. One request at a time: a single KV
+cache; concurrent generations would interleave. Keep the host tab visible —
+Chrome throttles backgrounded tabs to ~1/3 throughput.
 
 ## Quality vs fidelity (`docs/QUALITY.md`)
 

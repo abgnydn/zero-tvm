@@ -69,19 +69,23 @@ function dialectFor(id: string): ToolDialect {
   return spec.id.startsWith('qwen36') ? 'chatml-xml' : 'chatml-json'
 }
 
-const boot = await bootEngine({
-  spec,
-  optionalFeatures: ['subgroups'],
-  probeSubgroups: true,
-})
-if (!boot.ok) {
-  setStatus(`cannot boot: ${boot.reason}`, 'err')
-  throw new Error(boot.reason)
-}
-const { engine, tokenizer } = boot
-const dialect = dialectFor(spec.chatTemplateId)
-setStatus(`ready — ${spec.maxContext.toLocaleString()} token context, ${dialect}`, 'ok')
-logLine(`engine up: ${spec.id}, dialect ${dialect}`)
+// No top-level await: the build targets es2020 (vite.config.ts), where it is a
+// hard error. Everything below the boot lives inside main(), started at the
+// bottom of the file — the same shape chat.ts uses.
+async function main(): Promise<void> {
+  const boot = await bootEngine({
+    spec,
+    optionalFeatures: ['subgroups'],
+    probeSubgroups: true,
+  })
+  if (!boot.ok) {
+    setStatus(`cannot boot: ${boot.reason}`, 'err')
+    throw new Error(boot.reason)
+  }
+  const { engine, tokenizer } = boot
+  const dialect = dialectFor(spec.chatTemplateId)
+  setStatus(`ready — ${spec.maxContext.toLocaleString()} token context, ${dialect}`, 'ok')
+  logLine(`engine up: ${spec.id}, dialect ${dialect}`)
 
 /** Batched so a 60-token/s stream is ~15 POSTs/s rather than 60. */
 class Emitter {
@@ -232,4 +236,7 @@ function connect(): void {
     setStatus(`agent-server unreachable at ${SERVER} — retrying`, 'err')
   }
 }
-connect()
+  connect()
+}
+
+void main()
