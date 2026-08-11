@@ -1599,3 +1599,22 @@ on any other browser the ladder degrades silently. The in-sequence matvec
 pair (3.24 vs 4.95 s) is thermally soft — the microbench's same-run 2.2×
 GEMM ratio is the number to trust; 3.24 s is also the best qwen3mlx chunked
 prefill ever recorded here, on a warm machine.
+
+### CAP sweep under sgmat (2026-08-12): M-scaling is real once the kernel can use it
+
+The 2026-08-11 sweep said cap didn't matter — measured with the matvec, which
+cannot exploit M beyond its 4-row block. Under the matrix-unit GEMM
+(qwen3mlx, 800-token prompt, tokens identical at every point):
+
+| cap | 64 | 256 | 512 |
+|---|---:|---:|---:|
+| chunked prefill | 3.26 s | **2.80 s** | 2.70 s |
+
+Default is now **256 when sgmat is active** (512's extra 3.6% is inside
+thermal noise and doubles the activation buffers), 64 for the FMA kernels.
+Re-gated at the new default: llama32 **0.84 s**, qwen35 **2.79 s** — best
+prefill numbers ever recorded in this repo, tokens identical.
+
+Running ratio vs LM Studio's 1,385 tok/s clean prefill: ours is now ~287
+tok/s on the same-family model — **0.17× → ~0.21×**. Still ~5× behind;
+the next levers are sgmat tile tuning and larger caps on long prompts.

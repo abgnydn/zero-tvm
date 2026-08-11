@@ -2141,12 +2141,16 @@ export function buildDecodeEngine(
   // (queue-ordered). ~394 dispatches per 64-token chunk vs 340/token before.
   // ============================================================
 
-  // Chunk capacity in tokens (buffer sizing). 64 shipped with the 2026-07-29
-  // prefill round; opts.chunkCap exists because the right value is an empirical
-  // question — a bigger cap amortises per-chunk fixed costs (uniform writes,
-  // one submit, one attention ramp) against CHUNK_CAP-times-wider activation
-  // buffers. Measured sweep lives in BENCH.md.
-  const CHUNK_CAP = opts.chunkCap ?? 64
+  // Chunk capacity in tokens (buffer sizing). The right value depends on the
+  // GEMM: the matvec cannot exploit M beyond its 4-row block (the 2026-08-11
+  // sweep was flat), but the matrix-unit GEMM scales with M — measured
+  // 3.26s / 2.80s / 2.70s at cap 64/256/512 on qwen3mlx's 800-token prompt,
+  // tokens identical at every cap. 256 is the default where sgmat runs
+  // (512's extra 3.6% is inside thermal noise and doubles the activation
+  // buffers); 64 remains the default for the FMA kernels it was tuned on.
+  const sgmatAvail = (AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat) != null
+    && (opts.chunkGemm ?? 'sgmat') === 'sgmat'
+  const CHUNK_CAP = opts.chunkCap ?? (sgmatAvail ? 256 : 64)
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
   interface ChunkPrefill {
