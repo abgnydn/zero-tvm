@@ -97,6 +97,9 @@ export interface Pipelines {
   int4MatmulF32Tiled8: GPUComputePipeline | null // wider tile variant of LM head matmul
   int4MatmulBatchedM4: GPUComputePipeline | null // M=4 batched GEMM (for spec decode / prefill chunks)
   int4MatmulBatchedDyn: GPUComputePipeline | null // runtime-M batched GEMM (chunked prefill projections)
+  /** The same GEMM for MLX-affine weights (w = s*q + b, group 64). Without it
+   *  every affine checkpoint prefills one token at a time. */
+  int4MatmulBatchedDynAffine: GPUComputePipeline | null
   // vec4-load variants — default ON since 2026-07-25 (+7.1% with the qkv
   // sibling on M2 Max, BENCH.md); ?vec4=0 opts out:
   int4MatmulSgVec4: GPUComputePipeline | null       // vec4-load _sg variant
@@ -276,6 +279,7 @@ export function compile(
     int4MatmulF32Tiled8: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, rowsPerWG: 8 }), 'int4_matmul_f32_tiled8') : null,
     int4MatmulBatchedM4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, m: 4 }), 'int4_matmul_batched_m4') : null,
     int4MatmulBatchedDyn: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true }), 'int4_matmul_batched_dyn') : null,
+    int4MatmulBatchedDynAffine: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, mDyn: true, affine: true }), 'int4_matmul_batched_dyn_affine') : null,
     int4MatmulSgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4') : null,
     int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
     int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,

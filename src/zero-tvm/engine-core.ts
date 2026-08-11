@@ -2052,7 +2052,22 @@ export function buildDecodeEngine(
 
   function buildChunkPrefill(): ChunkPrefill {
     const C = CHUNK_CAP
-    const dyn = P.int4MatmulBatchedDyn!
+    // MLC symmetric and MLX affine are different kernels with different
+    // bindings — affine takes a 6th buffer (biases at @binding(5)) and reads
+    // its scales in groups of 64 rather than 32.
+    const dyn = (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
+    /** A batched-GEMM bind group. bg() maps array position to binding index, so
+     *  the bias buffer must come LAST and only when the affine kernel is in
+     *  use — a 6-buffer group against a 5-binding layout is rejected outright,
+     *  which is the loud failure we want rather than a silent misbind. */
+    const dynBg = (
+      out: BindEntry,
+      inp: BindEntry,
+      scales: GPUBuffer,
+      wts: GPUBuffer,
+      uni: GPUBuffer,
+      biases?: GPUBuffer,
+    ) => bg(device, dyn, AFFINE ? [out, inp, scales, wts, uni, biases!] : [out, inp, scales, wts, uni])
     // Batched activation buffers ([C, dim] row-major).
     const CB = {
       inputIds: makeBuf(device, C * 4, 'c.inputIds'),
@@ -2145,9 +2160,9 @@ export function buildDecodeEngine(
         addNorm1: bg(device, P.addNorm, [CB.hidden2, CB.residual, lw.normGamma2, CB.hidden1, CB.residual2, cU.norm]),
         // Chunked prefill is dense-only — buildDecodeEngine sets chunkPrefill
         // null for a MoE spec, so ffn* are present wherever this runs.
-        gateUp: bg(device, dyn, [CB.gateUp, CB.hidden1, lw.ffnScales!, lw.ffnWeights!, cU.gateUp]),
+        gateUp: dynBg(CB.gateUp, CB.hidden1, lw.ffnScales!, lw.ffnWeights!, cU.gateUp, lw.ffnBiases),
         silu: bg(device, P.siluMul, [CB.ffnOut, CB.gateUp, cU.silu]),
-        ffnDown: bg(device, dyn, [CB.hidden2, CB.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, cU.ffnDown]),
+        ffnDown: dynBg(CB.hidden2, CB.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, cU.ffnDown, lw.ffnDownBiases),
         addNorm2: bg(device, P.addNorm, [CB.hidden2, CB.residual2, nextGamma, CB.hidden1, CB.residual, cU.norm]),
       }
       if (isGdn) {
@@ -2164,25 +2179,34 @@ export function buildDecodeEngine(
           size: (C - 1) * S.gdnProjRows * 2 + 2 * S.gdnVHeads * 2,
         }
         cLayers.push({
-          gdnProj: bg(device, dyn, [CB.gdnProjOut, CB.hidden1, gw.projScales, gw.projWeights, cU.gdnProj]),
+          gdnProj: dynBg(CB.gdnProjOut, CB.hidden1, gw.projScales, gw.projWeights, cU.gdnProj, gw.projBiases),
           conv: bg(device, P.gdnConvSeq, [CB.gdnConvOut, CB.gdnProjOut, gdnConvState[L]!, gw.convWeight, cU.conv]),
           convCommit: bg(device, P.gdnConvCommit, [gdnConvState[L]!, CB.gdnProjOut, cU.convCommit]),
           gates: bg(device, P.gdnGates, [CB.gdnGates, abRegion, gw.aLog, gw.dtBias, cU.gates]),
           recur: bg(device, P.gdnRecur, [CB.gdnRecurOut, CB.gdnConvOut, CB.gdnGates, gdnRecurState[L]!, cU.recur]),
           normOut: bg(device, P.gdnNormOut, [CB.gdnNormed, CB.gdnRecurOut, gw.normGamma, zRegion, cU.normOut]),
-          oProj: bg(device, dyn, [CB.hidden2, CB.gdnNormed, gw.outScales, gw.outWeights, cU.gdnOut]),
+          oProj: dynBg(CB.hidden2, CB.gdnNormed, gw.outScales, gw.outWeights, cU.gdnOut, gw.outBiases),
           ...common,
         })
       } else {
+        // GATED attention (Qwen3.5) fuses a per-head gate into the projection
+        // and splits it out; a plain spec projects straight into qkvOut and has
+        // no gate. cAttnDim already collapses to qkvDim when !attnGate, so the
+        // dispatch is identical — only the destination and the two extra steps
+        // differ.
+        const gated = S.attnGate === true
         cLayers.push({
-          cAttn: bg(device, dyn, [CB.cAttnOut, CB.hidden1, lw.qkvScales!, lw.qkvWeights!, cU.cAttn]),
-          gatedSplit: bg(device, P.gatedQkvSplit, [CB.qkvOut, CB.gateRaw, CB.cAttnOut, cU.gatedSplit]),
+          cAttn: dynBg(gated ? CB.cAttnOut : CB.qkvOut, CB.hidden1,
+            lw.qkvScales!, lw.qkvWeights!, cU.cAttn, lw.qkvBiases),
+          gatedSplit: gated
+            ? bg(device, P.gatedQkvSplit, [CB.qkvOut, CB.gateRaw, CB.cAttnOut, cU.gatedSplit])
+            : undefined,
           qkNorm: bg(device, P.qkNorm, [CB.qkvOut, lw.qNormGamma!, lw.kNormGamma!, cU.qkNorm]),
           rope: bg(device, P.rope, [CB.qOut, CB.kOut, CB.vOut, CB.qkvOut, CB.posMap, cU.rope, ropeFreqs!]),
           kvApp: bg(device, P.kvAppend, [CB.kOut, CB.vOut, kvPages[kvIndex[L]], CB.posMap, cU.kvApp]),
           attn: bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
-          attnGate: bg(device, P.attnGate, [CB.attnOut, CB.gateRaw, cU.attnGate]),
-          oProj: bg(device, dyn, [CB.hidden2, CB.attnOut, lw.oProjScales!, lw.oProjWeights!, cU.oProj]),
+          attnGate: gated ? bg(device, P.attnGate, [CB.attnOut, CB.gateRaw, cU.attnGate]) : undefined,
+          oProj: dynBg(CB.hidden2, CB.attnOut, lw.oProjScales!, lw.oProjWeights!, cU.oProj, lw.oProjBiases),
           ...common,
         })
       }
@@ -2236,12 +2260,12 @@ export function buildDecodeEngine(
           dispatch(enc, dyn, blk.oProj, dynGrid(S.d), 1, 1, 'cGdnOutProj')
         } else {
           dispatch(enc, dyn, blk.cAttn!, dynGrid(S.cAttnDim), 1, 1, 'cCAttn')
-          dispatch(enc, P.gatedQkvSplit, blk.gatedSplit!, n * CATTN_WGS, 1, 1, 'cGatedSplit')
+          if (blk.gatedSplit) dispatch(enc, P.gatedQkvSplit, blk.gatedSplit, n * CATTN_WGS, 1, 1, 'cGatedSplit')
           if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, n * QK_NORM_WGS, 1, 1, 'cQkNorm')
           dispatch(enc, P.rope, blk.rope!, n * QKV_WGS, 1, 1, 'cRope')
           dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
           dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
-          dispatch(enc, P.attnGate, blk.attnGate!, n * ATTN_GATE_WGS, 1, 1, 'cAttnGate')
+          if (blk.attnGate) dispatch(enc, P.attnGate, blk.attnGate, n * ATTN_GATE_WGS, 1, 1, 'cAttnGate')
           dispatch(enc, dyn, blk.oProj, dynGrid(S.d), 1, 1, 'cOProj')
         }
         dispatch(enc, P.addNorm, blk.addNorm1, n, 1, 1, 'cAddNorm1')
@@ -2271,14 +2295,38 @@ export function buildDecodeEngine(
   //   2. the MoE ids[] buffer is indexed by SLOT with no token dimension, so
   //      batching a chunk would apply one token's expert choice to all of them.
   // The cost is per-token prefill; correctness is not negotiable for a speedup.
+  //
+  // TWO of those three arms are gone as of 2026-08-11.
+  //   - !AFFINE lifted: int4_matmul_batched_dyn_affine exists now (w = s*q + b,
+  //     group 64), pinned against a CPU reference at 4.52e-4.
+  //   - `hybrid` lifted: the attention branch dispatched gatedQkvSplit and
+  //     attnGate unconditionally, which are Qwen3.5's GATED attention. cAttnDim
+  //     already collapses to qkvDim when !attnGate, so a plain spec projects
+  //     straight into qkvOut and skips both steps.
+  // S.moe stays, and reason 2 above is why: ids[] is indexed by SLOT with no
+  // token dimension, so batching a chunk would apply one token's expert choice
+  // to every token in it.
+  const dynReady = (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn) != null
+  // `hybrid` is BACK, and it is not conservatism this time — it is a measured
+  // defect. With the gate open, scripts/chunk-prefill-test.mjs shows qwen3mlx
+  // (plain attention + affine) diverging from the per-token path at the very
+  // first generated token, on every prompt long enough to chunk. qwen35 stays
+  // token-identical, so the shared machinery is fine and the fault is in the
+  // plain-attention branch below or in how the engine drives the affine GEMM —
+  // the GEMM itself is pinned at 4.70e-4 with M-invariance at engine scale
+  // (N=256, M=31, CAP=64), so it is not the kernel.
+  // Everything needed is in place; what is missing is the diagnosis. Shipping
+  // it would trade correct prefill for a 2.98x speedup, which is the one trade
+  // this file refuses everywhere else.
   const chunkPrefill: ChunkPrefill | null =
-    hybrid && !S.moe && !AFFINE && !partial && (opts.chunkedPrefill ?? true) && P.int4MatmulBatchedDyn
+    hybrid && !S.moe && !partial && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
-  if (hybrid) {
-    const why = chunkPrefill ? `on (cap ${CHUNK_CAP})`
-      : S.moe ? 'off (per-token — MoE: affine has no batched_dyn, and ids[] has no token dim)'
-      : AFFINE ? 'off (per-token — affine has no batched_dyn)'
+  {
+    const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''})`
+      : S.moe ? 'off (per-token — MoE: ids[] has no token dimension)'
+      : !dynReady ? 'off (per-token — no subgroups, so no batched GEMM)'
+      : !hybrid ? 'off (per-token — plain-attention chunking diverges, see chunk-prefill-test.mjs)'
       : 'off (per-token)'
     console.log(`[engine] chunked prefill: ${why}`)
   }

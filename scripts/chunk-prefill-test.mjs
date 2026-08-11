@@ -1,0 +1,68 @@
+#!/usr/bin/env node
+// CHUNK-PREFILL-TEST — does chunked prefill compute what per-token prefill does?
+//
+//   node scripts/chunk-prefill-test.mjs qwen3mlx
+//
+// Chunking replaces n matvecs with one batched GEMM over n tokens. That is a
+// different ARITHMETIC ORDER, not a different algorithm, so f16 rounding can
+// differ — but the tokens must not. Two engines over the same weights, one with
+// ?chunk=0, same prompt, greedy.
+//
+// Until 2026-08-11 this path was hybrid-and-MLC only. The gate now admits
+// plain-attention and MLX-affine specs, which is what this checks.
+
+import { startHarness, stopHarness, newPage } from '../tests/e2e/harness.ts'
+
+const param = process.argv.slice(2).find((a) => !a.startsWith('--')) ?? 'qwen3mlx'
+const TOKENS = Number(process.env.TOKENS) || 24
+// Long enough to span several chunks (CHUNK_CAP is 64) and to make the batched
+// GEMM's ragged final block non-trivial.
+const PROMPT = Number(process.env.PROMPT) || 150
+const IDS = Array.from({ length: PROMPT }, (_, i) => 1000 + ((i * 37) % 900))
+
+let failed = false
+const check = (name, ok, detail) => {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(26)} ${detail}`)
+  if (!ok) failed = true
+}
+
+await startHarness()
+try {
+  const page = await newPage(`/model-smoke.html?model=${param}`)
+  await page.waitForFunction(() => window.__phase === 'loaded' || window.__phase === 'error',
+    { timeout: 8 * 60_000, polling: 1000 })
+  if (await page.evaluate(() => window.__phase) === 'error') {
+    throw new Error(await page.evaluate(() => window.__error))
+  }
+  const logs = []
+  let sawChunks = 0
+  page.on('console', (m) => {
+    const t = m.text()
+    if (t.includes('chunked prefill')) logs.push(t)
+    // CHUNK_MIN gates chunking, so a short prompt runs the per-token path in
+    // BOTH arms and passes vacuously. The first version of this test reported
+    // PASS at 4 and 8 tokens for exactly that reason while the engine was
+    // broken at every length that actually chunked.
+    const m2 = /prefill: .*?(\d+) chunks? of/.exec(t)
+    if (m2) sawChunks += Number(m2[1])
+  })
+
+  for (const [label, v] of [['scalar', {}], ['shipped', { subgroups: true, matmul: 'tiled', splitK: 8 }]]) {
+    const { chunked, perToken } = await page.evaluate(
+      (ids, n, vv) => window.__chunkCheck(ids, n, vv), IDS, TOKENS, v)
+    const same = chunked.length === perToken.length && chunked.every((t, i) => t === perToken[i])
+    const at = chunked.findIndex((t, i) => t !== perToken[i])
+    check(`${label} tokens identical`, same,
+      same ? `${chunked.length} tokens over ${IDS.length}-token prompt`
+        : `diverges at ${at}: ${chunked[at]} vs ${perToken[at]}`)
+  }
+  check('chunking actually ran', sawChunks > 0,
+    sawChunks ? `${sawChunks} chunks recorded` : 'ZERO chunks — this run proves nothing, raise PROMPT')
+  const gpuErrs = await page.evaluate(() => window.__gpuErrs())
+  check('gpu errors', gpuErrs === 0, String(gpuErrs))
+  for (const l of [...new Set(logs)]) console.log(`      ${l}`)
+} finally {
+  await stopHarness()
+}
+console.log(failed ? '\nchunked prefill DIVERGES from per-token' : '\nchunked prefill agrees with per-token')
+process.exit(failed ? 1 : 0)

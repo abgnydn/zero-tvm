@@ -126,6 +126,21 @@ try{
     })
     return Array.from(await e.generate(ids, 0, n, () => {}))
   }
+  // CHUNKED PREFILL equivalence. Chunking changes the ARITHMETIC ORDER of
+  // prefill — one batched GEMM over n tokens instead of n matvecs — so the only
+  // honest check is that it yields the same tokens as the per-token path on the
+  // same prompt. Two engines over the SAME weights, one with chunking off.
+  window.__chunkCheck = async (ids, n, v) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
+    const mk = (chunkedPrefill) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: V, chunkedPrefill,
+    })
+    const run = async (e) => { const out=[]; await e.generatePipelined(ids, n, (t)=>out.push(t), ()=>false); return out }
+    const chunked = await run(mk(true))
+    const perToken = await run(mk(false))
+    return { chunked, perToken }
+  }
+
   // PAGE TABLE falsifier (docs/PAGING_PLAN.md §0.4). Runs the same ids twice on
   // a FRESH engine each time — identity table, then `perm` — and returns both
   // logit vectors. The readers (attention*.wgsl) go through the table; the

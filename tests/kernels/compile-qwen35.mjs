@@ -890,7 +890,10 @@ async function testMatmulBatchedDyn(device) {
 async function testMatmulBatchedDynAffine(device) {
   if (!HAS_SG32) return skip('int4_matmul_batched_dyn_affine')
   const r = rng(37)
-  const K = Q.d, N = 64, M = 6, CAP = 8      // M=6: a partial last row-block
+  // Engine-scale: CHUNK_CAP is 64 and a chunk's M is whatever is left, so M=31
+  // with CAP=64 is the shape a real prefill actually dispatches. The first
+  // version of this test used M=6/CAP=8 and passed while the engine diverged.
+  const K = Q.d, N = 256, M = 31, CAP = 64
   const KP = K / 8, SPR = K / 64             // group 64, not 32
   const weights = Uint32Array.from(arr(N * KP, () => (r() * 0xffffffff) >>> 0))
   const scales = arr(N * SPR, () => toF16(r() * 0.05 + 0.01))
@@ -914,7 +917,11 @@ async function testMatmulBatchedDynAffine(device) {
     return new Uint16Array(bytes)
   }
   const got6 = await run(M)
-  const got8 = await run(8)
+  // M-invariance must compare against a run that COVERS the same rows, so the
+  // second M is CAP, not a smaller number. Comparing M=31 against M=8 counts
+  // the 23 rows the second run never wrote as mismatches — (31-8)*256 = 5888 of
+  // them, which looks exactly like a kernel bug.
+  const got8 = await run(CAP)
 
   let maxRel = 0
   for (let b = 0; b < M; b++) {
