@@ -157,9 +157,12 @@ const server = createServer(async (req, res) => {
   // ---- the OpenAI surface -------------------------------------------------
 
   if (path === '/v1/models' && req.method === 'GET') {
-    // pi and Cline both read this to populate a picker, and a 404 here reads
-    // as "the server is down" rather than "no models" — so it always answers,
-    // even with no tab connected.
+    // Neither client NEEDS this: pi takes its model list entirely from
+    // ~/.pi/agent/models.json and never asks, and Cline only calls it to fill
+    // the settings dropdown, falling back to a free-text box on any error.
+    // Kept because it costs nothing and makes the dropdown work — and it
+    // answers even with no tab connected, so "is the server up" is separable
+    // from "is a model loaded".
     json(res, 200, {
       object: 'list',
       data: [{
@@ -176,9 +179,12 @@ const server = createServer(async (req, res) => {
     let body
     try { body = await readBody(req) } catch { return fail(res, 400, 'bad JSON') }
     if (!host) {
-      return fail(res, 503,
-        'no browser tab is hosting a model — open agent-host.html and wait for "hosting"',
-        'server_error')
+      // 400, NOT 503. pi retries 5xx with backoff — a 503 here makes it hang
+      // for ~2 minutes and then fail, instead of telling you to open the tab.
+      // Verified against pi 0.84.1's own retry path. The same reasoning applies
+      // to every unrecoverable condition below: prefer 4xx.
+      return fail(res, 400,
+        'no browser tab is hosting a model — open agent-host.html and wait for "hosting"')
     }
     const messages = normalizeMessages(body.messages)
     if (!messages.length) return fail(res, 400, 'messages must contain at least one entry')
@@ -219,7 +225,9 @@ const server = createServer(async (req, res) => {
         })
       } catch (e) {
         pending.delete(id)
-        fail(res, 500, e.message, 'server_error')
+        // 4xx for the same reason: these are context overflow, a busy tab, or a
+        // dead tab — none of them get better by retrying.
+        fail(res, 400, e.message)
       }
       return
     }

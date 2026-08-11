@@ -27,13 +27,19 @@
 import { bootEngine } from './loading-ui.js'
 import { specFromSearch, buildChatPromptFor, modelBranding } from './model-select.js'
 import {
-  withTools, parseToolCalls, type ToolDef, type ToolDialect, type ToolChatMessage,
+  withTools, parseToolCalls, renderAssistantCalls,
+  type ToolDef, type ToolDialect, type ToolChatMessage,
 } from './tool-calls.js'
 
 /** One unit of work as scripts/agent-server.mjs relays it. */
 interface Job {
   id: string
-  messages: { role: 'system' | 'user' | 'assistant'; content: string }[]
+  messages: {
+    role: 'system' | 'user' | 'assistant'
+    content: string
+    /** OpenAI `tool_calls` off an assistant turn, relayed verbatim. */
+    toolCalls?: { id?: string; type?: string; function?: { name?: string; arguments?: string } }[]
+  }[]
   tools: ToolDef[] | null
   maxTokens: number | null
   temperature: number | null
@@ -125,7 +131,20 @@ async function run(job: Job): Promise<void> {
   const t0 = performance.now()
   const emit = new Emitter(job.id)
   try {
-    let messages: ToolChatMessage[] = job.messages
+    // An assistant turn that called a tool arrives as
+    // {content: null, tool_calls: [...]} — flattening it to '' would erase the
+    // call from the transcript, and from turn 2 onward the model would not see
+    // what it had already done. Render it back in this dialect's own syntax,
+    // which is the same text the model emitted in the first place.
+    let messages: ToolChatMessage[] = job.messages.map((m) => {
+      if (m.role !== 'assistant' || !m.toolCalls?.length) return { role: m.role, content: m.content }
+      const calls = m.toolCalls.map((c) => {
+        let args: Record<string, unknown> = {}
+        try { args = JSON.parse(c.function?.arguments || '{}') } catch { /* keep {} */ }
+        return { name: c.function?.name ?? '', arguments: args }
+      })
+      return { role: m.role, content: renderAssistantCalls(dialect, m.content ?? '', calls) }
+    })
     if (job.tools?.length) messages = withTools(dialect, messages, job.tools)
 
     const promptIds = buildChatPromptFor(spec, messages as Parameters<typeof buildChatPromptFor>[1], tokenizer)

@@ -164,13 +164,48 @@ try {
       + ` (plumbing verified: request accepted, ${JSON.stringify((r5.choices?.[0]?.message?.content ?? '').slice(0, 50))})`)
   }
 
-  // 6. Errors stay OpenAI-shaped.
+  // 6. A SECOND turn carrying the assistant's own prior tool call plus its
+  //    result — the shape every agent loop sends from turn 2 onward. pi puts
+  //    the assistant turn on the wire as {content: null, tool_calls: [...]},
+  //    which a naive flattener turns into '' and erases the call from the
+  //    transcript.
+  if (calls?.length) {
+    const r6 = await (await fetch(`${BASE}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL, max_tokens: 64,
+        messages: [
+          { role: 'user', content: 'What is the weather in Paris? Use the tool.' },
+          { role: 'assistant', content: null, tool_calls: calls },
+          { role: 'tool', tool_call_id: calls[0].id, content: '{"temp_c": 17, "sky": "rain"}' },
+        ],
+      }),
+    })).json()
+    const answer = r6.choices?.[0]?.message?.content ?? ''
+    check('tool round trip', /17|rain/i.test(answer), JSON.stringify(answer.slice(0, 70)))
+  }
+
+  // 7. Errors stay OpenAI-shaped.
   const bad = await (await fetch(`${BASE}/v1/chat/completions`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model: MODEL, messages: [] }),
   })).json()
   check('error envelope', typeof bad.error?.message === 'string' && !!bad.error?.type,
     bad.error?.message?.slice(0, 50))
+
+  // 8. Unrecoverable failures must be 4xx. pi retries 5xx with backoff, so a
+  //    503 for "no tab" makes it hang ~2 minutes instead of saying what is
+  //    wrong. Checked by asking for a context that cannot fit.
+  const over = await fetch(`${BASE}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: MODEL, max_tokens: 8,
+      messages: [{ role: 'user', content: 'x '.repeat(200_000) }],
+    }),
+  })
+  const overBody = await over.json()
+  check('overflow is 4xx not 5xx', over.status >= 400 && over.status < 500,
+    `HTTP ${over.status} · ${(overBody.error?.message ?? '').slice(0, 60)}`)
 } finally {
   await stopHarness().catch(() => {})
   srv.kill('SIGTERM')
