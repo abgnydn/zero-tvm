@@ -62,14 +62,17 @@ function sweepWGSL({ sg, tm, tn, tk, sw }) {
     ? (i) => `Bsh[base + ${i}u * 8u] = ${i % 2 === 0 ? 'lo' : 'hi'}[${(i - (i % 2)) / 2}u];`
     : (i) => `Bsh[base + ${i}u] = ${i % 2 === 0 ? 'lo' : 'hi'}[${(i - (i % 2)) / 2}u];`
   // ^ value order: element k sits at nibble k; lo carries k=0,2,4,6, hi k=1,3,5,7.
-  //   pad layout: Bsh[base+k]. swizzle: element (n,k) at blk*64 + k*8 + n%8 —
-  //   wait, dense right-fragment load wants col-major 8x8: element (k,n) at
-  //   base + n*8 + k? Keep it simple and CORRECT: swizzle stores column n of
-  //   the block at offset (n%8), k-major stride 8 → load col_major stride 8.
+  //   pad layout: Bsh[base+k] = row-major [n][k], which for the k x n right
+  //   operand is COL-major (stride tk+8). swizzle: block element (k, n) sits
+  //   at blk*64 + k*8 + n — ROW-major inside the dense 8x8 block, so the
+  //   fragment load must say colMajor=false with stride 8 (the first sweep
+  //   said true, grading every swz config against a transposed B; it also
+  //   stepped nSub by 32 when a fragment covers 8 N).
   const bLoadOff = sw === 'swz'
-    ? (nSub) => `((${nSub} * 32u + bBase) / 8u * ${tk / 8}u + k8) * 64u`
+    ? (nSub) => `(((bBase + ${nSub} * 8u) / 8u) * ${tk / 8}u + k8) * 64u`
     : (nSub) => `bBase * ${tk + 8}u + ${nSub} * 8u * ${tk + 8}u + k8 * 8u`
   const bLoadStride = sw === 'swz' ? 8 : tk + 8
+  const bLoadCol = sw === 'swz' ? 'false' : 'true'
 
   return `
 diagnostic(off, chromium.subgroup_matrix_uniformity);
@@ -146,10 +149,10 @@ fn sweep(
       let aOff = sgRow * 16u * ${aStride}u + k8 * 8u;
       let a0 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&Ash, aOff, false, ${aStride}u);
       let a1 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&Ash, aOff + 8u * ${aStride}u, false, ${aStride}u);
-      let b0 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('0u')}, true, ${bLoadStride}u);
-      let b1 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('1u')}, true, ${bLoadStride}u);
-      let b2 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('2u')}, true, ${bLoadStride}u);
-      let b3 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('3u')}, true, ${bLoadStride}u);
+      let b0 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('0u')}, ${bLoadCol}, ${bLoadStride}u);
+      let b1 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('1u')}, ${bLoadCol}, ${bLoadStride}u);
+      let b2 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('2u')}, ${bLoadCol}, ${bLoadStride}u);
+      let b3 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&Bsh, ${bLoadOff('3u')}, ${bLoadCol}, ${bLoadStride}u);
       c00 = subgroupMatrixMultiplyAccumulate(a0, b0, c00);
       c01 = subgroupMatrixMultiplyAccumulate(a0, b1, c01);
       c02 = subgroupMatrixMultiplyAccumulate(a0, b2, c02);
@@ -266,7 +269,11 @@ async function gate(pipe, cfg) {
       // coerced them to 0, and the whole first sweep was graded against a
       // zero reference: every kernel "failed" at |got|/1e-2 and the shipped
       // E1's own config read 9.1e+2. Only `got` needs bit-decoding.
-      acc += (s.raw.sc[n * 2 + g] * nib + s.raw.bi[n * 2 + g]) * s.raw.a[m * 128 + k]
+      // The kernel rounds the dequantized weight to f16 (lo/hi are vec4<f16>)
+      // BEFORE the MMA; a reference that keeps it in f64 disagrees by up to
+      // ~1e-1 on unlucky draws, and with per-config random data the old gate
+      // flipped configs across the 6e-2 line run to run. Round like the GPU.
+      acc += toF16(s.raw.sc[n * 2 + g] * nib + s.raw.bi[n * 2 + g]) * s.raw.a[m * 128 + k]
     }
     const gv = f16BitsToF32(got[m * 96 + n])
     maxRel = Math.max(maxRel, Math.abs(gv - acc) / Math.max(1e-2, Math.abs(acc)))
@@ -316,7 +323,12 @@ for (const cfg of CONFIGS) {
   const rel = await gate(made.pipe, cfg)
   // NaN must FAIL: NaN > x is false, and the first run let NaN-producing
   // configs through the gate and into the timing table.
-  if (!(rel <= 6e-2)) { console.log(`${name.padEnd(22)} GATE FAIL ${Number.isNaN(rel) ? 'NaN' : rel.toExponential(1)} — VOID`); continue }
+  // With the reference rounding dequant to f16 like the kernel, every correct
+  // config lands ~5e-4; a layout/transpose bug lands O(1). 5e-3 splits them
+  // with 10x headroom each way (the old 6e-2 was noise-driven).
+  if (!(rel <= 5e-3)) { console.log(`${name.padEnd(22)} GATE FAIL ${Number.isNaN(rel) ? 'NaN' : rel.toExponential(1)} — VOID`); continue }
+  // --gate-only: correctness without timing — valid on any power/thermal state.
+  if (process.argv.includes('--gate-only')) { console.log(`${name.padEnd(22)} gate ${rel.toExponential(1)} PASS`); continue }
   const row = { name, cfg, tf: {} }
   for (const M of MS) {
     let sum = 0
