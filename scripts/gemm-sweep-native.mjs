@@ -1,15 +1,12 @@
 #!/usr/bin/env node
 // GEMM-SWEEP-NATIVE — the E3/E5 sweep, headless on dawn.node.
 //
-// STATUS 2026-08-12: HARNESS WIP — results VOID, do not graduate from it.
-// Two proven defects on the first run: (1) NaN passed the correctness gate
-// (NaN comparisons are false; fixed below), and (2) the config identical to
-// the shipped E1 kernel (sg4 32x64 k32 pad) FAILS the gate at 9.1e+2 — the
-// builder's addressing diverges from int4MatmulSgE1WGSL somewhere, so every
-// timing it printed describes kernels that compute something else. The one
-// usable observation: no swept config beat hand-E1's numbers even before
-// correctness was checked, so E1 stays the shipped kernel. Debug from the
-// E1-shape diff (generate both, diff the WGSL) before trusting anything here.
+// FIRST RUN POST-MORTEM (2026-08-12): the whole run was VOID, and the fault
+// was the GATE, not the kernels — a mechanical WGSL diff proved the builder's
+// E1 config semantically identical to the shipped kernel, and the "failures"
+// traced to the CPU reference bit-decoding FLOAT VALUES (all-zero reference).
+// Two gate fixes are in: NaN fails (!(rel<=tol)), and the reference uses the
+// raw float values directly.
 //
 //   npm i --no-save webgpu
 //   node --experimental-strip-types scripts/gemm-sweep-native.mjs [--full]
@@ -191,6 +188,12 @@ fn sweep(
 // ---------------------------------------------------------------- harness
 
 await installShims({ unsafe: true })
+// dawn.node delivers onSubmittedWorkDone/mapAsync completions from an
+// immediate-chain that BACKS OFF once the event loop idles — a sleeping loop
+// adds a fixed ~10-30 ms to every await, which inflated the first sweep's
+// per-iteration times ~2x and read as "the machine is throttled". A live
+// setImmediate chain keeps delivery sub-ms; a bench can afford the busy core.
+const spin = () => setImmediate(spin); spin()
 const adapter = await navigator.gpu.requestAdapter()
 if (!adapter.features.has('chromium-experimental-subgroup-matrix')) {
   console.log('no subgroup-matrix on this adapter'); process.exit(1)
@@ -258,7 +261,12 @@ async function gate(pipe, cfg) {
     for (let k = 0; k < 128; k++) {
       const nib = (s.raw.w[n * 16 + (k >> 3)] >>> ((k & 7) * 4)) & 15
       const g = k >> 6
-      acc += (f16BitsToF32(s.raw.sc[n * 2 + g]) * nib + f16BitsToF32(s.raw.bi[n * 2 + g])) * f16BitsToF32(s.raw.a[m * 128 + k])
+      // raw.* hold ROUNDED FLOAT VALUES (toF16 returns the value, not bits) —
+      // wrapping them in f16BitsToF32 treated floats as bit patterns, JS
+      // coerced them to 0, and the whole first sweep was graded against a
+      // zero reference: every kernel "failed" at |got|/1e-2 and the shipped
+      // E1's own config read 9.1e+2. Only `got` needs bit-decoding.
+      acc += (s.raw.sc[n * 2 + g] * nib + s.raw.bi[n * 2 + g]) * s.raw.a[m * 128 + k]
     }
     const gv = f16BitsToF32(got[m * 96 + n])
     maxRel = Math.max(maxRel, Math.abs(gv - acc) / Math.max(1e-2, Math.abs(acc)))
@@ -330,3 +338,4 @@ for (const M of MS) {
   const best = [...results].sort((a, b) => b.tf[`mean@${M}`] - a.tf[`mean@${M}`])[0]
   if (best) console.log(`\nBEST @M=${M}: ${best.name} — ` + SHAPES.map(([l]) => `${l} ${(best.tf[`${l}@${M}`] / 1000).toFixed(2)}TF`).join(', '))
 }
+process.exit(0) // the keep-delivery-hot immediate chain never lets the loop drain
