@@ -1679,3 +1679,27 @@ host (PREFILL_RESEARCH L2) is unblocked — same WGSL kernels, no browser
 process, no tab throttling, robustness off by default. Remaining work is the
 engine shims (navigator.gpu global, OPFS→fs weights, the `build:lib` bundle)
 — the 1-2 day estimate stands, with the riskiest unknown now retired.
+
+### The native host ships (2026-08-12): `ztvm native` — no browser at all
+
+`scripts/agent-native.mjs`: the OpenAI server with the engine IN-PROCESS on
+dawn.node (the `webgpu` prebuilt), robustness off, same wire contract as the
+browser host. Three shims made the whole browser engine run unmodified
+(`scripts/native/shims.mjs`): WebGPU globals before any src import,
+fs-backed OPFS under `~/.zerotvm/opfs` (weight cache AND the KV pool
+persist), and a fetch rewrite that sends HF resolve URLs to the local vite
+mirror — added after the first boot silently pulled from huggingface.co at
+0.9 MB/s for ten minutes (Node has no `import.meta.env.DEV`, so
+weight-loader skipped its mirror).
+
+| | native (dawn.node) | flagged Chrome | note |
+|---|---:|---:|---|
+| boot to ready | 2.6–6 s | ~8 s + a window | |
+| llama32 prefill | **1,523 tok/s** | 1,212 | +26% |
+| qwen3-4B prefill | 467 tok/s | 482 | parity, first-request |
+| tool round trip | ✓ | ✓ | same contract |
+
+The lib grew `createEngineRaw` (+ ctx override, + subgroup-matrix feature)
+and a LAZY `hostSurface()` — lazy because a static re-export would evaluate
+weight-loader's module-scope `GPUBufferUsage` and crash every non-GPU import
+of the library, the exact failure its lazy-import design exists to prevent.

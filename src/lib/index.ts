@@ -137,7 +137,32 @@ async function probeSubgroupSize(device: GPUDevice): Promise<boolean> {
  * a cold start (cached in OPFS afterwards) and holds them on the GPU for the
  * lifetime of the returned engine.
  */
-export async function createEngine(opts: CreateEngineOptions = {}): Promise<ZeroTvmEngine> {
+/**
+ * RAW boot for embedding hosts (the Dawn-native agent server) — everything
+ * createEngine assembles, before the chat() wrapper narrows it. `ctx`
+ * rebuilds the spec through specWithCtx (same knob as `?ctx=`). No DOM
+ * anywhere on this path; the caller supplies navigator.gpu (a browser, or
+ * dawn.node behind scripts/native/shims.mjs).
+ */
+export async function createEngineRaw(opts: CreateEngineOptions & { ctx?: number } = {}): Promise<{
+  engine: import('../zero-tvm/engine-core.js').DecodeEngine
+  tokenizer: Awaited<ReturnType<typeof import('../zero-tvm/model-select.js')['loadTokenizerFor']>>
+  spec: ModelSpec
+  variants: import('../zero-tvm/variants.js').VariantFlags
+  info: ModelInfo
+}> {
+  const built = await bootShared(opts)
+  return built
+}
+
+async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise<{
+  engine: import('../zero-tvm/engine-core.js').DecodeEngine
+  tokenizer: Awaited<ReturnType<typeof import('../zero-tvm/model-select.js')['loadTokenizerFor']>>
+  spec: ModelSpec
+  variants: import('../zero-tvm/variants.js').VariantFlags
+  info: ModelInfo
+  buildChatPromptFor: typeof import('../zero-tvm/model-select.js')['buildChatPromptFor']
+}> {
   const param = opts.model ?? ''
   const hit = SHIPPED_MODELS.find((m) => m.param === param)
   // specForParam() falls back to Phi-3 for anything unknown, which is right
@@ -150,7 +175,12 @@ export async function createEngine(opts: CreateEngineOptions = {}): Promise<Zero
       SHIPPED_MODELS.map((m) => JSON.stringify(m.param)).join(', '),
     )
   }
-  const spec = hit.spec
+  let spec = hit.spec
+  const ctxWanted = (opts as { ctx?: number }).ctx
+  if (ctxWanted) {
+    const { specWithCtx } = await import('../zero-tvm/model-registry.js')
+    spec = specWithCtx(spec, ctxWanted)
+  }
   const report = opts.onProgress ?? ((): void => {})
 
   // Checked BEFORE the dynamic imports below, so a runtime without WebGPU
@@ -175,6 +205,11 @@ export async function createEngine(opts: CreateEngineOptions = {}): Promise<Zero
   if (!adapter) throw new Error('No GPU adapter found')
   const features: GPUFeatureName[] = ['shader-f16' as GPUFeatureName]
   if (adapter.features.has('subgroups')) features.push('subgroups' as GPUFeatureName)
+  // The matrix unit (experimental Chrome/Dawn). compile() creates the sgmat
+  // GEMM only when the device carries it; absent, the ladder degrades.
+  if (adapter.features.has('chromium-experimental-subgroup-matrix')) {
+    features.push('chromium-experimental-subgroup-matrix' as GPUFeatureName)
+  }
   // Lift the storage-binding/buffer ceilings to whatever the adapter offers
   // (always valid per spec). The default 128 MiB maxStorageBufferBindingSize
   // is smaller than a 4B model's tied embedding/LM-head weight; binding it
@@ -232,9 +267,14 @@ export async function createEngine(opts: CreateEngineOptions = {}): Promise<Zero
   await engine.generatePipelined(spec.moe ? warmupIds.slice(0, 1) : warmupIds, 1, () => {})
   report({ stage: 'ready', message: 'Ready' })
 
+  return { engine, tokenizer, spec, variants, info: infoFor(param, spec), buildChatPromptFor }
+}
+
+export async function createEngine(opts: CreateEngineOptions = {}): Promise<ZeroTvmEngine> {
+  const { engine, tokenizer, spec, info, buildChatPromptFor } = await bootShared(opts)
   let generating = false
   return {
-    model: infoFor(param, spec),
+    model: info,
     async chat(messages: ChatMessage[], chatOpts: ChatOptions = {}): Promise<string> {
       // The engine is single-stream (batch = 1) and carries KV state across
       // the call, so two overlapping chats would interleave submissions into
@@ -267,5 +307,27 @@ export async function createEngine(opts: CreateEngineOptions = {}): Promise<Zero
       }
       return tokenizer.decode(ids)
     },
+  }
+}
+
+// ---- host surface (the Dawn-native agent server rides these) --------------
+// LAZY, deliberately: a static re-export would evaluate model-select →
+// weight-loader at module scope, which reads GPUBufferUsage and would crash
+// every non-GPU import of this library — the exact failure the lazy-import
+// design at the top of createEngine exists to prevent. Hosts call this after
+// installing their shims.
+export async function hostSurface() {
+  const [ms, tc, pool] = await Promise.all([
+    import('../zero-tvm/model-select.js'),
+    import('../zero-tvm/tool-calls.js'),
+    import('../zero-tvm/kv-pool.js'),
+  ])
+  return {
+    buildChatPromptFor: ms.buildChatPromptFor,
+    withTools: tc.withTools,
+    parseToolCalls: tc.parseToolCalls,
+    renderAssistantCalls: tc.renderAssistantCalls,
+    poolSave: pool.poolSave,
+    poolTryRestore: pool.poolTryRestore,
   }
 }

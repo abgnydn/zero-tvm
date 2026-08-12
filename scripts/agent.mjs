@@ -37,6 +37,9 @@ const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i +
 //   ztvm fast   -> llama32 (chat only; it does not call tools)
 //   ztvm code   -> like default, then DROPS YOU INTO pi when ready
 const PRESETS = {
+  //   ztvm native -> NO BROWSER: the engine in-process on dawn.node,
+  //                  robustness off, same OpenAI surface. The fastest mode.
+  native: { param: 'qwen3mlx', native: true },
   big: { param: 'qwen35', ctx: 65536 },
   max: { param: 'qwen35', ctx: 262144 },
   fast: { param: 'llama32', ctx: 0 },
@@ -78,6 +81,48 @@ for (let i = 0; i < 40; i++) {
   await new Promise((r) => setTimeout(r, 500))
 }
 
+// 2a. NATIVE mode: no tab at all — agent-native.mjs runs the engine
+// in-process on dawn.node (see scripts/dawn-probe.mjs for the numbers).
+if (preset?.native || args.includes('--native')) {
+  // 8017 may be held by a BROWSER-mode server from an earlier launch — the
+  // native host then dies on EADDRINUSE under detached stdio and the wait
+  // below spins forever (found live). Evict it; the two modes are exclusive.
+  try {
+    const h = await (await fetch('http://127.0.0.1:8017/health', { signal: AbortSignal.timeout(1500) })).json()
+    if (!h.native) {
+      console.log('stopping the browser-mode agent-server on :8017')
+      spawn('pkill', ['-f', 'scripts/agent-server.mjs']).on('error', () => {})
+      await new Promise((r) => setTimeout(r, 800))
+    }
+  } catch { /* nothing on 8017 — good */ }
+  try { await import('webgpu') } catch {
+    console.log('installing dawn.node prebuilt (once)…')
+    await new Promise((r) => spawn('npm', ['i', '--no-save', 'webgpu'], { cwd: ROOT, stdio: 'inherit' }).on('exit', r))
+  }
+  detach('node', [join(ROOT, 'scripts/agent-native.mjs'), param,
+    ...(ctx ? ['--ctx', String(ctx)] : []), ...(pool ? [] : ['--pool', '0'])], 'agent-native (dawn.node)')
+  patchPi()
+  process.stdout.write('waiting for the native host (first run builds the weight cache)')
+  let ok = false
+  for (let i = 0; i < 600; i++) {
+    try { const h = await (await fetch('http://127.0.0.1:8017/health')).json(); if (h.native) { ok = true; break } } catch { /* booting */ }
+    process.stdout.write('.'); await new Promise((r) => setTimeout(r, 1000))
+  }
+  console.log('')
+  if (!ok) { console.log('native host never came up — check `node scripts/agent-native.mjs` directly'); process.exit(1) }
+  console.log(`
+READY (native, no browser) — http://127.0.0.1:8017/v1
+
+  pi:     PI_OFFLINE=1 pi --model ztvm
+  Cline:  OpenAI Compatible · Base URL http://127.0.0.1:8017/v1 · model ztvm
+`)
+  if (intoPi) {
+    spawn('pi', ['--model', 'ztvm'], { stdio: 'inherit', env: { ...process.env, PI_OFFLINE: '1' } })
+      .on('exit', (code) => process.exit(code ?? 0))
+  }
+  process.exit(0)
+}
+
 // 2. the hosting tab — in ZTVM'S OWN Chrome instance, not the user's browser.
 // A Chrome we launch can take Dawn flags the public web never gets, and one of
 // them is worth +22% prefill end-to-end: disable_robustness removes the
@@ -106,6 +151,7 @@ if (!args.includes('--safe') && existsSync(CHROME)) {
 }
 
 // 3. pi config. Touches ONLY providers.zerotvm; everything else verbatim.
+function patchPi() {
 const piPath = join(homedir(), '.pi/agent/models.json')
 if (existsSync(piPath)) {
   const bak = piPath.replace(/\.json$/, '.zerotvm.bak.json')
@@ -131,6 +177,8 @@ if (existsSync(piPath)) {
 } else {
   console.log(`pi config not found at ${piPath} — skipping (curl/Cline still work)`)
 }
+}
+patchPi()
 
 // 4. wait for the model.
 process.stdout.write('waiting for the tab to host (first run downloads weights)')
