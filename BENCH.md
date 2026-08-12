@@ -1703,3 +1703,43 @@ The lib grew `createEngineRaw` (+ ctx override, + subgroup-matrix feature)
 and a LAZY `hostSurface()` — lazy because a static re-export would evaluate
 weight-loader's module-scope `GPUBufferUsage` and crash every non-GPU import
 of the library, the exact failure its lazy-import design exists to prevent.
+
+### dawn.node's idle-loop backoff: decode was paying a sleep per token (2026-08-13)
+
+The first native DECODE measurement (qwen35, per-token timestamps over a
+136-token generate) read **19.5 tok/s** against 72.4 in the browser — a 3.7×
+collapse that prefill never showed. The GPU was innocent: `profileStep` (the
+lib now requests `timestamp-query` when the adapter has it) put the forward
+pass at ~18 ms/token, and a CPU profile of the run was **74% idle** — the
+process was *waiting*, not working.
+
+The wait is the `webgpu` binding's completion delivery. dawn.node fires
+mapAsync/onSubmittedWorkDone callbacks from its own setImmediate chain, and
+that chain **backs off once the Node event loop goes idle** — so every decode
+token (one mapAsync readback each) ate a backoff sleep on top of its GPU
+time. Prefill amortizes one readback over a whole chunk, which is why the
+native-vs-Chrome story looked clean until decode was measured.
+
+Proof by intervention, same run order, on a machine that was *degrading the
+whole time* (see below): a no-op `setImmediate` chain kept alive during the
+generate → **69.7 tok/s** (3.6× against a falling baseline). A 1 ms interval
+timer is NOT enough (29.4 — waking the loop does not reschedule the
+binding's chain). The binding exposes no tick/processEvents API, so the spin
+is the only lever; `agent-native.mjs` now runs it exactly while a generation
+or pool save is in flight (`withHotLoop`), one busy core for the duration.
+
+Two corollaries, both applied:
+- `gemm-sweep-native.mjs` and `dawn-probe.mjs` timed batches with an
+  `onSubmittedWorkDone` await per measurement — each await could carry the
+  same fixed sleep, inflating per-iteration times of SHORT kernels the most.
+  Both harnesses now spin for their whole run. The first sweep's "machine is
+  ~2× throttled" reading is suspect for this reason; its within-run ranking
+  (no config beat E1) survives, because a fixed additive penalty per timing
+  batch preserves order.
+- Absolute numbers from the 08-13 morning session are VOID for a second,
+  unrelated reason: the battery was at 5% on an adapter that could not
+  charge it ("AC attached; not charging"), and macOS hard-throttles the SoC
+  in that state — decode fell to 7 tok/s with a COOL, idle GPU before the
+  cause was found. The decode table below is to be re-taken on healthy
+  power; the 19.5→69.7 intervention stands because it beat a monotonically
+  falling baseline.

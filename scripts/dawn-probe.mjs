@@ -12,6 +12,10 @@ import { int4MatmulSgE1WGSL } from '../src/compiler/shaders/int4_matmul.gen.ts'
 const gpu = create([
   'enable-dawn-features=allow_unsafe_apis,disable_robustness',
 ])
+// Keep completion delivery prompt: dawn.node's immediate-chain backs off when
+// the loop idles, adding a fixed ~10-30 ms to every onSubmittedWorkDone await
+// — which reads as a slower GPU. A bench can afford the busy core.
+const spin = () => setImmediate(spin); spin()
 const adapter = await gpu.requestAdapter()
 const feats = [...adapter.features]
 console.log('features:', feats.filter(f => /subgroup|f16|matrix/.test(f)).join(', ') || '(none relevant)')
@@ -69,3 +73,4 @@ const ms = (performance.now() - t1) / 20
 const gf = (2 * M * N * K / 1e9) / (ms / 1000)
 console.log(`sg-e1 gate_up M=256: ${ms.toFixed(2)} ms  (${gf.toFixed(0)} GF)`)
 console.log(`Chrome same shape: safe 6.65 ms (3832 GF), unsafe 5.27 ms (4839 GF)`)
+process.exit(0) // the keep-delivery-hot immediate chain never lets the loop drain
