@@ -1704,42 +1704,70 @@ and a LAZY `hostSurface()` — lazy because a static re-export would evaluate
 weight-loader's module-scope `GPUBufferUsage` and crash every non-GPU import
 of the library, the exact failure its lazy-import design exists to prevent.
 
-### dawn.node's idle-loop backoff: decode was paying a sleep per token (2026-08-13)
+### The native decode mystery (2026-08-13): three suspects, one guilty — timestamp-query
 
-The first native DECODE measurement (qwen35, per-token timestamps over a
-136-token generate) read **19.5 tok/s** against 72.4 in the browser — a 3.7×
-collapse that prefill never showed. The GPU was innocent: `profileStep` (the
-lib now requests `timestamp-query` when the adapter has it) put the forward
-pass at ~18 ms/token, and a CPU profile of the run was **74% idle** — the
-process was *waiting*, not working.
+The first native DECODE measurement read qwen35 at **19.5 tok/s** against
+72.4 in the browser. Over one morning that number was blamed on three
+different causes; two were retracted the same day. The record, in order:
 
-The wait is the `webgpu` binding's completion delivery. dawn.node fires
-mapAsync/onSubmittedWorkDone callbacks from its own setImmediate chain, and
-that chain **backs off once the Node event loop goes idle** — so every decode
-token (one mapAsync readback each) ate a backoff sleep on top of its GPU
-time. Prefill amortizes one readback over a whole chunk, which is why the
-native-vs-Chrome story looked clean until decode was measured.
+1. **RETRACTED: "dawn.node backs off completion delivery when the loop
+   idles."** A hot `setImmediate` chain appeared to lift 19.5 → 69.7 tok/s,
+   and a hot-loop fix shipped on that basis. The intervention was confounded:
+   the hot run also happened to be the first after a lib rebuild that added
+   timestamp-query (see 3), on a machine whose battery was dying (see 2).
+   The clean A/B — healthy power, no timestamp-query, idle/hot phases
+   alternating IN ONE PROCESS (`scripts/decode-bench-native.mjs`) — shows
+   **no idle/hot gap at all** (qwen3mlx 75-85 both ways; qwen35 65-77 both
+   ways), and on llama32 the spinner is ~8% SLOWER (277-278 idle vs 250-259
+   hot — the busy core steals from the submit loop). The hot-loop code is
+   reverted everywhere.
+2. **REAL but environmental: the battery.** The machine spent the morning at
+   5% on an adapter that could not charge it ("AC attached; not charging"),
+   and macOS hard-throttles the SoC in that state — decode fell to 7 tok/s
+   with a cool, idle GPU. Every absolute number taken in that state was
+   VOID. Check `pmset -g batt` before blaming thermals or code.
+3. **REAL and in the code: requesting `timestamp-query` at device creation
+   costs ~3× decode** — with no query ever taken. qwen3mlx: a uniform
+   ~19 tok/s with the feature on the device, 54-84 without, A/B'd minutes
+   apart on the same machine. Dawn's Metal timestamp path serializes
+   command execution device-wide. The lib now requests it only under
+   `ZTVM_PROFILE=1`; `engine.profileStep()` still works when asked for.
 
-Proof by intervention, same run order, on a machine that was *degrading the
-whole time* (see below): a no-op `setImmediate` chain kept alive during the
-generate → **69.7 tok/s** (3.6× against a falling baseline). A 1 ms interval
-timer is NOT enough (29.4 — waking the loop does not reschedule the
-binding's chain). The binding exposes no tick/processEvents API, so the spin
-is the only lever; `agent-native.mjs` now runs it exactly while a generation
-or pool save is in flight (`withHotLoop`), one busy core for the duration.
+**The clean decode table** (healthy power, no timestamp-query, dawn.node,
+robustness off; browser + LM Studio columns from the 08-12 A/B):
 
-Two corollaries, both applied:
-- `gemm-sweep-native.mjs` and `dawn-probe.mjs` timed batches with an
-  `onSubmittedWorkDone` await per measurement — each await could carry the
-  same fixed sleep, inflating per-iteration times of SHORT kernels the most.
-  Both harnesses now spin for their whole run. The first sweep's "machine is
-  ~2× throttled" reading is suspect for this reason; its within-run ranking
-  (no config beat E1) survives, because a fixed additive penalty per timing
-  batch preserves order.
-- Absolute numbers from the 08-13 morning session are VOID for a second,
-  unrelated reason: the battery was at 5% on an adapter that could not
-  charge it ("AC attached; not charging"), and macOS hard-throttles the SoC
-  in that state — decode fell to 7 tok/s with a COOL, idle GPU before the
-  cause was found. The decode table below is to be re-taken on healthy
-  power; the 19.5→69.7 intervention stands because it beat a monotonically
-  falling baseline.
+| model | native decode | browser (flagged) | LM Studio |
+|---|---:|---:|---:|
+| llama32 | **277 tok/s** | — | — |
+| qwen3mlx | **~84 tok/s** | — | — |
+| qwen35 | **~76 tok/s** | 72.4 | 89.0 |
+
+Native now BEATS the browser on the A/B model (76 vs 72.4) and stands at
+**0.85× LM Studio** decode — with context (1.32×) and cold-restore (~35×)
+already won. Numbers taken at 20% charge on a working adapter; treat as
+same-day-comparable, not protocol-final.
+
+### Sweep round 2 (2026-08-13, clean power): E1 is beatable, twice
+
+With the gate deterministic (reference rounds dequant to f16 like the
+kernel; all buildable configs at ~4.8e-4), the fixed swizzle, and the new
+E4 split-K arm (`sk` grid-z K-slices, f32 partials + reduce dispatch):
+
+- **M=64: `sg4 32x64 k32 pad sk4` wins** — 3.05 TF mean vs the E1 shape's
+  2.82 (+8%), strongest exactly on the small-grid shapes (ffn_down 3.13,
+  o_proj 2.74) the MLX split-K heuristic predicts (mTiles×nTiles < ~400).
+- **M=256: `sg8 64x64 k32 swz` wins** — 3.68 TF vs E1's 3.45 (+7%),
+  consistent with llama.cpp's 8-subgroup config flipping to the winner
+  under disable_robustness (E2). The swizzle, now correct, edges pad.
+- The 08-12 "no config beats E1" reading came from a machine in state (2)
+  above and is superseded.
+
+Not yet wired into the engine: graduating these two as chunk-GEMM variants
+(sg8-swz for CAP-256 prefill, sk4 for small-M) is the next kernel step.
+
+### `ztvm native big` gate (2026-08-13): qwen35 @ 65,536 PASS
+
+Native host boots qwen35 at ctx 65,536 in 6.2 s (warm cache), answers a
+completion correctly (finish_reason stop, 42 tokens, 736 ms wall including
+prefill), pool fingerprint-miss then saves 66 tokens on idle. The `ztvm big`
+preset is safe to hand to pi/Cline against the native host.

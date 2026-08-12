@@ -224,12 +224,6 @@ fn reduce(@builtin(global_invocation_id) gid : vec3<u32>) {
 // ---------------------------------------------------------------- harness
 
 await installShims({ unsafe: true })
-// dawn.node delivers onSubmittedWorkDone/mapAsync completions from an
-// immediate-chain that BACKS OFF once the event loop idles — a sleeping loop
-// adds a fixed ~10-30 ms to every await, which inflated the first sweep's
-// per-iteration times ~2x and read as "the machine is throttled". A live
-// setImmediate chain keeps delivery sub-ms; a bench can afford the busy core.
-const spin = () => setImmediate(spin); spin()
 const adapter = await navigator.gpu.requestAdapter()
 if (!adapter.features.has('chromium-experimental-subgroup-matrix')) {
   console.log('no subgroup-matrix on this adapter'); process.exit(1)
@@ -423,4 +417,4 @@ for (const M of MS) {
   const best = [...results].sort((a, b) => b.tf[`mean@${M}`] - a.tf[`mean@${M}`])[0]
   if (best) console.log(`\nBEST @M=${M}: ${best.name} — ` + SHAPES.map(([l]) => `${l} ${(best.tf[`${l}@${M}`] / 1000).toFixed(2)}TF`).join(', '))
 }
-process.exit(0) // the keep-delivery-hot immediate chain never lets the loop drain
+

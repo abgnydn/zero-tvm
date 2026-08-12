@@ -79,21 +79,6 @@ let busy = false
 let poolTried = false
 let saveTimer = null
 
-// dawn.node delivers mapAsync/onSubmittedWorkDone completions from its own
-// immediate-chain, which BACKS OFF once the event loop goes idle — so every
-// decode token (one mapAsync each) was paying a backoff sleep on top of its
-// GPU time: qwen35 measured 19.5 tok/s with the loop asleep, 69.7 with it
-// hot, same run. A 1 ms interval timer is NOT enough (29.4 — waking the loop
-// does not reschedule the binding's chain); only a live setImmediate chain
-// keeps delivery prompt. Costs one busy core, so it runs ONLY while a
-// generation (or pool save — also GPU readbacks) is in flight.
-let hot = 0
-const spin = () => { if (hot > 0) setImmediate(spin) }
-async function withHotLoop(fn) {
-  if (++hot === 1) setImmediate(spin)
-  try { return await fn() } finally { hot-- }
-}
-
 async function runJob(body, onDelta) {
   let messages = normalize(body.messages)
   if (body.tools?.length) messages = S.withTools(dialect, messages, body.tools)
@@ -142,7 +127,7 @@ const scheduleSave = () => {
     saveTimer = null
     if (busy) return
     try {
-      const sv = await withHotLoop(() => S.poolSave(engine, poolCfg()))
+      const sv = await S.poolSave(engine, poolCfg())
       if (sv.tokens) console.log(`[native] pool: saved ${sv.tokens} tokens`)
     } catch (e) { console.log(`[native] pool save failed: ${e.message}`) }
   }, 1500)
@@ -203,7 +188,7 @@ createServer(async (req, res) => {
         choices: [{ index: 0, delta, finish_reason: finish }],
       })
       chunk({ role: 'assistant', content: '' })
-      const done = await withHotLoop(() => runJob(body, (t) => chunk({ content: t })))
+      const done = await runJob(body, (t) => chunk({ content: t }))
       if (done.toolCalls.length) chunk({ tool_calls: done.toolCalls.map((c, i) => ({ index: i, ...c })) })
       chunk({}, done.finishReason)
       if (body.stream_options?.include_usage) {
@@ -212,7 +197,7 @@ createServer(async (req, res) => {
       res.write('data: [DONE]\n\n')
       res.end()
     } else {
-      const done = await withHotLoop(() => runJob(body, null))
+      const done = await runJob(body, null)
       json(res, 200, {
         id: `chatcmpl-${id}`, object: 'chat.completion', created, model: spec.id,
         choices: [{
