@@ -210,8 +210,13 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   if (adapter.features.has('chromium-experimental-subgroup-matrix')) {
     features.push('chromium-experimental-subgroup-matrix' as GPUFeatureName)
   }
-  // Enables engine.profileStep() (per-kernel timings) on hosts that carry it.
-  if (adapter.features.has('timestamp-query')) features.push('timestamp-query' as GPUFeatureName)
+  // Enables engine.profileStep() (per-kernel timings) — OPT-IN via
+  // ZTVM_PROFILE=1 / ?profile=1, never default: requesting timestamp-query on
+  // the device is suspected of serializing Metal command execution.
+  const wantProfile = typeof process !== 'undefined' && process.env?.ZTVM_PROFILE === '1'
+  if (wantProfile && adapter.features.has('timestamp-query')) {
+    features.push('timestamp-query' as GPUFeatureName)
+  }
   // Lift the storage-binding/buffer ceilings to whatever the adapter offers
   // (always valid per spec). The default 128 MiB maxStorageBufferBindingSize
   // is smaller than a 4B model's tied embedding/LM-head weight; binding it
