@@ -33,7 +33,7 @@ const FULL = process.argv.includes('--full')
 
 // ---------------------------------------------------------------- builder
 
-function sweepWGSL({ sg, tm, tn, tk, sw }) {
+function sweepWGSL({ sg, tm, tn, tk, sw, sk = 1 }) {
   // subtile grid: how the sg subgroups cover the tm x tn tile in 16x32 steps
   const rows = tm / 16, cols = tn / 32
   if (rows * cols !== sg) throw new Error(`sg=${sg} cannot tile ${tm}x${tn}`)
@@ -80,7 +80,9 @@ enable f16;
 enable subgroups;
 enable chromium_experimental_subgroup_matrix;
 
-@group(0) @binding(0) var<storage, read_write> output_buf : array<f16>;
+${sk > 1
+    ? '@group(0) @binding(0) var<storage, read_write> partials : array<f32>; // [sk][M][N]'
+    : '@group(0) @binding(0) var<storage, read_write> output_buf : array<f16>;'}
 @group(0) @binding(1) var<storage, read> input_buf : array<f16>;
 @group(0) @binding(2) var<storage, read> scales : array<f16>;
 @group(0) @binding(3) var<storage, read> weights : array<u32>;
@@ -115,7 +117,13 @@ fn sweep(
   var c10 : subgroup_matrix_result<f32, 8, 8>; var c11 : subgroup_matrix_result<f32, 8, 8>;
   var c12 : subgroup_matrix_result<f32, 8, 8>; var c13 : subgroup_matrix_result<f32, 8, 8>;
 
-  for (var k0 : u32 = 0u; k0 < K; k0 = k0 + ${tk}u) {
+  // split-K (E4): grid z slices K; each slice is a tk-multiple, computed from
+  // the RUNTIME K so one pipeline serves every shape. sk=1 degenerates to the
+  // whole range.
+  let KS = ((K / ${sk}u + ${tk - 1}u) / ${tk}u) * ${tk}u;
+  let kLo = wid.z * KS;
+  let kHi = min(kLo + KS, K);
+  for (var k0 : u32 = kLo; k0 < kHi; k0 = k0 + ${tk}u) {
     for (var i : u32 = 0u; i < ${aPer}u; i = i + 1u) {
       let idx = tid * ${aPer}u + i;
       if (idx < ${tm * tk}u) {
@@ -181,10 +189,35 @@ fn sweep(
       let m = idx / ${tn}u;
       let n2 = idx % ${tn}u;
       if (mBase + m < M && nBase + n2 < N) {
-        output_buf[(mBase + m) * N + nBase + n2] = f16(Osh[idx]);
+        ${sk > 1
+    // Accumulators zero-init, so a z-slice past K still stores zeros —
+    // partials never need a clear pass.
+    ? `partials[(wid.z * M + mBase + m) * N + nBase + n2] = Osh[idx];`
+    : `output_buf[(mBase + m) * N + nBase + n2] = f16(Osh[idx]);`}
       }
     }
   }
+}`
+}
+
+// E4's second dispatch: sum the sk f32 partial planes into the f16 output.
+function reduceWGSL(sk) {
+  return `
+enable f16;
+@group(0) @binding(0) var<storage, read_write> output_buf : array<f16>;
+@group(0) @binding(1) var<storage, read> partials : array<f32>;
+struct PODArgs { K_PACKED: u32, SCALES_PER_ROW: u32, packGridDimX: u32, M_ROWS: u32 }
+@group(0) @binding(2) var<uniform> podArgs : PODArgs;
+
+@compute @workgroup_size(256, 1, 1)
+fn reduce(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let MN = podArgs.M_ROWS * podArgs.packGridDimX;
+  if (gid.x >= MN) { return; }
+  var acc = 0.0;
+  for (var z : u32 = 0u; z < ${sk}u; z = z + 1u) {
+    acc = acc + partials[z * MN + gid.x];
+  }
+  output_buf[gid.x] = f16(acc);
 }`
 }
 
@@ -203,14 +236,19 @@ if (!adapter.features.has('chromium-experimental-subgroup-matrix')) {
 }
 const device = await adapter.requestDevice({
   requiredFeatures: ['shader-f16', 'subgroups', 'chromium-experimental-subgroup-matrix'],
-  requiredLimits: { maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize },
+  requiredLimits: {
+    maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+    // split-K partials at M=512 x N=19456 x sk4 (f32) outgrow the 128 MiB default
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+    maxBufferSize: adapter.limits.maxBufferSize,
+  },
 })
 
 const rnd = (() => { let st = 47; return () => (st = (st * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff })()
-const mk = (code) => {
+const mk = (code, entry = 'sweep') => {
   device.pushErrorScope('validation')
   const pipe = device.createComputePipeline({
-    layout: 'auto', compute: { module: device.createShaderModule({ code }), entryPoint: 'sweep' },
+    layout: 'auto', compute: { module: device.createShaderModule({ code }), entryPoint: entry },
   })
   return device.popErrorScope().then((e) => (e ? { err: e.message.split('\n')[0] } : { pipe }))
 }
@@ -234,23 +272,46 @@ function setup(M, N, K, CAP) {
     podB: buf(new Uint32Array([KP, SPR, N, M]), GPUBufferUsage.UNIFORM),
   }
 }
-const bind = (pipe, s) => device.createBindGroup({
+const bind = (pipe, s, first) => device.createBindGroup({
   layout: pipe.getBindGroupLayout(0),
   entries: [
-    { binding: 0, resource: { buffer: s.outB } }, { binding: 1, resource: { buffer: s.aB } },
+    { binding: 0, resource: { buffer: first ?? s.outB } }, { binding: 1, resource: { buffer: s.aB } },
     { binding: 2, resource: { buffer: s.scB } }, { binding: 3, resource: { buffer: s.wB } },
     { binding: 4, resource: { buffer: s.podB } }, { binding: 5, resource: { buffer: s.biB } },
   ],
 })
+const reduceBind = (pipe, s, part) => device.createBindGroup({
+  layout: pipe.getBindGroupLayout(0),
+  entries: [
+    { binding: 0, resource: { buffer: s.outB } },
+    { binding: 1, resource: { buffer: part } },
+    { binding: 2, resource: { buffer: s.podB } },
+  ],
+})
+// One config = one or two dispatches (split-K adds the reduce). WebGPU orders
+// dispatches within a pass, so main→reduce chains without a pass break.
+function encodeRun(pass, made, cfg, s, part) {
+  pass.setPipeline(made.pipe)
+  pass.setBindGroup(0, bind(made.pipe, s, part))
+  pass.dispatchWorkgroups(Math.ceil(s.N / cfg.tn), Math.ceil(s.M / cfg.tm), cfg.sk ?? 1)
+  if (made.reduce) {
+    pass.setPipeline(made.reduce)
+    pass.setBindGroup(0, reduceBind(made.reduce, s, part))
+    pass.dispatchWorkgroups(Math.ceil((s.M * s.N) / 256), 1, 1)
+  }
+}
+const mkPart = (cfg, s) => (cfg.sk ?? 1) > 1
+  ? device.createBuffer({ size: cfg.sk * s.M * s.N * 4, usage: ST })
+  : null
 
 // gate: small shape vs the formula
-async function gate(pipe, cfg) {
+async function gate(made, cfg) {
   const s = setup(13, 96, 128, 32)
   device.queue.writeBuffer(s.outB, 0, new Uint16Array(32 * 96))
+  const part = mkPart(cfg, s)
   const enc = device.createCommandEncoder()
   const pass = enc.beginComputePass()
-  pass.setPipeline(pipe); pass.setBindGroup(0, bind(pipe, s))
-  pass.dispatchWorkgroups(Math.ceil(96 / cfg.tn), Math.ceil(13 / cfg.tm), 1)
+  encodeRun(pass, made, cfg, s, part)
   pass.end()
   const rb = device.createBuffer({ size: 13 * 96 * 2, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
   enc.copyBufferToBuffer(s.outB, 0, rb, 0, 13 * 96 * 2)
@@ -278,23 +339,25 @@ async function gate(pipe, cfg) {
     const gv = f16BitsToF32(got[m * 96 + n])
     maxRel = Math.max(maxRel, Math.abs(gv - acc) / Math.max(1e-2, Math.abs(acc)))
   }
+  part?.destroy()
   return maxRel
 }
 
-async function time(pipe, cfg, s) {
-  const bg = bind(pipe, s)
+async function time(made, cfg, s) {
+  const part = mkPart(cfg, s)
   const once = (iters) => {
     const enc = device.createCommandEncoder()
     const pass = enc.beginComputePass()
-    pass.setPipeline(pipe); pass.setBindGroup(0, bg)
-    for (let i = 0; i < iters; i++) pass.dispatchWorkgroups(Math.ceil(s.N / cfg.tn), Math.ceil(s.M / cfg.tm), 1)
+    for (let i = 0; i < iters; i++) encodeRun(pass, made, cfg, s, part)
     pass.end()
     device.queue.submit([enc.finish()])
   }
   once(3); await device.queue.onSubmittedWorkDone()
   const t0 = performance.now()
   once(20); await device.queue.onSubmittedWorkDone()
-  return (performance.now() - t0) / 20
+  const ms = (performance.now() - t0) / 20
+  part?.destroy()
+  return ms
 }
 
 // ---------------------------------------------------------------- sweep
@@ -310,17 +373,27 @@ for (const sg of [4, 8]) {
     }
   }
 }
+// E4: split-K on the E1 shape. Motivation (docs/PREFILL_RESEARCH.md): MLX
+// splits K when mTiles*nTiles < ~400; at chunk M=256 our ffn_down/o_proj
+// grids are ~320 tiles. sk multiplies occupancy at the cost of an f32
+// partials round-trip + a reduce dispatch.
+for (const sk of [2, 4]) CONFIGS.push({ sg: 4, tm: 32, tn: 64, tk: 32, sw: 'pad', sk })
 const SHAPES = [['gate_up', 2560, 19456], ['ffn_down', 9728, 2560], ['o_proj', 4096, 2560]]
 const MS = FULL ? [64, 256, 512] : [64, 256]
 
 console.log(`${CONFIGS.length} configs x ${SHAPES.length} shapes x M ${MS.join('/')} — E1 baseline: 3.55/2.86/2.80 TF at M=64\n`)
 const results = []
 for (const cfg of CONFIGS) {
-  const name = `sg${cfg.sg} ${cfg.tm}x${cfg.tn} k${cfg.tk} ${cfg.sw}`
+  const name = `sg${cfg.sg} ${cfg.tm}x${cfg.tn} k${cfg.tk} ${cfg.sw}${cfg.sk ? ` sk${cfg.sk}` : ''}`
   let made
   try { made = await mk(sweepWGSL(cfg)) } catch (e) { console.log(`${name}: build threw ${e.message.slice(0, 60)}`); continue }
   if (made.err) { console.log(`${name}: ${made.err.slice(0, 90)}`); continue }
-  const rel = await gate(made.pipe, cfg)
+  if (cfg.sk) {
+    const r = await mk(reduceWGSL(cfg.sk), 'reduce')
+    if (r.err) { console.log(`${name}: reduce ${r.err.slice(0, 80)}`); continue }
+    made.reduce = r.pipe
+  }
+  const rel = await gate(made, cfg)
   // NaN must FAIL: NaN > x is false, and the first run let NaN-producing
   // configs through the gate and into the timing table.
   // With the reference rounding dequant to f16 like the kernel, every correct
@@ -334,7 +407,7 @@ for (const cfg of CONFIGS) {
     let sum = 0
     for (const [label, K, N] of SHAPES) {
       const s = setup(M, N, K, M)
-      const ms = await time(made.pipe, cfg, s)
+      const ms = await time(made, cfg, s)
       const gf = (2 * M * N * K / 1e9) / (ms / 1000)
       row.tf[`${label}@${M}`] = gf
       sum += gf
