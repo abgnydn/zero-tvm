@@ -534,5 +534,12 @@ for (const M of MS) {
 // was still holding the GPU when the next run started — every timing taken
 // beside it is contended. Leave explicitly, CARRYING the exit code: a bare
 // exit(0) here would have thrown away every gate failure set above.
+//
+// Drain stdout first. When stdout is a PIPE Node buffers it and writes
+// asynchronously, so process.exit() discards whatever has not flushed — the
+// results table, in a run whose whole purpose is the results table. This is
+// also why a piped run shows nothing until it ends; redirect to a file to
+// watch progress.
+await new Promise((r) => process.stdout.write('', r))
 process.exit(process.exitCode ?? 0)
 

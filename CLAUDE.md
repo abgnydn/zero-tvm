@@ -178,6 +178,34 @@ npm run test:kernels:mlx      # byte-exact repack + loader replay + model budget
 npm run test:kernels:real     # kernels vs mlx_lm's own modules on real weights
 ```
 
+## Chunk-prefill GEMM (`chunkGemm`)
+
+The chunk path picks a GEMM: `sgmat` (E1 on Metal's matrix unit, the default
+where the device has `chromium-experimental-subgroup-matrix`) → `tiled` →
+`matvec`. `e5` is the same unit at a 64(M)x32(N) tile with a swizzled B —
+18-22% over E1 in isolation, **13-15% on real prefill** (BENCH.md, "Sweep
+round 3" and "E5 in the engine"). Opt-in until it passes token identity on an
+MLC-symmetric and a hybrid spec; neither checkpoint is on this disk.
+
+An EXPLICIT `chunkGemm` that cannot run now **throws** instead of falling back.
+Silent substitution is how a kernel A/B measures the same code twice.
+
+```bash
+npm run test:kernels:sgmat    # numerics for both matrix-unit kernels, both
+                              # quant flavors, ragged M/N/K — exits non-zero
+                              # on failure (needs a GPU + `npm i --no-save webgpu`)
+node --experimental-strip-types scripts/gemm-sweep-native.mjs   # the tile sweep,
+                              # ranked against the SHIPPED kernel in the same run
+node --experimental-strip-types scripts/prefill-gemm-ab.mjs llama32
+                              # in-engine A/B: two engines, one weight load,
+                              # arms alternated; throws if a round did not chunk
+GEMM=e5 node scripts/chunk-prefill-test.mjs llama32   # token identity
+```
+
+Read the sweep's header before trusting any number it prints: rounds 1 and 2
+ranked configs against the harness's own reconstruction of E1 rather than the
+shipped kernel, and were wrong by 26%.
+
 ## Adding models (`scripts/add-model.mjs`)
 
 Covered-architecture MLX checkpoints are added by pipeline, not by hand:

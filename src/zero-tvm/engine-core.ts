@@ -2206,6 +2206,17 @@ export function buildDecodeEngine(
       : (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
     const gemmTiledGrid = sgmatOK || tiledOK
     chunkGemmUsed = e5OK ? 'e5' : sgmatOK ? 'sgmat' : tiledOK ? 'tiled' : 'matvec'
+    // An EXPLICIT request that cannot be honoured is an error, not a fallback.
+    // Silently substituting is how a kernel A/B measures the same code twice:
+    // ask for 'e5', get sgmat, read two identical numbers, conclude the kernels
+    // are equivalent. The ladder still applies when nothing was asked for.
+    if (opts.chunkGemm && chunkGemmUsed !== opts.chunkGemm) {
+      const why = !dimsOK ? `dims do not tile (cap ${CHUNK_CAP}, d/qDim/ffn must be %64 and cap %32)`
+        : opts.chunkGemm === 'e5' && CHUNK_CAP % 64 !== 0 ? `E5 stages a 64-row tile, so cap must be %64 (got ${CHUNK_CAP})`
+        : opts.chunkGemm === 'e5' || opts.chunkGemm === 'sgmat' ? 'its pipeline was not built — usually a device without chromium-experimental-subgroup-matrix'
+        : 'that pipeline was not built'
+      throw new Error(`chunkGemm: asked for '${opts.chunkGemm}', can only run '${chunkGemmUsed}' — ${why}`)
+    }
     const dyn = gemm
     /** A batched-GEMM bind group. bg() maps array position to binding index, so
      *  the bias buffer must come LAST and only when the affine kernel is in

@@ -75,5 +75,8 @@ console.log(`  e5         ${b.toFixed(0)} tok/s   ${((b / a - 1) * 100).toFixed(
 console.log(`  spread     E1 ${Math.min(...got['sgmat (E1)']).toFixed(0)}-${Math.max(...got['sgmat (E1)']).toFixed(0)}`
   + `  e5 ${Math.min(...got.e5).toFixed(0)}-${Math.max(...got.e5).toFixed(0)}`)
 
-// dawn.node holds the loop open after the last submit; leave explicitly.
-process.exit(0)
+// dawn.node holds the loop open after the last submit; leave explicitly, but
+// drain stdout first — piped stdout is written asynchronously and exit()
+// discards what has not flushed, which here is the whole comparison.
+await new Promise((r) => process.stdout.write('', r))
+process.exit(process.exitCode ?? 0)
