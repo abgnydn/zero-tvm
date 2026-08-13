@@ -1454,6 +1454,31 @@ per-token path to itself.
 
 ---
 
+### MoE: the experts are the MINORITY of the work (2026-08-13)
+
+`scripts/decode-profile-native.mjs qwen30b`, LM Studio idle (a first run with
+it generating read 12.12 ms vs 12.06 idle, so contention was not material).
+MoE prefills per token today, so a decode profile IS a prefill profile here.
+
+| kernel | share | expert-bound? |
+|---|---:|---|
+| moeUp | 13.6% | yes |
+| moeGate | 13.0% | yes |
+| qkvMatmul | 12.5% | no |
+| moeDown | 11.4% | yes |
+| oproj | 10.3% | no |
+
+The three expert matmuls total **~38%**. The other ~62% — projections,
+attention, norms, the router's own matmul, the combine — is the same dense
+chain every other spec already chunks.
+
+This inverts the plan. The stated blocker ("ids[] has no token dimension") is
+real and does prevent batching the expert matmuls, but it does not touch the
+rest of the layer, and the rest of the layer is the majority. Chunking
+everything EXCEPT the experts needs no new kernel, no permutation and no
+grouped GEMM — only a token dimension on the router's two outputs. Plan in
+docs/MOE_CHUNK_PLAN.md.
+
 ### Where a decode token's time goes (2026-08-13)
 
 `scripts/decode-profile-native.mjs qwen3mlx` — one step, 36 layers, 14 distinct
