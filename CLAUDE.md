@@ -154,13 +154,19 @@ resident, needs ~24 GB free RAM) and `?model=qwen36q3` → `QWEN36_35B_A3B_Q3`
 Engine notes: the MoE block is 7 dispatches (router_logits → router_topk →
 gate/up/silu/down → combine) with the expert index in grid `z` and the shared
 expert stacked as index E of every expert tensor (its gate is router row E) —
-no special cases anywhere. Chunked prefill is OFF for MoE (`ids[]` has no
-token dimension, so a chunk would apply one token's expert choice to every
-token in it); MoE prefill is per-token. Since 2026-08-11 that is the ONLY
-remaining gate: dense affine specs chunk via `int4_matmul_batched_dyn_affine`
-(qwen3mlx 3.26x, llama32 3.57x prefill, token-identical — BENCH.md). MoE
-specs require subgroups — there is no scalar router/expert path and
-`buildDecodeEngine` throws rather than running the dense FFN.
+no special cases anywhere. Since 2026-08-13 MoE CHUNKS its prefill like every
+other spec: `moeIds`/`moeScores` are `[chunk, slots]`, the router's two kernels
+and `moe_combine` take the token in grid `y`, and the expert matmul takes it in
+grid `y` with the slot still in `z`. Experts never mix tokens, so this is a
+re-indexing, not a grouped GEMM — see `docs/MOE_CHUNK_PLAN.md` for what Phase B
+would add. MLA is now the only spec shape that cannot chunk (no chunked
+attention path). MoE specs require subgroups — there is no scalar router/expert
+path and `buildDecodeEngine` throws rather than running the dense FFN.
+
+```bash
+node scripts/chunk-prefill-test.mjs qwen30b      # MoE, pure attention, no shared expert
+PROMPT=400 node scripts/chunk-prefill-test.mjs qwen36q3   # MoE + GDN + shared + 3-bit
+```
 
 Weights load via `weight-loader-mlx.ts`: byte-range fetches (never a whole
 5.3 GB shard), OPFS keyed by BUILT buffer, bf16 conversion at load. The dev

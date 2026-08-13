@@ -657,9 +657,13 @@ export function buildDecodeEngine(
   // Static uniforms — matmul shapes (K_packed, scales_per_row, M)
   const qkvU   = fused ? null : uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(S.qkvDim)])
   const oProjU = uniformBuf(device, [u32(OPROJ_K_PACKED),  u32(OPROJ_SCALES),  u32(S.d)])
-  // MoE uniforms. The matmul PODArgs is FIVE u32 here, not three: the moe
-  // variant adds IN_SLOT_STRIDE and OUT_SLOT_STRIDE. IN_SLOT_STRIDE 0 means
-  // every slot reads the SAME activation (gate/up); down strides both.
+  // MoE uniforms. The matmul PODArgs is EIGHT u32 here, not three: the moe
+  // variant adds IN_SLOT_STRIDE and OUT_SLOT_STRIDE, then the three TOKEN
+  // strides chunked prefill rides on. IN_SLOT_STRIDE 0 means every slot reads
+  // the SAME activation (gate/up); down strides both.
+  // Decode is a one-token chunk — grid y is 1, so the token strides multiply by
+  // zero and are inert — but they are written with their real values anyway, so
+  // there is one layout, not a decode one and a prefill one.
   // Affine groups are 64, so scales-per-row is K/64, not K/32.
   const MOE_ROUTER_ROWS = S.moe ? S.moe.experts + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
   // 4-bit vs 8-bit router: two entry points, chosen once. Picking the wrong one
@@ -677,10 +681,12 @@ export function buildDecodeEngine(
   // K_PACKED is words per weight row: K*bits/32 (4-bit: K/8, 3-bit: 3K/32).
   const moeBits = S.moe?.bits ?? 4
   const moeGateU = S.moe
-    ? uniformBuf(device, [u32((S.d * moeBits) / 32), u32(S.d / 64), u32(S.ffn), u32(0), u32(2 * S.ffn)])
+    ? uniformBuf(device, [u32((S.d * moeBits) / 32), u32(S.d / 64), u32(S.ffn), u32(0), u32(2 * S.ffn),
+                          u32(S.d), u32(S.moeSlots * 2 * S.ffn), u32(S.moeSlots)])
     : null
   const moeDownU = S.moe
-    ? uniformBuf(device, [u32((S.ffn * moeBits) / 32), u32(S.ffn / 64), u32(S.d), u32(S.ffn), u32(S.d)])
+    ? uniformBuf(device, [u32((S.ffn * moeBits) / 32), u32(S.ffn / 64), u32(S.d), u32(S.ffn), u32(S.d),
+                          u32(S.moeSlots * S.ffn), u32(S.moeSlots * S.d), u32(S.moeSlots)])
     : null
   const moeSiluU = S.moe
     ? uniformBuf(device, [i32(S.moeSlots), i32(Math.ceil(S.moeSlots * S.ffn / 256))])
@@ -2260,6 +2266,22 @@ export function buildDecodeEngine(
       gdnNormed:  makeBuf(device, C * S.gdnVDim * 2, 'c.gdnNormed'),
     }
 
+    // MoE chunk buffers: the decode layouts with a leading TOKEN dimension.
+    // moeIds/moeScores growing from [slots] to [C, slots] is the whole of what
+    // kept MoE off this path — with one expert choice per token per slot, the
+    // expert matmul batches the way every other projection already does.
+    // MoE-only: on a dense spec moeDown alone would be the largest buffer here.
+    const CM = S.moe
+      ? {
+          routerLogits: makeBuf(device, C * MOE_ROUTER_ROWS * 4, 'c.routerLogits'),
+          moeIds:    makeBuf(device, C * S.moeSlots * 4, 'c.moeIds'),
+          moeScores: makeBuf(device, C * S.moeSlots * 4, 'c.moeScores'),
+          moeGateUp: makeBuf(device, C * S.moeSlots * 2 * S.ffn * 2, 'c.moeGateUp'),
+          moeH:      makeBuf(device, C * S.moeSlots * S.ffn * 2, 'c.moeH'),
+          moeDown:   makeBuf(device, C * S.moeSlots * S.d * 2, 'c.moeDown'),
+        }
+      : null
+
     // Elementwise grids per token (packGridDimX values scale with seq_len).
     const CATTN_WGS = S.cAttnDim / WG_SIZE_D
     const FFN_WGS = S.ffn / WG_SIZE_D
@@ -2289,6 +2311,12 @@ export function buildDecodeEngine(
       recur:  uniformBuf(device, [i32(0), u32(S.gdnVHeads)]),
       normOut: uniformBuf(device, [i32(0), i32(S.gdnProjRows), u32(0)]),
       silu:   uniformBuf(device, [i32(0), u32(0)]),
+      // The MoE block's only per-chunk uniform. Its router, top-k, expert
+      // matmul and combine uniforms are chunk-invariant, so the chunk path
+      // binds the DECODE ones rather than keeping a second copy in step.
+      // silu_mul is the exception: it walks a flat [rows, 2*ffn] buffer, and a
+      // chunk has n*slots rows where decode has slots.
+      moeSilu: uniformBuf(device, [i32(0), u32(0)]),
     }
 
     // Bind groups (buffers are fixed; only uniform contents change per chunk).
@@ -2326,24 +2354,63 @@ export function buildDecodeEngine(
       // shared
       oProj: GPUBindGroup
       addNorm1: GPUBindGroup
-      gateUp: GPUBindGroup
-      silu: GPUBindGroup
-      ffnDown: GPUBindGroup
       addNorm2: GPUBindGroup
+      // dense FFN — absent on a MoE layer, which carries `moe` instead
+      gateUp?: GPUBindGroup
+      silu?: GPUBindGroup
+      ffnDown?: GPUBindGroup
+      moe?: {
+        routerLogits: GPUBindGroup
+        routerTopk: GPUBindGroup
+        gate: GPUBindGroup
+        up: GPUBindGroup
+        silu: GPUBindGroup
+        down: GPUBindGroup
+        combine: GPUBindGroup
+      }
     }
     const cLayers: ChunkLayerBG[] = []
     for (let L = 0; L < S.layers; L++) {
       const lw = weights.layers[L]
       const isGdn = S.layerKinds[L] === 'gdn'
       const nextGamma = L < S.layers - 1 ? weights.layers[L + 1].normGamma1 : weights.finalNormGamma
+      // A MoE layer has no ffn* weights at all, and bg() over an undefined
+      // buffer throws while BUILDING the engine — so the two FFN shapes are
+      // built exclusively, never both.
+      const mw = S.moe ? lw.moe : undefined
       const common = {
         addNorm1: bg(device, P.addNorm, [CB.hidden2, CB.residual, lw.normGamma2, CB.hidden1, CB.residual2, cU.norm]),
-        // Chunked prefill is dense-only — buildDecodeEngine sets chunkPrefill
-        // null for a MoE spec, so ffn* are present wherever this runs.
-        gateUp: dynBg(CB.gateUp, CB.hidden1, lw.ffnScales!, lw.ffnWeights!, cU.gateUp, lw.ffnBiases),
-        silu: bg(device, P.siluMul, [CB.ffnOut, CB.gateUp, cU.silu]),
-        ffnDown: dynBg(CB.hidden2, CB.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, cU.ffnDown, lw.ffnDownBiases),
         addNorm2: bg(device, P.addNorm, [CB.hidden2, CB.residual2, nextGamma, CB.hidden1, CB.residual, cU.norm]),
+        ...(mw
+          // The MoE block reads CB.hidden1 and writes CB.hidden2 — the dense
+          // FFN's contract, the same one the decode path relies on, which is
+          // why nothing on either side of it changes for a chunk.
+          ? {
+              moe: {
+                routerLogits: bg(device, moeRouterPipe, routerBits === 16
+                  ? [CM!.routerLogits, CB.hidden1, mw.routerWeights, moeRouterU!]
+                  : [CM!.routerLogits, CB.hidden1, mw.routerWeights, mw.routerScales, mw.routerBiases, moeRouterU!]),
+                routerTopk: bg(device, P.moeRouterTopk!, [CM!.moeIds, CM!.moeScores, CM!.routerLogits, moeTopkU!]),
+                // Same interleaved [.., slot, gate|up] layout as decode; `up`
+                // bound ffn*2 bytes in, an offset that must stay 256-aligned.
+                gate: bg(device, moeMM!, [
+                  { buffer: CM!.moeGateUp, offset: 0, size: C * S.moeSlots * 2 * S.ffn * 2 },
+                  CB.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, CM!.moeIds]),
+                up: bg(device, moeMM!, [
+                  { buffer: CM!.moeGateUp, offset: S.ffn * 2, size: C * S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
+                  CB.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, CM!.moeIds]),
+                silu: bg(device, P.siluMul, [CM!.moeH, CM!.moeGateUp, cU.moeSilu]),
+                down: bg(device, moeMM!, [
+                  { buffer: CM!.moeDown, offset: 0, size: C * S.moeSlots * S.d * 2 },
+                  CM!.moeH, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, CM!.moeIds]),
+                combine: bg(device, P.moeCombine, [CB.hidden2, CM!.moeDown, CM!.moeScores, moeCombU!]),
+              },
+            }
+          : {
+              gateUp: dynBg(CB.gateUp, CB.hidden1, lw.ffnScales!, lw.ffnWeights!, cU.gateUp, lw.ffnBiases),
+              silu: bg(device, P.siluMul, [CB.ffnOut, CB.gateUp, cU.silu]),
+              ffnDown: dynBg(CB.hidden2, CB.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, cU.ffnDown, lw.ffnDownBiases),
+            }),
       }
       if (isGdn) {
         const gw = lw.gdn!
@@ -2424,6 +2491,12 @@ export function buildDecodeEngine(
       device.queue.writeBuffer(cU.normOut, 0, new Int32Array([n]))
       device.queue.writeBuffer(cU.normOut, 8, new Uint32Array([n * S.gdnVHeads]))
       device.queue.writeBuffer(cU.silu, 0, new Int32Array([n, n * FFN_WGS]))
+      // silu_mul walks [rows, 2*ffn] and does not know what a slot is: a chunk
+      // is n*slots rows of it, laid out exactly as decode's slots are.
+      if (S.moe) {
+        device.queue.writeBuffer(cU.moeSilu, 0,
+          new Int32Array([n * S.moeSlots, Math.ceil((n * S.moeSlots * S.ffn) / 256)]))
+      }
 
       // Tiled: 2-D grid over (N/32, n/32). Fallback matvec: N/4 on x alone.
       const gemmDispatch = (enc2: GPUCommandEncoder, bgx: GPUBindGroup, rows: number, label: string) =>
@@ -2461,9 +2534,24 @@ export function buildDecodeEngine(
           gemmDispatch(enc, blk.oProj, S.d, 'cOProj')
         }
         dispatch(enc, P.addNorm, blk.addNorm1, n, 1, 1, 'cAddNorm1')
-        gemmDispatch(enc, blk.gateUp, 2 * S.ffn, 'cGateUp')
-        dispatch(enc, P.siluMul, blk.silu, n * FFN_WGS, 1, 1, 'cSiluMul')
-        gemmDispatch(enc, blk.ffnDown, S.d, 'cFfnDown')
+        if (blk.moe) {
+          // The decode block's seven dispatches with a token dimension added:
+          // grid y is the token everywhere it appears, and the expert matmuls
+          // keep the slot in grid z. Seven dispatches for a whole chunk where
+          // per-token prefill spent seven PER TOKEN.
+          dispatch(enc, moeRouterPipe, blk.moe.routerLogits, MOE_ROUTER_ROWS, n, 1, 'cMoeRouterLogits')
+          dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, n, 1, 1, 'cMoeRouterTopk')
+          const rows = S.ffn / MOE_RPW
+          dispatch(enc, moeMM!, blk.moe.gate, rows, n, S.moeSlots, 'cMoeGate')
+          dispatch(enc, moeMM!, blk.moe.up, rows, n, S.moeSlots, 'cMoeUp')
+          dispatch(enc, P.siluMul, blk.moe.silu, Math.ceil((n * S.moeSlots * S.ffn) / 256), 1, 1, 'cMoeSilu')
+          dispatch(enc, moeMM!, blk.moe.down, S.d / MOE_RPW, n, S.moeSlots, 'cMoeDown')
+          dispatch(enc, P.moeCombine, blk.moe.combine, Math.ceil(S.d / 256), n, 1, 'cMoeCombine')
+        } else {
+          gemmDispatch(enc, blk.gateUp!, 2 * S.ffn, 'cGateUp')
+          dispatch(enc, P.siluMul, blk.silu!, n * FFN_WGS, 1, 1, 'cSiluMul')
+          gemmDispatch(enc, blk.ffnDown!, S.d, 'cFfnDown')
+        }
         dispatch(enc, P.addNorm, blk.addNorm2, n, 1, 1, 'cAddNorm2')
       }
       device.queue.submit([enc.finish()])
@@ -2474,7 +2562,7 @@ export function buildDecodeEngine(
     return {
       record,
       destroy() {
-        for (const b of [...Object.values(CB), ...Object.values(cU)]) b.destroy()
+        for (const b of [...Object.values(CB), ...Object.values(cU), ...Object.values(CM ?? {})]) b.destroy()
       },
     }
   }
@@ -2495,9 +2583,19 @@ export function buildDecodeEngine(
   //     attnGate unconditionally, which are Qwen3.5's GATED attention. cAttnDim
   //     already collapses to qkvDim when !attnGate, so a plain spec projects
   //     straight into qkvOut and skips both steps.
-  // S.moe stays, and reason 2 above is why: ids[] is indexed by SLOT with no
-  // token dimension, so batching a chunk would apply one token's expert choice
-  // to every token in it.
+  // ALL THREE are gone as of 2026-08-13. Reason 2 was a buffer SHAPE, not an
+  // algorithm: moeIds/moeScores are now [C, slots], the router's two kernels
+  // and moe_combine take the token in grid y, and the expert matmul takes it in
+  // grid y with the slot still in z. Experts never mix tokens, so batching them
+  // is a re-indexing rather than a grouped GEMM — a token reads its own ids[]
+  // entry and writes its own rows, which is exactly what the per-token path did
+  // one token at a time.
+  //
+  // Phase B — sorting the (token, slot) pairs by expert so each expert's rows
+  // are one contiguous GEMM — is the remaining win and is NOT this. Worth
+  // knowing which half that is: profiled on qwen30b, the expert matmuls are 38%
+  // of a MoE step and the dense chain this now batches is the other 62%
+  // (BENCH.md, "MoE: the experts are the MINORITY of the work").
   const dynReady = (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn) != null
   // The `hybrid` arm came back for one day (2026-08-11): with the gate first
   // opened, qwen3mlx diverged from per-token at the FIRST generated token. The
@@ -2506,13 +2604,18 @@ export function buildDecodeEngine(
   // cbgEmb comment in buildChunkPrefill). Fixed and re-opened; the equivalence
   // gate is scripts/chunk-prefill-test.mjs, which now also refuses to pass a
   // run in which no chunk actually executed.
+  // MLA is the one attention shape this path does not have. buildChunkPrefill's
+  // attention branch dispatches qkv -> rope -> kv_append -> attention_prefill,
+  // and an MLA spec has none of those weights, so it is excluded HERE rather
+  // than left to fail at bind time. Until 2026-08-13 `!S.moe` covered it by
+  // accident — DeepSeek-V2-Lite is both — and accident is not a guard.
   const chunkPrefill: ChunkPrefill | null =
-    !S.moe && !partial && (opts.chunkedPrefill ?? true) && dynReady
+    !partial && !S.mla && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
   {
-    const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed})`
-      : S.moe ? 'off (per-token — MoE: ids[] has no token dimension)'
+    const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''})`
+      : S.mla ? 'off (per-token — MLA has no chunked attention path)'
       : !dynReady ? 'off (per-token — no subgroups, so no batched GEMM)'
       : 'off (per-token)'
     console.log(`[engine] chunked prefill: ${why}`)

@@ -132,20 +132,38 @@ try{
   // same prompt. Two engines over the SAME weights, one with chunking off.
   window.__chunkCheck = async (ids, n, v, cap) => {
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
-    const mk = (chunkedPrefill) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+    const mk = (chunkedPrefill, kv) => buildDecodeEngine(dev, weights, kv, {
       spec: S, variants: V, chunkedPrefill, ...(cap ? { chunkCap: cap } : {}),
       chunkTiled: new URLSearchParams(location.search).get('tiled') === '1',
       ...(new URLSearchParams(location.search).get('gemm')
         ? { chunkGemm: new URLSearchParams(location.search).get('gemm') } : {}),
     })
-    const run = async (e) => {
+    // ONE ARM RESIDENT AT A TIME. The arms are compared after both finish, but
+    // they never RUN together, and an engine's KV cache is a GiB on the specs
+    // this test most needs to cover — a 30B MoE ran four caches deep (two arms
+    // x two variant configs) beside 17 GB of weights before this freed them.
+    // destroy() is the engine's own buffers; kvPages came from here, so they
+    // are freed here.
+    const run = async (chunkedPrefill) => {
+      const kv = allocKVPages(dev, S)
+      const e = mk(chunkedPrefill, kv)
       const t0 = performance.now()
       const out = []
-      await e.generatePipelined(ids, n, (t)=>out.push(t), ()=>false)
-      return { out, ms: performance.now() - t0 }
+      let ms = 0
+      // No `return` in the finally: that swallows the exception, and two arms
+      // that both threw would come back as two empty token lists, which the
+      // caller's length-then-elementwise comparison reads as IDENTICAL.
+      try {
+        await e.generatePipelined(ids, n, (t)=>out.push(t), ()=>false)
+        ms = performance.now() - t0
+      } finally {
+        e.destroy()
+        for (const b of kv) b.destroy()
+      }
+      return { out, ms }
     }
-    const a = await run(mk(true))
-    const b = await run(mk(false))
+    const a = await run(true)
+    const b = await run(false)
     return { chunked: a.out, perToken: b.out, chunkedMs: a.ms, perTokenMs: b.ms }
   }
 

@@ -1441,8 +1441,7 @@ arms in every configuration, 26 chunks per run.
 | llama32 (Llama-3.2-1B) | shipped | 3.61 s | **1.01 s** | **3.57×** |
 | llama32 | scalar | 9.25 s | 1.06 s | 8.77× |
 
-MoE stays per-token (`ids[]` has no token dimension — one token's expert choice
-would apply to the whole chunk).
+MoE stayed per-token here; it chunks as of 2026-08-13 (below).
 
 **The bug this shipped over.** With the gate first opened, qwen3mlx diverged
 from per-token at the FIRST generated token: the chunk path bound `P.embedding`
@@ -1478,6 +1477,45 @@ rest of the layer, and the rest of the layer is the majority. Chunking
 everything EXCEPT the experts needs no new kernel, no permutation and no
 grouped GEMM — only a token dimension on the router's two outputs. Plan in
 docs/MOE_CHUNK_PLAN.md.
+
+### MoE chunked prefill (2026-08-13)
+
+The blocker was a buffer SHAPE. `moeIds`/`moeScores` are `[chunk, slots]` now,
+the router's two kernels and `moe_combine` take the token in grid `y`, and the
+expert matmul takes it in grid `y` with the slot still in `z`. Experts never
+mix tokens, so a token reading its own `ids[]` entry computes exactly what the
+per-token path computed — a re-indexing, not a grouped GEMM. Seven dispatches
+per CHUNK where there were seven per TOKEN.
+
+`scripts/chunk-prefill-test.mjs`, 400-token prompt + 8 decode tokens, default
+cap 256, E5 GEMM. Both MoE families, both token-identical to per-token prefill,
+0 GPU errors:
+
+| model | shape | per-token | chunked | speedup |
+|---|---|---:|---:|---:|
+| qwen30b (Qwen3-30B-A3B) | pure attention, no shared expert, 4-bit router | 5.87 s | **1.96 s** | **2.99×** |
+| qwen36q3 (Qwen3.6-35B-A3B) | hybrid GDN, shared expert, 8-bit router, 3-bit experts | 6.51 s | **2.65 s** | **2.45×** |
+
+Both rows are the SECOND arm of their run. The first arm's chunked engine pays
+one-time pipeline creation for the chunk path — ~9-10 s on both models, which
+is why its ratio reads 1.32× and 0.57× and is not a measurement of anything.
+The two arms each carry the same 8 decode tokens, so prefill alone is slightly
+better than the ratio shown.
+
+**MLA is now the only spec shape that cannot chunk**, and it is excluded
+explicitly rather than by accident: `buildChunkPrefill`'s attention branch
+dispatches qkv → rope → kv_append → attention_prefill, none of which an MLA
+spec has. Until this change `!S.moe` happened to cover DeepSeek-V2-Lite because
+it is both.
+
+**A leak the big models made visible.** `__chunkCheck` built four engines per
+run (two arms × two variant configs) and freed none of them, each with its own
+~1 GiB KV cache. Invisible at 0.7 GB; four caches beside 17 GB of weights is
+not. Each arm now frees its engine and its KV pages before the next is built.
+The teardown went in with a `finally` that must NOT return — two arms that both
+threw would come back as two empty token lists, which the caller's
+length-then-elementwise comparison reads as identical. The comparison now also
+requires the arms to have produced the tokens that were asked for.
 
 ### Where a decode token's time goes (2026-08-13)
 

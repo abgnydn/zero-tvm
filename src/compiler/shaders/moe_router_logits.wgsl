@@ -21,7 +21,9 @@
 // Row E is the shared-expert GATE, stacked onto the router by the loader so
 // that one dispatch produces every logit the block needs — see moe_router_topk.
 //
-// Grid: one workgroup per row.
+// Grid: (rows, tokens). Grid y is the token — decode dispatches one, chunked
+// prefill dispatches the whole chunk, and x is then [M, D] and logits [M, rows].
+// Both strides come from podArgs, so a token never reads its neighbour's row.
 
 enable f16;
 
@@ -46,6 +48,8 @@ fn moe_router_logits(
 ) {
   let e : u32 = blockIdx.x;
   if (e >= podArgs.rows) { return; }
+  let t : u32 = blockIdx.y;          // token within the chunk (0 when decoding)
+  let xBase : u32 = t * podArgs.D;
 
   let WPR : u32 = podArgs.D / 4u;    // u32 words per expert row
   let GPR : u32 = podArgs.D / 64u;   // affine groups per row
@@ -65,7 +69,7 @@ fn moe_router_logits(
     var dot : f32 = 0.0;
     var xs : f32 = 0.0;
     for (var n : u32 = 0u; n < 4u; n = n + 1u) {
-      let v : f32 = f32(x[base + n]);
+      let v : f32 = f32(x[xBase + base + n]);
       dot = dot + v * f32((word >> (8u * n)) & 255u);
       xs = xs + v;
     }
@@ -79,7 +83,7 @@ fn moe_router_logits(
     if (tid < st) { red[tid] = red[tid] + red[tid + st]; }
     workgroupBarrier();
   }
-  if (tid == 0u) { logits[e] = red[0]; }
+  if (tid == 0u) { logits[t * podArgs.rows + e] = red[0]; }
 }
 
 // ── 4-BIT ROUTER ────────────────────────────────────────────────────────────
@@ -100,6 +104,8 @@ fn moe_router_logits_q4(
 ) {
   let e : u32 = blockIdx.x;
   if (e >= podArgs.rows) { return; }
+  let t : u32 = blockIdx.y;          // token within the chunk (0 when decoding)
+  let xBase : u32 = t * podArgs.D;
 
   let WPR : u32 = podArgs.D / 8u;    // u32 words per expert row (8 nibbles each)
   let GPR : u32 = podArgs.D / 64u;   // affine groups per row
@@ -117,7 +123,7 @@ fn moe_router_logits_q4(
     // Unsigned nibbles, no -7 offset: MLX affine stores w = s*q + b directly
     // (the -7 in int4_matmul's symmetric path is an MLC artifact).
     for (var n : u32 = 0u; n < 8u; n = n + 1u) {
-      let v : f32 = f32(x[base + n]);
+      let v : f32 = f32(x[xBase + base + n]);
       dot = dot + v * f32((word >> (4u * n)) & 15u);
       xs = xs + v;
     }
@@ -130,5 +136,5 @@ fn moe_router_logits_q4(
     if (tid < st) { red[tid] = red[tid] + red[tid + st]; }
     workgroupBarrier();
   }
-  if (tid == 0u) { logits[e] = red[0]; }
+  if (tid == 0u) { logits[t * podArgs.rows + e] = red[0]; }
 }

@@ -38,7 +38,25 @@ the router's own matmul, the combine.
 The hard part of MoE chunking is therefore the *minority* of the win. That
 inverts the natural plan.
 
-## Phase A — chunk everything except the expert matmuls
+## Phase A — LANDED 2026-08-13, and it batched the experts too
+
+Written as "loop over m for the expert pass", implemented as a grid dimension:
+`workgroup_id.y` is the token in `int4_matmul`'s moe variant, in both router
+kernels and in `moe_combine`, so the loop is the GPU's, not the encoder's. The
+whole layer is seven dispatches per CHUNK where it was seven per TOKEN.
+
+The expert matmuls read the same weight bytes per (token, slot) pair either
+way — batching them here removes dispatches, not memory traffic. That is Phase
+B's job, and the profile above says it is the smaller half.
+
+Gates, both MoE families, token-identical against per-token prefill:
+
+| spec | covers | result |
+|---|---|---|
+| qwen30b | pure attention, no shared expert, 4-bit router | PASS, 0 GPU errors |
+| qwen36q3 | hybrid GDN, shared expert, 8-bit router, 3-bit experts | PASS, 0 GPU errors |
+
+## Phase A as planned — chunk everything except the expert matmuls
 
 Batch the whole layer for M tokens exactly as the dense path does, and inside
 the MoE block run the expert pass M times sequentially:

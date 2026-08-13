@@ -36,13 +36,15 @@ fn moe_router_logits_f16(
 ) {
   let e : u32 = blockIdx.x;
   if (e >= podArgs.rows) { return; }
+  let t : u32 = blockIdx.y;          // token within the chunk (0 when decoding)
+  let xBase : u32 = t * podArgs.D;
   let tid : u32 = threadIdx.x;
 
   // f32 accumulation over D terms — the same reason the quantized entries do
   // it. The output is a logit going into a softmax over experts.
   var acc : f32 = 0.0;
   for (var i : u32 = tid; i < podArgs.D; i = i + 64u) {
-    acc = acc + f32(x[i]) * f32(w[e * podArgs.D + i]);
+    acc = acc + f32(x[xBase + i]) * f32(w[e * podArgs.D + i]);
   }
 
   red[tid] = acc;
@@ -51,5 +53,5 @@ fn moe_router_logits_f16(
     if (tid < st) { red[tid] = red[tid] + red[tid + st]; }
     workgroupBarrier();
   }
-  if (tid == 0u) { logits[e] = red[0]; }
+  if (tid == 0u) { logits[t * podArgs.rows + e] = red[0]; }
 }

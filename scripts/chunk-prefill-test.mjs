@@ -56,7 +56,11 @@ try {
       console.log(`      ${label}: chunked ${(chunkedMs / 1000).toFixed(2)}s vs per-token ${(perTokenMs / 1000).toFixed(2)}s`
         + `  (${(perTokenMs / chunkedMs).toFixed(2)}x, ${IDS.length}-token prompt + ${TOKENS} decode)`)
     }
-    const same = chunked.length === perToken.length && chunked.every((t, i) => t === perToken[i])
+    // A run that produced NO tokens must not be able to pass. Two empty lists
+    // are elementwise identical, so the length is checked against what was
+    // asked for, not just against the other arm.
+    const same = chunked.length === TOKENS && chunked.length === perToken.length
+      && chunked.every((t, i) => t === perToken[i])
     const at = chunked.findIndex((t, i) => t !== perToken[i])
     check(`${label} tokens identical`, same,
       same ? `${chunked.length} tokens over ${IDS.length}-token prompt`

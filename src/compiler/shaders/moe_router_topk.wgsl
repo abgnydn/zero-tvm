@@ -38,6 +38,8 @@
 // kernel writes exactly K slots. Every other kernel in the block already reads
 // its slot count from a uniform, so none of them change.
 //
+// Grid: one workgroup per TOKEN.
+//
 // Outputs are written in DESCENDING score order (slot 0 = largest). mlx's
 // argpartition happens to return ascending; the block output is order-invariant,
 // so callers that compare against a reference should match on (index, score)
@@ -62,10 +64,21 @@ const PER : u32 = 8u;   // 32 lanes x 8 = the 256-expert ceiling this is written
 var<workgroup> top : array<f32, 32>;   // the K survivors, by rank
 
 @compute @workgroup_size(32, 1, 1)
-fn moe_router_topk(@builtin(local_invocation_id) threadIdx : vec3<u32>) {
+fn moe_router_topk(
+  @builtin(workgroup_id) blockIdx : vec3<u32>,
+  @builtin(local_invocation_id) threadIdx : vec3<u32>
+) {
   let t : u32 = threadIdx.x;
   let E : u32 = podArgs.E;
   let K : u32 = podArgs.K;
+  // ONE WORKGROUP PER TOKEN. Decode dispatches one; chunked prefill dispatches
+  // the chunk. Both strides follow from the uniforms already here — the router
+  // writes E+hasShared logits per token and this emits K+hasShared slots — so a
+  // token's slots can never land in its neighbour's, which is the whole reason
+  // MoE could not chunk before.
+  let tok : u32 = blockIdx.x;
+  let lBase : u32 = tok * (E + podArgs.hasShared);
+  let oBase : u32 = tok * (K + podArgs.hasShared);
 
   // Eight logits per lane, kept in registers: every loop below is constant-trip
   // and indexed by the loop counter, so nothing spills to scratch.
@@ -74,7 +87,7 @@ fn moe_router_topk(@builtin(local_invocation_id) threadIdx : vec3<u32>) {
   for (var i : u32 = 0u; i < PER; i = i + 1u) {
     let e : u32 = t * PER + i;
     // Lanes past E must lose every max: -inf, not 0 (logits can be negative).
-    let v : f32 = select(-3.0e38, logits[e], e < E);
+    let v : f32 = select(-3.0e38, logits[lBase + e], e < E);
     pv[i] = v;
     m = max(m, v);
   }
@@ -105,19 +118,19 @@ fn moe_router_topk(@builtin(local_invocation_id) threadIdx : vec3<u32>) {
     for (var i : u32 = 0u; i < PER; i = i + 1u) {
       if (t * PER + i == widx) { pv[i] = -1.0; }
     }
-    if (t == 0u) { out_idx[k] = widx; }
+    if (t == 0u) { out_idx[oBase + k] = widx; }
   }
 
   if (t == 0u) {
     let scale : f32 = select(1.0 / denom, 1.0 / total, podArgs.normTopk == 1u);
-    for (var k : u32 = 0u; k < K; k = k + 1u) { out_score[k] = top[k] * scale; }
+    for (var k : u32 = 0u; k < K; k = k + 1u) { out_score[oBase + k] = top[k] * scale; }
     // The shared slot exists only when the checkpoint has a shared expert.
     // Without one there is no row E in the router and no index E in the expert
     // stacks, so the block is exactly its K routed slots and nothing is
     // written past them — moe_combine sums SLOTS, which is K in that case.
     if (podArgs.hasShared == 1u) {
-      out_idx[K] = E;                                     // shared expert's slot in the stack
-      out_score[K] = 1.0 / (1.0 + exp(-logits[E]));
+      out_idx[oBase + K] = E;                             // shared expert's slot in the stack
+      out_score[oBase + K] = 1.0 / (1.0 + exp(-logits[lBase + E]));
     }
   }
 }

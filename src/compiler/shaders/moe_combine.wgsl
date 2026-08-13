@@ -13,7 +13,9 @@
 // it. Writing f32 here would be silently accepted at bind time (WebGPU does not
 // type-check storage element types) and reinterpreted as twice as many f16s.
 //
-// Grid: ceil(N / 256) workgroups.
+// Grid: (ceil(N / 256), tokens). Grid y is the token — decode dispatches one,
+// chunked prefill dispatches the chunk, and the slot block of token t starts at
+// t*SLOTS, which is exactly how moe_router_topk laid the scores out.
 
 enable f16;
 
@@ -31,10 +33,12 @@ struct PODArgs {
 fn moe_combine(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i : u32 = gid.x;
   if (i >= podArgs.N) { return; }
+  let t : u32 = gid.y;
+  let sBase : u32 = t * podArgs.SLOTS;
 
   var acc : f32 = 0.0;
   for (var s : u32 = 0u; s < podArgs.SLOTS; s = s + 1u) {
-    acc = acc + score[s] * f32(slots[s * podArgs.N + i]);
+    acc = acc + score[sBase + s] * f32(slots[(sBase + s) * podArgs.N + i]);
   }
-  out_buf[i] = f16(acc);
+  out_buf[t * podArgs.N + i] = f16(acc);
 }

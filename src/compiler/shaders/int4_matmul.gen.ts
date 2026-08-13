@@ -96,9 +96,10 @@ export interface Int4MatmulOpts {
    */
   affine?: boolean
   /**
-   * MoE indirection: `workgroup_id.z` is a SLOT (0..top_k-1), and the expert row
-   * for that slot is read from an `ids` buffer at `@binding(6)`, so one dispatch
-   * covers every selected expert instead of one dispatch each. Measured: 960
+   * MoE indirection: `workgroup_id.z` is a SLOT (0..top_k-1) and `workgroup_id.y`
+   * is a TOKEN, and the expert row for that pair is read from an `ids` buffer at
+   * `@binding(6)`, so one dispatch covers every selected expert of every token in
+   * a chunk instead of one dispatch each. Measured: 960
    * per-expert dispatches cost 7.6 ms/token against 1.0 ms when the expert is a
    * grid dimension, at 7.9 µs of launch overhead apiece.
    *
@@ -208,7 +209,10 @@ struct PODArgs {
   SCALES_PER_ROW: u32,  // K / ${affine ? '64' : '32'} (int4 group scales per weight row)
   packGridDimX: u32${moe ? ',' : ''}     // N (number of output ${m > 1 ? 'columns' : 'elements'})${moe ? `
   IN_SLOT_STRIDE: u32,  // activation elements per slot (0 = all slots share one input)
-  OUT_SLOT_STRIDE: u32  // output elements per slot` : ''}
+  OUT_SLOT_STRIDE: u32, // output elements per slot
+  IN_TOK_STRIDE: u32,   // activation elements per token
+  OUT_TOK_STRIDE: u32,  // output elements per token
+  IDS_STRIDE: u32       // ids[] entries per token (= slot count)` : ''}
 }
 @group(0) @binding(4) var<uniform> podArgs : PODArgs;
 `
@@ -220,19 +224,24 @@ fn ${entry}(
   @builtin(num_workgroups) gridDim : vec3<u32>,
   @builtin(local_invocation_id) threadIdx : vec3<u32>
 ) {
-${moe ? `  // z is the SLOT here, not part of the row flattening the other variants use.
+${moe ? `  // z is the SLOT here and y is the TOKEN, so neither is part of the row
+  // flattening the other variants use. Decode dispatches y = 1; chunked prefill
+  // dispatches the whole chunk, and every token reads its own ids[] entry —
+  // which is the difference between batching a MoE block and applying one
+  // token's expert choice to all of them.
   let slot : u32 = blockIdx.z;
+  let token : u32 = blockIdx.y;
   let row_base : u32 = blockIdx.x * ${rowsPerWG}u;` : `  let row_base : u32 = (blockIdx.z * gridDim.x + blockIdx.x) * ${rowsPerWG}u;`}
   if (row_base >= podArgs.packGridDimX) { return; }
 
   let K_PACKED : u32 = podArgs.K_PACKED;
   let SCALES_PER_ROW : u32 = podArgs.SCALES_PER_ROW;
   let tid : u32 = threadIdx.x;
-${moe ? `  let expert : u32 = ids[slot];
+${moe ? `  let expert : u32 = ids[token * podArgs.IDS_STRIDE + slot];
   let wBase : u32 = expert * podArgs.packGridDimX * K_PACKED;
   let sBase : u32 = expert * podArgs.packGridDimX * SCALES_PER_ROW;
-  let inBase : u32 = slot * podArgs.IN_SLOT_STRIDE;
-  let outBase : u32 = slot * podArgs.OUT_SLOT_STRIDE;
+  let inBase : u32 = token * podArgs.IN_TOK_STRIDE + slot * podArgs.IN_SLOT_STRIDE;
+  let outBase : u32 = token * podArgs.OUT_TOK_STRIDE + slot * podArgs.OUT_SLOT_STRIDE;
 ` : ''}`
 
   // Per-thread K-chunk loop. Each thread strides by the workgroup width.

@@ -173,8 +173,12 @@ async function moeBlock(device, dir, meta) {
   const u32 = (a) => buffer(device, new Uint32Array(a), BU.UNIFORM | BU.COPY_DST)
   // IN_SLOT_STRIDE 0 = every slot reads the same activation (gate/up); D/F for down.
   // K_PACKED is words per row: K*bits/32 (4-bit: K/8, 3-bit: 3K/32).
-  const podGateMoe = u32([(D * bits) / 32, D / 64, F, 0, 2 * F])
-  const podDownMoe = u32([(F * bits) / 32, F / 64, D, F, D])
+  // EIGHT u32: the five slot fields plus the three TOKEN strides chunked
+  // prefill dispatches on. This test is one token, so grid y is 1 and the token
+  // strides never multiply by anything — but they are part of the struct, and a
+  // 20-byte uniform against a 32-byte one is a bind failure, not a wrong number.
+  const podGateMoe = u32([(D * bits) / 32, D / 64, F, 0, 2 * F, D, SLOTS * 2 * F, SLOTS])
+  const podDownMoe = u32([(F * bits) / 32, F / 64, D, F, D, SLOTS * F, SLOTS * D, SLOTS])
 
   const bgMoe = (out, outOff, outSize, inp, proj, pod) => device.createBindGroup({
     layout: mmMoe.getBindGroupLayout(0),
@@ -628,8 +632,8 @@ async function qwen36Layer(device, dir, meta) {
     { buffer: out, offset: outOff, size: outSize }, inp, W[`${proj2}_s`], W[`${proj2}_w`], pod,
     W[`${proj2}_b`], rIdx,
   ]
-  const podGate = u32([D / 8, D / 64, F, 0, 2 * F])
-  const podDown = u32([F / 8, F / 64, D, F, D])
+  const podGate = u32([D / 8, D / 64, F, 0, 2 * F, D, SLOTS * 2 * F, SLOTS])
+  const podDown = u32([F / 8, F / 64, D, F, D, SLOTS * F, SLOTS * D, SLOTS])
   steps.push(
     [mmMoe, bgMoe(gu, 0, SLOTS * GU, n2, 'gate_proj', podGate), [F / RPW, 1, SLOTS]],
     [mmMoe, bgMoe(gu, F * 2, SLOTS * GU - F * 2, n2, 'up_proj', podGate), [F / RPW, 1, SLOTS]],
