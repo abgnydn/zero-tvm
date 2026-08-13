@@ -1598,6 +1598,40 @@ either token is the model's answer. The bench measures that gap rather than
 asserting it — this repo once spent an afternoon "fixing" exactly this and
 reverted the fix.
 
+### MoE Phase B measured before building, and killed (2026-08-13)
+
+Phase A gave the MoE block a token dimension. Phase B was to sort the (token,
+slot) pairs by expert so each expert's weights are read once for every row that
+chose it — the obvious next move, and the one `docs/MOE_CHUNK_PLAN.md` argued
+for on weight-traffic grounds.
+
+`scripts/moe-group-probe.mjs`, synthetic buffers at real shapes, arm A the
+SHIPPED moe kernel and arm B the SHIPPED E5 GEMM once per expert:
+
+| chunk x slots / experts | rows/expert | A (shipped) | B (grouped) | |
+|---|---:|---:|---:|---|
+| 256 x 8 / 128 — **qwen30b as shipped** | 16 | **5.30 ms** | 13.59 ms | grouping **0.39x** |
+| 1024 x 8 / 128 | 64 | 20.97 ms | **14.88 ms** | grouping 1.41x |
+| 256 x 8 / 32 | 64 | 5.40 ms | **3.68 ms** | grouping 1.47x |
+
+**At the cap we ship, grouping is 2.6x SLOWER while reading 16x FEWER weight
+bytes.** The traffic argument is arithmetically right and practically
+irrelevant: the caches already serve the re-reads. Arm A moves 1728 MiB of
+logical weight reads in 5.30 ms, which would need 326 GB/s sustained on a
+400 GB/s machine — so most of it never reaches DRAM.
+
+What decides it is rows per expert (`chunk x slots / experts`), break-even
+around 64 — E5's tile height. qwen30b at cap 256 gives 16; qwen36 gives ~9.
+Phase B would need CHUNK_CAP at 1024 to pay at all, and returns 1.41x there on
+kernels that are 38% of a MoE step (~1.15x overall) in exchange for a
+permutation kernel, per-expert offsets, a grouped GEMM and 4x the chunk
+activation buffers. Not built.
+
+The probe's first run reported arm A at **0.013 ms** — a bind group with two
+bindings at the wrong index, which WebGPU answers by skipping the dispatch. It
+now validates the dispatch and throws. Third time this failure mode has
+appeared in this repo; a skipped dispatch always looks like a fast one.
+
 ### Landing rate labels, measured (2026-08-13)
 
 The `rateLabel` on each landing card is a measured number or it is blank —

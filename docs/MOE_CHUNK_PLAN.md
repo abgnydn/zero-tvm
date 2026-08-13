@@ -82,16 +82,50 @@ not algorithm changes.
 
 Expected: ~62% of the work moves from M dispatches to 1.
 
-## Phase B — group tokens by expert
+## Phase B — group tokens by expert: MEASURED, and NOT worth building
 
-The remaining ~38%. Sort the (token, slot) pairs by expert, build per-expert
-offsets, and run one grouped GEMM where expert `e` covers its contiguous block
-of token rows; scatter back through the permutation.
+The plan was to sort the (token, slot) pairs by expert so each expert's weights
+are read once for all the rows that chose it. `scripts/moe-group-probe.mjs`
+measures that ceiling on synthetic buffers at real shapes before anyone builds
+it: arm A is the SHIPPED moe kernel, arm B is the SHIPPED E5 chunk GEMM
+dispatched once per expert with that expert's rows.
 
-At a 256-token chunk with top-8 that is 2048 pairs over up to 256 experts —
-about 8 rows per expert on average, so the GEMM stays narrow and the win comes
-from dispatch count, not tile efficiency. Worth doing after Phase A is
-measured, and worth re-measuring before assuming the shape.
+| chunk x slots / experts | rows per expert | A (shipped) | B (grouped) | |
+|---|---:|---:|---:|---|
+| 256 x 8 / 128 — **qwen30b as shipped** | 16 | **5.30 ms** | 13.59 ms | grouping **0.39x** |
+| 1024 x 8 / 128 | 64 | 20.97 ms | **14.88 ms** | grouping 1.41x |
+| 256 x 8 / 32 | 64 | 5.40 ms | **3.68 ms** | grouping 1.47x |
+
+**At the cap we actually ship, grouping is 2.6x SLOWER** — while reading 16x
+FEWER weight bytes. That is the whole finding: the traffic argument this plan
+rested on is real and it does not matter, because the caches already serve the
+re-reads. Arm A moves 1728 MiB of logical weight reads in 5.30 ms; sustaining
+that from DRAM would need 326 GB/s on a 400 GB/s machine, so most of it never
+reaches DRAM.
+
+What decides it is **rows per expert**, which is `chunk x slots / experts`:
+
+- qwen30b at cap 256: 256x8/128 = **16** — grouping loses
+- qwen36 at cap 256: 256x9/257 ≈ **9** — worse
+- break-even is around 64, E5's tile height
+
+So Phase B needs `CHUNK_CAP` at 1024 to pay at all, and there it returns 1.41x
+on the expert matmuls — which are 38% of a MoE step, so ~1.15x overall, bought
+with a permutation kernel, per-expert offsets, a grouped GEMM, and 4x the
+chunk activation buffers.
+
+**Not building it.** Revisit only if the cap rises or a model ships with few
+enough experts to put rows-per-expert near 64.
+
+One caveat kept honest: arm B uses E5, whose tile is 64 rows, so at 16 rows per
+expert it wastes 75% of every tile. A GEMM with a 16-row tile would close some
+of that — and building one is part of Phase B's cost, not an argument against
+this measurement. It would have to be ~2.6x better than E5-at-M=16 merely to
+draw.
+
+The probe binds the whole expert stack as one storage buffer, so E=256 exceeds
+the default 128 MiB binding limit and it fails loudly rather than timing a
+skipped dispatch — which is how the first run of it reported arm A at 0.013 ms.
 
 ## Gates
 
