@@ -489,7 +489,14 @@ for (const cfg of CONFIGS) {
   // With the reference rounding dequant to f16 like the kernel, every correct
   // config lands ~5e-4; a layout/transpose bug lands O(1). 5e-3 splits them
   // with 10x headroom each way (the old 6e-2 was noise-driven).
-  if (!(rel <= 5e-3)) { console.log(`${name.padEnd(22)} GATE FAIL ${Number.isNaN(rel) ? 'NaN' : rel.toExponential(1)} — VOID`); continue }
+  // A failing gate must FAIL THE PROCESS, not just print. This printed
+  // "GATE FAIL — VOID" and exited 0, so wiring the script into a test entry
+  // would have reported green while a kernel was numerically wrong.
+  if (!(rel <= 5e-3)) {
+    console.log(`${name.padEnd(22)} GATE FAIL ${Number.isNaN(rel) ? 'NaN' : rel.toExponential(1)} — VOID`)
+    process.exitCode = 1
+    continue
+  }
   // --gate-only: correctness without timing — valid on any power/thermal state.
   if (process.argv.includes('--gate-only')) { console.log(`${name.padEnd(22)} gate ${rel.toExponential(1)} PASS`); continue }
   const row = { name, cfg, tf: {} }
@@ -525,6 +532,7 @@ for (const M of MS) {
 // dawn.node holds the loop open after the last submit, so the script prints its
 // table and then sits there. One such process survived overnight at 35% CPU and
 // was still holding the GPU when the next run started — every timing taken
-// beside it is contended. Leave explicitly.
-process.exit(0)
+// beside it is contended. Leave explicitly, CARRYING the exit code: a bare
+// exit(0) here would have thrown away every gate failure set above.
+process.exit(process.exitCode ?? 0)
 
