@@ -187,6 +187,14 @@ export interface Pipelines {
   int4MatmulTiledAffine: GPUComputePipeline | null
   int4MatmulF32SgAffine: GPUComputePipeline | null
   int4MatmulF32TiledAffine: GPUComputePipeline | null
+  // Wide-load affine sibling, K%512. Only the HALF width ships: the full vec4
+  // body measured slower than narrow loads on the one affine model that can
+  // take either (see resolveMatmul). resolveMatmul falls through to the
+  // scalar-load affine kernels when the shape does not clear K%512.
+  int4MatmulSgVec4hAffine: GPUComputePipeline | null
+  int4MatmulTiledVec4hAffine: GPUComputePipeline | null
+  int4MatmulF32SgVec4hAffine: GPUComputePipeline | null
+  int4MatmulF32TiledVec4hAffine: GPUComputePipeline | null
   // ── Sparse MoE block (Qwen3.6). Seven dispatches: router logits, top-k,
   // gate, up, silu_mul, down, combine. moeMatmul folds the expert into grid z.
   moeRouterLogits: GPUComputePipeline
@@ -366,6 +374,10 @@ export function compile(
     int4MatmulTiledAffine: subgroups ? mm({ subgroups: true, rowsPerWG: 4, affine: true }) : null,
     int4MatmulF32SgAffine: subgroups ? mm({ outF32: true, subgroups: true, affine: true }) : null,
     int4MatmulF32TiledAffine: subgroups ? mm({ outF32: true, subgroups: true, rowsPerWG: 4, affine: true }) : null,
+    int4MatmulSgVec4hAffine: subgroups ? mm({ subgroups: true, vec4Half: true, affine: true }) : null,
+    int4MatmulTiledVec4hAffine: subgroups ? mm({ subgroups: true, rowsPerWG: 4, vec4Half: true, affine: true }) : null,
+    int4MatmulF32SgVec4hAffine: subgroups ? mm({ outF32: true, subgroups: true, vec4Half: true, affine: true }) : null,
+    int4MatmulF32TiledVec4hAffine: subgroups ? mm({ outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true, affine: true }) : null,
     moeRouterLogits: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits'),
     moeRouterLogitsQ4: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits_q4'),
     moeRouterLogitsF16: createPipeline(device, moeRouterLogitsF16Src, 'moe_router_logits_f16'),

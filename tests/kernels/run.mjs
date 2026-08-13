@@ -1103,6 +1103,43 @@ const TESTS = [
     ),
     minSg: 32,
   },
+  // AFFINE WIDE LOADS. The symmetric vec4 gets one scale per vec4 because its
+  // groups are 32; affine groups are 64, so the scale index is v_off>>1 (vec4)
+  // or v_off>>2 (vec2), and Σx must cover exactly the values the iteration
+  // dequantizes. Both indices are off-by-a-shift bugs that produce plausible
+  // numbers, so each width is graded at BOTH row counts.
+  {
+    label: 'int4_matmul_sg_vec4_affine',
+    fn: makeInt4MatmulTest(
+      int4MatmulWGSL({ subgroups: true, vec4: true, affine: true }),
+      'int4_matmul_sg_vec4_affine', { affine: true, K: 1024 },
+    ),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_tiled_vec4_affine',
+    fn: makeInt4MatmulTest(
+      int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true, affine: true }),
+      'int4_matmul_tiled_vec4_affine', { affine: true, rowsPerWG: 4, K: 1024 },
+    ),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_sg_vec4h_affine',
+    fn: makeInt4MatmulTest(
+      int4MatmulWGSL({ subgroups: true, vec4Half: true, affine: true }),
+      'int4_matmul_sg_vec4h_affine', { affine: true, K: 512 },
+    ),
+    minSg: 32,
+  },
+  {
+    label: 'int4_matmul_tiled_vec4h_affine',
+    fn: makeInt4MatmulTest(
+      int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4Half: true, affine: true }),
+      'int4_matmul_tiled_vec4h_affine', { affine: true, rowsPerWG: 4, K: 512 },
+    ),
+    minSg: 32,
+  },
   {
     // 3-bit experts (MLX bits=3): continuous-bitstream packing. The test's own
     // packer straddles word boundaries, so a kernel that mishandles the

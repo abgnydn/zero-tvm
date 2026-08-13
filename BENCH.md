@@ -1555,6 +1555,39 @@ in order: the weight-read efficiency of the two FFN matmuls (decode is
 memory-bound, so this is bytes/second against the M2 Max's ceiling), and an
 affine `fused_ffn` to cut the dispatch count.
 
+### Affine wide loads — built, correct, NOT measured (2026-08-13)
+
+Following the profile above: the MLX-affine matmul family had no wide-load
+sibling, so every affine model (5 of the 9 shipped) read weights one `u32` at a
+time in decode while the symmetric family read four. `int4_matmul_*_vec4h_affine`
+closes that. Affine groups are 64 rather than 32, so a `vec2<u32>` covers a
+QUARTER of a group and the scale index is `v_off >> 2` — a shift, not a match.
+
+Numerics are exact against the CPU reference at both row counts, and three
+mutations were checked to make sure the gate can see a wrong one: the vec4
+scale index unshifted (2.51e+0), the vec4h index using the symmetric shift
+(2.22e+0), and the bias term dropped (1.95e-1). Both engine models generate
+**identical tokens** to the narrow path in every A/B round.
+
+**The perf claim is not made, because the measurement did not converge.** Three
+runs of the same qwen3mlx comparison, alternated arms in one process, read
+**+5.4%, +13.2% and −3.0%**, with absolute rates inside a single run spanning
+67–91 tok/s. The machine was on a **discharging battery** throughout. That is
+the condition BENCH.md already says voids a number, and an inconsistent sign is
+what it looks like from the inside. llama32's runs were tight (+5.5%, +5.7%,
+narrow spread) but one stable model is not a result.
+
+So it ships **opt-in as `?vec4aff=1`**, the same way every unmeasured
+experiment here does, and `scripts/decode-kernel-ab.mjs` is the bench that
+settles it on mains power. It flips to default when that run says so.
+
+One thing the inconsistent runs did settle, because llama32 can take either
+width and its numbers were stable: the FULL `vec4` affine body reads **−5.2%**
+against narrow loads where `vec4h` reads **+5.6%**. 32 activations in registers
+plus a per-row bias costs more than the wider load saves. `vec4`-affine is
+generatable and graded but NOT shipped — re-test before adding it on a GPU with
+a bigger register file.
+
 ## Head-to-head vs LM Studio (2026-08-13) — SAME CHECKPOINT BYTES, native host
 
 The 08-12 comparison below ran different bytes on each side (ours MLC q4f16_1,

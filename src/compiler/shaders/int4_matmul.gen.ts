@@ -173,8 +173,15 @@ export function int4MatmulWGSL(opts: Int4MatmulOpts = {}): string {
   if (q3 && !affine) throw new Error('q3 requires affine (3-bit ships only in the MLX-affine layout)')
   // mDyn is the exception: chunked prefill needs a batched affine GEMM, and
   // without it every MLX checkpoint prefills one token at a time.
-  if (affine && (m !== 1 || vec4 || vec4Half))
-    throw new Error('affine is implemented for the scalar and mDyn paths only (m=1, no vec4/vec4Half)')
+  if (affine && m !== 1)
+    throw new Error('affine is implemented at m=1 (plus the mDyn path); no fixed-M sibling exists')
+  if (q3 && (vec4 || vec4Half))
+    throw new Error('q3 has no wide-load path: its 3-bit bitstream is not word-aligned')
+  // The wide-load bodies index input_buf/output_buf directly and know nothing
+  // of inBase/outBase, so a moe variant built on them would read slot 0's
+  // activations for every slot — wrong output, no error.
+  if (moe && (vec4 || vec4Half))
+    throw new Error('moe has no wide-load path: the vec4 bodies do not apply the slot/token offsets')
   if (rowsPerWG !== 1 && !subgroups) throw new Error('rowsPerWG > 1 requires subgroups')
   if (m === 4 && (!subgroups || rowsPerWG !== 4)) throw new Error('m=4 requires subgroups + rowsPerWG=4')
   if (vec4 && !subgroups) throw new Error('vec4 requires subgroups (32-thread WG keeps K=3072 divisible)')
@@ -269,16 +276,28 @@ ${moe ? `  let expert : u32 = ids[token * podArgs.IDS_STRIDE + slot];
       .join('\n')
     // Activation accessor for word j (0..3), element i (0..7).
     const x = (j: number) => (i: number) => `${vecs[j]}${i >> 1}.${i & 1 ? 'y' : 'x'}`
+    // SYMMETRIC groups are 32 values, so one vec4 (32 nibbles) IS one group and
+    // the scale index is the vec4 index. AFFINE groups are 64, so a vec4 is
+    // HALF a group and the index is v_off >> 1 — the same relationship vec4h
+    // already has to the symmetric layout, one step further along.
+    const sIdx = affine ? '(v_off >> 1u)' : 'v_off'
+    const xsum = affine
+      ? `    // Σx over exactly the 32 values this iteration dequantizes, paired with
+    // the same group's bias — w = s*q + b reduces to s*Σ(x·q) + b*Σx per group.
+    let xs : f32 = ${[0, 1, 2, 3]
+      .flatMap((j) => [...Array(8).keys()].map((i) => x(j)(i)))
+      .reduce((acc, t, i) => (i === 0 ? t : `${acc}${i % 8 === 0 ? '\n      + ' : ' + '}${t}`), '')};\n`
+      : ''
     const rowBlocks = rows
       .map(
-        (r) => `    { // row r${r}: one vec4 weight load + one scale (4 words = 1 scale group)
+        (r) => `    { // row r${r}: one vec4 weight load + one scale${affine ? '/bias' : ''} (4 words = ${affine ? 'half a' : '1'} scale group)
       let w = weights[r${r} * KPV + v_off];
-      let s = f32(scales[r${r} * SCALES_PER_ROW + v_off]);
-      acc${r} = acc${r} + s * (
-          ${dequantDot('w.x', x(0), '        ')}
-        + ${dequantDot('w.y', x(1), '        ')}
-        + ${dequantDot('w.z', x(2), '        ')}
-        + ${dequantDot('w.w', x(3), '        ')});
+      let s = f32(scales[r${r} * SCALES_PER_ROW + ${sIdx}]);
+${affine ? `      let b = f32(biases[r${r} * SCALES_PER_ROW + ${sIdx}]);\n` : ''}      acc${r} = acc${r} + s * (
+          ${dequantDot('w.x', x(0), '        ', !affine)}
+        + ${dequantDot('w.y', x(1), '        ', !affine)}
+        + ${dequantDot('w.z', x(2), '        ', !affine)}
+        + ${dequantDot('w.w', x(3), '        ', !affine)})${affine ? ' + b * xs' : ''};
     }`,
       )
       .join('\n')
@@ -292,11 +311,11 @@ ${accDecl}
 ${rowDecl}
 
   for (var chunk : u32 = 0u; chunk < KPV / ${wgSize}u; chunk = chunk + 1u) {
-    let v_off : u32 = tid + chunk * ${wgSize}u;   // vec4 index == int4 scale-group index
+    let v_off : u32 = tid + chunk * ${wgSize}u;   // vec4 index${affine ? '; scale group = v_off >> 1' : ' == int4 scale-group index'}
 
 ${loads}
 ${unpacks}
-
+${xsum}
 ${rowBlocks}
   }
 `
@@ -321,14 +340,24 @@ ${rowBlocks}
       .join('\n')
     // Activation accessor for word j (0..1), element i (0..7).
     const x = (j: number) => (i: number) => `${vecs[j]}${i >> 1}.${i & 1 ? 'y' : 'x'}`
+    // 16 values per vec2: half a symmetric group of 32, a QUARTER of an affine
+    // group of 64.
+    const sIdx = affine ? '(v_off >> 2u)' : '(v_off >> 1u)'
+    const xsum = affine
+      ? `    // Σx over exactly the 16 values this iteration dequantizes (see the
+    // vec4 sibling — same reduction, a quarter of a group at a time).
+    let xs : f32 = ${[0, 1]
+      .flatMap((j) => [...Array(8).keys()].map((i) => x(j)(i)))
+      .reduce((acc, t, i) => (i === 0 ? t : `${acc}${i % 8 === 0 ? '\n      + ' : ' + '}${t}`), '')};\n`
+      : ''
     const rowBlocks = rows
       .map(
-        (r) => `    { // row r${r}: one vec2 weight load + one scale (2 words = half a scale group)
+        (r) => `    { // row r${r}: one vec2 weight load + one scale${affine ? '/bias' : ''} (2 words = ${affine ? 'a quarter of a' : 'half a'} scale group)
       let w = weights[r${r} * KPV + v_off];
-      let s = f32(scales[r${r} * SCALES_PER_ROW + (v_off >> 1u)]);
-      acc${r} = acc${r} + s * (
-          ${dequantDot('w.x', x(0), '        ')}
-        + ${dequantDot('w.y', x(1), '        ')});
+      let s = f32(scales[r${r} * SCALES_PER_ROW + ${sIdx}]);
+${affine ? `      let b = f32(biases[r${r} * SCALES_PER_ROW + ${sIdx}]);\n` : ''}      acc${r} = acc${r} + s * (
+          ${dequantDot('w.x', x(0), '        ', !affine)}
+        + ${dequantDot('w.y', x(1), '        ', !affine)})${affine ? ' + b * xs' : ''};
     }`,
       )
       .join('\n')
@@ -342,11 +371,11 @@ ${accDecl}
 ${rowDecl}
 
   for (var chunk : u32 = 0u; chunk < KPV / ${wgSize}u; chunk = chunk + 1u) {
-    let v_off : u32 = tid + chunk * ${wgSize}u;   // vec2 index; scale group = v_off >> 1
+    let v_off : u32 = tid + chunk * ${wgSize}u;   // vec2 index; scale group = v_off >> ${affine ? '2' : '1'}
 
 ${loads}
 ${unpacks}
-
+${xsum}
 ${rowBlocks}
   }
 `
@@ -700,6 +729,19 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   // 62080 and does not.
   { outF32: true, subgroups: true, affine: true }, // int4_matmul_f32_sg_affine
   { outF32: true, subgroups: true, rowsPerWG: 4, affine: true }, // int4_matmul_f32_tiled_affine
+  // Affine WIDE-LOAD sibling, the HALF width only. Decode is memory-bound and
+  // the FFN is 54% of a decode token (BENCH.md), so the affine family reading
+  // one u32 at a time while the symmetric family read four was the plainest
+  // thing left on the table. Groups are 64 here, so a vec2 covers a quarter of
+  // one and the scale index shifts rather than matching the load index.
+  // The FULL vec4 width is generatable and graded (tests/kernels/run.mjs) but
+  // NOT shipped: measured -5.2% against narrow loads on llama32, where vec4h
+  // reads +5.6%. 32 activations in registers plus a per-row bias costs more
+  // than the wider load saves. Re-test before adding it back on another GPU.
+  { subgroups: true, vec4Half: true, affine: true }, // int4_matmul_sg_vec4h_affine
+  { subgroups: true, rowsPerWG: 4, vec4Half: true, affine: true }, // int4_matmul_tiled_vec4h_affine
+  { outF32: true, subgroups: true, vec4Half: true, affine: true }, // int4_matmul_f32_sg_vec4h_affine
+  { outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true, affine: true }, // int4_matmul_f32_tiled_vec4h_affine
   // MoE: workgroup_id.z is the SLOT and the expert row comes from ids[] at
   // @binding(6), so one dispatch covers every selected expert.
   { affine: true, moe: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_tiled_affine_moe

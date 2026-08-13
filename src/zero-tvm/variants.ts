@@ -23,6 +23,10 @@
  *               2026-07-25 M2 Max A/B)
  *   ?vec4qkv=0  opt OUT of the vec4-load qkv_fused sibling (32-thread;
  *               default ON with sg32; measured +4.2% alone)
+ *   ?vec4aff=1  opt INTO the wide-load MLX-affine matmul (K%512). Correct and
+ *               token-identical; default OFF because three A/B runs on battery
+ *               read +5.4% / +13.2% / -3.0% for the same comparison.
+ *               scripts/decode-kernel-ab.mjs settles it on mains power.
  *
  * Measured experiments (2026-07-25/27 on M2 Max — see BENCH.md):
  *   ?splitk=N      split-K flash-decode attention, N partitions per head +
@@ -64,6 +68,10 @@ export interface VariantFlags {
   vec4Half: boolean
   /** vec4-load qkv_fused sibling — default ON (measured +4.2% on M2 Max); ?vec4qkv=0 to disable. */
   vec4Qkv: boolean
+  /** Wide-load (vec4h) MLX-affine matmuls — OPT-IN (?vec4aff=1) until measured
+   *  on mains power. Correct and token-identical; the perf question is open,
+   *  see BENCH.md "Affine wide loads". */
+  vec4Affine: boolean
   /** Fused qk_norm+RoPE+KV-append on the unfused qkNorm decode path (Qwen3):
    *  3 post-matmul dispatches become 1 (10 → 8 per layer). Default ON;
    *  ?fuseqk=0 restores the reference 3-dispatch chain for A/B. */
@@ -88,6 +96,7 @@ export const SCALAR_VARIANTS: VariantFlags = {
   vec4: false,
   vec4Half: false,
   vec4Qkv: false,
+  vec4Affine: false,
   fuseQkNorm: false,
   splitK: 0,
   fusePrologue: false,
@@ -131,6 +140,12 @@ export function parseVariantFlags(
     // them (the K%1024 full-vec4 instances stay on).
     vec4Half: sgAll && q.get('vec4') !== '0' && q.get('vec4h') !== '0',
     vec4Qkv: sgAll && q.get('vec4qkv') !== '0',
+    // Opt-in: the affine wide-load matmul. Default OFF not because it is
+    // suspect — it is numerically exact and token-identical — but because
+    // three A/B runs on a discharging battery read +5.4%, +13.2% and -3.0%
+    // for the same comparison. An unmeasured kernel does not become the
+    // default here; ?vec4aff=1 is how it gets measured.
+    vec4Affine: sgAll && q.get('vec4') !== '0' && q.get('vec4aff') === '1',
     // Fused qk_norm+RoPE+append on the qkNorm decode path (plain 32-thread
     // kernel — no subgroups needed). ?fuseqk=0 restores the reference chain.
     fuseQkNorm: q.get('fuseqk') !== '0',
@@ -173,6 +188,7 @@ export function resolveMatmul(
   k?: number,
   vec4Half = vec4,
   affine = false,
+  vec4Affine = false,
 ): { pipeline: GPUComputePipeline; pipelineF32: GPUComputePipeline; rowsPerWG: number; label: string } {
   // AFFINE (MLX) weights take a different family entirely and MUST be resolved
   // first. A symmetric kernel reads the same buffers happily — it just divides
@@ -181,9 +197,24 @@ export function resolveMatmul(
   // three K instances (d=2048, qDim=4096) even satisfy the vec4 gate, so the
   // default resolution lands on int4_matmul_tiled_vec4, which is exactly wrong.
   //
-  // vec4/vec4Half are not available here at all: int4_matmul.gen.ts forbids
-  // affine with vec4/vec4Half/mDyn/m=4, so `k` never matters on this path.
+  // The affine family has a wide-load sibling as of 2026-08-13, so `k` DOES
+  // matter here now — but only ONE width, unlike the symmetric ladder below.
+  //
+  // vec4h ONLY, and that is a measured decision. The affine vec4 body carries
+  // 32 activations in registers plus a per-row BIAS the symmetric body does
+  // not have, and at rowsPerWG=4 that costs more than the wider load saves:
+  // llama32 (K%1024, so it can take either) reads -5.2% on vec4 and +5.6% on
+  // vec4h against the same narrow-load baseline, alternated in one process.
+  // qwen3mlx (K%512, vec4h its only option) reads +5.4%. See BENCH.md.
+  // ?vec4=0 turns both families back to narrow loads.
   if (affine) {
+    const wide = k !== undefined && vec4Affine && k % 512 === 0 ? 'vec4h' : 'none'
+    if (wide === 'vec4h' && variant !== 'scalar' && P.int4MatmulTiledVec4hAffine && P.int4MatmulF32TiledVec4hAffine) {
+      return { pipeline: P.int4MatmulTiledVec4hAffine, pipelineF32: P.int4MatmulF32TiledVec4hAffine, rowsPerWG: 4, label: 'tiled_vec4h_affine' }
+    }
+    if (wide === 'vec4h' && P.int4MatmulSgVec4hAffine && P.int4MatmulF32SgVec4hAffine) {
+      return { pipeline: P.int4MatmulSgVec4hAffine, pipelineF32: P.int4MatmulF32SgVec4hAffine, rowsPerWG: 1, label: 'sg_vec4h_affine' }
+    }
     if (variant !== 'scalar' && P.int4MatmulTiledAffine && P.int4MatmulF32TiledAffine) {
       return { pipeline: P.int4MatmulTiledAffine, pipelineF32: P.int4MatmulF32TiledAffine, rowsPerWG: 4, label: 'tiled_affine' }
     }
@@ -274,9 +305,9 @@ export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines, spec:
   // kernel, and the failure would be silent.
   const affine = spec.weightFormat === 'mlx-safetensors'
   const { pipeline: matmul, pipelineF32: matmulF32, rowsPerWG: matmulRowsPerWG, label: matmulLabel } =
-    resolveMatmul(flags.matmul, P, flags.vec4, spec.d, flags.vec4Half, affine)
-  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim, flags.vec4Half, affine)
-  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn, flags.vec4Half, affine)
+    resolveMatmul(flags.matmul, P, flags.vec4, spec.d, flags.vec4Half, affine, flags.vec4Affine)
+  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim, flags.vec4Half, affine, flags.vec4Affine)
+  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn, flags.vec4Half, affine, flags.vec4Affine)
   const attention = (flags.sgAttn && P.attentionSg) ? P.attentionSg : P.attention
   // ?splitk=N experiment: partial pass follows the sgAttn toggle (subgroup
   // reduce when available), combine is feature-free.
