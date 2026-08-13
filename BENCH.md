@@ -1747,23 +1747,59 @@ Native now BEATS the browser on the A/B model (76 vs 72.4) and stands at
 already won. Numbers taken at 20% charge on a working adapter; treat as
 same-day-comparable, not protocol-final.
 
-### Sweep round 2 (2026-08-13, clean power): E1 is beatable, twice
+### Sweep round 2 (2026-08-13): WITHDRAWN — both winners were ranked against a handicapped baseline
 
-With the gate deterministic (reference rounds dequant to f16 like the
-kernel; all buildable configs at ~4.8e-4), the fixed swizzle, and the new
-E4 split-K arm (`sk` grid-z K-slices, f32 partials + reduce dispatch):
+Round 2 reported `sg4 32x64 k32 pad sk4` +8% at M=64 and `sg8 64x64 k32 swz`
++7% at M=256, both "over E1". Neither claim survives.
 
-- **M=64: `sg4 32x64 k32 pad sk4` wins** — 3.05 TF mean vs the E1 shape's
-  2.82 (+8%), strongest exactly on the small-grid shapes (ffn_down 3.13,
-  o_proj 2.74) the MLX split-K heuristic predicts (mTiles×nTiles < ~400).
-- **M=256: `sg8 64x64 k32 swz` wins** — 3.68 TF vs E1's 3.45 (+7%),
-  consistent with llama.cpp's 8-subgroup config flipping to the winner
-  under disable_robustness (E2). The swizzle, now correct, edges pad.
-- The 08-12 "no config beats E1" reading came from a machine in state (2)
-  above and is superseded.
+The sweep never timed the shipped E1. It timed its own parameterized
+reconstruction of E1's config and quoted the real kernel from a **previous
+run's header line** — a cross-run ratio, which this file rejects everywhere
+else. Running the shipped generator as arm zero of the same process:
+shipped E1 4.36 TF at M=256, the builder's supposedly-identical arm 3.46 TF.
+**26% apart.** Against the real kernel, round 2's two winners are −7% and
+−16%. They lost.
 
-Not yet wired into the engine: graduating these two as chunk-GEMM variants
-(sg8-swz for CAP-256 prefill, sk4 for small-M) is the next kernel step.
+The gap was the builder's, not the kernel's: every staging loop carried a
+range guard (`if (idx < TM*TK)`) that is provably always true for all but
+one config, since the thread count divides the work evenly. An always-true
+branch per staged element, in the two loops that feed the matrix unit.
+
+It also **skewed the ranking**, not just the level: the tax scales with
+elements staged per thread, so `64x32` tiles (16 A-elements/thread) paid
+twice what `32x64` tiles (8) did. Emitting each guard only where the
+division is ragged — one config, `sg8 128x32` — moved `sg4 64x32 k32 swz`
+from near-last to first.
+
+### Sweep round 3 (2026-08-13, 3 runs, AC power): the swizzle at a 64x32 tile beats E1
+
+`sg4 64x32 k32 swz` — 4 subgroups, 64(M)x32(N) tile, TILE_K 32, llama.cpp
+8x8-block dense B layout. E1's tile shape transposed, plus the swizzle.
+
+| | shipped E1 | sg4 64x32 k32 swz | |
+| --- | --- | --- | --- |
+| M=256 mean | 4.37 / 4.26 / 4.37 | 5.15 / 5.19 / 5.16 | **+18 to +22%** |
+| M=64 mean | 3.30 / 3.25 / 3.00 | 3.83 / 4.25 / 4.12 | **+16 to +37%** |
+
+Three independent processes, same machine, AC power, no other GPU work.
+M=256 is the trustworthy row — both kernels reproduce inside ±1.5% there,
+so the ratio is solid. M=64 swings ±5% per kernel and the ratio with it;
+read it as "wins, magnitude uncertain".
+
+It wins every shape at M=256, not just the mean (gate_up 5.78 vs 4.83,
+ffn_down 5.09 vs 4.26, o_proj 4.62 vs 4.00), so there is nothing to
+per-shape switch between — one config replaces E1 outright.
+
+Gate 4.6e-4, same band as every other arm.
+
+Two harness bugs fixed alongside: the sweep never exited (dawn.node holds
+the loop open after the last submit — one such process was found still
+running overnight at 35% CPU, holding the GPU beside a new run), and its
+stdout buffered invisibly when piped.
+
+Not yet wired into the engine: graduating `sg4 64x32 k32 swz` as the
+chunk-GEMM kernel is the next step, and needs A-staging bounds work — a
+64-row tile stages 64 rows of activations regardless of M.
 
 ### `ztvm native big` gate (2026-08-13): qwen35 @ 65,536 PASS
 

@@ -28,6 +28,7 @@
 
 import { installShims } from './native/shims.mjs'
 import { toF16, f16Array, f16BitsToF32 } from '../tests/kernels/half.mjs'
+import { int4MatmulSgE1WGSL } from '../src/compiler/shaders/int4_matmul.gen.ts'
 
 const FULL = process.argv.includes('--full')
 
@@ -47,6 +48,18 @@ function sweepWGSL({ sg, tm, tn, tk, sw, sk = 1 }) {
   const wordsPer = Math.ceil(wordsTotal / WG)
   const aPer = Math.ceil((tm * tk) / WG)
   const oPer = Math.ceil((tm * tn) / WG)
+
+  // Emit a range guard ONLY where the thread count does not divide the work
+  // evenly. Guarding unconditionally cost the builder ~26% against the shipped
+  // E1 at M=256 — an always-true branch per staged element, in the loops that
+  // feed the matrix unit. Every arm paid it equally, so the sweep's INTERNAL
+  // ranking was never wrong; what it could not support was the comparison
+  // round 2 actually made, "+8% over E1". Of the current configs only
+  // sg8 128x32 needs one (32 rows x 4 words = 128 words across 256 threads).
+  const guard = (per, total) => (per * WG === total ? ['', ''] : [`if (idx < ${total}u) {`, '}'])
+  const [aGuard, aEnd] = guard(aPer, tm * tk)
+  const [oGuard, oEnd] = guard(oPer, tm * tn)
+  const [wGuard, wEnd] = wordsPer * WG === wordsTotal ? ['', ''] : [`if (widx < ${wordsTotal}u) {`, '}']
 
   // B addressing: pad layout stores row-major [n][k] stride tk+8 and loads
   // col-major fragments; swizzle stores each (n8, k8) 8x8 block contiguously
@@ -120,20 +133,24 @@ fn sweep(
   // split-K (E4): grid z slices K; each slice is a tk-multiple, computed from
   // the RUNTIME K so one pipeline serves every shape. sk=1 degenerates to the
   // whole range.
-  let KS = ((K / ${sk}u + ${tk - 1}u) / ${tk}u) * ${tk}u;
+${sk > 1
+    ? `  let KS = ((K / ${sk}u + ${tk - 1}u) / ${tk}u) * ${tk}u;
   let kLo = wid.z * KS;
-  let kHi = min(kLo + KS, K);
+  let kHi = min(kLo + KS, K);`
+    // sk=1 degenerates to the whole range (KS >= K, wid.z = 0). Spelling that
+    // out gives the sk=1 arms the same loop the shipped kernel has.
+    : '  let kLo = 0u;\n  let kHi = K;'}
   for (var k0 : u32 = kLo; k0 < kHi; k0 = k0 + ${tk}u) {
     for (var i : u32 = 0u; i < ${aPer}u; i = i + 1u) {
       let idx = tid * ${aPer}u + i;
-      if (idx < ${tm * tk}u) {
+      ${aGuard}
         Ash[(idx / ${tk}u) * ${aStride}u + (idx % ${tk}u)] =
           input_buf[(mBase + idx / ${tk}u) * K + k0 + (idx % ${tk}u)];
-      }
+      ${aEnd}
     }
     for (var wq : u32 = 0u; wq < ${wordsPer}u; wq = wq + 1u) {
       let widx = tid * ${wordsPer}u + wq;
-      if (widx < ${wordsTotal}u) {
+      ${wGuard}
         let row = widx / ${kWords}u;
         let wcol = widx % ${kWords}u;
         let n2 = nBase + row;
@@ -148,7 +165,7 @@ fn sweep(
         } else {
           ${[...Array(8).keys()].map((i) => (sw === 'swz' ? `Bsh[base + ${i}u * 8u] = 0.0h;` : `Bsh[base + ${i}u] = 0.0h;`)).join('\n          ')}
         }
-      }
+      ${wEnd}
     }
     workgroupBarrier();
 
@@ -185,7 +202,7 @@ fn sweep(
   workgroupBarrier();
   for (var i : u32 = 0u; i < ${oPer}u; i = i + 1u) {
     let idx = tid * ${oPer}u + i;
-    if (idx < ${tm * tn}u) {
+    ${oGuard}
       let m = idx / ${tn}u;
       let n2 = idx % ${tn}u;
       if (mBase + m < M && nBase + n2 < N) {
@@ -195,7 +212,7 @@ fn sweep(
     ? `partials[(wid.z * M + mBase + m) * N + nBase + n2] = Osh[idx];`
     : `output_buf[(mBase + m) * N + nBase + n2] = f16(Osh[idx]);`}
       }
-    }
+    ${oEnd}
   }
 }`
 }
@@ -356,7 +373,14 @@ async function time(made, cfg, s) {
 
 // ---------------------------------------------------------------- sweep
 
-const CONFIGS = []
+// The SHIPPED E1 generator runs as arm zero. Round 2 ranked the winners
+// against the builder's own sg4/32x64/k32/pad arm and quoted the shipped
+// kernel from a PREVIOUS run's header — a cross-run ratio, which this repo
+// does not accept anywhere else (BENCH.md: only same-run ratios are valid).
+// The two are meant to be the same kernel; if they measure apart, the gap is
+// the sweep's, and every "+x% over E1" claim is measured against the wrong
+// baseline. Graduation depends on this arm, so it is in the table.
+const CONFIGS = [{ shipped: true, tm: 32, tn: 64 }]
 for (const sg of [4, 8]) {
   for (const [tm, tn] of sg === 4 ? [[32, 64], [64, 32], [16, 128]] : [[64, 64], [32, 128], [128, 32]]) {
     if ((tm / 16) * (tn / 32) !== sg) continue
@@ -375,12 +399,18 @@ for (const sk of [2, 4]) CONFIGS.push({ sg: 4, tm: 32, tn: 64, tk: 32, sw: 'pad'
 const SHAPES = [['gate_up', 2560, 19456], ['ffn_down', 9728, 2560], ['o_proj', 4096, 2560]]
 const MS = FULL ? [64, 256, 512] : [64, 256]
 
-console.log(`${CONFIGS.length} configs x ${SHAPES.length} shapes x M ${MS.join('/')} — E1 baseline: 3.55/2.86/2.80 TF at M=64\n`)
+console.log(`${CONFIGS.length} configs x ${SHAPES.length} shapes x M ${MS.join('/')} — baseline is arm zero, same run\n`)
 const results = []
 for (const cfg of CONFIGS) {
-  const name = `sg${cfg.sg} ${cfg.tm}x${cfg.tn} k${cfg.tk} ${cfg.sw}${cfg.sk ? ` sk${cfg.sk}` : ''}`
+  const name = cfg.shipped
+    ? 'E1 SHIPPED gen.ts'
+    : `sg${cfg.sg} ${cfg.tm}x${cfg.tn} k${cfg.tk} ${cfg.sw}${cfg.sk ? ` sk${cfg.sk}` : ''}`
   let made
-  try { made = await mk(sweepWGSL(cfg)) } catch (e) { console.log(`${name}: build threw ${e.message.slice(0, 60)}`); continue }
+  try {
+    made = cfg.shipped
+      ? await mk(int4MatmulSgE1WGSL(true), 'int4_matmul_sg_e1_affine')
+      : await mk(sweepWGSL(cfg))
+  } catch (e) { console.log(`${name}: build threw ${e.message.slice(0, 60)}`); continue }
   if (made.err) { console.log(`${name}: ${made.err.slice(0, 90)}`); continue }
   if (cfg.sk) {
     const r = await mk(reduceWGSL(cfg.sk), 'reduce')
@@ -413,8 +443,22 @@ for (const cfg of CONFIGS) {
   console.log(`${name.padEnd(22)} gate ${rel.toExponential(1)}  ` + MS.map((M) => `M${M} ${(row.tf[`mean@${M}`] / 1000).toFixed(2)}TF`).join('  '))
 }
 
+// Ranked against the shipped kernel from THIS run — a config only graduates on
+// a ratio measured here, never against a figure carried in from another day.
+const ship = results.find((r) => r.cfg.shipped)
 for (const M of MS) {
-  const best = [...results].sort((a, b) => b.tf[`mean@${M}`] - a.tf[`mean@${M}`])[0]
-  if (best) console.log(`\nBEST @M=${M}: ${best.name} — ` + SHAPES.map(([l]) => `${l} ${(best.tf[`${l}@${M}`] / 1000).toFixed(2)}TF`).join(', '))
+  const ranked = [...results].sort((a, b) => b.tf[`mean@${M}`] - a.tf[`mean@${M}`])
+  const rel = (r) => (ship ? ` (${((r.tf[`mean@${M}`] / ship.tf[`mean@${M}`] - 1) * 100).toFixed(1)}% vs shipped)` : '')
+  console.log(`\n@M=${M} — shipped E1 ${(ship ? ship.tf[`mean@${M}`] / 1000 : NaN).toFixed(2)}TF`)
+  for (const r of ranked.slice(0, 4)) {
+    console.log(`  ${r.name.padEnd(22)} ${(r.tf[`mean@${M}`] / 1000).toFixed(2)}TF${rel(r)}  ` +
+      SHAPES.map(([l]) => `${l} ${(r.tf[`${l}@${M}`] / 1000).toFixed(2)}`).join(' '))
+  }
 }
+
+// dawn.node holds the loop open after the last submit, so the script prints its
+// table and then sits there. One such process survived overnight at 35% CPU and
+// was still holding the GPU when the next run started — every timing taken
+// beside it is contended. Leave explicitly.
+process.exit(0)
 
