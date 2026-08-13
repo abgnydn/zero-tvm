@@ -131,7 +131,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
     // output. scripts/quality-ab.py against the 4-bit build is the missing run.
     // See docs/QUALITY.md.
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · 3-bit experts',
-    sizeLabel: '~16.4 GB', rateLabel: '~55 t/s',
+    sizeLabel: '~16.4 GB', rateLabel: '~66 t/s',   // 65.56 total, M2 Max (BENCH.md 2026-08-13)
     ramNote: 'needs ~20 GB free RAM',
   },
   [QWEN36_35B_A3B.id]: {
@@ -139,20 +139,26 @@ const BRANDINGS: Record<string, ModelBrand> = {
     sizeLabel: '~19.5 GB', rateLabel: '',
     ramNote: 'needs ~24 GB free RAM (64 GB Mac recommended)',
   },
+  // THESE THREE ARE FROM AN OLDER BUILD (2026-07-30) than the labels below it,
+  // which were re-measured 2026-08-13. Every kernel round since — E5 prefill,
+  // the affine wide loads, MoE chunking — lands in the newer numbers and not
+  // in these, so reading the column as a cross-model ranking overstates the
+  // MLX builds. Refreshing them means re-downloading Phi-3 and Qwen3-4B from
+  // HF (neither is in .weights-local); qwen35 IS local and can be redone alone.
   [QWEN35_4B.id]: { name: 'Qwen3.5-4B', params: '4B hybrid (DeltaNet)', sizeLabel: '~2.6 GB', rateLabel: '~65 t/s' },  // 65.28 total, M2 Max (BENCH.md 2026-07-30)
   [QWEN3_4B.id]: { name: 'Qwen3-4B', params: '4B dense · q4f16_1', sizeLabel: '~2.3 GB', rateLabel: '~60 t/s' },  // 59.85 total, M2 Max (BENCH.md 2026-07-30)
   [PHI3.id]: { name: 'Phi-3-mini', params: '3.8B dense', sizeLabel: '~2 GB', rateLabel: '~70 t/s' },  // 69.55 total, M2 Max (BENCH.md 2026-07-30)
   // The first pipeline-added model (scripts/add-model.mjs, 2026-08-06) — the
   // same Qwen3-4B as the MLC build above, from the MLX-affine checkpoint;
   // validated against mlx_lm (cosine 0.999879, greedy token-exact).
-  [QWEN3_4B_MLX.id]: { name: 'Qwen3-4B', params: '4B dense · MLX 4-bit', sizeLabel: '~2.1 GB', rateLabel: '' },
-  [LLAMA_3_2_1B_INSTRUCT_4BIT.id]: { name: 'Llama-3.2-1B-Instruct', params: '1B dense', sizeLabel: '~0.6 GB', rateLabel: '' },
+  [QWEN3_4B_MLX.id]: { name: 'Qwen3-4B', params: '4B dense · MLX 4-bit', sizeLabel: '~2.1 GB', rateLabel: '~81 t/s' },  // 80.78 total, M2 Max (BENCH.md 2026-08-13)
+  [LLAMA_3_2_1B_INSTRUCT_4BIT.id]: { name: 'Llama-3.2-1B-Instruct', params: '1B dense', sizeLabel: '~0.6 GB', rateLabel: '~256 t/s' },  // 255.90 total, M2 Max (BENCH.md 2026-08-13)
   // First MoE WITHOUT a shared expert, and the first 4-bit router — both are
   // spec flags now rather than engine assumptions. Validated against mlx_lm in
   // f32: cosine 0.999985, greedy token-exact through the stop id. (Against
   // mlx's own bf16 forward it scores 0.9978 — that is bf16's error, not the
   // engine's; see the dtype note in scripts/mlx-ref.py.)
-  [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~16.0 GB', rateLabel: '', ramNote: 'needs ~20 GB free RAM' },
+  [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~16.0 GB', rateLabel: '~75 t/s', ramNote: 'needs ~20 GB free RAM' },  // 74.96 total, M2 Max (BENCH.md 2026-08-13)
   // Not a chat model. Its output is the pooled hidden state, so rateLabel stays
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },

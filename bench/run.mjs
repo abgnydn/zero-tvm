@@ -57,10 +57,18 @@ const BASELINES = {
   wllama: { page: '/wllama-bench.html', name: 'wllama (llama.cpp WebGPU, GGUF)', global: 'wllamaResult', label: 'wllama' },
   tjs:    { page: '/tjs-bench.html',    name: 'transformers.js (ORT Web WebGPU, ONNX q4f16)', global: 'tjsResult', label: 'tjs' },
 }
-const BASELINE = BASELINES[process.env.BENCH_BASELINE] ? process.env.BENCH_BASELINE : 'webllm'
-const BASE_PAGE = BASELINES[BASELINE].page
-const BASE_NAME = BASELINES[BASELINE].name
-const BASE_GLOBAL = BASELINES[BASELINE].global
+//   none             — NO second half. Four of the nine shipped models have no
+//                      baseline engine at all (the MLX checkpoints and both
+//                      MoE builds: WebLLM ships no build, wllama/tjs no
+//                      equivalent bytes), so "what does OUR engine do on this
+//                      model" had no supported path and their landing
+//                      rateLabels stayed empty. This is that path. It never
+//                      writes results.json — there is nothing to compare.
+const BASELINE = process.env.BENCH_BASELINE === 'none' ? 'none'
+  : BASELINES[process.env.BENCH_BASELINE] ? process.env.BENCH_BASELINE : 'webllm'
+const BASE_PAGE = BASELINES[BASELINE]?.page
+const BASE_NAME = BASELINES[BASELINE]?.name
+const BASE_GLOBAL = BASELINES[BASELINE]?.global
 const HARDWARE = process.env.BENCH_HW ?? 'unknown GPU'
 const READY_MS = 12 * 60 * 1000 // first run downloads ~2 GB
 // headless:false matches the e2e harness (most reliable on a desktop GPU under
@@ -234,7 +242,18 @@ try {
   const zt = await ztPage.evaluate((n, runs) => window.bench(n, runs), N_TOKENS, N_RUNS)
   console.log(`→ Zero-TVM median: ${zt.median.toFixed(2)} tok/s${QUERY ? `  (${QUERY})` : ''}`)
 
-  if (QUERY && AB_MODEL) {
+  if (BASELINE === 'none') {
+    // Solo: our engine only. Printed as the rateLabel protocol number —
+    // total tok/s, median of N runs, in the BROWSER (native is a different
+    // number: BENCH.md has native decode BEATING browser on qwen35, 76 vs
+    // 72.4, so the two must never be mixed in one column).
+    console.log(`[solo] runs: ${zt.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)
+    console.log(
+      `\n[solo] ${AB_MODEL ?? 'phi3'} — Zero-TVM ${zt.median.toFixed(2)} tok/s median ` +
+      `of ${N_RUNS} x ${N_TOKENS} tokens (no baseline half; results.json NOT written)`,
+    )
+    ok = true
+  } else if (QUERY && AB_MODEL) {
     // Cross-engine A/B (?model=…): run the baseline half too, same model, same
     // session — but never write results.json (Phi-3 headline artifact).
     console.log(`[a/b] zt runs: ${zt.runs?.map((x) => x.tokPerS.toFixed(2)).join(', ')}`)

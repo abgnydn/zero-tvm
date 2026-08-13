@@ -1598,6 +1598,42 @@ either token is the model's answer. The bench measures that gap rather than
 asserting it — this repo once spent an afternoon "fixing" exactly this and
 reverted the fix.
 
+### Landing rate labels, measured (2026-08-13)
+
+The `rateLabel` on each landing card is a measured number or it is blank —
+never an estimate. Four were blank because four of the nine shipped models have
+no baseline engine to pair against (the MLX checkpoints and both MoE builds:
+WebLLM ships no build of them, wllama and tjs have no equivalent bytes), and
+`bench/run.mjs` had no mode that runs our half alone. `BENCH_BASELINE=none` is
+that mode. It never writes `results.json` — there is nothing to compare.
+
+Same protocol as the 2026-07-30 pairs: Apple M2 Max, Chrome, 128-token target
+x 5 runs + warmup, median, **total** tok/s (prefill + decode wall clock), in the
+BROWSER. Native is a different number and the two are never mixed in one column
+— BENCH.md already records native decode BEATING browser on qwen35 (76 vs 72.4).
+
+| model | total tok/s | decode | TTFT | run spread |
+|---|---:|---:|---:|---|
+| llama32 | **255.90** | 279.00 | 45 ms | 255.2-256.9 |
+| qwen3mlx | **80.78** | 90.88 | 150 ms | 68.9-81.2 |
+| qwen30b | **74.96** | 88.40 | 171 ms | 66.4-75.6 |
+| qwen36q3 | **65.56** | 74.87 | 194 ms | 65.3-65.6 |
+
+qwen36q3 supersedes the `~55 t/s` that card carried, which was explicitly a
+single owner-run rather than a protocol round.
+
+Two things this column does NOT yet say:
+
+- **The other three labels (Phi-3 ~70, Qwen3-4B ~60, Qwen3.5 ~65) are from the
+  2026-07-30 build.** Every kernel round since — E5 prefill, the affine wide
+  loads, MoE chunking — is in the four rows above and in none of those three,
+  so reading the column as a cross-model ranking overstates the MLX builds.
+  Refreshing Phi-3 and Qwen3-4B means re-downloading them from HF (neither is
+  in `.weights-local/`); qwen35 is local and can be redone on its own.
+- **qwen36 (full 4-bit, 19.5 GB) is unmeasured.** It wants ~24 GB free and LM
+  Studio is holding 5.98 GB resident on a 32 GB machine, which is the exact
+  configuration that froze this Mac once before. Not run unattended.
+
 ## Head-to-head vs LM Studio (2026-08-13) — SAME CHECKPOINT BYTES, native host
 
 The 08-12 comparison below ran different bytes on each side (ours MLC q4f16_1,
