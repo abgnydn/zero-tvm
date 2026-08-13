@@ -23,10 +23,9 @@
  *               2026-07-25 M2 Max A/B)
  *   ?vec4qkv=0  opt OUT of the vec4-load qkv_fused sibling (32-thread;
  *               default ON with sg32; measured +4.2% alone)
- *   ?vec4aff=1  opt INTO the wide-load MLX-affine matmul (K%512). Correct and
- *               token-identical; default OFF because three A/B runs on battery
- *               read +5.4% / +13.2% / -3.0% for the same comparison.
- *               scripts/decode-kernel-ab.mjs settles it on mains power.
+ *   ?vec4aff=0  opt OUT of the wide-load MLX-affine matmul (K%512; default ON,
+ *               measured +10% decode on qwen3mlx and +6-9% on llama32, paired
+ *               per round — scripts/decode-kernel-ab.mjs)
  *
  * Measured experiments (2026-07-25/27 on M2 Max — see BENCH.md):
  *   ?splitk=N      split-K flash-decode attention, N partitions per head +
@@ -68,9 +67,9 @@ export interface VariantFlags {
   vec4Half: boolean
   /** vec4-load qkv_fused sibling — default ON (measured +4.2% on M2 Max); ?vec4qkv=0 to disable. */
   vec4Qkv: boolean
-  /** Wide-load (vec4h) MLX-affine matmuls — OPT-IN (?vec4aff=1) until measured
-   *  on mains power. Correct and token-identical; the perf question is open,
-   *  see BENCH.md "Affine wide loads". */
+  /** Wide-load (vec4h) MLX-affine matmuls — default ON (measured +10% qwen3mlx,
+   *  +6-9% llama32 decode, paired per round on mains power); ?vec4aff=0 to
+   *  A/B off. See BENCH.md "Affine wide loads". */
   vec4Affine: boolean
   /** Fused qk_norm+RoPE+KV-append on the unfused qkNorm decode path (Qwen3):
    *  3 post-matmul dispatches become 1 (10 → 8 per layer). Default ON;
@@ -140,12 +139,12 @@ export function parseVariantFlags(
     // them (the K%1024 full-vec4 instances stay on).
     vec4Half: sgAll && q.get('vec4') !== '0' && q.get('vec4h') !== '0',
     vec4Qkv: sgAll && q.get('vec4qkv') !== '0',
-    // Opt-in: the affine wide-load matmul. Default OFF not because it is
-    // suspect — it is numerically exact and token-identical — but because
-    // three A/B runs on a discharging battery read +5.4%, +13.2% and -3.0%
-    // for the same comparison. An unmeasured kernel does not become the
-    // default here; ?vec4aff=1 is how it gets measured.
-    vec4Affine: sgAll && q.get('vec4') !== '0' && q.get('vec4aff') === '1',
+    // The affine wide-load matmul. Default ON since 2026-08-13: +10% decode on
+    // qwen3mlx and +6-9% on llama32, paired per round across four runs on mains
+    // power (scripts/decode-kernel-ab.mjs). It shipped opt-in for a few hours
+    // first, because the same comparison on a discharging battery read +5.4%,
+    // +13.2% and -3.0% and none of those were measurements.
+    vec4Affine: sgAll && q.get('vec4') !== '0' && q.get('vec4aff') !== '0',
     // Fused qk_norm+RoPE+append on the qkNorm decode path (plain 32-thread
     // kernel — no subgroups needed). ?fuseqk=0 restores the reference chain.
     fuseQkNorm: q.get('fuseqk') !== '0',
@@ -203,9 +202,9 @@ export function resolveMatmul(
   // vec4h ONLY, and that is a measured decision. The affine vec4 body carries
   // 32 activations in registers plus a per-row BIAS the symmetric body does
   // not have, and at rowsPerWG=4 that costs more than the wider load saves:
-  // llama32 (K%1024, so it can take either) reads -5.2% on vec4 and +5.6% on
-  // vec4h against the same narrow-load baseline, alternated in one process.
-  // qwen3mlx (K%512, vec4h its only option) reads +5.4%. See BENCH.md.
+  // llama32 (K%1024, so it can take either) reads -5.2% on vec4 where vec4h
+  // reads +6-9%, against the same narrow-load baseline in one process.
+  // qwen3mlx (K%512, vec4h its only option) reads +10%. See BENCH.md.
   // ?vec4=0 turns both families back to narrow loads.
   if (affine) {
     const wide = k !== undefined && vec4Affine && k % 512 === 0 ? 'vec4h' : 'none'

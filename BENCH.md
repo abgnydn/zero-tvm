@@ -1555,7 +1555,7 @@ in order: the weight-read efficiency of the two FFN matmuls (decode is
 memory-bound, so this is bytes/second against the M2 Max's ceiling), and an
 affine `fused_ffn` to cut the dispatch count.
 
-### Affine wide loads — built, correct, NOT measured (2026-08-13)
+### Affine wide loads — +10% decode, and the method mattered (2026-08-13)
 
 Following the profile above: the MLX-affine matmul family had no wide-load
 sibling, so every affine model (5 of the 9 shipped) read weights one `u32` at a
@@ -1563,30 +1563,40 @@ time in decode while the symmetric family read four. `int4_matmul_*_vec4h_affine
 closes that. Affine groups are 64 rather than 32, so a `vec2<u32>` covers a
 QUARTER of a group and the scale index is `v_off >> 2` — a shift, not a match.
 
-Numerics are exact against the CPU reference at both row counts, and three
-mutations were checked to make sure the gate can see a wrong one: the vec4
-scale index unshifted (2.51e+0), the vec4h index using the symmetric shift
-(2.22e+0), and the bias term dropped (1.95e-1). Both engine models generate
-**identical tokens** to the narrow path in every A/B round.
+`scripts/decode-kernel-ab.mjs`, two engines in one process, arm order flipped
+every round, rates over tokens 8.. Paired per round:
 
-**The perf claim is not made, because the measurement did not converge.** Three
-runs of the same qwen3mlx comparison, alternated arms in one process, read
-**+5.4%, +13.2% and −3.0%**, with absolute rates inside a single run spanning
-67–91 tok/s. The machine was on a **discharging battery** throughout. That is
-the condition BENCH.md already says voids a number, and an inconsistent sign is
-what it looks like from the inside. llama32's runs were tight (+5.5%, +5.7%,
-narrow spread) but one stable model is not a result.
+| model | median | rounds won | K |
+|---|---:|---:|---|
+| qwen3mlx | **+10.0%** | 7/8 | 2560 / 9728 (vec4h only) |
+| llama32 | **+5.6% / +8.7%** (two runs) | 7/8, 6/8 | 2048 / 8192 |
 
-So it ships **opt-in as `?vec4aff=1`**, the same way every unmeasured
-experiment here does, and `scripts/decode-kernel-ab.mjs` is the bench that
-settles it on mains power. It flips to default when that run says so.
+**PAIRED, and that is not a detail.** Absolute rates decay ~20% across a run as
+the SoC heats, so a median of absolutes mostly reports where in the decay each
+arm's samples landed: the same qwen3mlx comparison read +7.9% and +17.4% that
+way, while every round agreed within itself at +9-12%. Differencing the arms
+inside a round cancels the drift — the same correction `quality-ab.py` needed
+(unpaired z=0.8, paired z=14.7 on identical data). Three earlier runs on a
+DISCHARGING battery read +5.4%, +13.2% and −3.0%; none of those were
+measurements and none were published as one.
 
-One thing the inconsistent runs did settle, because llama32 can take either
-width and its numbers were stable: the FULL `vec4` affine body reads **−5.2%**
-against narrow loads where `vec4h` reads **+5.6%**. 32 activations in registers
-plus a per-row bias costs more than the wider load saves. `vec4`-affine is
-generatable and graded but NOT shipped — re-test before adding it on a GPU with
-a bigger register file.
+**The full `vec4` width is generatable and graded but NOT shipped.** llama32 can
+take either width, and there `vec4` reads **−5.2%** where `vec4h` reads +6-9%.
+32 activations in registers plus a per-row bias costs more than the wider load
+saves. Re-test before adding it on a GPU with a bigger register file.
+
+Correctness: exact against the CPU reference at both row counts, with three
+mutations checked so the gate is known to see a wrong kernel — vec4 scale index
+unshifted (2.51e+0), vec4h index using the symmetric shift (2.22e+0), bias term
+dropped (1.95e-1).
+
+The arms agree token for token except once, at generated token 81 of a
+256-token llama32 run, where the **top-2 logit gap was 0.0023 against a logit
+std of 2.19**. Greedy decoding takes a hard argmax over a continuous quantity,
+so at a near-tie any change in summation order lands on the other side and
+either token is the model's answer. The bench measures that gap rather than
+asserting it — this repo once spent an afternoon "fixing" exactly this and
+reverted the fix.
 
 ## Head-to-head vs LM Studio (2026-08-13) — SAME CHECKPOINT BYTES, native host
 
