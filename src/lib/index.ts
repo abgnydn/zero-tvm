@@ -155,6 +155,11 @@ export async function createEngineRaw(opts: CreateEngineOptions & { ctx?: number
   spec: ModelSpec
   variants: import('../zero-tvm/variants.js').VariantFlags
   info: ModelInfo
+  /** Was already returned and merely undeclared. A caller that has to render a
+   *  prompt with the model's own template — any bench comparing us to another
+   *  runtime — needs it, and reaching for an undeclared runtime property is how
+   *  a harness silently renders the wrong template. */
+  buildChatPromptFor: typeof import('../zero-tvm/model-select.js')['buildChatPromptFor']
 }> {
   const built = await bootShared(opts)
   return built

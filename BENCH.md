@@ -1454,6 +1454,58 @@ per-token path to itself.
 
 ---
 
+## Head-to-head vs LM Studio (2026-08-13) — SAME CHECKPOINT BYTES, native host
+
+The 08-12 comparison below ran different bytes on each side (ours MLC q4f16_1,
+theirs MLX 4-bit) and drove our BROWSER. This one removes both differences.
+
+LM Studio has no `Qwen3-4B-4bit`, and it reads its own store — but symlinking
+`.weights-local/Qwen3-4B-4bit` into `~/.lmstudio/models/mlx-community/` makes it
+load the files we already have. Verified, not assumed: **2,278,972,183 bytes on
+both sides.** The only difference left is the runtime.
+
+`MODEL=qwen3mlx GEMM=e5 LMS_URL=http://<addr>:1234 node --experimental-strip-types
+scripts/lmstudio-ab.mjs --native` — ~980-token prompt, 128 decode tokens, 3
+interleaved rounds, medians; three separate processes.
+
+| | zero-tvm (dawn.node, E5) | LM Studio (MLX) | ratio |
+|---|---:|---:|---:|
+| prefill tok/s | 497 / 467 / 458 | 427 / 423 / 411 | **1.10-1.16x us** |
+| decode tok/s | 71.2 / 65.4 / 62.9 | 78.7 / 76.2 / 74.0 | 0.85-0.90x |
+
+**Prefill is won.** The 0.17x -> 0.35x arc in this file was measured against
+LM Studio's 1,385 tok/s on Qwen3.5-4B; on the same bytes and the same model,
+our chunked prefill with E5 is ahead. Decode remains the gap, unchanged in
+character at ~0.85x.
+
+Three defects had to be fixed before any of this meant anything, and each one
+printed a plausible-looking number first:
+
+- **Our prefix cache served rounds 2..N**, reporting 16,443 tok/s "prefill".
+  Fixed with a distinct prompt per round; the harness now throws when a round
+  reuses more than 5% of its ids.
+- **THEIR cache served the whole second run** — 3,751 tok/s against our cold
+  491 — because LM Studio's server outlives our process and had seen those
+  prompts already. Our guard could not see it: it only watched our side. The
+  prompt now carries a per-process nonce, so neither engine can be warm.
+- **LM Studio ignored both thinking switches.** `reasoning_effort: none` and
+  `chat_template_kwargs.enable_thinking` were accepted and had no effect — all
+  128 tokens went to reasoning, content was empty, and the ttft arithmetic
+  produced a NEGATIVE prefill rate that printed as a result. `/no_think` in the
+  message body is what works on this checkpoint. The harness now refuses a
+  response with no content deltas.
+
+Caveats that remain: Qwen3-4B dense, not the Qwen3.5-4B hybrid of the run
+below; LM Studio held its own 9 GB model resident alongside, and our decode
+(63-73) sits under the ~84 tok/s measured solo, so contention is likely on both
+sides; LM Studio ran ctx 8192, parallel 4. Ratios are same-run and interleaved,
+which is what they are for.
+
+Also worth knowing: LM Studio may bind ONE non-loopback interface (here a
+Tailscale address) with "serve on local network" on, and `127.0.0.1:1234` is
+then refused outright while `lms server status` still says running. Find it with
+`lsof -nP -iTCP:1234 -sTCP:LISTEN`.
+
 ## Head-to-head vs LM Studio (2026-08-12, M2 Max 32 GB) — same machine, same session, interleaved
 
 The first cross-runtime A/B in this file that is not against another browser
