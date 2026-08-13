@@ -4,17 +4,17 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE</title>
-  <meta name="description" content="Phi-3-mini, Qwen3-4B, Qwen3.5-4B and the Qwen3.6-35B-A3B MoE decoding in the browser on hand-written WGSL — 10 kernel roles, ~2,000 lines of TypeScript, no TVM, no WebLLM runtime, readable end-to-end.">
+  <meta name="description" content="Nine models, from Phi-3-mini to the Qwen3.6-35B-A3B sparse MoE, decoding in the browser on hand-written WGSL. Ten kernel roles and ~2,000 lines of TypeScript, readable end-to-end, measured against WebLLM and LM Studio.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zerotvm.com/">
   <meta property="og:title" content="Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE">
-  <meta property="og:description" content="Four models — up to a 35B sparse MoE — decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. No TVM, no WebLLM runtime, readable end-to-end.">
+  <meta property="og:description" content="Nine models, up to a 35B sparse MoE, decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. Readable end-to-end, measured against WebLLM and LM Studio.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE">
-  <meta name="twitter:description" content="Four models — up to a 35B sparse MoE — decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. No TVM, no WebLLM runtime, readable end-to-end.">
+  <meta name="twitter:description" content="Nine models, up to a 35B sparse MoE, decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. Readable end-to-end, measured against WebLLM and LM Studio.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <link rel="canonical" href="https://zerotvm.com/">
   <script type="application/ld+json">
@@ -28,7 +28,7 @@
         "url": "https://zerotvm.com",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Any (WebGPU browser, Chrome or Edge)",
-        "description": "Phi-3-mini, Qwen3-4B, Qwen3.5-4B and the Qwen3.6-35B-A3B MoE decoding in the browser on hand-written WGSL — 10 kernel roles, ~2,000 lines of TypeScript, no TVM, no WebLLM runtime, readable end-to-end.",
+        "description": "Nine models, from Phi-3-mini to the Qwen3.6-35B-A3B sparse MoE, decoding in the browser on hand-written WGSL. Ten kernel roles and ~2,000 lines of TypeScript, readable end-to-end, measured against WebLLM and LM Studio.",
         "author": { "@id": "https://zerotvm.com#author" },
         "isPartOf": {
           "@type": "CreativeWork",
@@ -741,13 +741,15 @@
 <section class="hero">
   <h1>
     LLM inference in the browser,<br>
-    <span class="green">on hand-written WebGPU kernels.</span>
+    <span class="green">on hand-written WGSL.</span>
   </h1>
 
   <p class="hero-sub">
-    Models from 3.8B to a 35B MoE, on ~2,000 lines of TypeScript and WGSL you can read.
-    No frameworks, no compilers, no WASM. Numbers and docs are
-    <a href="https://github.com/abgnydn/zero-tvm" style="color:var(--accent);">in the repo</a>.
+    zero-tvm is an LLM inference engine written by hand in WGSL and TypeScript.
+    It runs entirely in the browser: weights download once, cache locally, and
+    inference runs on your own GPU. It is measured against WebLLM and against
+    LM Studio, and the protocol, the raw runs and the withdrawn claims are all
+    <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md" style="color:var(--accent);">in BENCH.md</a>.
   </p>
 
   <div class="hero-actions">

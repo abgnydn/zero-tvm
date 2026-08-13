@@ -5,7 +5,7 @@
 [![CI](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml/badge.svg)](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Live](https://img.shields.io/badge/live-zerotvm.com-6ea8ff)](https://zerotvm.com)
-[![Bench](https://img.shields.io/badge/bench-vs%20WebLLM%20%2B%20llama.cpp-orange)](./BENCH.md)
+[![Bench](https://img.shields.io/badge/bench-vs%20WebLLM%20%2B%20LM%20Studio-orange)](./BENCH.md)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20838918.svg)](https://doi.org/10.5281/zenodo.20838918)
 
 **[zerotvm.com](https://zerotvm.com)** — pick a model, it runs in your tab.
@@ -19,8 +19,9 @@ no WASM runtime.
 - int4 / int3 quantized weights, loaded by byte range, cached in the browser
 - Paged KV cache, gated DeltaNet, sparse-MoE routing — in plain WGSL
 - Layers validated against mlx_lm's own modules on the real checkpoints
-- Benchmarked against WebLLM on identical weights; protocol and all numbers,
-  including withdrawn claims, in [BENCH.md](BENCH.md)
+- Benchmarked against WebLLM on identical weights, and against LM Studio on
+  identical checkpoint bytes; protocol and all numbers, including withdrawn
+  claims, in [BENCH.md](BENCH.md)
 
 ## Try it
 
@@ -192,6 +193,40 @@ src/
 ```
 
 `RESEARCH.md` is the writeup of how the shader capture worked and what reading TVM's output revealed about its kernel set. `BENCH.md` records the measured numbers, the head-to-head methodology, and the experiments that were falsified rather than shipped. `RESEARCH_STANDARDS.md` is the 15-principle engineering discipline this repo shares with its sibling WebGPU/WGSL research projects (webgpu-q quantum chemistry, webgpu-dna radiobiology, neuropulse LLM visualization) — single source of truth, falsifiable JSON artifacts, honest negatives, no fudge factors, shader byte-hashing, multi-level correctness.
+
+## Measured against LM Studio
+
+WebLLM is the obvious comparison and the one this repo started with. LM Studio
+is the harder one: a native MLX runtime with no browser between it and the GPU.
+
+Both sides load the **same checkpoint bytes** (`mlx-community/Qwen3-4B-4bit`,
+2,278,972,183 bytes, verified on each side). Our arm is the native host on
+dawn.node; ~980-token prompt, 128 decode tokens, three interleaved rounds,
+medians of three separate processes, one M2 Max.
+
+| | zero-tvm | LM Studio | |
+|---|---:|---:|---|
+| context | 262,144 tokens | 198,400 | **1.32x us** |
+| cold prefix restore | ~0.4 s from disk | rebuilt each start | **~35x us** |
+| prefill | 497 / 467 / 458 tok/s | 427 / 423 / 411 | **1.10-1.16x us** |
+| decode | 71.2 / 65.4 / 62.9 tok/s | 78.7 / 76.2 / 74.0 | 0.85-0.90x |
+
+Context is structural rather than tuning: KV lives on 8 of 32 layers, so a
+token costs ~32 KiB against their ~101 KiB and the model's full native window
+fits. The restore figure is a category difference — our prefix cache is in
+OPFS and survives a reload or a crash, theirs is in RAM and ends with the
+process.
+
+Decode is the axis still behind. Reproduce with:
+
+```bash
+MODEL=qwen3mlx GEMM=e5 node --experimental-strip-types \
+  scripts/lmstudio-ab.mjs --native
+```
+
+The harness refuses to report a round that was served from either engine's
+prefix cache, or a response that returned no content — each of those printed a
+plausible number first, and BENCH.md records what they looked like.
 
 ## Where everything lives
 
