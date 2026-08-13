@@ -342,10 +342,11 @@ export interface DecodeEngineOptions {
    *  the tiledOK note in buildChunkPrefill: correct, but not yet measured
    *  faster on a quiet machine). */
   chunkTiled?: boolean
-  /** Chunk GEMM selection: 'sgmat' (matrix unit, needs the experimental
-   *  feature), 'tiled', 'matvec'. Default: sgmat when its pipelines exist,
-   *  else matvec. */
-  chunkGemm?: 'sgmat' | 'tiled' | 'matvec'
+  /** Chunk GEMM selection: 'sgmat' (E1 on the matrix unit, needs the
+   *  experimental feature), 'e5' (same unit, 64x32 tile + swizzled B — 20%
+   *  faster in isolation at M=256, opt-in pending an in-engine A/B), 'tiled',
+   *  'matvec'. Default: sgmat when its pipelines exist, else matvec. */
+  chunkGemm?: 'sgmat' | 'e5' | 'tiled' | 'matvec'
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -2148,8 +2149,10 @@ export function buildDecodeEngine(
   // tokens identical at every cap. 256 is the default where sgmat runs
   // (512's extra 3.6% is inside thermal noise and doubles the activation
   // buffers); 64 remains the default for the FMA kernels it was tuned on.
+  // Both matrix-unit kernels get the 256 cap; asking for 'e5' must not silently
+  // drop the engine to the 64 the non-subgroup fallback uses.
   const sgmatAvail = (AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat) != null
-    && (opts.chunkGemm ?? 'sgmat') === 'sgmat'
+    && ['sgmat', 'e5'].includes(opts.chunkGemm ?? 'sgmat')
   const CHUNK_CAP = opts.chunkCap ?? (sgmatAvail ? 256 : 64)
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
@@ -2190,14 +2193,19 @@ export function buildDecodeEngine(
     // the gate is empirical token identity in chunk-prefill-test.mjs, and
     // sgmat passes it on every chunking spec before it may default here.
     const sgmatPipes = AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat
+    const e5Pipes = AFFINE ? P.int4MatmulSgE5Affine : P.int4MatmulSgE5
     const wantGemm = opts.chunkGemm ?? (sgmatPipes ? 'sgmat' : 'matvec')
-    const sgmatOK = wantGemm === 'sgmat' && dimsOK && sgmatPipes != null
-    const tiledOK = !sgmatOK && (wantGemm === 'tiled' || opts.chunkTiled === true) && dimsOK
-    const gemm = sgmatOK ? sgmatPipes!
+    // E5's A stage reads a full 64 rows whatever M is, so the activation
+    // buffers — which are exactly CHUNK_CAP rows — must tile by 64, not 32.
+    const e5OK = wantGemm === 'e5' && dimsOK && CHUNK_CAP % 64 === 0 && e5Pipes != null
+    const sgmatOK = !e5OK && (wantGemm === 'sgmat' || wantGemm === 'e5') && dimsOK && sgmatPipes != null
+    const tiledOK = !sgmatOK && !e5OK && (wantGemm === 'tiled' || opts.chunkTiled === true) && dimsOK
+    const gemm = e5OK ? e5Pipes!
+      : sgmatOK ? sgmatPipes!
       : tiledOK ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
       : (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
     const gemmTiledGrid = sgmatOK || tiledOK
-    chunkGemmUsed = sgmatOK ? 'sgmat' : tiledOK ? 'tiled' : 'matvec'
+    chunkGemmUsed = e5OK ? 'e5' : sgmatOK ? 'sgmat' : tiledOK ? 'tiled' : 'matvec'
     const dyn = gemm
     /** A batched-GEMM bind group. bg() maps array position to binding index, so
      *  the bias buffer must come LAST and only when the affine kernel is in
@@ -2402,7 +2410,10 @@ export function buildDecodeEngine(
 
       // Tiled: 2-D grid over (N/32, n/32). Fallback matvec: N/4 on x alone.
       const gemmDispatch = (enc2: GPUCommandEncoder, bgx: GPUBindGroup, rows: number, label: string) =>
-        sgmatOK
+        e5OK
+          // E5 tiles are 64(M) x 32(N) — E1's, transposed.
+          ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 64), 1, label)
+          : sgmatOK
           // E1 tiles are 32(M) x 64(N) — grid x is N/64, y is M/32.
           ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 64), Math.ceil(n / 32), 1, label)
           : gemmTiledGrid

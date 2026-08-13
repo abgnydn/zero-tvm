@@ -15,7 +15,7 @@
 // generated (see shaders/int4_matmul.gen.ts). Every source is piped through
 // withPrelude() so model-shape constants come from one place (shader-prelude.ts).
 import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
-import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledStWGSL, int4MatmulSgE1WGSL } from './shaders/int4_matmul.gen'
+import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledStWGSL, int4MatmulSgE1WGSL, int4MatmulSgE5WGSL } from './shaders/int4_matmul.gen'
 import embeddingAffineSrc from './shaders/embedding_affine.wgsl?raw'
 import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
 import moeRouterLogitsF16Src from './shaders/moe_router_logits_f16.wgsl?raw'
@@ -111,6 +111,12 @@ export interface Pipelines {
    *  as every other chunk-path kernel. */
   int4MatmulSgMat: GPUComputePipeline | null
   int4MatmulSgMatAffine: GPUComputePipeline | null
+  /** E5 — the same matrix unit at a 64(M)x32(N) tile with a swizzled B.
+   *  Measured 18-22% over E1 at M=256 on every chunk shape (BENCH.md, "Sweep
+   *  round 3"). Opt-in via chunkGemm:'e5' until an in-engine A/B promotes it;
+   *  isolated-kernel TF is not prefill tok/s. */
+  int4MatmulSgE5: GPUComputePipeline | null
+  int4MatmulSgE5Affine: GPUComputePipeline | null
   // vec4-load variants — default ON since 2026-07-25 (+7.1% with the qkv
   // sibling on M2 Max, BENCH.md); ?vec4=0 opts out:
   int4MatmulSgVec4: GPUComputePipeline | null       // vec4-load _sg variant
@@ -299,6 +305,10 @@ export function compile(
       ? createPipeline(device, int4MatmulSgE1WGSL(false), 'int4_matmul_sg_e1') : null,
     int4MatmulSgMatAffine: device.features.has('chromium-experimental-subgroup-matrix')
       ? createPipeline(device, int4MatmulSgE1WGSL(true), 'int4_matmul_sg_e1_affine') : null,
+    int4MatmulSgE5: device.features.has('chromium-experimental-subgroup-matrix')
+      ? createPipeline(device, int4MatmulSgE5WGSL(false), 'int4_matmul_sg_e5') : null,
+    int4MatmulSgE5Affine: device.features.has('chromium-experimental-subgroup-matrix')
+      ? createPipeline(device, int4MatmulSgE5WGSL(true), 'int4_matmul_sg_e5_affine') : null,
     int4MatmulSgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, vec4: true }), 'int4_matmul_sg_vec4') : null,
     int4MatmulTiledVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ subgroups: true, rowsPerWG: 4, vec4: true }), 'int4_matmul_tiled_vec4') : null,
     int4MatmulF32SgVec4: subgroups ? createPipeline(device, int4MatmulWGSL({ outF32: true, subgroups: true, vec4: true }), 'int4_matmul_f32_sg_vec4') : null,

@@ -28,7 +28,7 @@
 
 import { installShims } from './native/shims.mjs'
 import { toF16, f16Array, f16BitsToF32 } from '../tests/kernels/half.mjs'
-import { int4MatmulSgE1WGSL } from '../src/compiler/shaders/int4_matmul.gen.ts'
+import { int4MatmulSgE1WGSL, int4MatmulSgE5WGSL } from '../src/compiler/shaders/int4_matmul.gen.ts'
 
 const FULL = process.argv.includes('--full')
 
@@ -315,10 +315,64 @@ const mkPart = (cfg, s) => (cfg.sk ?? 1) > 1
   ? device.createBuffer({ size: cfg.sk * s.M * s.N * 4, usage: ST })
   : null
 
-// gate: small shape vs the formula
+// Symmetric (MLC) gate. The sweep's builder only ever emitted the MLX-affine
+// flavor, so the symmetric halves of the shipped generators — the ones every
+// MLC checkpoint runs — were never graded here or anywhere else. They differ
+// from affine in the dequant alone: scales in groups of 32 (wordIdx >> 2),
+// no bias, value = (nib - 7) * scale. No MLC checkpoint is on this disk, so
+// this is the only place they can be checked.
+async function gateSym(pipe, tm, tn) {
+  const M = 13, N = 96, K = 128, CAP = 64
+  const KP = K / 8, SPR = K / 32
+  const w = new Uint32Array(N * KP); for (let i = 0; i < w.length; i++) w[i] = (rnd() * 0xffffffff) >>> 0
+  const sc = Array.from({ length: N * SPR }, () => toF16(rnd() * 0.05 + 0.01))
+  const a = Array.from({ length: CAP * K }, () => toF16(rnd() * 2 - 1))
+  const wB = buf(w, ST), scB = buf(f16Array(sc), ST), aB = buf(f16Array(a), ST)
+  const outB = device.createBuffer({ size: CAP * N * 2, usage: ST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
+  const podB = buf(new Uint32Array([KP, SPR, N, M]), GPUBufferUsage.UNIFORM)
+  device.queue.writeBuffer(outB, 0, new Uint16Array(CAP * N))
+  // No biases entry: the symmetric shader never declares @binding(5), so an
+  // auto layout has no slot for it and binding one is a validation failure.
+  const bg = device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: outB } }, { binding: 1, resource: { buffer: aB } },
+      { binding: 2, resource: { buffer: scB } }, { binding: 3, resource: { buffer: wB } },
+      { binding: 4, resource: { buffer: podB } },
+    ],
+  })
+  const enc = device.createCommandEncoder()
+  const pass = enc.beginComputePass()
+  pass.setPipeline(pipe); pass.setBindGroup(0, bg)
+  pass.dispatchWorkgroups(Math.ceil(N / tn), Math.ceil(M / tm), 1)
+  pass.end()
+  const rb = device.createBuffer({ size: M * N * 2, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+  enc.copyBufferToBuffer(outB, 0, rb, 0, M * N * 2)
+  device.queue.submit([enc.finish()])
+  await rb.mapAsync(GPUMapMode.READ)
+  const got = new Uint16Array(rb.getMappedRange().slice(0))
+  rb.unmap()
+  let maxRel = 0
+  for (let m = 0; m < M; m++) for (let n = 0; n < N; n++) {
+    let acc = 0
+    for (let k = 0; k < K; k++) {
+      const nib = (w[n * KP + (k >> 3)] >>> ((k & 7) * 4)) & 15
+      acc += toF16((nib - 7) * sc[n * SPR + (k >> 5)]) * a[m * K + k]
+    }
+    maxRel = Math.max(maxRel, Math.abs(f16BitsToF32(got[m * N + n]) - acc) / Math.max(1e-2, Math.abs(acc)))
+  }
+  for (const b of [wB, scB, aB, outB, podB, rb]) b.destroy()
+  return maxRel
+}
+
+// gate: small shape vs the formula.
+// CAP is 64, not 32: a tm=64 tile stages 64 activation rows whatever M is, so
+// at CAP 32 every 64-row arm read past its own buffer and was graded on
+// whatever robustness returned. Allocating the tile height makes the staged
+// rows real data, which is also what the engine guarantees (CHUNK_CAP % 64).
 async function gate(made, cfg) {
-  const s = setup(13, 96, 128, 32)
-  device.queue.writeBuffer(s.outB, 0, new Uint16Array(32 * 96))
+  const s = setup(13, 96, 128, 64)
+  device.queue.writeBuffer(s.outB, 0, new Uint16Array(64 * 96))
   const part = mkPart(cfg, s)
   const enc = device.createCommandEncoder()
   const pass = enc.beginComputePass()
@@ -380,7 +434,7 @@ async function time(made, cfg, s) {
 // The two are meant to be the same kernel; if they measure apart, the gap is
 // the sweep's, and every "+x% over E1" claim is measured against the wrong
 // baseline. Graduation depends on this arm, so it is in the table.
-const CONFIGS = [{ shipped: true, tm: 32, tn: 64 }]
+const CONFIGS = [{ shipped: 'e1', tm: 32, tn: 64 }, { shipped: 'e5', tm: 64, tn: 32 }]
 for (const sg of [4, 8]) {
   for (const [tm, tn] of sg === 4 ? [[32, 64], [64, 32], [16, 128]] : [[64, 64], [32, 128], [128, 32]]) {
     if ((tm / 16) * (tn / 32) !== sg) continue
@@ -400,15 +454,27 @@ const SHAPES = [['gate_up', 2560, 19456], ['ffn_down', 9728, 2560], ['o_proj', 4
 const MS = FULL ? [64, 256, 512] : [64, 256]
 
 console.log(`${CONFIGS.length} configs x ${SHAPES.length} shapes x M ${MS.join('/')} — baseline is arm zero, same run\n`)
+
+for (const [label, gen, entry, tm, tn] of [
+  ['E1 symmetric', int4MatmulSgE1WGSL, 'int4_matmul_sg_e1', 32, 64],
+  ['E5 symmetric', int4MatmulSgE5WGSL, 'int4_matmul_sg_e5', 64, 32],
+]) {
+  const made = await mk(gen(false), entry)
+  if (made.err) { console.log(`${label.padEnd(22)} ${made.err.slice(0, 90)}`); continue }
+  const rel = await gateSym(made.pipe, tm, tn)
+  console.log(`${label.padEnd(22)} gate ${rel.toExponential(1)} ${rel <= 5e-3 ? 'PASS' : 'FAIL — VOID'}`)
+  if (!(rel <= 5e-3)) process.exitCode = 1
+}
+
 const results = []
 for (const cfg of CONFIGS) {
   const name = cfg.shipped
-    ? 'E1 SHIPPED gen.ts'
+    ? `${cfg.shipped.toUpperCase()} SHIPPED gen.ts`
     : `sg${cfg.sg} ${cfg.tm}x${cfg.tn} k${cfg.tk} ${cfg.sw}${cfg.sk ? ` sk${cfg.sk}` : ''}`
   let made
   try {
-    made = cfg.shipped
-      ? await mk(int4MatmulSgE1WGSL(true), 'int4_matmul_sg_e1_affine')
+    made = cfg.shipped === 'e1' ? await mk(int4MatmulSgE1WGSL(true), 'int4_matmul_sg_e1_affine')
+      : cfg.shipped === 'e5' ? await mk(int4MatmulSgE5WGSL(true), 'int4_matmul_sg_e5_affine')
       : await mk(sweepWGSL(cfg))
   } catch (e) { console.log(`${name}: build threw ${e.message.slice(0, 60)}`); continue }
   if (made.err) { console.log(`${name}: ${made.err.slice(0, 90)}`); continue }
@@ -445,7 +511,7 @@ for (const cfg of CONFIGS) {
 
 // Ranked against the shipped kernel from THIS run — a config only graduates on
 // a ratio measured here, never against a figure carried in from another day.
-const ship = results.find((r) => r.cfg.shipped)
+const ship = results.find((r) => r.cfg.shipped === 'e1')
 for (const M of MS) {
   const ranked = [...results].sort((a, b) => b.tf[`mean@${M}`] - a.tf[`mean@${M}`])
   const rel = (r) => (ship ? ` (${((r.tf[`mean@${M}`] / ship.tf[`mean@${M}`] - 1) * 100).toFixed(1)}% vs shipped)` : '')

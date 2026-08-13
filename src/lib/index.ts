@@ -62,6 +62,11 @@ export interface CreateEngineOptions {
   /** A `param` from listModels(). Default '' (Phi-3). */
   model?: string
   onProgress?: (p: LoadProgress) => void
+  /** Which chunk-prefill GEMM to build. Exposed so the native host can A/B
+   *  kernels against one weight load — an isolated-kernel TF number is not a
+   *  prefill rate, and the only honest comparison is two engines over the same
+   *  buffers in one process. Default: the engine's own ladder. */
+  chunkGemm?: import('../zero-tvm/engine-core.js').DecodeEngineOptions['chunkGemm']
 }
 
 export interface ChatOptions {
@@ -263,7 +268,9 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   // hook, and dequantises symmetric group-32 inline. Same rule chat.ts
   // applies; the failure mode is not a crash, it is wrong logits.
   const fused = !spec.qkNorm && spec.weightFormat !== 'mlx-safetensors'
-  const engine = buildDecodeEngine(device, weights, allocKVPages(device, spec), { spec, variants, fused })
+  const engine = buildDecodeEngine(device, weights, allocKVPages(device, spec), {
+    spec, variants, fused, ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
+  })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs
   // ~190 ms warm), so pay it here rather than inside the caller's first
