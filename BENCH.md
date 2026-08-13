@@ -1454,6 +1454,44 @@ per-token path to itself.
 
 ---
 
+### Where a decode token's time goes (2026-08-13)
+
+`scripts/decode-profile-native.mjs qwen3mlx` — one step, 36 layers, 14 distinct
+kernels. Decode is the one axis still behind LM Studio, and prefill only moved
+because it was measured before it was touched; this is the same first step.
+
+| kernel | share | cum |
+|---|---:|---:|
+| ffnGateUp | 27.7% | 27.7% |
+| ffnDown | 26.2% | 53.9% |
+| attention | 7.3% | 61.3% |
+| addNorm2 | 7.3% | 68.6% |
+| addNorm1 | 6.8% | 75.4% |
+| qkvMatmul | 6.3% | 81.7% |
+| oproj | 6.3% | 88.0% |
+| lmHead | 5.2% | 93.2% |
+
+**The FFN is the decode budget** — two kernels, 54%. Nothing else is close, and
+the tail below lmHead is rounding.
+
+Two caveats, both load-bearing:
+
+- `profileStep()` requires `timestamp-query`, and requesting that feature costs
+  ~3x decode on its own (see above). Everything here is SERIALIZED, so the
+  totals are inflated and are not a decode rate, and kernels that normally
+  overlap are over-counted. The SHARES are the signal.
+- Serialization is also why the two norms read 14% combined: 36 dispatches of
+  an elementwise pass over d=2560 is ~25 us each, which is mostly launch
+  latency that would otherwise hide. Read it as "dispatch count costs
+  something", not "the norms are slow".
+
+This model runs the MLX-affine path, which is **unfused** — `fused_ffn` and
+`qkv_fused` are symmetric-only, so an affine spec pays gate_up + silu_mul +
+down as three dispatches where a symmetric one pays fewer. Two levers follow,
+in order: the weight-read efficiency of the two FFN matmuls (decode is
+memory-bound, so this is bytes/second against the M2 Max's ceiling), and an
+affine `fused_ffn` to cut the dispatch count.
+
 ## Head-to-head vs LM Studio (2026-08-13) — SAME CHECKPOINT BYTES, native host
 
 The 08-12 comparison below ran different bytes on each side (ours MLC q4f16_1,
