@@ -2194,7 +2194,13 @@ export function buildDecodeEngine(
     // sgmat passes it on every chunking spec before it may default here.
     const sgmatPipes = AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat
     const e5Pipes = AFFINE ? P.int4MatmulSgE5Affine : P.int4MatmulSgE5
-    const wantGemm = opts.chunkGemm ?? (sgmatPipes ? 'sgmat' : 'matvec')
+    // E5 is the default as of 2026-08-13. It cleared the bar this file has held
+    // since sgmat — token identity vs per-token prefill on EVERY chunking spec
+    // family, not just the convenient one: llama32 and qwen3mlx (dense MLX
+    // affine), and qwen35, which is both MLC-symmetric and hybrid GDN. Measured
+    // in-engine on all three: +13.1% / +14.7% / +39.7% prefill.
+    // It degrades to sgmat by itself when the cap does not tile by 64.
+    const wantGemm = opts.chunkGemm ?? (e5Pipes ? 'e5' : sgmatPipes ? 'sgmat' : 'matvec')
     // E5's A stage reads a full 64 rows whatever M is, so the activation
     // buffers — which are exactly CHUNK_CAP rows — must tile by 64, not 32.
     const e5OK = wantGemm === 'e5' && dimsOK && CHUNK_CAP % 64 === 0 && e5Pipes != null

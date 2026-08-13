@@ -1925,12 +1925,22 @@ Verified before shipping:
 - Token identity vs per-token prefill: llama32 (150 and 600-token prompts,
   caps 64 and 256) and qwen3mlx (cap 256), 0 GPU errors.
 
-**Still opt-in, and this is the reason**: both specs proven are dense
-MLX-affine. No MLC checkpoint is on this disk, so the symmetric variant has
-never run in an engine, and the hybrid GDN chunk path (qwen35) is untested.
-The rule this file has held since sgmat is that a chunk kernel defaults only
-after passing token identity on every chunking spec. Promotion needs an MLC
-checkpoint and a qwen35 run, nothing more.
+**DEFAULT as of 2026-08-13.** The bar was token identity on every chunking
+spec family, and qwen35 closed both open ones at once — it is MLC-symmetric
+*and* hybrid GDN. Full set:
+
+| spec | family | token-identical | in-engine prefill |
+|---|---|---|---|
+| llama32 | dense, MLX affine | yes (caps 64 and 256) | +13.1% |
+| qwen3mlx | dense, MLX affine | yes | +14.7% |
+| qwen35 | MLC symmetric + hybrid GDN | yes | +39.7% |
+
+qwen35's arm is noisy — E1 145-219, e5 183-275 across rounds — but e5 wins
+every PAIRED round, and pairing is what the interleaving is for. The GDN
+recurrence adds variance the dense specs do not have.
+
+E5 falls back to sgmat by itself when the chunk cap does not tile by 64, so
+the ladder still holds on any spec that cannot take it.
 
 ### `ztvm native big` gate (2026-08-13): qwen35 @ 65,536 PASS
 
