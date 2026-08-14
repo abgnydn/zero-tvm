@@ -1,7 +1,7 @@
 # Where does onnxruntime-web put an ONNX `Scan`?
 
 Supporting evidence for the transformers.js#1599 analysis (see
-`../tjs-1599-comment.md` and `../tjs-1599-repro.ipynb`).
+`../tjs-1599-repro.ipynb`).
 
 The notebook establishes that the Qwen3.5-4B ONNX export evaluates its 24
 gated-DeltaNet layers with a sequential `Scan` on the prefill path. This
@@ -23,9 +23,14 @@ pins — the 16 are the delta-rule body, the 1 is the `Scan`. The identical spli
 on `1.22.0-dev`, where the provider was still called `JsExecutionProvider`.)
 
 So the loop control runs on CPU while the body ops are assigned to WebGPU,
-with a host copy inserted at the boundary. Independently, `Scan`, `If` and
-`Loop` appear zero times in onnxruntime-web's shipped op registry
-(178 entries in both 1.22 and 1.26), which is consistent with the log above.
+with a host copy inserted at the boundary. Independently, the WebGPU EP's
+`core/providers/webgpu/controlflow/` directory contains only `if.cc` and `if.h`
+at HEAD, so `Scan` and `Loop` have no WebGPU kernel to be assigned to.
+
+(An earlier version of this file cited a count of 178 entries in the shipped JS
+op registry as the evidence here. That method was retracted in `a5c22c8`: from
+1.26 the WebGPU EP is native WASM rather than JSEP, so the JS registry is no
+longer authoritative. The provider source is. The conclusion is unchanged.)
 
 This is a property of the runtime's op registry rather than of any one model,
 so it does not depend on the 2.5 GB Qwen3.5 weights — a ~1 KB model with the
@@ -81,11 +86,11 @@ node_modules: 4.2.0 -> `onnxruntime-web@1.26.0-dev.20260416`, 3.8.1 -> `1.22.0-d
 ## Scope
 
 Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
-WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
-the recurrence accounts for **91-93% of prefill** at a 252-token prompt, measured
-by in-place ablation with a control re-run, reproduced twice. Chrome, Apple M2 Max,
-onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: any backend other than
-WebGPU, or any hardware other than this one.
+WebGPU; a memcpy is inserted between them; and the recurrence accounts for
+**91-93% of prefill** at a 252-token prompt, measured by in-place ablation with a
+control re-run, reproduced twice. Chrome, Apple M2 Max, onnxruntime-web 1.22.0-dev
+and 1.26.0-dev. Not measured: any backend other than WebGPU, or any hardware other
+than this one.
 
 ## Full model vs isolated Scan (same session)
 
@@ -139,81 +144,16 @@ A `Scan` inside the model cannot cost more than the model, so this is an upper b
 with systematic upward bias — about 25% high against the ablation figure. The 90% in
 run 1 was luck, not measurement.
 
-## Scope
+Two of the five runs were discarded before they produced a number, because their
+before/after controls disagreed by 29% and 110%. That discard rule is the only
+reason the remaining three were trustworthy enough to refute the method with.
 
-Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
-WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
-the recurrence accounts for **91-93% of prefill** at a 252-token prompt, measured
-by in-place ablation with a control re-run, reproduced twice. Chrome, Apple M2 Max,
-onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: any backend other than
-WebGPU, or any hardware other than this one.
+Note the two machine regimes: runs 1-3 caught the machine about 2x slower
+(isolated 1.1-1.3 s, full 31 s), runs 4-5 the fast regime (isolated ~0.69 s, full
+~13.6 s). Absolute times move by 2x with load, which is why only same-session
+ratios are worth reporting.
 
-## Full model vs isolated Scan (same session)
-
-`full-model-bench.html` loads the real 2.5 GB decoder in the browser and times
-prefill, alongside the isolated `Scan`, in one session — so the ratio is not
-affected by machine load the way two separate absolute numbers would be.
-Serve `.weights-local/onnx/Qwen3.5-4B-ONNX/onnx` at `/weights/` (stream it; the
-data file is 2.1 GB) and open with `?s=252`.
-
-Five controlled runs (2026-08-04, machine load ~3.3). Each run times the isolated
-`Scan` **before and after** the full-model prefill; if those two controls disagree
-the run is discarded, so a drifting machine eliminates itself rather than
-producing a plausible-looking number.
-
-| run | control drift | isolated x24 | full prefill | ratio |
-|---|---|---:|---:|---:|
-| 1 | 8% ok | 27.8 s | 31.06 s | 90% |
-| 2 | 29% — discarded | | | |
-| 3 | 110% — discarded | | | |
-| 4 | 14% ok | 16.0 s | 13.90 s | 115% |
-| 5 | **1% ok** | 16.5 s | 13.59 s | 122% |
-
-**Read this as a refutation of the method, not as a 122% share.** A `Scan` that lives
-inside the model cannot cost more than the whole model, so `isolated x 24` is an
-**upper bound with a systematic upward bias**, not an estimate. Across valid runs it
-lands at 90-122%, which is too loose to quote a percentage from.
-
-What survives: at a 252-token prompt the recurrence alone costs on the order of the
-entire prefill (16.5 s against 13.6 s measured in the same session). That supports
-"the recurrence dominates prefill" and does not support any specific number.
-
-Note the two regimes: runs 1-3 caught the machine at ~2x slower (isolated 1.1-1.3 s,
-full 31 s), runs 4-5 in the fast regime (isolated ~0.69 s, full ~13.6 s) matching the
-first clean run ever taken (546 ms / 13.11 s). Absolute times move by 2x with load;
-that is why the same-session ratio is the only thing worth reporting — and even that
-is bounded, not pinned.
-
-## Scope
-
-Measured: `Scan` is rejected by the WebGPU EP and placed on CPU; body ops go to
-WebGPU; a memcpy is inserted between them; and the isolated real `Scan` costs
-the recurrence accounts for **91-93% of prefill** at a 252-token prompt, measured
-by in-place ablation with a control re-run, reproduced twice. Chrome, Apple M2 Max,
-onnxruntime-web 1.22.0-dev and 1.26.0-dev. Not measured: any backend other than
-WebGPU, or any hardware other than this one.
-
-## Full model vs isolated Scan (same session)
-
-`full-model-bench.html` loads the real 2.5 GB decoder in the browser and times
-prefill, alongside the isolated `Scan`, in one session — so the ratio is not
-affected by machine load the way two separate absolute numbers would be.
-Serve `.weights-local/onnx/Qwen3.5-4B-ONNX/onnx` at `/weights/` (stream it; the
-data file is 2.1 GB) and open with `?s=252`.
-
-One clean run (session created in 4.6 s, three repeats within 0.5%):
-
-| | |
-|---|---:|
-| isolated `Scan` x24, 252 positions | 13.10 s |
-| **full decoder prefill, 252 tokens** | **13.11 s** (13.05 / 13.11 / 13.12) |
-
-i.e. the recurrence accounted for essentially the whole prefill. **Treat this as
-one data point, not a settled number.** Repeat runs afterwards were unusable: a
-leaked browser process was pegging a core, the isolated `Scan` slowed 4.4x
-(546 ms -> 1229 ms at the same size), session creation went 4.6 s -> 37.6 s, and
-the ratio moved to ~73%. Confirm on a quiet machine before quoting a percentage.
-
-Worth noting *why* it degrades so hard under CPU load: the loop control runs on
-the CPU, so CPU contention hits this workload directly. A GPU-bound stage would
-not lose 4.4x to a single busy core.
+The loop control runs on the CPU, so CPU contention hits this workload directly.
+Under a single busy core the isolated `Scan` slowed 4.4x (546 ms -> 1229 ms at the
+same size) and session creation went 4.6 s -> 37.6 s. A GPU-bound stage would not
+lose 4.4x to one busy core.
