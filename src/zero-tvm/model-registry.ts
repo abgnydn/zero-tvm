@@ -33,6 +33,7 @@ import { QWEN3_4B_MLX } from '../compiler/model-spec.ts'
 import { LLAMA_3_2_1B_INSTRUCT_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_30B_A3B_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_EMBEDDING_06B } from '../compiler/model-spec.ts'
+import { QWEN3_5_9B_MLX_4BIT } from '../compiler/model-spec.ts'
 // ADD-MODEL:IMPORTS
 
 /** URL `?model=` value for each spec; Phi-3 is the no-flag default. */
@@ -49,6 +50,7 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
   { param: 'qwen30b', spec: QWEN3_30B_A3B_4BIT },
   // Not a chat model: ?model=embed serves forwardEmbedding, not generation.
   { param: 'embed', spec: QWEN3_EMBEDDING_06B },
+  { param: 'qwen35mlx', spec: QWEN3_5_9B_MLX_4BIT },
   // ADD-MODEL:MODELS
 ]
 
@@ -162,6 +164,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // Not a chat model. Its output is the pooled hidden state, so rateLabel stays
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },
+  [QWEN3_5_9B_MLX_4BIT.id]: { name: 'Qwen3.5-9B', params: '9B hybrid (DeltaNet)', sizeLabel: '~4.7 GB', rateLabel: '' },
   // ADD-MODEL:BRANDINGS
 }
 

@@ -1668,6 +1668,55 @@ Two things this column does NOT yet say:
   Studio is holding 5.98 GB resident on a 32 GB machine, which is the exact
   configuration that froze this Mac once before. Not run unattended.
 
+## Head-to-head vs LM Studio on the 9B (2026-08-14) — THE SAME FILES, not just the same bytes
+
+The 08-13 run below compared Qwen3-4B because that is what both sides could be
+made to load. This one runs `lmstudio-community/Qwen3.5-9B-MLX-4bit` — the
+model the machine's owner actually uses day to day — and the checkpoint is not
+merely byte-identical, it is the SAME DIRECTORY: `.weights-local/` carries a
+symlink to LM Studio's own store, so there is one copy on disk and the only
+difference left is the runtime.
+
+`MODEL=qwen35mlx LMS_MODEL=mid node --experimental-strip-types
+scripts/lmstudio-ab.mjs --native` — ~1010-token prompt, 128 decode tokens, 3
+interleaved rounds, medians.
+
+| | zero-tvm (dawn.node, E5) | LM Studio (MLX) | ratio |
+|---|---:|---:|---:|
+| prefill tok/s | 307 / 302 / 298 | 254 / 245 / 240 | **1.23x us** |
+| decode tok/s | 40.4 / 42.1 / 39.9 | 43.8 / 42.8 / 42.1 | **0.94x** |
+
+Both axes moved our way against the 4B run below (prefill 1.10-1.16x, decode
+0.85-0.90x), which is what the affine wide-load kernel predicted — it landed
+between the two runs and is worth ~10% decode on exactly this quant family.
+**Decode is now within 6%.**
+
+One asymmetry to keep in view: Qwen3.5-9B thinks on every turn and ignores
+`/no_think` (that switch is a Qwen3 thing), so LM Studio's 128 tokens are
+reasoning tokens while ours are ordinary ones. The harness counts reasoning
+deltas deliberately — a decode RATE is tokens per second, and a reasoning token
+costs exactly what a content token costs on the same weights. Counting only
+`content` is the right measure for "when does the user see text" and the wrong
+one here; it read zero tokens for the whole generation and tripped the
+no-deltas guard.
+
+Getting here needed two engine fixes, both found by the validation gate rather
+than by a wrong number:
+
+- **`A_log`/`dt_bias` ship as F32 in this checkpoint and BF16 in Qwen3.6** —
+  same tensor, same architecture family, different width. The loader hardcoded
+  `bf16->f32` and threw. Now it reads the width from the safetensors header,
+  and `planBytes` takes the dtype too so the residency budget does not
+  over-report. Same correction the F16-scales bug forced on 2026-08-06: **dtype
+  comes from the header, never from the plan.**
+- **`constraints.ts` was printing a stale note** on every GREEN report —
+  "hybrid chunked prefill is off (no affine batched_dyn)" — untrue since
+  2026-08-11. A stale note inside a passing report is worse than none: it tells
+  whoever is adding a model that a path they will actually run does not exist.
+
+Fidelity before any of it counted: cosine **0.999998** vs mlx_lm, argmax match,
+top-5 5/5, greedy 24/24 tokens exact, 0 GPU errors.
+
 ## Head-to-head vs LM Studio (2026-08-13) — SAME CHECKPOINT BYTES, native host
 
 The 08-12 comparison below ran different bytes on each side (ours MLC q4f16_1,

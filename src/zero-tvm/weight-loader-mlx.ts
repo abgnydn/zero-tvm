@@ -178,7 +178,12 @@ export async function buildPlan(
 /** Total GPU bytes the model will occupy, before fetching anything. */
 export function modelBytes(spec: ModelSpec, locate: (record: string) => RecordLoc): number {
   const src = (r: string) => { const l = locate(r); return l.end - l.begin }
-  return planModel(spec).reduce((a, { plan }) => a + planBytes(plan, src), 0)
+  // The dtype goes in too: a bf16->f32 plan doubles only when the source is
+  // really 2 bytes wide, and Qwen3.5-9B-MLX ships A_log/dt_bias already F32.
+  // Without this the budget over-reports and the residency check refuses a
+  // model that fits.
+  const dt = (r: string) => locate(r).info.dtype
+  return planModel(spec).reduce((a, { plan }) => a + planBytes(plan, src, dt), 0)
 }
 
 // ============================================================

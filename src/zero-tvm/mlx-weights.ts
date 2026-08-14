@@ -449,14 +449,24 @@ export function planGlobal(
  *  the failure mode of under-reporting is telling a user a model fits when it
  *  does not.
  */
-export function planBytes(plan: BufferPlan, sourceBytes: (record: string) => number): number {
+export function planBytes(
+  plan: BufferPlan,
+  sourceBytes: (record: string) => number,
+  dtypeOf?: (record: string) => string,
+): number {
   const op = plan.op
   // Fused, not concatenated: the source trio's byte count says nothing here.
   if (op?.kind === 'dequantAffineSplit') return op.heads * (op.nope + op.v) * op.k * 2
   let n = 0
   for (const part of plan.parts) {
     const b = sourceBytes(part.record)
-    n += part.convert === 'bf16->f32' ? b * 2 : b
+    // `bf16->f32` doubles only when the source really is 2 bytes wide.
+    // Qwen3.5-9B-MLX ships A_log/dt_bias already F32, where Qwen3.6 ships them
+    // BF16 — same tensor, same architecture family, different width. Reading
+    // the width from the header rather than the plan is the same correction
+    // the F16-scales bug forced on 2026-08-06.
+    const wide = part.convert === 'bf16->f32' && (dtypeOf?.(part.record) ?? 'BF16') !== 'F32'
+    n += wide ? b * 2 : b
   }
   return n   // permuteRows is size-preserving
 }
@@ -491,6 +501,8 @@ export function buildBuffer(
       pieces.push(raw)
     } else if (part.convert === 'bf16->f16' && dtype === 'F16') {
       pieces.push(raw)   // already what the kernels read — pass through
+    } else if (part.convert === 'bf16->f32' && dtype === 'F32') {
+      pieces.push(raw)   // already f32 — pass through, and planBytes agrees
     } else if (dtype !== 'BF16') {
       // f32-target plans (A_log/dt_bias) double their byte count in
       // planBytes; a non-BF16 source would need that audit too. No shipped

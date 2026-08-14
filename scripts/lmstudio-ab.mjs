@@ -78,7 +78,15 @@ async function lmstudio(round) {
       if (!line.startsWith('data: ') || line.includes('[DONE]')) continue
       const j = JSON.parse(line.slice(6))
       if (j.usage) usage = j.usage
-      const d = j.choices?.[0]?.delta?.content
+      // REASONING DELTAS COUNT. A decode rate is tokens per second, and a
+      // reasoning token costs exactly what a content token costs — same
+      // weights, same KV growth. Qwen3.5-9B thinks on every turn and ignores
+      // /no_think (that switch is a Qwen3 thing), so counting only `content`
+      // measured zero tokens over the whole generation and tripped the guard
+      // below. Counting only content is right for "when does the user see
+      // text"; it is wrong for "how fast does this model decode".
+      const dd = j.choices?.[0]?.delta ?? {}
+      const d = dd.content || dd.reasoning_content || dd.reasoning
       if (d) { if (!tFirst) tFirst = performance.now(); nOut++ }
     }
   }
@@ -86,7 +94,7 @@ async function lmstudio(round) {
   // No content delta means tFirst never moved, and `tFirst - t0` then reports a
   // NEGATIVE ttft and a negative prefill rate. That printed as a result once;
   // it must be an error instead.
-  if (!tFirst) throw new Error('lmstudio: no content deltas — the model produced only reasoning, or the request failed')
+  if (!tFirst) throw new Error('lmstudio: no deltas at all (content or reasoning) — the request failed')
   const pt = usage?.prompt_tokens ?? 0
   const ct = usage?.completion_tokens ?? nOut
   return {

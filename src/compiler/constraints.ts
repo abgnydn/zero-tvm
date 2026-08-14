@@ -458,7 +458,12 @@ export function checkModel(m: DetectedModel): CheckResult {
 
   // ── notes that gate flags, not support ─────────────────────
   if (m.headDim !== null && m.headDim > 128) notes.push('int8 KV (?kv8=1) unavailable — kv_quantize_int8 packs headDim ≤ 128')
-  if (m.quant) notes.push('MLX-affine runs the unfused composition (no fused QKV, 3-dispatch dense FFN); hybrid chunked prefill is off (no affine batched_dyn)')
+  // The chunked-prefill half of this note was true until 2026-08-11, when
+  // int4_matmul_batched_dyn_affine landed; hybrid + affine has chunked ever
+  // since, and qwen36q3 (hybrid GDN + affine + MoE) is token-identity gated on
+  // it. A stale note in a GREEN report is worse than no note — it tells someone
+  // adding a model that a path they will actually run does not exist.
+  if (m.quant) notes.push('MLX-affine runs the unfused composition (no fused QKV, 3-dispatch dense FFN); chunked prefill is ON (affine batched GEMM, E5)')
 
   return { ok: failures.length === 0, failures, notes }
 }
