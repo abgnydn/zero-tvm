@@ -177,11 +177,13 @@ export function int4MatmulWGSL(opts: Int4MatmulOpts = {}): string {
     throw new Error('affine is implemented at m=1 (plus the mDyn path); no fixed-M sibling exists')
   if (q3 && (vec4 || vec4Half))
     throw new Error('q3 has no wide-load path: its 3-bit bitstream is not word-aligned')
-  // The wide-load bodies index input_buf/output_buf directly and know nothing
-  // of inBase/outBase, so a moe variant built on them would read slot 0's
-  // activations for every slot — wrong output, no error.
-  if (moe && (vec4 || vec4Half))
-    throw new Error('moe has no wide-load path: the vec4 bodies do not apply the slot/token offsets')
+  // The FULL vec4 body still indexes input_buf/output_buf without the
+  // slot/token offsets (and measured -5.2% on dense affine anyway); vec4Half
+  // gained the moe offsets on 2026-08-15 — the shared prologue already
+  // computes inBase/wBase/sBase and the shared epilogue already writes at
+  // outBase, so the body only had to use them.
+  if (moe && vec4)
+    throw new Error('moe has no full-vec4 path: that body does not apply the slot/token offsets')
   if (rowsPerWG !== 1 && !subgroups) throw new Error('rowsPerWG > 1 requires subgroups')
   if (m === 4 && (!subgroups || rowsPerWG !== 4)) throw new Error('m=4 requires subgroups + rowsPerWG=4')
   if (vec4 && !subgroups) throw new Error('vec4 requires subgroups (32-thread WG keeps K=3072 divisible)')
@@ -326,8 +328,12 @@ ${rowBlocks}
     // (16 f16). Weight loads drop 2×, activation loads 8× vs the scalar path.
     const accDecl = rows.map((r) => `  var acc${r} : f32 = 0.0;`).join('\n')
     const vecs = ['xa', 'xb']
+    // MoE: input_buf is declared as vec4<u32> (8 f16 per index), and inBase is
+    // in f16 ELEMENTS — so the offset shifts by 3. Every shipped MoE stride
+    // (d, per-expert ffn, 2*ffn) is a multiple of 8; the resolver only picks
+    // this variant when K % 512 == 0, which implies the strides comply.
     const loads = vecs
-      .map((v, j) => `    let ${v} = input_buf[v_off * 2u${j ? ` + ${j}u` : ''}];`)
+      .map((v, j) => `    let ${v} = input_buf[${moe ? '(inBase >> 3u) + ' : ''}v_off * 2u${j ? ` + ${j}u` : ''}];`)
       .join('\n')
     const unpacks = vecs
       .map(
@@ -353,9 +359,9 @@ ${rowBlocks}
     const rowBlocks = rows
       .map(
         (r) => `    { // row r${r}: one vec2 weight load + one scale${affine ? '/bias' : ''} (2 words = ${affine ? 'a quarter of a' : 'half a'} scale group)
-      let w = weights[r${r} * KPV + v_off];
-      let s = f32(scales[r${r} * SCALES_PER_ROW + ${sIdx}]);
-${affine ? `      let b = f32(biases[r${r} * SCALES_PER_ROW + ${sIdx}]);\n` : ''}      acc${r} = acc${r} + s * (
+      let w = weights[${moe ? '(wBase >> 1u) + ' : ''}r${r} * KPV + v_off];
+      let s = f32(scales[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + ${sIdx}]);
+${affine ? `      let b = f32(biases[${moe ? 'sBase + ' : ''}r${r} * SCALES_PER_ROW + ${sIdx}]);\n` : ''}      acc${r} = acc${r} + s * (
           ${dequantDot('w.x', x(0), '        ', !affine)}
         + ${dequantDot('w.y', x(1), '        ', !affine)})${affine ? ' + b * xs' : ''};
     }`,
@@ -745,6 +751,14 @@ export const INT4_MATMUL_VARIANTS: ReadonlyArray<Int4MatmulOpts> = [
   // MoE: workgroup_id.z is the SLOT and the expert row comes from ids[] at
   // @binding(6), so one dispatch covers every selected expert.
   { affine: true, moe: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_tiled_affine_moe
+  // Wide-load MoE sibling. The expert matmuls are ~38% of a MoE decode step
+  // and were reading one u32 per load while every dense affine path read
+  // wide; the same intervention on dense affine measured +10% e2e decode.
+  // K % 512 gates per MATMUL: qwen36's gate/up/down all comply (2048/2048/512),
+  // qwen30b's down (K=768) does not and stays on the narrow kernel. q3 is
+  // excluded structurally (bitstream not word-aligned). OPT-IN until the
+  // paired decode A/B runs on AC power — awaiting measurement.
+  { affine: true, moe: true, subgroups: true, rowsPerWG: 4, vec4Half: true }, // int4_matmul_tiled_vec4h_affine_moe
   // 3-bit experts (MLX bits=3, continuous bitstream — see the q3 option note).
   { affine: true, q3: true }, // int4_matmul_affine_q3
   { affine: true, q3: true, subgroups: true, rowsPerWG: 4 }, // int4_matmul_tiled_affine_q3

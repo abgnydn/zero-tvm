@@ -165,6 +165,14 @@ async function moeBlock(device, dir, meta) {
   // tree reduction, so the 8 activations a thread loads are reused 4 times.
   const MOE_OPTS = { affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: bits === 3 }
   const mmMoe = pipelineFor(device, withPrelude(int4MatmulWGSL(MOE_OPTS)), int4MatmulEntry(MOE_OPTS))
+  // The wide-load sibling, graded against the SAME mlx reference. 4-bit only —
+  // q3's bitstream has no wide path. Both K's in this block (D=2048 for
+  // gate/up, F=512 for down) satisfy the K % 512 gate, so this grades every
+  // dispatch the engine would route wide.
+  const WIDE_OPTS = { ...MOE_OPTS, vec4Half: true }
+  const mmWide = bits === 4
+    ? pipelineFor(device, withPrelude(int4MatmulWGSL(WIDE_OPTS)), int4MatmulEntry(WIDE_OPTS))
+    : null
   const RPW = 4
   const silu = pipelineFor(device, withPrelude(readFileSync(join(SHADERS, 'silu_mul.wgsl'), 'utf8'),
                                                { ...QWEN35_4B, ffn: F }), 'silu_mul')
@@ -180,8 +188,8 @@ async function moeBlock(device, dir, meta) {
   const podGateMoe = u32([(D * bits) / 32, D / 64, F, 0, 2 * F, D, SLOTS * 2 * F, SLOTS])
   const podDownMoe = u32([(F * bits) / 32, F / 64, D, F, D, SLOTS * F, SLOTS * D, SLOTS])
 
-  const bgMoe = (out, outOff, outSize, inp, proj, pod) => device.createBindGroup({
-    layout: mmMoe.getBindGroupLayout(0),
+  const bgMoe = (pipe, out, outOff, outSize, inp, proj, pod) => device.createBindGroup({
+    layout: pipe.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: out, offset: outOff, size: outSize } },
       { binding: 1, resource: { buffer: inp } },
@@ -198,10 +206,10 @@ async function moeBlock(device, dir, meta) {
 
   // Every slot — the K routed experts AND the shared one — in the same dispatch.
   pass.setPipeline(mmMoe)
-  pass.setBindGroup(0, bgMoe(gu, 0, SLOTS * GU_SLOT, xBuf, 'gate_proj', podGateMoe))
+  pass.setBindGroup(0, bgMoe(mmMoe, gu, 0, SLOTS * GU_SLOT, xBuf, 'gate_proj', podGateMoe))
   pass.dispatchWorkgroups(F / RPW, 1, SLOTS)
   // up writes the second half of each slot: same kernel, output bound 1024 B in.
-  pass.setBindGroup(0, bgMoe(gu, F * 2, SLOTS * GU_SLOT - F * 2, xBuf, 'up_proj', podGateMoe))
+  pass.setBindGroup(0, bgMoe(mmMoe, gu, F * 2, SLOTS * GU_SLOT - F * 2, xBuf, 'up_proj', podGateMoe))
   pass.dispatchWorkgroups(F / RPW, 1, SLOTS)
 
   pass.setPipeline(silu)
@@ -213,7 +221,7 @@ async function moeBlock(device, dir, meta) {
   pass.dispatchWorkgroups(Math.ceil(SLOTS * F / 256))
 
   pass.setPipeline(mmMoe)
-  pass.setBindGroup(0, bgMoe(dOut, 0, SLOTS * D * 2, h, 'down_proj', podDownMoe))
+  pass.setBindGroup(0, bgMoe(mmMoe, dOut, 0, SLOTS * D * 2, h, 'down_proj', podDownMoe))
   pass.dispatchWorkgroups(D / RPW, 1, SLOTS)
 
   pass.setPipeline(comb)
@@ -234,9 +242,50 @@ async function moeBlock(device, dir, meta) {
   const scale = Math.max(...Array.from(yRef, Math.abs))
   let maxRel = 0
   for (let i2 = 0; i2 < D; i2++) maxRel = Math.max(maxRel, Math.abs(got[i2] - yRef[i2]) / scale)
+
+  // Wide arm: the SAME chain re-recorded with the vec4h pipeline into the same
+  // buffers (every write covers its whole region, and the narrow readback has
+  // completed). Graded against the same reference at the same bar — a wide
+  // kernel that read slot 0's activations for every slot (the bug the old ban
+  // guarded against) fails this by orders of magnitude, not by epsilon.
+  let maxRelW = -1
+  if (mmWide) {
+    const encW = device.createCommandEncoder()
+    const passW = encW.beginComputePass()
+    passW.setPipeline(mmWide)
+    passW.setBindGroup(0, bgMoe(mmWide, gu, 0, SLOTS * GU_SLOT, xBuf, 'gate_proj', podGateMoe))
+    passW.dispatchWorkgroups(F / RPW, 1, SLOTS)
+    passW.setBindGroup(0, bgMoe(mmWide, gu, F * 2, SLOTS * GU_SLOT - F * 2, xBuf, 'up_proj', podGateMoe))
+    passW.dispatchWorkgroups(F / RPW, 1, SLOTS)
+    passW.setPipeline(silu)
+    passW.setBindGroup(0, device.createBindGroup({
+      layout: silu.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: h } }, { binding: 1, resource: { buffer: gu } },
+                { binding: 2, resource: { buffer: buffer(device, new Int32Array([SLOTS, Math.ceil(SLOTS * F / 256)]), BU.UNIFORM | BU.COPY_DST) } }],
+    }))
+    passW.dispatchWorkgroups(Math.ceil(SLOTS * F / 256))
+    passW.setPipeline(mmWide)
+    passW.setBindGroup(0, bgMoe(mmWide, dOut, 0, SLOTS * D * 2, h, 'down_proj', podDownMoe))
+    passW.dispatchWorkgroups(D / RPW, 1, SLOTS)
+    passW.setPipeline(comb)
+    passW.setBindGroup(0, bg(comb, [acc, dOut, rScore, u32([D, SLOTS])]))
+    passW.dispatchWorkgroups(Math.ceil(D / 256))
+    passW.end()
+    const outW = device.createBuffer({ size: D * 2, usage: BU.COPY_DST | BU.MAP_READ })
+    encW.copyBufferToBuffer(acc, 0, outW, 0, D * 2)
+    device.queue.submit([encW.finish()])
+    await outW.mapAsync(MM.READ)
+    const gotW = Array.from(new Uint16Array(outW.getMappedRange().slice(0)), f16BitsToF32)
+    maxRelW = 0
+    for (let i2 = 0; i2 < D; i2++) maxRelW = Math.max(maxRelW, Math.abs(gotW[i2] - yRef[i2]) / scale)
+  }
+
+  const widePass = mmWide ? maxRelW < 0.005 : true
   return {
-    pass: maxRel < 0.005 && scoreErr < 0.005,
-    detail: `router top-${K} exact, scores ${scoreErr.toExponential(2)} | full block ${maxRel.toExponential(2)} | ${SLOTS} slots in 7 dispatches`,
+    pass: maxRel < 0.005 && scoreErr < 0.005 && widePass,
+    detail: `router top-${K} exact, scores ${scoreErr.toExponential(2)} | full block ${maxRel.toExponential(2)}`
+      + (mmWide ? ` | wide ${maxRelW.toExponential(2)}` : '')
+      + ` | ${SLOTS} slots in 7 dispatches`,
   }
 }
 
