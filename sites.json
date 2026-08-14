@@ -5,23 +5,23 @@
       "url": "https://kernelfusion.dev",
       "domain": "kernelfusion.dev",
       "name": "kernelfusion.dev",
-      "tagline": "Single-kernel fusion — 2,865× on Apple Silicon, 623× on phones.",
-      "shortDesc": "The research line. Two published preprints, one npm SDK, 592 real devices tested. The theory that all the applied projects build on.",
+      "tagline": "Single-kernel fusion — 71× median on Apple Silicon, 56× NVIDIA, 20× phones.",
+      "shortDesc": "The research line. Two published preprints and one npm SDK. The theory the applied projects build on.",
       "category": "Theory",
       "badge": "research",
       "githubRepo": "https://github.com/abgnydn/kernelfusion",
       "stats": [
         {
-          "value": "2,865×",
-          "label": "Apple Silicon avg"
+          "value": "71×",
+          "label": "Apple Silicon median"
         },
         {
-          "value": "623×",
-          "label": "Android avg"
+          "value": "56×",
+          "label": "NVIDIA median"
         },
         {
-          "value": "592",
-          "label": "devices tested"
+          "value": "20×",
+          "label": "phone median"
         }
       ],
       "cta": "Read the research →"
@@ -38,19 +38,15 @@
       "githubRepo": "https://github.com/abgnydn/webgpu-dna",
       "stats": [
         {
-          "value": "0.985×",
+          "value": "0.988×",
           "label": "CSDA vs Geant4-DNA"
-        },
-        {
-          "value": "1.00×",
-          "label": "ions/primary vs Geant4"
         },
         {
           "value": "100%",
           "label": "energy conservation"
         },
         {
-          "value": "46/46",
+          "value": "71",
           "label": "unit tests pass"
         }
       ],
@@ -61,8 +57,8 @@
       "url": "https://zerotvm.com",
       "domain": "zerotvm.com",
       "name": "zerotvm.com",
-      "tagline": "Phi-3-mini in the browser — 10 hand-written kernels, no compiler.",
-      "shortDesc": "Phi-3-mini (3.8B) running end-to-end via 10 kernel roles across 27 WGSL files, replacing the 85 TVM-autotuned shaders WebLLM needs. 69.6 tok/s total / 83.1 tok/s decode on M2 Max — +16% / +31% vs WebLLM on identical weights, same session.",
+      "tagline": "Phi-3-mini in the browser on 50 hand-written WGSL kernels, no compiler.",
+      "shortDesc": "Phi-3-mini (3.8B) running end-to-end on 50 hand-written WGSL files, replacing the 85 TVM-autotuned shaders WebLLM needs. 69.55 tok/s against WebLLM's 59.95 on identical weights in the same session, +16%.",
       "category": "LLM inference",
       "badge": "applied",
       "githubRepo": "https://github.com/abgnydn/zero-tvm",
@@ -72,12 +68,12 @@
           "label": "kernel roles"
         },
         {
-          "value": "27",
+          "value": "50",
           "label": "WGSL files"
         },
         {
-          "value": "~70",
-          "label": "tok/s total (M2 Max)"
+          "value": "69.55",
+          "label": "tok/s (M2 Max)"
         }
       ],
       "cta": "Run it live →"
@@ -88,18 +84,14 @@
       "domain": "gpubench.dev",
       "name": "gpubench.dev",
       "tagline": "How fast is your GPU in the browser?",
-      "shortDesc": "Open WebGPU compute benchmarks on 592 real devices — Rastrigin, N-body, Monte Carlo Pi, RL environments. Every result published, no cherry-picking.",
+      "shortDesc": "Open WebGPU compute benchmarks — Rastrigin, N-body, Monte Carlo Pi, RL environments. 794 runs published, no cherry-picking.",
       "category": "Benchmarks",
       "badge": "companion",
       "githubRepo": "https://github.com/abgnydn/gpubench",
       "stats": [
         {
-          "value": "592",
-          "label": "devices tested"
-        },
-        {
-          "value": "170",
-          "label": "transformer runs"
+          "value": "794",
+          "label": "runs published"
         },
         {
           "value": "100%",
@@ -297,5 +289,10 @@
     "https://fused-lora.pages.dev",
     "https://github.com/abgnydn",
     "https://www.linkedin.com/in/abgnydn/"
-  ]
+  ],
+  "_source": true,
+  "_generated": {
+    "by": "sites-shared/bin/build-sites.mjs",
+    "warning": "DO NOT EDIT. Numbers come from facts.json. Editing this file is how three contradictory copies ended up live."
+  }
 }

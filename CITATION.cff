@@ -9,6 +9,7 @@ authors:
     given-names: Ahmet Baris
     email: hi@barisgunaydin.com
     # orcid: "https://orcid.org/0000-0000-0000-0000"   # <- add your ORCID
+    affiliation: Independent Researcher
 license: MIT
 repository-code: "https://github.com/abgnydn/zero-tvm"
 url: "https://zerotvm.com"

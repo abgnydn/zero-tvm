@@ -7,7 +7,8 @@
   "language": "eng",
   "creators": [
     {
-      "name": "Gunaydin, Ahmet Baris"
+      "name": "Gunaydin, Ahmet Baris",
+      "affiliation": "Independent Researcher"
     }
   ],
   "keywords": [
@@ -20,5 +21,12 @@
     "mlc-llm",
     "tvm"
   ],
-  "notes": "Live demo: https://zerotvm.com \u2014 Source and methodology: https://github.com/abgnydn/zero-tvm"
+  "notes": "Live demo: https://zerotvm.com \u2014 Source and methodology: https://github.com/abgnydn/zero-tvm",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/abgnydn/zero-tvm",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
 }
