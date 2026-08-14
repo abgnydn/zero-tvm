@@ -878,12 +878,17 @@ export const QWEN35_4B: ModelSpec = makeModelSpec({
  * width: it is what silu_mul strides by between slots.
  *
  * maxPages: one position costs 2 (K+V) × 2 kvHeads × 256 headDim × 2 B × 10
- * attention layers = 20 KiB. 384 pages = 6144 tokens on a 126 MiB KV budget —
- * deliberately small, because the MODEL is 19.5 GiB resident and decode dies
- * the moment the total working set exceeds physical RAM (measured 2026-08-05:
- * the GPU process is killed mid-prefill at 0.1 GB free; every hundred MiB of
- * headroom is worth more than context length here). maxSeq is 262144; even
- * the old 3072-page budget (49k tokens, 960 MiB) was 1/5th of that.
+ * attention layers = 20 KiB. 2048 pages = 32768 tokens on a 640 MiB KV budget.
+ *
+ * RAISED 384 → 2048 on 2026-08-14 (ctx-test.mjs qwen36q3 CTX=32768: boots,
+ * generates, last slot addressable, 0 GPU errors, tokens identical to the
+ * 6144-token engine — "the budget was the only ceiling"). The old 126 MiB /
+ * 6144-token budget dated from 2026-08-05, when the 4-bit build's 19.7 GiB
+ * residency left no headroom (the GPU process was measured being killed
+ * mid-prefill at 0.1 GB free). Two things changed: the q3 build runs at
+ * 15.7 GiB resident, and the expert pool can drop that to ~4.8-8.4 GiB —
+ * hundreds of MiB of KV stopped being the marginal allocation. maxSeq is
+ * 262144; 32k is still 1/8th of what the checkpoint supports.
  *
  * The checkpoint is MULTIMODAL — every text record sits under
  * `language_model.`, and `vision_tower.*` (0.89 GB) is never read for text.
@@ -898,7 +903,7 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
   ffn: 512,        // moe_intermediate_size — per-expert, not a dense FFN width
   vocab: 248320,
   pageSize: 16,
-  maxPages: 384,
+  maxPages: 2048,
   maxSeq: 262144,
   ropeTheta: 1e7,
   rmsEps: 1e-6,
