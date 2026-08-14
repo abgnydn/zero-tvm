@@ -212,6 +212,9 @@ export interface Pipelines {
   /** 3-bit sibling of moeMatmul (MLX bits=3 bitstream) — used when the spec's
    *  MoeDims.bits is 3. Same bindings, different unpack. */
   moeMatmulQ3: GPUComputePipeline | null
+  /** Wide-load (vec4h) sibling of moeMatmul — 4-bit experts only. Picked per
+   *  MATMUL where K % 512 == 0 (?vec4moe=1, opt-in awaiting measurement). */
+  moeMatmulWide: GPUComputePipeline | null
   moeCombine: GPUComputePipeline
   // ── Multi-head latent attention (DeepSeek-V2). Six dispatches replacing the
   // rope/kv_append/attention chain, and the only attention family in the repo
@@ -386,6 +389,7 @@ export function compile(
     moeRouterTopk: subgroups ? createPipeline(device, moeRouterTopkSrc, 'moe_router_topk') : null,
     moeMatmul: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4 }) : null,
     moeMatmulQ3: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: true }) : null,
+    moeMatmulWide: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, vec4Half: true }) : null,
     moeCombine: createPipeline(device, moeCombineSrc, 'moe_combine'),
     mlaQSplit: createPipeline(device, mlaQSplitSrc, 'mla_q_split'),
     mlaKvWrite: createPipeline(device, mlaKvWriteSrc, 'mla_kv_write'),

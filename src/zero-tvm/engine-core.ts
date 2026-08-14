@@ -581,6 +581,15 @@ export function buildDecodeEngine(
   // (MoeDims.bits), resolved once — bind groups and dispatches must use the
   // same object, since layout:'auto' pipelines each own a distinct layout.
   const moeMM = S.moe?.bits === 3 ? P.moeMatmulQ3 : P.moeMatmul
+  // Wide loads per MATMUL, not per model: gate/up contract over K = d, down
+  // over K = ffn (per-expert), and the vec4h body needs K % 512. qwen36 takes
+  // all three wide; qwen30b's down (K=768) stays narrow beside wide gate/up.
+  // Opt-in (?vec4moe=1) until the paired A/B runs on AC. Bind groups are
+  // created against the pipeline that dispatches them — layout:'auto'.
+  const moeWideOK = (k: number): boolean =>
+    variants.vec4Moe && S.moe?.bits !== 3 && k % 512 === 0 && !!P.moeMatmulWide
+  const moeMMGate = S.moe && moeWideOK(S.d) ? P.moeMatmulWide! : moeMM
+  const moeMMDown = S.moe && moeWideOK(S.ffn) ? P.moeMatmulWide! : moeMM
   if (S.moe && !(P.moeRouterTopk && moeMM)) {
     throw new Error(
       'buildDecodeEngine: a MoE spec requires the subgroups feature — moe_router_topk '
@@ -1689,14 +1698,14 @@ export function buildDecodeEngine(
           // gate and up write interleaved halves of one [slot][2*ffn] buffer:
           // same kernel, `up` bound ffn*2 bytes in, which is the layout silu_mul
           // reads. The bind OFFSET must stay 256-aligned — ffn*2 = 1024 here.
-          gate: bg(device, moeMM!, [
+          gate: bg(device, moeMMGate!, [
             { buffer: B.moeGateUp!, offset: 0, size: S.moeSlots * 2 * S.ffn * 2 },
             B.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, B.moeIds!]),
-          up: bg(device, moeMM!, [
+          up: bg(device, moeMMGate!, [
             { buffer: B.moeGateUp!, offset: S.ffn * 2, size: S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
             B.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, B.moeIds!]),
           silu: bg(device, P.siluMul, [B.moeH!, B.moeGateUp!, moeSiluU!]),
-          down: bg(device, moeMM!, [
+          down: bg(device, moeMMDown!, [
             { buffer: B.moeDown!, offset: 0, size: S.moeSlots * S.d * 2 },
             B.moeH!, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, B.moeIds!]),
           combine: bg(device, P.moeCombine, [B.hidden2, B.moeDown!, B.moeScores!, moeCombU!]),
@@ -1970,10 +1979,10 @@ export function buildDecodeEngine(
    *  rides in grid z, so the expert count costs dispatches, not the top-k. */
   function recordMoeExperts(enc: GPUCommandEncoder, moe: NonNullable<LayerBG['moe']>): void {
     const rows = S.ffn / MOE_RPW
-    dispatch(enc, moeMM!, moe.gate, rows, 1, S.moeSlots, 'moeGate')
-    dispatch(enc, moeMM!, moe.up, rows, 1, S.moeSlots, 'moeUp')
+    dispatch(enc, moeMMGate!, moe.gate, rows, 1, S.moeSlots, 'moeGate')
+    dispatch(enc, moeMMGate!, moe.up, rows, 1, S.moeSlots, 'moeUp')
     dispatch(enc, P.siluMul, moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
-    dispatch(enc, moeMM!, moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
+    dispatch(enc, moeMMDown!, moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
     dispatch(enc, P.moeCombine, moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
   }
 
@@ -3053,14 +3062,14 @@ export function buildDecodeEngine(
                 routerTopk: bg(device, P.moeRouterTopk!, [CM!.moeIds, CM!.moeScores, CM!.routerLogits, moeTopkU!]),
                 // Same interleaved [.., slot, gate|up] layout as decode; `up`
                 // bound ffn*2 bytes in, an offset that must stay 256-aligned.
-                gate: bg(device, moeMM!, [
+                gate: bg(device, moeMMGate!, [
                   { buffer: CM!.moeGateUp, offset: 0, size: C * S.moeSlots * 2 * S.ffn * 2 },
                   CB.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, CM!.moeIds]),
-                up: bg(device, moeMM!, [
+                up: bg(device, moeMMGate!, [
                   { buffer: CM!.moeGateUp, offset: S.ffn * 2, size: C * S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
                   CB.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, CM!.moeIds]),
                 silu: bg(device, P.siluMul, [CM!.moeH, CM!.moeGateUp, cU.moeSilu]),
-                down: bg(device, moeMM!, [
+                down: bg(device, moeMMDown!, [
                   { buffer: CM!.moeDown, offset: 0, size: C * S.moeSlots * S.d * 2 },
                   CM!.moeH, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, CM!.moeIds]),
                 combine: bg(device, P.moeCombine, [CB.hidden2, CM!.moeDown, CM!.moeScores, moeCombU!]),
@@ -3202,10 +3211,10 @@ export function buildDecodeEngine(
           dispatch(enc, moeRouterPipe, blk.moe.routerLogits, MOE_ROUTER_ROWS, n, 1, 'cMoeRouterLogits')
           dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, n, 1, 1, 'cMoeRouterTopk')
           const rows = S.ffn / MOE_RPW
-          dispatch(enc, moeMM!, blk.moe.gate, rows, n, S.moeSlots, 'cMoeGate')
-          dispatch(enc, moeMM!, blk.moe.up, rows, n, S.moeSlots, 'cMoeUp')
+          dispatch(enc, moeMMGate!, blk.moe.gate, rows, n, S.moeSlots, 'cMoeGate')
+          dispatch(enc, moeMMGate!, blk.moe.up, rows, n, S.moeSlots, 'cMoeUp')
           dispatch(enc, P.siluMul, blk.moe.silu, Math.ceil((n * S.moeSlots * S.ffn) / 256), 1, 1, 'cMoeSilu')
-          dispatch(enc, moeMM!, blk.moe.down, S.d / MOE_RPW, n, S.moeSlots, 'cMoeDown')
+          dispatch(enc, moeMMDown!, blk.moe.down, S.d / MOE_RPW, n, S.moeSlots, 'cMoeDown')
           dispatch(enc, P.moeCombine, blk.moe.combine, Math.ceil(S.d / 256), n, 1, 'cMoeCombine')
         } else {
           gemmDispatch(enc, blk.gateUp!, 2 * S.ffn, 'cGateUp')

@@ -71,6 +71,10 @@ export interface VariantFlags {
    *  +6-9% llama32 decode, paired per round on mains power); ?vec4aff=0 to
    *  A/B off. See BENCH.md "Affine wide loads". */
   vec4Affine: boolean
+  /** Wide loads for the MoE expert matmuls (?vec4moe=1). OPT-IN — awaiting the
+   *  paired decode A/B on AC power. Applies per matmul where K % 512 == 0 and
+   *  the experts are 4-bit; q3's bitstream has no wide path. */
+  vec4Moe: boolean
   /** Fused qk_norm+RoPE+KV-append on the unfused qkNorm decode path (Qwen3):
    *  3 post-matmul dispatches become 1 (10 → 8 per layer). Default ON;
    *  ?fuseqk=0 restores the reference 3-dispatch chain for A/B. */
@@ -96,6 +100,7 @@ export const SCALAR_VARIANTS: VariantFlags = {
   vec4Half: false,
   vec4Qkv: false,
   vec4Affine: false,
+  vec4Moe: false,
   fuseQkNorm: false,
   splitK: 0,
   fusePrologue: false,
@@ -145,6 +150,7 @@ export function parseVariantFlags(
     // first, because the same comparison on a discharging battery read +5.4%,
     // +13.2% and -3.0% and none of those were measurements.
     vec4Affine: sgAll && q.get('vec4') !== '0' && q.get('vec4aff') !== '0',
+    vec4Moe: sgAll && q.get('vec4moe') === '1',
     // Fused qk_norm+RoPE+append on the qkNorm decode path (plain 32-thread
     // kernel — no subgroups needed). ?fuseqk=0 restores the reference chain.
     fuseQkNorm: q.get('fuseqk') !== '0',
