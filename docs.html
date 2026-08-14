@@ -534,7 +534,7 @@
 <!-- QUICKSTART -->
 <h2 id="quickstart">Quick start</h2>
 
-<p>No install. Just open the chat page. Weights load from your browser cache (if you've used WebLLM before) or download fresh from HuggingFace (~2.1 GB).</p>
+<p>No install. Just open the chat page. Weights load from your browser cache (if you've used WebLLM before) or download fresh from HuggingFace (~2 GB).</p>
 
 <div class="step-flow">
   <div class="step-row">
@@ -548,7 +548,7 @@
     <div class="step-line"><div class="step-dot">2</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Wait for weights</h5>
-      <p>First load downloads ~2.1 GB. Subsequent loads are instant from browser Cache API. Progress shown per shard in the log panel.</p>
+      <p>First load downloads ~2 GB. Subsequent loads are instant from browser Cache API. Progress shown per shard in the log panel.</p>
     </div>
   </div>
   <div class="step-row">
@@ -562,7 +562,7 @@
     <div class="step-line"><div class="step-dot">4</div></div>
     <div class="step-content">
       <h5>(Optional) Cache weights locally</h5>
-      <p>Run <code>node scripts/download-weights.mjs</code> once to save all 83 shards to <code>public/weights/</code>. Subsequent loads are served from localhost at full disk speed.</p>
+      <p>Run <code>node scripts/download-weights.mjs</code> once to save the shards to <code>.weights-local/</code>. Subsequent loads are served from localhost at full disk speed.</p>
     </div>
   </div>
 </div>
@@ -583,7 +583,7 @@
   <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
 </ol>
 
-<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>228 dispatches per token</strong> in the default f16-KV path (260 with the <code>?int8kv=1</code> flag) — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token using 85 distinct shaders.</p>
+<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>228 dispatches per token</strong> in the default f16-KV path (260 with the <code>?kv8=1</code> flag) — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token using 85 distinct shaders.</p>
 
 <!-- ARCHITECTURE -->
 <h2 id="overview">Architecture overview</h2>
@@ -837,7 +837,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@6</code></td><td><code>uniform</code></td><td>attention config (scale, pages)</td></tr>
       </tbody>
     </table>
-    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 × HEADS workgroups (1 × 32). An <code>attention_int8.wgsl</code> variant reads an int8-quantized KV cache; enable via <code>?int8kv=1</code>.</p>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 × HEADS workgroups (1 × 32). An <code>attention_int8.wgsl</code> variant reads an int8-quantized KV cache; enable via <code>?kv8=1</code>.</p>
   </div>
 </div>
 
@@ -1131,9 +1131,9 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="code-label">terminal</div>
   <pre><code>node scripts/download-weights.mjs
 
-<span class="cm"># Downloads to: public/weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/</span>
-<span class="cm"># Served at:    /weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/</span>
-<span class="cm"># Size:         ~2.1 GB</span></code></pre>
+<span class="cm"># Downloads to: .weights-local/Phi-3-mini-4k-instruct-q4f16_1-MLC/</span>
+<span class="cm"># Served at:    /local-weights/Phi-3-mini-4k-instruct-q4f16_1-MLC/</span>
+<span class="cm"># Size:         ~2 GB</span></code></pre>
 </div>
 
 <div class="callout danger">
@@ -1210,9 +1210,9 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Decode only</td><td>83.10 tok/s</td><td>63.23 tok/s (self-reported)</td></tr>
     <tr><td>Time to first token (~35-token prompt)</td><td>291 ms</td><td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM ahead</td></tr>
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
-    <tr><td>Dispatches / token</td><td>228 (260 with <code>?int8kv=1</code>)</td><td>342</td></tr>
+    <tr><td>Dispatches / token</td><td>228 (260 with <code>?kv8=1</code>)</td><td>342</td></tr>
     <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>85 TVM-generated shaders</td></tr>
-    <tr><td>Shipped JS bundle</td><td>~432 kB / ~116 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (WebLLM)</td></tr>
+    <tr><td>Shipped JS bundle</td><td>~432 kB / ~116 kB gz (<code>zero-tvm.html</code>)</td><td>~6.0 MB / ~2.2 MB gz (@mlc-ai/web-llm 0.2.84)</td></tr>
     <tr><td>Bandwidth utilization (total / decode)</td><td>~31% / ~37% of the 222 tok/s ceiling</td><td>~27% / ~28% of the same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
     <tr><td>Readable kernels?</td><td>✓ Yes — every .wgsl file is in the repo</td><td>✗ No — emitted by the TVM compiler</td></tr>

@@ -149,7 +149,9 @@ async function openOPFS(dirName: string): Promise<OpenedOPFS> {
   }
 }
 
-function opfsKey(dataPath: string): string {
+/** Exported for cache-probe: it must resolve the same OPFS filenames this
+ *  loader writes, or a completeness check looks for keys that never existed. */
+export function opfsKey(dataPath: string): string {
   // OPFS filenames can't contain '/'. Flatten to a safe ASCII key.
   return dataPath.replace(/[^A-Za-z0-9._-]/g, '_')
 }

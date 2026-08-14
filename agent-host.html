@@ -1,5 +1,10 @@
 <!doctype html><meta charset="utf-8"><title>zero-tvm · agent host</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- Not a public destination: it needs a local agent-server on 127.0.0.1:8017,
+     so a visitor arriving from search pays for weights and gets "booting…"
+     forever. share.html and 404.html already carry this; this page did not,
+     while robots.txt is Allow: / — so it was indexable. -->
+<meta name="robots" content="noindex">
 <link rel="stylesheet" href="/chat-ui.css">
 <style>
   body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 2rem;

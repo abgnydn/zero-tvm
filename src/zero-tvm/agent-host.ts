@@ -75,8 +75,52 @@ function dialectFor(id: string): ToolDialect {
 // No top-level await: the build targets es2020 (vite.config.ts), where it is a
 // hard error. Everything below the boot lives inside main(), started at the
 // bottom of the file — the same shape chat.ts uses.
+/**
+ * Consent gate. This page had NO button of any kind — `querySelectorAll(
+ * 'button')` returned an empty list — and called bootEngine on load, so simply
+ * opening it started the weight download. Measured during review: 19 MB off the
+ * HF CDN in 12 seconds with nothing pressed, on the way to ~1.8 GB.
+ *
+ * It is worse here than anywhere else, because this page ALSO cannot work
+ * without a local agent-server on 127.0.0.1:8017 — so the bandwidth bought a
+ * page that then sits on "booting…" forever. And the manifest the aborted
+ * download leaves in OPFS used to disarm the chat page's gate (see
+ * cache-probe.ts).
+ */
+async function confirmBoot(): Promise<void> {
+  const { isModelCached } = await import('./cache-probe.js')
+  if (await isModelCached(spec)) return
+  const dlg = document.createElement('dialog')
+  dlg.id = 'agent-gate'
+  dlg.style.cssText = 'max-width:32rem;background:#0f1216;color:#d6dbe1;border:1px solid #21262d;'
+    + 'border-radius:10px;padding:1.5rem 1.6rem;font:inherit'
+  dlg.innerHTML = `
+    <h2 style="font-size:1rem;margin:0 0 .7rem">Run ${spec.id} in this tab?</h2>
+    <p style="color:#8b949e;margin:0 0 .7rem">
+      This is a developer surface. It downloads the model
+      and then talks to an agent-server on <code>127.0.0.1:8017</code> —
+      start it with <code>npm run agent</code> from the repo. Without that
+      server running, this page has nothing to serve.
+    </p>
+    <p class="warn" style="margin:0 0 1.1rem">Weights download once and cache locally.</p>
+    <div style="display:flex;gap:.8rem;justify-content:flex-end">
+      <a href="/" style="color:#7d8590">Not now</a>
+      <button type="button" id="agent-gate-go" autofocus
+        style="background:#d29922;color:#0b0d10;border:0;border-radius:8px;padding:.55rem 1.1rem;
+               font:inherit;font-weight:600;cursor:pointer">Download &amp; boot</button>
+    </div>`
+  document.body.appendChild(dlg)
+  dlg.showModal()
+  await new Promise<void>((resolve) => {
+    dlg.querySelector<HTMLButtonElement>('#agent-gate-go')?.addEventListener('click', () => {
+      dlg.close(); dlg.remove(); resolve()
+    }, { once: true })
+  })
+}
+
 async function main(): Promise<void> {
   let flags: VariantFlags | null = null
+  await confirmBoot()
   const boot = await bootEngine({
     spec,
     optionalFeatures: ['subgroups', 'chromium-experimental-subgroup-matrix' as GPUFeatureName],
