@@ -45,17 +45,44 @@
 # method was discarded after it returned >100%, which is impossible; it overcounts
 # by ~25%. Both the method and the negative result are in docs/webgpu-placement/.
 #
-# THREAD STATE (checked 2026-08-04): issue is OPEN, 5 comments, last activity
-# 2026-04-12. @xenova replied twice suggesting ORT #27780; @youqibing pushed back
-# ("I'm not entirely sure whether these two issues are related") and that doubt was
-# never resolved; @kokroo added "+1 Experiencing the same issue" on 2026-04-05.
-# So this is a stalled thread with an unanswered question, not a closed one — and
-# the comment below answers exactly the question that was left hanging.
+# THREAD STATE (re-checked 2026-08-14): issue is OPEN, still 5 comments, NO new
+# ones — nobody has posted this diagnosis. @xenova replied twice suggesting ORT
+# #27780; @youqibing pushed back ("I'm not entirely sure whether these two issues
+# are related") and that doubt was never resolved; @kokroo added "+1" 2026-04-05.
+# CORRECTION: real last activity is 2026-04-05, not 04-12 — the 04-12 timestamp is
+# `comment_deleted` by huggingface (spam removal), not a reply.
 #
-# The Colab link below is live and was checked anonymously (14 cells render,
-# no sign-in needed to read). It points at the `tjs-1599-repro` branch — if you
-# ever delete or rename that branch, the link dies. Merge the notebook to main
-# before posting if you want it to outlive the branch.
+# The Colab link is no longer in the posted text (removed in the 08-04 rewrite), so
+# the branch-pinning warning is moot. For the record: `tjs-1599-repro` is already
+# merged into main and the notebook resolves on both refs.
+#
+# 2026-08-14 PRE-POST VERIFICATION — five defects found and fixed in the body below.
+# (1) NO VERSION FLOOR: `-OPT` needs `LinearAttention` AND `CausalConvWithState`,
+#     both added by onnxruntime#27996 (merged 2026-04-09). @youqibing is on
+#     transformers.js 4.0.0-next.7 → ORT 1.25.0-dev.20260307, which predates them, so
+#     the recommendation as written sends him to a model that FAILS TO LOAD. 4.1.0 is
+#     the first release that can run it. Version floor now stated explicitly.
+# (2) #27780 MISCHARACTERISED: it is not "tunes FlashAttention for MHA/GQA" — it is
+#     "Optimize FlashAttention for M4 Max (20x speedup)", Apple-vendor-gated, merged
+#     2026-05-14, first shipped in ORT 1.27 (NOT the 1.26.0-dev that tjs 4.2.0 pins).
+#     It is also xenova's own PR.
+# (3) "FIX CAME FROM THE EXPORT SIDE RATHER THAN THE KERNEL SIDE" was WRONG: it took
+#     both. #27996 added the kernels; the re-export emits them. Export alone = nothing.
+# (4) "~92%" DID NOT FOLLOW from 13.99 -> 1.24 (that is 91.1%; the repo's 91.3% uses a
+#     mean-of-two-runs denominator the comment never showed). Now quotes both runs and
+#     the 91-93% range, which is what the artifacts support.
+# (5) FRAMING: xenova authored `-OPT`, added the `new_version` banner himself, AND
+#     wrote #27780. The old opening presented all three to him as discoveries. The
+#     opening now credits him and states what is actually unpublished: the mechanism.
+#
+# STILL TRUE after re-verification: issue open, no new comments, `new_version` field
+# present verbatim on the old card, `-OPT` public and not itself superseded, WebGPU EP
+# still has no `Scan` kernel (only `If` in controlflow/), and the python snippet was
+# RUN against both real graphs — prints exactly `24 8 0` and `0 8 24`.
+#
+# KNOWN WEAKNESS, accepted: the headline 13.0 / 0.9 s table has no committed harness.
+# Its only record is commit a5c22c8's message (13.00/12.99 and 0.85/0.93). Both runs
+# are now quoted inline so the reader sees the spread rather than a bare median.
 
 ---
 

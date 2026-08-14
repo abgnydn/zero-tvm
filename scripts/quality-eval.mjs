@@ -89,13 +89,12 @@ const PROSE_PATH = join(ROOT, 'tests/fixtures/quality-corpus.txt')
 // ------------------------------------------------------------------- run
 
 const spec = specForParam(param)
-const tokDir = {
-  llama32: 'Llama-3.2-1B-Instruct-4bit',
-  qwen3mlx: 'Qwen3-4B-4bit',
-  qwen30b: 'Qwen3-30B-A3B-4bit',
-  qwen36q3: 'Qwen3.6-35B-A3B-MLX-q3exp',
-  qwen36: 'Qwen3.6-35B-A3B-MLX-4bit',
-}[param]
+// DERIVED, not a hardcoded table. `.weights-local/<repo tail>` is how the dev
+// mirror is laid out for every MLX checkpoint, so the spec already knows the
+// directory. The table this replaces silently SKIPPED any model added after it
+// was last edited — qwen35mlx was added 2026-08-14 and the quality sweep
+// reported "no tokenizer (unmapped)" for it rather than failing.
+const tokDir = spec.weightFormat === 'mlx-safetensors' ? spec.hfRepo.split('/').pop() : null
 const tokPath = tokDir && join(ROOT, '.weights-local', tokDir, 'tokenizer.json')
 if (!tokPath || !existsSync(tokPath)) {
   console.log(`SKIP  no tokenizer for ${param} at ${tokPath ?? '(unmapped)'}`)

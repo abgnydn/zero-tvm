@@ -1,10 +1,10 @@
-model llama32 | corpus prose | 512 positions to score
+model qwen3mlx | corpus prose | 512 positions to score
 [console.error] Failed to load resource: the server responded with a status of 404 (Not Found)
 
   tokens scored  512
-  mean NLL       4.1090
-  PERPLEXITY     60.888  [45.296, 81.847]
-  83.4 positions/s, 6s, gpu errors 0
+  mean NLL       3.6126
+  PERPLEXITY     37.063  [28.099, 48.887]
+  37.0 positions/s, 14s, gpu errors 0
 
   NOT COMPARABLE ACROSS --tokens: this scores one contiguous prefix, so the
   number falls steeply with window length (5x between 128 and 1198 on a 1B).
@@ -12,13 +12,13 @@ model llama32 | corpus prose | 512 positions to score
   To compare two CHECKPOINTS, use scripts/quality-ab.py — independent
   windows, error bars, and it runs on the reference in seconds.
 
-  uniform-over-vocab perplexity would be 128256 (llama32 vocab)
+  uniform-over-vocab perplexity would be 151936 (qwen3mlx vocab)
 
   vs mlx_lm on the SAME ids (float32):
-    mlx perplexity     60.888
-    engine perplexity  60.888
-    ratio              1.0000
-    max |ΔNLL| at any position  2.34e-2
+    mlx perplexity     37.055
+    engine perplexity  37.063
+    ratio              1.0002
+    max |ΔNLL| at any position  8.71e-2
   (fidelity, over 512 positions rather than one prompt's final logits.
    It says nothing about whether the model is good — both sides are the same
    quantized checkpoint.)

@@ -127,11 +127,13 @@ const BRANDINGS: Record<string, ModelBrand> = {
     // (2026-08-05, single session — not yet a protocol round).
     //
     // NO ACCURACY EVIDENCE. Every other entry below names a validation record;
-    // this one cannot. The 3-bit choice rests on a block-output cosine (0.936),
-    // which is fidelity and cannot see quality, and there is no e2e test file
-    // for either MoE build — so nothing anywhere has ever checked this model's
-    // output. scripts/quality-ab.py against the 4-bit build is the missing run.
-    // See docs/QUALITY.md.
+    // MEASURED 2026-08-14, and it costs something: +10.4% perplexity against
+    // the 4-bit build (26.179 -> 28.908, paired z = 18.5, worse on 24 of 24
+    // windows — scripts/quality-ab.py, BENCH.md). The harness calls that
+    // MARGINAL: real, but perplexity is the wrong instrument to decide it and
+    // no task benchmark has been run on either build. It buys 15 GB against
+    // 19 GB, which is the difference between running and not running on a
+    // 32 GB machine. See docs/QUALITY.md.
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · 3-bit experts',
     sizeLabel: '~16.4 GB', rateLabel: '~66 t/s',   // 65.56 total, M2 Max (BENCH.md 2026-08-13)
     ramNote: 'needs ~20 GB free RAM',

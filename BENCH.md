@@ -1671,6 +1671,72 @@ Two things this column does NOT yet say:
   Studio is holding 5.98 GB resident on a 32 GB machine, which is the exact
   configuration that froze this Mac once before. Not run unattended.
 
+## Quality, measured at last (2026-08-14)
+
+Everything else in this file is speed or FIDELITY. Fidelity asks whether the
+engine computes what mlx_lm computes; it cannot see a checkpoint quantized into
+uselessness, because the reference is the same quantized checkpoint (a 2-bit
+Llama-1B passes every gate here). These are the first quality numbers.
+
+### 1. The engine does not cost quality
+
+`scripts/quality-sweep.sh` — ids picked first so the reference scores the SAME
+text, then mlx_lm scores them, then the engine does. 512 tokens per corpus.
+
+| model | corpus | engine ppl | mlx ppl | ratio | max abs dNLL |
+|---|---|---:|---:|---:|---:|
+| llama32 | prose | 60.888 | 60.888 | 1.0000 | 2.3e-2 |
+| llama32 | code | 60.766 | 60.784 | 0.9997 | 1.3e-2 |
+| qwen3mlx | prose | 37.063 | 37.055 | 1.0002 | 8.7e-2 |
+| qwen3mlx | code | 27.685 | 27.686 | 1.0000 | 1.8e-2 |
+| qwen35mlx | prose | 17.100 | 17.100 | 1.0000 | 5.3e-2 |
+| qwen35mlx | code | 14.923 | 14.921 | 1.0001 | 3.8e-2 |
+| qwen30b | prose | 24.442 | 24.331 | 1.0046 | 7.7e-1 |
+| qwen30b | code | 21.892 | 21.809 | 1.0038 | 6.9e-1 |
+
+Worst case 0.46%. This is a much stronger fidelity result than the single-prompt
+logits check — hundreds of scored positions rather than one — but it is still
+fidelity, and it says nothing about whether the checkpoint is any good.
+
+The 9B is the best build here on both corpora, and it is the one the LM Studio
+head-to-head runs.
+
+qwen30b's drift is ~100x the dense models'. Unexplained; a plausible cause is
+routing flipping at near-tie logits, which changes which experts run. Not
+verified, and not chased.
+
+### 2. The 3-bit build we SHIP costs 10.4% perplexity
+
+`scripts/quality-ab.py`, 24 windows of 512 tokens, each build scored
+separately and combined with `--compare` so 19 GB and 15 GB are never resident
+together:
+
+| build | perplexity | 95% CI |
+|---|---:|---|
+| Qwen3.6-35B-A3B MLX **4-bit** | **26.179** | [24.762, 27.677] |
+| Qwen3.6-35B-A3B **3-bit experts** (what `?model=qwen36q3` serves) | **28.908** | [27.364, 30.540] |
+
+**+10.4%, paired z = 18.5, worse on 24 of 24 windows.** The harness's own
+verdict is MARGINAL: real, and a task benchmark rather than perplexity should
+decide whether it matters.
+
+The pairing is the whole reason this is visible: **unpaired z = 1.3** on the
+same data, which reads as "not distinguishable". Same correction quality-ab.py
+was built for.
+
+Two things this does NOT say. Perplexity understates reasoning damage —
+published work puts the math-accuracy drop at 3-bit near 3x the perplexity
+drop, so this is necessary and not sufficient. And it does not say the 3-bit
+build is unusable: it buys 15 GB against 19 GB, which is the difference between
+running and not running on a 32 GB machine.
+
+### What is still not measured
+
+No task benchmark on any build — no MMLU, no GSM8K, nothing with a right
+answer. `mlx_lm.evaluate` wraps the lm-eval API and is the ready-made way in.
+Until then "quality" here means perplexity on held-out text, and that is a
+weaker claim than it sounds.
+
 ## Kernel vs kernel: MLX's is faster than ours, everywhere (2026-08-14)
 
 The runtime tables in this file cannot answer "is our WGSL faster than MLX's
