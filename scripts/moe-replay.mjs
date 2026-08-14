@@ -22,6 +22,10 @@
 //         against, and the gap to it says how much prediction could buy.
 
 import { readFileSync } from 'node:fs'
+// The SHIPPED pool, not a second implementation of LRU. The number this script
+// reports is the decision the engine will actually make; two LRUs would drift
+// and the drift would not be visible until someone re-derived the projection.
+import { ExpertPool } from '../src/zero-tvm/expert-pool.ts'
 
 const file = process.argv[2] ?? 'bench/quality/moe-trace-qwen30b.json'
 const t = JSON.parse(readFileSync(file, 'utf8'))
@@ -56,6 +60,15 @@ console.log(`  top 50%  take ${(share(Math.ceil(experts * 0.5)) * 100).toFixed(1
 console.log(`  (uniform routing would give 10% / 25% / 50%)`)
 
 // ---- policies ----
+// LRU runs through the real pool. Requests go one at a time here because the
+// trace is flattened per layer; the engine resolves a whole top-K at once,
+// which only ever helps (duplicates inside a request are charged once).
+function runPool(stream, cap, pin) {
+  const pool = new ExpertPool(cap, pin >= 0 ? { pin: [pin] } : {})
+  for (const e of stream) pool.resolve([e])
+  return pool.hitRate
+}
+
 function run(policy, stream, cap) {
   const resident = new Map()          // expert -> metadata
   let hits = 0, tick = 0
@@ -99,7 +112,9 @@ for (const f of FRACTIONS) {
   const cap = Math.max(1, Math.round(experts * f))
   const row = POLICIES.map((p) => {
     // OPT is O(n^2) per layer; on a long trace that is minutes. Cap its work.
-    const hs = streams.map((s) => run(p, p === 'opt' ? s.slice(0, 4000) : s, cap))
+    const hs = streams.map((s) => (p === 'lru'
+      ? runPool(s, cap, -1)
+      : run(p, p === 'opt' ? s.slice(0, 4000) : s, cap)))
     return hs.reduce((a, b) => a + b, 0) / hs.length
   })
   results[f] = row
@@ -172,33 +187,42 @@ console.log(`    compute   ${COMPUTE_MS.toFixed(1)} ms/token (all experts reside
 // can hide at all. They are the same order of magnitude here, which is the
 // whole reason the pipelined column below is worth computing.
 const perLayerCompute = COMPUTE_MS / layers
-console.log(`    per layer: ${perLayerCompute.toFixed(3)} ms compute vs ${READBACK_MS.toFixed(3)} ms readback`)
+console.log(`    split     ${((probe.splitPerLayerMs - probe.splitOneSubmitMs) / probe.layers).toFixed(3)} ms/layer serial, `
+  + `${((probe.splitPipelinedMs - probe.splitOneSubmitMs) / probe.layers).toFixed(3)} ms/layer pipelined (measured)`)
+console.log(`    per layer: ${perLayerCompute.toFixed(3)} ms compute vs ${READBACK_MS.toFixed(3)} ms isolated round trip`)
 console.log(`\n  ${'pool'.padEnd(12)} ${'miss'.padStart(6)} ${'xfer ms'.padStart(8)} ${'serial'.padStart(9)} ${'overlapped'.padStart(11)} ${'pipelined'.padStart(10)}`)
 for (const f of FRACTIONS) {
   const best = Math.max(...results[f].slice(0, 3))     // best IMPLEMENTABLE policy
   const misses = layers * topK * (1 - best)
   const xfer = misses * bytesPerExpert / (GBPS * 1e9) * 1000
-  // SERIAL: fetch cannot start until the readback lands, and compute cannot
-  // start until the fetch lands. This is the naive implementation.
-  const serial = COMPUTE_MS + READBACK_MS * layers + xfer
+  // SERIAL / PIPELINED overheads are MEASURED by moe-stream-probe.mjs, not
+  // derived from the isolated round trip. Splitting the encoder per layer costs
+  // 0.184 ms/layer when each readback is awaited before the next submit, and
+  // 0.062 ms/layer when the next layer is submitted first — the round trip
+  // partly hides, but only partly, and only if the engine pipelines.
+  const splitSerial = (probe.splitPerLayerMs - probe.splitOneSubmitMs) / probe.layers
+  const splitPipe = (probe.splitPipelinedMs - probe.splitOneSubmitMs) / probe.layers
+  const serial = COMPUTE_MS + splitSerial * layers + xfer
   // OVERLAPPED: speculating the next layer's experts lets the fetch run under
   // compute, so transfer only costs what exceeds it. The readback does NOT
   // disappear — the prediction still has to come back to JS, and WebGPU has no
   // GPU-side wait for it.
-  const overlapped = COMPUTE_MS + READBACK_MS * layers + Math.max(0, xfer - COMPUTE_MS)
+  const overlapped = COMPUTE_MS + splitPipe * layers + Math.max(0, xfer - COMPUTE_MS)
   // PIPELINED, an upper bound. Running layer L+1's router on layer L's hidden
   // state produces the prediction one layer early, so its readback overlaps
   // layer L's compute instead of blocking layer L+1. Whether that works turns
   // on per-layer compute exceeding the round trip, which here it barely does.
   // Requires speculation to be correct; published accuracy is ~96% at L+1, and
   // a wrong guess costs a stall, so treat this as the ceiling and not a plan.
-  const pipelined = layers * Math.max(perLayerCompute, READBACK_MS) + Math.max(0, xfer - COMPUTE_MS)
+  const pipelined = COMPUTE_MS + splitPipe * layers * 0.5 + Math.max(0, xfer - COMPUTE_MS)
   console.log(`  ${`${Math.round(experts * f)}/${experts}`.padEnd(12)} `
     + `${`${(100 - best * 100).toFixed(0)}%`.padStart(6)} ${xfer.toFixed(0).padStart(8)} `
     + `${`${(1000 / serial).toFixed(1)} t/s`.padStart(9)} ${`${(1000 / overlapped).toFixed(1)} t/s`.padStart(11)} `
     + `${`${(1000 / pipelined).toFixed(1)} t/s`.padStart(9)}`)
 }
-console.log(`\n  The readback is ${(READBACK_MS * layers).toFixed(1)} ms of every token and no cache policy`)
-console.log(`  removes it: WebGPU has no GPU-waits-on-host primitive, so each layer's`)
-console.log(`  router ids must reach JS before its experts can be fetched. That is the`)
-console.log(`  cost llama.cpp's Metal build avoids with MTLSharedEvent.`)
+console.log(`\n  Splitting the encoder per layer is unavoidable — WebGPU has no`)
+console.log(`  GPU-waits-on-host primitive, so each layer's router ids must reach JS`)
+console.log(`  before its experts can be fetched. Submitting the next layer BEFORE`)
+console.log(`  awaiting the previous readback cuts that cost to a third, and is`)
+console.log(`  therefore worth more than any cache-policy change: LRU already sits`)
+console.log(`  within a point of Belady.`)

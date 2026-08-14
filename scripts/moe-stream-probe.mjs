@@ -83,7 +83,110 @@ console.log(`  x40 layers = ${(rtMs * 40).toFixed(1)} ms/token (qwen36)`)
 console.log(`\n  This is a FLOOR. dawn.node has no browser task scheduling in the way,`)
 console.log(`  and a real engine also has compute queued behind these submits.`)
 
+// ---- does splitting the encoder per layer cost what it looks like? ----
+// The projection's spread (36 vs 88 t/s) is entirely this question. A streaming
+// engine cannot record a whole token into one command buffer: each layer's
+// router ids must reach JS before its experts can be fetched. So the real cost
+// is not the round trip in isolation, it is the round trip with a layer's
+// compute queued behind it.
+//
+// Arm A is what the engine does today — one submit for the whole token.
+// Arm B is the split: per layer, submit, copy ids, await, continue.
+const LAYERS = 48
+const busy = device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read_write> o : array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) g : vec3<u32>) {
+  var a = f32(g.x) * 0.5;
+  for (var i = 0; i < 900; i = i + 1) { a = a * 1.0000001 + 0.000001; }
+  o[g.x % 64u] = a;
+}` })
+const busyPipe = device.createComputePipeline({ layout: 'auto', compute: { module: busy, entryPoint: 'main' } })
+const outBuf = device.createBuffer({ size: 4096, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
+const busyBg = device.createBindGroup({
+  layout: busyPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: outBuf } }] })
+// Calibrated so one dispatch costs what one real layer costs (~0.236 ms for
+// qwen30b: 11.3 ms of decode over 48 layers). Testing a 0.18 ms round trip
+// against 0.07 ms of compute answers a question nobody asked.
+let WG = 512
+
+const oneLayer = (enc) => {
+  const pass = enc.beginComputePass()
+  pass.setPipeline(busyPipe); pass.setBindGroup(0, busyBg); pass.dispatchWorkgroups(WG); pass.end()
+}
+
+// Arm A — everything in one command buffer, one wait at the end.
+const armA = async () => {
+  const enc = device.createCommandEncoder()
+  for (let i = 0; i < LAYERS; i++) oneLayer(enc)
+  device.queue.submit([enc.finish()])
+  await device.queue.onSubmittedWorkDone()
+}
+// Arm B — split, with a readback between layers.
+const armB = async () => {
+  for (let i = 0; i < LAYERS; i++) {
+    const enc = device.createCommandEncoder()
+    oneLayer(enc)
+    enc.copyBufferToBuffer(gpuBuf, 0, readBuf, 0, idsBytes)
+    device.queue.submit([enc.finish()])
+    await readBuf.mapAsync(GPUMapMode.READ)
+    readBuf.unmap()
+  }
+}
+// Calibrate WG against the real per-layer compute time.
+{
+  const target = 0.236
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const enc = device.createCommandEncoder()
+    for (let i = 0; i < 20; i++) oneLayer(enc)
+    device.queue.submit([enc.finish()])
+    const t = performance.now()
+    await device.queue.onSubmittedWorkDone()
+    const per = (performance.now() - t) / 20
+    if (per > target * 0.85 && per < target * 1.15) break
+    WG = Math.max(64, Math.round(WG * Math.min(4, Math.max(0.25, target / Math.max(per, 1e-4)))))
+  }
+}
+
+// Arm C — PIPELINED. Submit the next layer before awaiting the previous
+// layer's readback, which is what next-layer speculation would let an engine
+// do. Two staging buffers, because a mapped buffer cannot be re-copied into.
+const readBuf2 = device.createBuffer({ size: idsBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+const ring = [readBuf, readBuf2]
+const armC = async () => {
+  let pending = null
+  for (let i = 0; i < LAYERS; i++) {
+    const rb = ring[i % 2]
+    const enc = device.createCommandEncoder()
+    oneLayer(enc)
+    enc.copyBufferToBuffer(gpuBuf, 0, rb, 0, idsBytes)
+    device.queue.submit([enc.finish()])
+    const p = rb.mapAsync(GPUMapMode.READ)
+    if (pending) { await pending.p; pending.rb.unmap() }
+    pending = { p, rb }
+  }
+  if (pending) { await pending.p; pending.rb.unmap() }
+}
+
+for (let i = 0; i < 3; i++) { await armA(); await armB(); await armC() }
+const time = async (fn, n) => {
+  const t = performance.now()
+  for (let i = 0; i < n; i++) await fn()
+  return (performance.now() - t) / n
+}
+const msA = await time(armA, 12)
+const msB = await time(armB, 12)
+const msC = await time(armC, 12)
+console.log(`\nencoder split, ${LAYERS} layers of synthetic compute`)
+console.log(`  one submit per token   ${msA.toFixed(2)} ms   (${(msA / LAYERS).toFixed(3)} ms/layer)`)
+console.log(`  split + readback       ${msB.toFixed(2)} ms   (${(msB / LAYERS).toFixed(3)} ms/layer)`)
+console.log(`  the split costs        ${(msB - msA).toFixed(2)} ms/token  (${((msB / msA - 1) * 100).toFixed(0)}% slower)`)
+console.log(`  pipelined (submit ahead) ${msC.toFixed(2)} ms   (${(msC / LAYERS).toFixed(3)} ms/layer)`)
+console.log(`  per layer overhead     serial ${((msB - msA) / LAYERS).toFixed(3)} ms · pipelined ${((msC - msA) / LAYERS).toFixed(3)} ms`)
+console.log(`  against a ${rtMs.toFixed(3)} ms isolated round trip and ${(msA / LAYERS).toFixed(3)} ms/layer of compute`)
+
 writeFileSync('bench/quality/moe-stream-probe.json', JSON.stringify({
+  splitOneSubmitMs: msA, splitPerLayerMs: msB, splitPipelinedMs: msC, layers: LAYERS,
   writeBuffer: write, readbackMs: rtMs, iters: ITERS,
 }, null, 2))
 console.log(`\nwrote bench/quality/moe-stream-probe.json`)
