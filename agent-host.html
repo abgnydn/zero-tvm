@@ -5,6 +5,11 @@
      forever. share.html and 404.html already carry this; this page did not,
      while robots.txt is Allow: / — so it was indexable. -->
 <meta name="robots" content="noindex">
+<!-- tokens.css FIRST: chat-ui.css is an alias layer over it, so without this
+     14 custom properties were undefined here — including --accent, which made
+     `outline: 2px solid var(--accent)` invalid at computed-value time and so
+     suppressed the browser focus ring page-wide with nothing replacing it. -->
+<link rel="stylesheet" href="/tokens.css">
 <link rel="stylesheet" href="/chat-ui.css">
 <style>
   body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 2rem;
@@ -19,6 +24,13 @@
          margin: 0 }
   code { background: #161b22; padding: .1rem .35rem; border-radius: 4px; color: #d6dbe1 }
   .warn { color: #d29922 }
+  #progress-wrap { display: none }
+  #progress-wrap.active { display: block }
+  #progress-bar { height: 6px; background: #d29922; width: 0%; border-radius: 3px; transition: width .2s }
+  #progress-status { margin-top: .6rem; font-size: 13px }
+  #progress-detail { color: #7d8590; font-size: 12px }
+  #progress-log { white-space: pre-wrap; color: #8b949e; font-size: 12px; max-height: 14rem;
+                  overflow: auto; margin: .6rem 0 0 }
 </style>
 <h1>zero-tvm · agent host</h1>
 <div class="sub">This tab runs the model. <code>scripts/agent-server.mjs</code> gives it an OpenAI-shaped address.</div>
@@ -46,6 +58,11 @@
 
 <div class="card"><pre id="log"></pre></div>
 
-<div id="progress-wrap" hidden><div id="progress"></div><div id="progress-status"></div><div id="progress-detail"></div></div>
+<!-- loading-ui writes to progress-bar / -status / -detail / -log and reveals
+     this by adding .active. The bar was id="progress", there was no log sink,
+     and `hidden` is an attribute that .active cannot override — so a
+     multi-gigabyte download showed "booting…" and nothing else. Same
+     display:none + .active shape share.html already uses. -->
+<div id="progress-wrap" class="card"><div id="progress-bar"></div><div id="progress-status"></div><div id="progress-detail"></div><pre id="progress-log"></pre></div>
 <div id="badge" hidden></div>
 <script type="module" src="/src/zero-tvm/agent-host.ts"></script>

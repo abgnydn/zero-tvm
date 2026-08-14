@@ -155,7 +155,10 @@ section { padding: 72px 0; }
 .sec-head p { color: var(--muted); margin: 12px 0 0; max-width: 66ch; }
 
 /* ── model browser ─────────────────────────────────────────────────── */
-#model-browser:focus-visible { outline: none; }
+/* The container IS the keyboard interface — index.html tells the reader the
+   arrow keys move between models, and this is the element that must be
+   focused for that to work. Removing its ring left no way to tell. */
+#model-browser:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
 .mb-stage { display: flex; align-items: center; gap: 8px; }
 .mb-arrow {
   flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%;

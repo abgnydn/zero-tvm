@@ -334,7 +334,7 @@
       transition: opacity 0.2s, transform 0.2s;
       z-index: 5;
     }
-    .scroll-fab.visible { opacity: 1; pointer-events: auto; }
+    .scroll-fab.visible { opacity: 1; pointer-events: auto; visibility: visible; }
     .scroll-fab:hover { background: var(--panel); color: var(--text); }
 
     /* ─────────── Composer ─────────── */

@@ -320,7 +320,30 @@
 
     .callout-title { font-weight: 700; margin-bottom: 0.3rem; color: inherit; }
 
-    /* ── TABLES ── */
+    /* ── NARROW SCREENS ──
+       This page shipped with NO media query at all, behind a 260px fixed
+       sidebar. At 390px that left main a 130px border-box and, after its 3rem
+       side padding, about 34px of readable text — with the sidebar covering
+       two thirds of the screen. It is nav-linked from every page and sits in
+       the sitemap, so a shared link opened on a phone landed on that. */
+    @media (max-width: 900px) {
+      :root { --sidebar-w: 0px; }
+      aside {
+        position: static; width: auto; min-width: 0; height: auto;
+        border-right: 0; border-bottom: 1px solid var(--border);
+        max-height: 40vh; overflow-y: auto;
+      }
+      main { margin-left: 0; padding: 2rem 1.1rem 4rem; max-width: none; }
+      body { display: block; }
+    }
+
+    /* ── TABLES ──
+       Nineteen of them are direct children of main with no wrapper. The
+       longest unbreakable cell is a weight name like
+       transformer.h.N.post_attention_layernorm.weight, which cannot shrink,
+       so on a phone the table pushed the BODY sideways rather than scrolling
+       inside itself. Each table gets its own scroll container instead. */
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 1rem 0; }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -590,7 +613,7 @@
 
 <p>Four source files make up the engine:</p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th>File</th><th>Role</th></tr></thead>
   <tbody>
     <tr><td><code>src/zero-tvm/chat.ts</code></td><td>Main decode engine + UI. Allocates buffers, builds bind groups, runs the decode loop.</td></tr>
@@ -598,7 +621,7 @@
     <tr><td><code>src/zero-tvm/tokenizer.ts</code></td><td>BPE tokenizer: encode text → token IDs, decode IDs → text.</td></tr>
     <tr><td><code>src/compiler/compiler.ts</code></td><td>Compiles every shader — the hand-written WGSL files plus the generated int4-matmul variants (tiled/subgroup/affine/MoE) — into <code>GPUComputePipeline</code> objects.</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <!-- WEIGHT LOADER -->
 <h2 id="weight-loader">Weight loader</h2>
@@ -625,7 +648,7 @@
 <h3>Parameter naming (MLC format)</h3>
 <p>MLC uses non-standard parameter names. The actual names in the cache:</p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th>MLC name</th><th>Role</th></tr></thead>
   <tbody>
     <tr><td><code>transformer.embd.q_weight</code></td><td>Embedding weights (uint32 packed int4)</td></tr>
@@ -639,7 +662,7 @@
     <tr><td><code>transformer.h.N.mlp.gate_up_proj.q_weight</code></td><td>Layer N FFN gate+up weights</td></tr>
     <tr><td><code>transformer.h.N.mlp.down_proj.q_weight</code></td><td>Layer N FFN down weights</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <!-- TOKENIZER -->
 <h2 id="tokenizer">Tokenizer</h2>
@@ -679,7 +702,7 @@ What is the capital of Australia?&lt;|end|&gt;
   positions it was written at. It is a prefix pool, and cannot become a block pool without moving RoPE.
 </p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th>Parameter</th><th>Value</th><th>Notes</th></tr></thead>
   <tbody>
     <tr><td><code>PAGE_SIZE</code></td><td>16</td><td>slots per page</td></tr>
@@ -687,7 +710,7 @@ What is the capital of Australia?&lt;|end|&gt;
     <tr><td>Bytes per page</td><td>196,608</td><td>32 heads × 16 slots × 96 dims × 2 (K+V) × 2 bytes</td></tr>
     <tr><td>Total KV buffer</td><td>~50 MB per layer</td><td>32 layers = ~1.6 GB</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <p>Each layer has its own <code>GPUBuffer</code> for KV pages. The page table is a simple identity mapping (page i → physical page i) for single-sequence inference.</p>
 
@@ -765,7 +788,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>🔤 1 · Embedding <span class="pill purple">embedding.wgsl</span></h4>
     <p>Token ID lookup with Q4F16 dequantization. Each output element is dequantized from a packed int4 value: <code>(nibble - 7) × scale</code>.</p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>output hidden state</td></tr>
@@ -774,7 +797,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@3</code></td><td><code>read u32[]</code></td><td>packed weights (8 int4 per u32)</td></tr>
         <tr><td><code>@4</code></td><td><code>uniform</code></td><td><code>{ seq_len, packGridDimX }</code></td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 12 workgroups × 256 threads = 3072 output elements (D=3072)</p>
   </div>
 </div>
@@ -784,7 +807,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>📐 2 · RMSNorm <span class="pill purple">rms_norm.wgsl</span></h4>
     <p>Root mean square layer normalization. Computes <code>x / sqrt(mean(x²) + ε) × gamma</code>. Uses 256-thread tree reduction in workgroup shared memory.</p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>normalized output</td></tr>
@@ -792,7 +815,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@2</code></td><td><code>read f16[]</code></td><td>gamma weights</td></tr>
         <tr><td><code>@3</code></td><td><code>uniform</code></td><td><code>{ packGridDimX }</code></td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 workgroup (one token, D=3072)</p>
   </div>
 </div>
@@ -804,7 +827,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <p>
       The big M4 fusion. One dispatch replaces three on the decode path: the int4 QKV matmul, the RoPE rotation of Q and K, and the write of K/V into the paged KV cache. Each workgroup computes two output rows that form a RoPE pair (dim and dim+48 within the same head), rotates the pair in registers, and writes K/V straight into <code>kv_pages</code> — the intermediate <code>qkv</code> / <code>k_out</code> / <code>v_out</code> buffers from the pre-fusion path are skipped entirely.
     </p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>q_out [3072]</td></tr>
@@ -815,7 +838,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@5</code></td><td><code>read i32[]</code></td><td>position map</td></tr>
         <tr><td><code>@6</code></td><td><code>uniform</code></td><td><code>{ position_map_elem_offset, pages_elem_offset, packGridDimX }</code></td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 4,608 workgroups (down from 9,216 matmul + 36 RoPE + 12 KV-append = 9,264 in the pre-fusion path). Decode-only; prefill still uses the 3-dispatch path (see shaders 8 and 9).</p>
   </div>
 </div>
@@ -825,7 +848,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>👁️ 4 · Paged Attention <span class="pill purple">attention.wgsl</span></h4>
     <p>Multi-head attention over the paged KV cache. Reads K and V from pages, computes scaled dot-product attention with an online-softmax reduction in shared memory. Each workgroup handles one attention head.</p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read f16[]</code></td><td>Q [3072]</td></tr>
@@ -836,7 +859,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@5</code></td><td><code>read_write f16[]</code></td><td>attn output [3072]</td></tr>
         <tr><td><code>@6</code></td><td><code>uniform</code></td><td>attention config (scale, pages)</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 × HEADS workgroups (1 × 32). An <code>attention_int8.wgsl</code> variant reads an int8-quantized KV cache; enable via <code>?kv8=1</code>.</p>
   </div>
 </div>
@@ -846,14 +869,14 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>✖️ 5 · int4 Matmul (output projection + LM head) <span class="pill purple">int4_matmul.wgsl</span></h4>
     <p>General-purpose dequantize-on-the-fly int4 × f16 matmul. Used for the attention <em>output projection</em> (3072 → 3072) and the <em>LM head</em> (3072 → 32064). Weights are Q4F16_1: <code>N</code> output rows × 384 u32 columns (each u32 = 8 int4 values = 32 elements, group_size=32). The <code>int4_matmul_tiled.wgsl</code> / <code>_tiled8</code> / <code>_sg</code> variants in the same directory add shared-memory tiling and subgroup reductions; the runtime picks one via the <code>?matmul=</code> URL flag.</p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Uniform field</th><th>Value</th></tr></thead>
       <tbody>
         <tr><td><code>K_groups</code></td><td>384 (= input_dim / 8)</td></tr>
         <tr><td><code>scale_stride</code></td><td>96 (= input_dim / group_size)</td></tr>
         <tr><td><code>N</code></td><td>3072 (o-proj) or 32064 (lm_head)</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> <code>N</code> workgroups — 3,072 for o-proj, 32,064 for lm_head.</p>
   </div>
 </div>
@@ -865,7 +888,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <p>
       Full SwiGLU FFN block in a single dispatch: the gate and up projections (both int4 matmuls sharing the 16,384-row <code>gate_up_proj</code> weight matrix), the SiLU activation, the elementwise multiply, and the final int4 down projection back to 3,072 dims. Intermediate 8,192-dim hidden state is kept in workgroup-shared memory across the two matmul stages.
     </p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>output [3072]</td></tr>
@@ -876,7 +899,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@5</code></td><td><code>read u32[]</code></td><td>down_proj packed weights (3,072 × 1,024)</td></tr>
         <tr><td><code>@6</code></td><td><code>uniform</code></td><td>FFN config</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 3,072 workgroups — one per output row of the down projection. A <code>fused_ffn_tiled_sg.wgsl</code> variant uses subgroup reductions; selectable via URL flag.</p>
   </div>
 </div>
@@ -886,7 +909,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>➕ 7 · Fused Add + RMSNorm <span class="pill purple">add_norm.wgsl</span></h4>
     <p>Residual add + RMSNorm in one pass. Computes <code>residual_out = A + B</code>, then <code>output = RMSNorm(residual_out) × gamma</code>. Used twice per layer (post-attention and post-FFN). Mirrors TVM's <code>fuse_add_norm_decode</code>.</p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read f16[]</code></td><td>A — the new contribution (O-proj or FFN-down output)</td></tr>
@@ -896,7 +919,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@4</code></td><td><code>read_write f16[]</code></td><td>new residual (resOut — ping-pong)</td></tr>
         <tr><td><code>@5</code></td><td><code>uniform</code></td><td><code>{ packGridDimX }</code></td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 workgroup · 256 threads · 12 elements each = 3,072.</p>
   </div>
 </div>
@@ -906,7 +929,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>💾 8 · KV Append (prefill path) <span class="pill purple">kv_append.wgsl</span></h4>
     <p>Writes K and V vectors into the paged KV cache at the correct slot for each position. On the decode path this work is folded into <code>qkv_fused</code>; on prefill it runs as a separate dispatch because prefill processes many tokens at once and the per-token fusion no longer pays off.</p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read f16[]</code></td><td>k_out [3072]</td></tr>
@@ -915,7 +938,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@3</code></td><td><code>read i32[]</code></td><td>position map</td></tr>
         <tr><td><code>@4</code></td><td><code>uniform</code></td><td>page config</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 12 workgroups per token (HEADS=32, HEAD_DIM=96).</p>
   </div>
 </div>
@@ -925,7 +948,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>🌀 9 · RoPE (prefill path) <span class="pill purple">rope.wgsl</span></h4>
     <p>Rotary position embeddings applied to Q and K. Prefill-only — the decode path folds RoPE into <code>qkv_fused</code>. Splits the concatenated 9,216-dim QKV buffer into Q / K / V, rotates Q and K in place based on position, and copies V unchanged.</p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read_write f16[]</code></td><td>q_out [3072]</td></tr>
@@ -935,7 +958,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@4</code></td><td><code>read i32[]</code></td><td>position map</td></tr>
         <tr><td><code>@5</code></td><td><code>uniform</code></td><td>RoPE config</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <div class="callout danger" style="margin-top:0.75rem;">
       <div class="callout-title">Critical binding order</div>
       <p>The binding order <strong>must</strong> be <code>[q_out, k_out, v_out, qkv, posMap, uniform]</code>. Swapping these caused a garbage-output bug during development.</p>
@@ -951,13 +974,13 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <p>
       Parallel-reduction argmax over the 32,064-entry logit buffer produced by the LM-head <code>int4_matmul</code>. Replaces TVM's ~20-dispatch sampling chain (penalty → softmax → cumsum → argsort → gather → …) with a single dispatch. Greedy decoding only; top-k / top-p not wired up yet.
     </p>
-    <table class="binding-table">
+    <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
       <tbody>
         <tr><td><code>@0</code></td><td><code>read f16[]</code></td><td>logits [32064]</td></tr>
         <tr><td><code>@1</code></td><td><code>read_write i32[]</code></td><td>output token id [1]</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 workgroup (tree reduction over 32,064 logits). An <code>argmax_sg.wgsl</code> subgroup variant is available.</p>
   </div>
 </div>
@@ -998,7 +1021,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 
 <p>Weight shapes in Q4F16 (for Phi-3-mini):</p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th>Parameter</th><th>q_weight shape (u32)</th><th>q_scale shape (f16)</th></tr></thead>
   <tbody>
     <tr><td>Embedding</td><td>[32064, 384]</td><td>[32064, 96]</td></tr>
@@ -1008,7 +1031,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Down FFN (per layer)</td><td>[3072, 1024]</td><td>[3072, 256]</td></tr>
     <tr><td>LM head</td><td>[32064, 384]</td><td>[32064, 96]</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <!-- QWEN3 -->
 <h2 id="qwen3">Qwen3-4B (<code>?model=qwen3</code>)</h2>
@@ -1022,7 +1045,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 
 <p>What the port exercises that Phi-3 doesn't:</p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th></th><th>Phi-3-mini (default)</th><th>Qwen3-4B</th></tr></thead>
   <tbody>
     <tr><td>Attention</td><td>MHA, 32/32 heads</td><td>GQA, 32 query heads over 8 KV heads</td></tr>
@@ -1031,7 +1054,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>LM head</td><td>separate</td><td>tied — logits reuse the quantized embedding matrix (151,936 vocab)</td></tr>
     <tr><td>Decode path</td><td>fused, 7 dispatches/layer</td><td>unfused QKV + fused qk_norm+RoPE+append, 8 dispatches/layer</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <p>
   Measured 2026-07-30 on an Apple M2 Max under the corrected protocol (same session, identical local weight
@@ -1060,7 +1083,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 
 <p>What the hybrid adds over Qwen3-4B:</p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th></th><th>Qwen3-4B</th><th>Qwen3.5-4B</th></tr></thead>
   <tbody>
     <tr><td>Layer stack</td><td>36 × attention</td><td>24 × gated DeltaNet + 8 × gated attention (every 4th layer)</td></tr>
@@ -1069,7 +1092,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Vocab</td><td>151,936</td><td>248,320 (renumbered specials — the shipped <code>mlc-chat-config.json</code> still lists stale Qwen3 stop ids; stops resolve from <code>tokenizer.json</code>)</td></tr>
     <tr><td>Weight manifest</td><td><code>ndarray-cache.json</code></td><td><code>tensor-cache.json</code> (MLC renamed it)</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <p>
   Measured 2026-07-30 on an Apple M2 Max under the corrected protocol (same session, identical local weight
@@ -1172,7 +1195,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <!-- BUGS FIXED -->
 <h2 id="bugs-fixed">Bugs we fixed (and how)</h2>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th>Bug</th><th>Symptom</th><th>Fix</th></tr></thead>
   <tbody>
     <tr>
@@ -1196,14 +1219,14 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
       <td>Always fetch index and shards from the same source atomically</td>
     </tr>
   </tbody>
-</table>
+</table></div>
 
 <!-- VS WEBLLM -->
 <h2 id="vs-webllm">vs WebLLM</h2>
 
 <p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same session, same browser (Chrome 150 with WebGPU), Apple M2 Max — <code>npm run bench</code>, 128-token target × 5 runs, median, 2026-07-30 corrected protocol (latest run recorded in <code>bench/results.json</code>). Every run pays a full prefill on both sides, and both metrics are reported: <em>total</em> is wall-clock throughput including prefill, <em>decode</em> excludes it.</p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th></th><th>Zero-TVM</th><th>WebLLM</th></tr></thead>
   <tbody>
     <tr><td>Total throughput (prefill + decode)</td><td><!--bench:zt-->69.55<!--/bench:zt--> tok/s</td><td><!--bench:webllm-->60.0<!--/bench:webllm--> tok/s</td></tr>
@@ -1217,7 +1240,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
     <tr><td>Readable kernels?</td><td>✓ Yes — every .wgsl file is in the repo</td><td>✗ No — emitted by the TVM compiler</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <h3>The corrected protocol (2026-07-30) — and what it invalidated</h3>
 
@@ -1231,14 +1254,14 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 
 <p>Monotonic on both metrics across the three models then shipped, all measured 2026-07-30 on the same machine (Qwen3.6-35B-A3B came later and has no WebLLM baseline to pair against — see BENCH.md):</p>
 
-<table>
+<div class="table-scroll"><table>
   <thead><tr><th>Model</th><th>Architecture released</th><th>Δ total</th><th>Δ decode</th></tr></thead>
   <tbody>
     <tr><td>Phi-3-mini</td><td>2024</td><td>+16.0%</td><td>+31.4%</td></tr>
     <tr><td>Qwen3-4B</td><td>2025</td><td>+31.7%</td><td>+58.0%</td></tr>
     <tr><td>Qwen3.5-4B</td><td>2026</td><td>+100.5%</td><td>+113.6%</td></tr>
   </tbody>
-</table>
+</table></div>
 
 <p>The reading that fits: compiler stacks have had less time to tune newer architectures, so there is more headroom for a hand-written kernel set to take. That is an <strong>observation across three points</strong>, not a proven law — one machine, one browser, one day, no mechanism isolated, and no control for how differently each model stresses the two engines. Worth testing on a fourth model.</p>
 
