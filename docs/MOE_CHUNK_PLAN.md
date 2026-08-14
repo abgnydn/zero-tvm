@@ -208,3 +208,47 @@ Worth building. 8.6 GB at 36-48 t/s against 16 GB at 88 t/s, and 4.6 GB for the
 35B. The order is: slot pool + OPFS streaming first (LRU, nothing cleverer),
 then next-layer speculation, which is worth more here than any policy change
 because it attacks the readback rather than the hit rate.
+
+
+## Repriced 2026-08-14 after measuring a miss end to end
+
+The projection above priced a miss as a `writeBuffer`. That is the GPU half.
+`scripts/moe-slab-probe.mjs` measures both halves against a real checkpoint:
+
+| stage | ms | GB/s |
+|---|---:|---:|
+| disk read (2.53 MiB, random offset) | 0.174 | 15.26 |
+| writeBuffer upload | 0.318 | 8.35 |
+| **chained — what a miss is** | **1.007** | 2.63 |
+
+Chained costs MORE than read plus upload because they do not pipeline:
+`writeBuffer` snapshots its source, so the next read cannot begin until the copy
+finishes. A miss is 1.007 ms, 3.4x the 0.292 ms the earlier projection used.
+
+Two methodology notes, both of which cost a wrong number first:
+
+- The first version reused one offset list across arms, so the read-only pass
+  warmed the page cache for the chained pass and "chained" came out FASTER than
+  "read alone" — impossible, and exactly how a benchmark reports a speed the
+  machine cannot deliver. Arms use disjoint offsets now.
+- The read arm ran at **15 GB/s, which is RAM, not disk**. A 16 GiB checkpoint
+  on a 32 GiB machine is largely page-cached. On the machine this feature
+  exists for — one too small to hold the checkpoint — reads are cold and
+  slower. Treat 1.007 ms as a floor.
+
+### The pool has to be big
+
+| pool | resident | miss | serial | pipelined |
+|---|---:|---:|---:|---:|
+| 13/128 | 2.5 GB | 50% | 8.2 t/s | 9.7 t/s |
+| 32/128 | 4.8 GB | 22% | 15.3 t/s | 21.4 t/s |
+| 64/128 | 8.6 GB | 6% | 31.9 t/s | **78.1 t/s** |
+
+The small pools are gone. At 50% miss a token pays 102 ms of transfer and no
+amount of pipelining rescues it. The half pool survives because its miss rate is
+6%, which is few enough that the transfer hides under compute.
+
+**So the honest offer is 8.6 GB at 31-78 t/s, against 16 GB at 88 t/s** — half
+the memory, and the spread depends entirely on whether the engine submits the
+next layer before awaiting the previous readback. The 2.5 GB configuration that
+looked attractive is not usable.

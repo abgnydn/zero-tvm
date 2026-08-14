@@ -174,12 +174,20 @@ const slabMiB = bytesPerExpert / 2 ** 20
 const sizes = Object.keys(probe.writeBuffer).map(Number)
 const near = sizes.reduce((a, b) => (Math.abs(b - slabMiB) < Math.abs(a - slabMiB) ? b : a))
 const GBPS = probe.writeBuffer[near].gbps
+// A miss is a disk read THEN an upload, and they do not pipeline: writeBuffer
+// snapshots its source, so the next read cannot start until the copy is done.
+// Measured end to end by moe-slab-probe.mjs at 1.007 ms for a 2.53 MiB slab —
+// 3.4x what the upload alone costs. Pricing a miss as an upload was wrong.
+let slab = null
+try { slab = JSON.parse(readFileSync('bench/quality/moe-slab-probe.json', 'utf8')) } catch { /* optional */ }
 const READBACK_MS = probe.readbackMs
 
 // Decode compute with everything resident — what the engine does today.
 const COMPUTE_MS = { 'qwen3-30b-a3b-4bit': 1000 / 88.4, 'qwen36-35b-a3b-q3': 1000 / 74.87 }[t.specId] ?? 12
 
 console.log(`\n  projection — ${slabMiB.toFixed(2)} MiB per expert`)
+if (slab) console.log(`    miss      ${(slab.missMs * (bytesPerExpert / slab.slabBytes)).toFixed(3)} ms `
+  + `(measured end to end: disk read + upload, they do not pipeline)`)
 console.log(`    transfer  ${GBPS.toFixed(2)} GB/s   (measured at ${near} MiB)`)
 console.log(`    readback  ${READBACK_MS.toFixed(3)} ms x ${layers} layers = ${(READBACK_MS * layers).toFixed(1)} ms/token`)
 console.log(`    compute   ${COMPUTE_MS.toFixed(1)} ms/token (all experts resident, measured)`)
@@ -194,7 +202,10 @@ console.log(`\n  ${'pool'.padEnd(12)} ${'miss'.padStart(6)} ${'xfer ms'.padStart
 for (const f of FRACTIONS) {
   const best = Math.max(...results[f].slice(0, 3))     // best IMPLEMENTABLE policy
   const misses = layers * topK * (1 - best)
-  const xfer = misses * bytesPerExpert / (GBPS * 1e9) * 1000
+  // Scale the measured miss to this model's slab size; the probe ran at 2.53
+  // MiB and the 35B's experts are 1.31.
+  const perMiss = slab ? slab.missMs * (bytesPerExpert / slab.slabBytes) : bytesPerExpert / (GBPS * 1e9) * 1000
+  const xfer = misses * perMiss
   // SERIAL / PIPELINED overheads are MEASURED by moe-stream-probe.mjs, not
   // derived from the isolated round trip. Splitting the encoder per layer costs
   // 0.184 ms/layer when each readback is awaited before the next submit, and
