@@ -164,7 +164,7 @@
     .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
     .badge.loading { color: #fbbf24; background: rgba(251, 191, 36, 0.08); border-color: rgba(251, 191, 36, 0.24); }
     .badge.loading .dot { background: #fbbf24; animation: pulse 1.4s infinite; }
-    .badge.ready   { color: var(--accent); background: var(--accent-tint); border-color: rgba(16, 185, 129, 0.3); }
+    .badge.ready   { color: var(--accent); background: var(--accent-tint); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
     .badge.ready .dot { background: var(--accent); }
     .badge.error   { color: var(--danger); background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.25); }
     .badge.error .dot { background: var(--danger); }
@@ -206,7 +206,7 @@
       width: 52px;
       height: 52px;
       border-radius: 14px;
-      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      background: linear-gradient(135deg, var(--accent), var(--accent-hi));
       display: flex;
       align-items: center;
       justify-content: center;
@@ -214,7 +214,7 @@
       color: #000;
       letter-spacing: -0.04em;
       font-size: 1.25rem;
-      box-shadow: 0 8px 32px rgba(16, 185, 129, 0.16);
+      box-shadow: 0 8px 32px color-mix(in srgb, var(--accent) 16%, transparent);
     }
     .welcome-title {
       font-size: 1.55rem;
@@ -312,7 +312,15 @@
       max-height: calc(100vh - 2rem);
       box-shadow: 0 20px 60px rgba(0,0,0,0.5);
     }
-    .dialog-models { padding: 0.85rem 1.25rem; border-top: 1px solid var(--border); }
+    /* No negative margin: it pulled the canvas up into the hero's padding,
+       where the dialog clipped the character's hair flat. */
+    .dialog-mascot { display: block; width: 100%; height: 210px; margin: 0 0 0.35rem; }
+    /* The same character, small, beside the model name — so closing the gate
+       does not drop the thing the page was themed around. */
+    .header-mascot { display: block; width: 40px; height: 40px; flex: 0 0 auto; }
+    .dialog-models { padding: 0.85rem 1.25rem; border-top: 1px solid var(--border); text-align: center; }
+    .dm-change { font-size: 0.8rem; color: var(--text-dim); }
+    .dm-change:hover { color: var(--accent); }
     .dialog-models .dm-label {
       font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.07em;
       color: var(--muted); margin-bottom: 0.5rem;
@@ -326,7 +334,7 @@
     }
     .dialog-models .dm-chip:hover { border-color: var(--border-2); background: #1b1b22; }
     .dialog-models .dm-chip[aria-pressed="true"] {
-      border-color: rgba(16, 185, 129, 0.45); background: var(--accent-tint);
+      border-color: var(--accent); background: var(--accent-tint);
     }
     .dialog-models .dm-chip .n { font-size: 0.78rem; font-weight: 600; color: var(--text); }
     .dialog-models .dm-chip .s { font-size: 0.66rem; color: var(--muted); }
@@ -344,7 +352,7 @@
     .dialog-logo {
       width: 52px; height: 52px;
       border-radius: 14px;
-      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      background: linear-gradient(135deg, var(--accent), var(--accent-hi));
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -457,7 +465,7 @@
     .progress-fill {
       height: 100%;
       width: 0;
-      background: linear-gradient(90deg, var(--accent), #8b5cf6);
+      background: linear-gradient(90deg, var(--accent), var(--accent-hi));
       border-radius: 999px;
       transition: width 0.25s ease;
     }
@@ -532,18 +540,17 @@
   <!-- ─────────── Pre-download gate ─────────── -->
   <dialog id="start-dialog">
     <div class="dialog-hero">
-      <div class="dialog-logo">Z</div>
+      <canvas class="dialog-mascot" id="gate-mascot" aria-hidden="true"></canvas>
       <div class="dialog-title">Phi-3-mini on raw WebGPU</div>
-      <div class="dialog-sub">Runs entirely in your browser on 10 hand-written WGSL kernels. No server, no API calls, no data leaves this tab.</div>
+      <div class="dialog-sub">Runs in your browser on hand-written WGSL kernels. Weights download once and cache locally; prompts and generation stay on this machine.</div>
     </div>
     <div class="dialog-stats">
       <div class="dstat"><div class="val">~2 GB</div><div class="lab">weights</div></div>
       <div class="dstat"><div class="val">60+ t/s</div><div class="lab">M2 Max</div></div>
-      <div class="dstat"><div class="val">f16</div><div class="lab">WebGPU</div></div>
+      <div class="dstat"><div class="val" id="gate-ctx">&mdash;</div><div class="lab">context</div></div>
     </div>
     <div class="dialog-models">
-      <div class="dm-label">Model</div>
-      <div class="dm-chips" id="dialog-models"></div>
+      <a class="dm-change" href="/#models">Pick a different model →</a>
     </div>
     <div class="dialog-notes">
       <ul>
@@ -554,7 +561,7 @@
     </div>
     <div class="dialog-actions">
       <a class="dialog-btn" data-variant="cancel" href="/">Not now</a>
-      <button class="dialog-btn" data-variant="primary" id="start-btn">Download &amp; start →</button>
+      <button class="dialog-btn" data-variant="primary" id="start-btn" autofocus>Download &amp; start →</button>
     </div>
   </dialog>
 
@@ -619,7 +626,7 @@
             <span class="welcome-pill">Runs on your GPU · WebGPU</span>
             <span class="welcome-pill">On-device only</span>
           </div>
-          <div class="welcome-sub">Running locally on your GPU through 10 hand-written WGSL kernels. Nothing leaves this tab — prompts, tokens and KV cache all stay in your browser.</div>
+          <div class="welcome-sub">Running on your own GPU through hand-written WGSL kernels. Prompts, tokens and the KV cache stay in this tab.</div>
           <div class="suggest-grid" id="suggest-grid">
             <button class="suggest" data-prompt="Explain WebGPU compute shaders in three sentences.">
               <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M19.07 4.93L4.93 19.07"/></svg></span>

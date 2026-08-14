@@ -31,6 +31,16 @@
       --font:        var(--body);
     }
 
+    /* The browser's default focus ring is blue, which on this palette reads as
+     * a second selected state next to the amber one — in the model picker two
+     * chips looked chosen at once. Shared by the chat page and the rooms guest,
+     * matching landing.css. */
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: var(--radius);
+    }
+
     /* ─────────── Chat area ─────────── */
     .chat-main {
       overflow-y: auto;

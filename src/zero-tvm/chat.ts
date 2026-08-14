@@ -14,6 +14,7 @@
 import { opfsDirFor } from './weight-loader.js'
 import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
 import { initModelSwitcher } from './model-switcher.js'
+import { mountMascot, mascotPalette } from '../mascot.js'
 import { initSamplingControls } from './sampling-ui.js'
 import {
   allocKVPages,
@@ -599,7 +600,21 @@ function applyModelBranding(): void {
   const statVals = document.querySelectorAll('#start-dialog .dialog-stats .dstat .val')
   if (statVals[0]) statVals[0].textContent = BRAND.sizeLabel   // download size
   if (statVals[1]) statVals[1].textContent = BRAND.rateLabel   // measured decode rate
+  // Context is derived from the spec (maxPages x pageSize), like every other
+  // figure on this page. The slot used to read a static 'f16 / WebGPU'.
+  set('#gate-ctx', `${Math.round(SPEC.maxContext / 1024)}K`)
   set('.model-info h1', BRAND.name)
+  {
+    const host = document.querySelector('.model-info')
+    if (host && !document.getElementById('header-mascot')) {
+      const c = document.createElement('canvas')
+      c.id = 'header-mascot'
+      c.className = 'header-mascot'
+      c.setAttribute('aria-hidden', 'true')
+      host.parentElement?.insertBefore(c, host)
+      void mountMascot(c, SPEC).then((m) => { if (!m) c.remove() }).catch(() => c.remove())
+    }
+  }
   set('#welcome .welcome-title', `Chat with ${BRAND.name}`)
 }
 
@@ -611,6 +626,32 @@ let liveEngine: import('./engine-core.js').DecodeEngine | null = null
 async function boot(): Promise<void> {
   applyModelBranding()
   initModelSwitcher(SPEC)
+  // The gate used to show a generic logo and a second model picker. By the
+  // time anyone reaches it they have already chosen — on the landing, or via
+  // ?model= — so the picker was asking a settled question. It shows THIS
+  // model's character instead, and the download it is about to commit to.
+  // Failure is silence: a browser without WebGPU still gets the gate, and the
+  // canvas simply removes itself.
+  // THEME FROM THE CHARACTER. The accent on this page is the model's own lane
+  // colour, so the creature on the gate and the buttons around it are the same
+  // colour — and that colour says what the architecture is rather than being
+  // picked per page. Amber stays the site's colour on the landing, where no
+  // single model is in view.
+  {
+    const { accent, accentHi } = mascotPalette(SPEC)
+    const root = document.documentElement.style
+    root.setProperty('--accent', accent)
+    root.setProperty('--accent-hi', accentHi)
+    root.setProperty('--accent-2', accentHi)
+    root.setProperty('--accent-dim', `${accent}22`)
+    root.setProperty('--accent-tint', `${accent}1f`)
+  }
+  {
+    const canvas = document.getElementById('gate-mascot') as HTMLCanvasElement | null
+    if (canvas) {
+      void mountMascot(canvas, SPEC).then((m) => { if (!m) canvas.remove() }).catch(() => canvas.remove())
+    }
+  }
   initSamplingControls(() => liveEngine)
   // Register the weight-cache SW first so it intercepts the very first
   // network fetch (from bootEngine's loadWeights call) — and any future

@@ -52,6 +52,29 @@ function buildGroups(): Group[] {
 
 const GROUPS = buildGroups()
 
+/** Spec ids whose weights are already in OPFS. Filled asynchronously; the
+ *  picker renders without waiting, and a model that turns out to be cached
+ *  simply gains a line when the probe lands. Restoring this — the carousel
+ *  rewrite dropped it — matters most on exactly the models where it is worth
+ *  knowing, since a 16 GB download is not something to start twice. */
+const CACHED = new Set<string>()
+
+async function probeCached(repaint: () => void): Promise<void> {
+  if (!('gpu' in navigator) || !navigator.storage?.getDirectory) return
+  try {
+    const { opfsDirFor } = await import('./zero-tvm/weight-loader.js')
+    const root = await navigator.storage.getDirectory()
+    for (const { spec } of SHIPPED_MODELS) {
+      try {
+        const dir = await root.getDirectoryHandle(opfsDirFor(spec))
+        await dir.getFileHandle(spec.manifestName ?? 'ndarray-cache.json')
+        CACHED.add(spec.id)
+      } catch { /* not cached */ }
+    }
+    repaint()
+  } catch { /* no WebGPU / import failed — badges stay hidden */ }
+}
+
 function render(): void {
   const host: HTMLElement | null = document.getElementById('model-browser')
   if (host === null) return
@@ -67,6 +90,7 @@ function render(): void {
           <div class="mb-params"></div>
           <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
           <dl class="mb-stats"></dl>
+          <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
           <p class="mb-ram"></p>
           <a class="mb-cta btn btn-primary">Open chat</a>
         </div>
@@ -117,6 +141,9 @@ function render(): void {
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
     }
+    const cached = el<HTMLElement>('.mb-cached')
+    cached.hidden = !CACHED.has(v.spec.id)
+
     mascot?.setSpec(v.spec)
   }
 
@@ -145,6 +172,7 @@ function render(): void {
   art.addEventListener('mouseleave', () => mascot?.setHover(false))
 
   paint()
+  void probeCached(paint)
   void mountMascot(canvas, GROUPS[gi].variants[vi].spec).then((m) => {
     if (!m) { art.style.display = 'none'; return }
     mascot = m

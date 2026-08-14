@@ -290,6 +290,23 @@ const IRIS = {
   embed: [0.45, 0.50, 0.58],
 }
 
+/** The lane a model's character belongs to, as CSS. The chat page themes
+ *  itself from this, so the accent on screen is the same colour as the
+ *  creature that was on the loading gate — one model, one colour, and both
+ *  derived from the architecture rather than picked per page. */
+export function mascotPalette(spec: ModelSpec): { accent: string; accentHi: string } {
+  const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
+  const coil = gdn / Math.max(spec.layers, 1)
+  const lane = spec.embeddingOnly === true ? 'embed'
+    : spec.moe != null ? 'moe'
+    : spec.mla != null ? 'mla'
+    : coil > 0.1 ? 'hybrid' : 'dense'
+  const hex = (c: number[]): string =>
+    '#' + c.map((v) => Math.round(Math.min(1, v) * 255).toString(16).padStart(2, '0')).join('')
+  const base = HAIR[lane as keyof typeof HAIR]
+  return { accent: hex(base), accentHi: hex(base.map((v) => v * 0.55 + 0.45)) }
+}
+
 /** Spec → the numbers the shader draws. Nothing is authored per model. */
 export function mascotParams(spec: ModelSpec): Float32Array<ArrayBuffer> {
   const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
