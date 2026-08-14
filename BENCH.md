@@ -1652,9 +1652,12 @@ BROWSER. Native is a different number and the two are never mixed in one column
 | qwen3mlx | **80.78** | 90.88 | 150 ms | 68.9-81.2 |
 | qwen30b | **74.96** | 88.40 | 171 ms | 66.4-75.6 |
 | qwen36q3 | **65.56** | 74.87 | 194 ms | 65.3-65.6 |
+| qwen35mlx | **42.82** | 48.28 | 295 ms | 40.4-46.8 |
 
 qwen36q3 supersedes the `~55 t/s` that card carried, which was explicitly a
-single owner-run rather than a protocol round.
+single owner-run rather than a protocol round. qwen35mlx (added 2026-08-14) is
+the 9B the LM Studio head-to-head runs; 42.82 in the browser against 40.4 on
+the native host, the same direction the qwen35 pair already showed.
 
 Two things this column does NOT yet say:
 

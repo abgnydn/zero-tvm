@@ -164,7 +164,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // Not a chat model. Its output is the pooled hidden state, so rateLabel stays
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },
-  [QWEN3_5_9B_MLX_4BIT.id]: { name: 'Qwen3.5-9B', params: '9B hybrid (DeltaNet)', sizeLabel: '~4.7 GB', rateLabel: '' },
+  [QWEN3_5_9B_MLX_4BIT.id]: { name: 'Qwen3.5-9B', params: '9B hybrid (DeltaNet)', sizeLabel: '~4.7 GB', rateLabel: '~43 t/s' },
   // ADD-MODEL:BRANDINGS
 }
 

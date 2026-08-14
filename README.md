@@ -199,17 +199,17 @@ src/
 WebLLM is the obvious comparison and the one this repo started with. LM Studio
 is the harder one: a native MLX runtime with no browser between it and the GPU.
 
-Both sides load the **same checkpoint bytes** (`mlx-community/Qwen3-4B-4bit`,
-2,278,972,183 bytes, verified on each side). Our arm is the native host on
-dawn.node; ~980-token prompt, 128 decode tokens, three interleaved rounds,
-medians of three separate processes, one M2 Max.
+Both sides load the **same files** — `.weights-local/` symlinks LM Studio's own
+store, so there is one copy on disk and the only difference left is the
+runtime. `lmstudio-community/Qwen3.5-9B-MLX-4bit`, ~1010-token prompt, 128
+decode tokens, three interleaved rounds, medians, one M2 Max.
 
 | | zero-tvm | LM Studio | |
 |---|---:|---:|---|
 | context | 262,144 tokens | 198,400 | **1.32x us** |
 | cold prefix restore | ~0.4 s from disk | rebuilt each start | **~35x us** |
-| prefill | 497 / 467 / 458 tok/s | 427 / 423 / 411 | **1.10-1.16x us** |
-| decode | 71.2 / 65.4 / 62.9 tok/s | 78.7 / 76.2 / 74.0 | 0.85-0.90x |
+| prefill | 307 / 302 / 298 tok/s | 254 / 245 / 240 | **1.23x us** |
+| decode | 40.4 / 42.1 / 39.9 tok/s | 43.8 / 42.8 / 42.1 | 0.94x |
 
 Context is structural rather than tuning: KV lives on 8 of 32 layers, so a
 token costs ~32 KiB against their ~101 KiB and the model's full native window
@@ -217,14 +217,32 @@ fits. The restore figure is a category difference — our prefix cache is in
 OPFS and survives a reload or a crash, theirs is in RAM and ends with the
 process.
 
-Decode is the axis still behind. These are whole-runtime numbers, not kernel
-numbers — LM Studio's arm carries an HTTP server, its own tokenizer and
-sampler; ours carries dawn.node. Neither column isolates a kernel, so nothing
-here says our WGSL beats MLX's Metal. Reproduce with:
+### The kernels themselves are SLOWER
+
+That table compares two runtimes. It says nothing about the shaders, so the
+shaders were measured separately — one kernel per side, matched shapes,
+4-bit/group-64/affine on both, the two processes alternated and paired
+(`scripts/kernel-ab.mjs`):
+
+| shape | M | ours | MLX | **MLX is** |
+|---|---:|---:|---:|---:|
+| ffn_gate_up | 1 | 0.240 ms | 0.202 ms | **1.19x** |
+| ffn_down | 1 | 0.177 ms | 0.094 ms | **1.89x** |
+| o_proj | 1 | 0.103 ms | 0.045 ms | **2.29x** |
+| every shape | 256 | 5.3-5.9 TFLOP/s | ~8.2 TFLOP/s | **1.39-1.53x** |
+
+**MLX wins every shape.** So the two results disagree in sign, and both are
+real: this engine leads on prefill and sits within 6% on decode while running
+kernels that are 1.4-2.3x slower. Whatever advantage it has is not kernel
+speed — it is chunked prefill, the prefix cache, dispatch structure, and
+whatever LM Studio spends around its own kernels.
+
+Reproduce either half with:
 
 ```bash
-MODEL=qwen3mlx GEMM=e5 node --experimental-strip-types \
-  scripts/lmstudio-ab.mjs --native
+MODEL=qwen35mlx LMS_MODEL=mid node --experimental-strip-types \
+  scripts/lmstudio-ab.mjs --native          # runtime vs runtime
+node --experimental-strip-types scripts/kernel-ab.mjs   # kernel vs kernel
 ```
 
 The harness refuses to report a round that was served from either engine's
