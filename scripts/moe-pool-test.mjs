@@ -175,18 +175,30 @@ check('unpooled arm produced tokens', ref.every((x) => x.tokens.length > WARMUP)
 check('unpooled arm reports no pool', ref.every((x) => x.pool === null), 'getPoolStats null')
 
 for (const slots of sizes) {
-  let same = true, at = -1, roundOf = -1
+  let same = true
+  const diverged = []
   const rates = [], hits = []
   for (let r = 0; r < ref.length; r++) {
     const got = runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots })
     rates.push(got.tokS)
     if (got.pool) hits.push(got.pool.hitRate)
     const i = got.tokens.findIndex((t, k) => t !== ref[r].tokens[k])
-    if (got.tokens.length !== ref[r].tokens.length || i >= 0) { same = false; at = i; roundOf = r }
+    if (got.tokens.length !== ref[r].tokens.length || i >= 0) {
+      same = false
+      // EVERY round, not just the last. This used to overwrite `at` per round,
+      // so a multi-round run reported one index and hid the rest — and the
+      // pattern ACROSS prompts is the diagnostic: an index that moves with
+      // prompt length is positional (a KV page boundary), one that does not is
+      // a property of the pool itself.
+      diverged.push({ round: r, at: i, prompt: prompts[r].slice(0, 38) })
+    }
   }
   check(`pool ${slots}/${E} token-identical`, same,
     same ? `${ref[0].tokens.length} tokens x ${ref.length} rounds`
-      : `round ${roundOf} diverges at token ${at}`)
+      : `${diverged.length}/${ref.length} rounds diverge`)
+  for (const d of diverged) {
+    console.log(`      round ${d.round} diverges at token ${d.at}  "${d.prompt}…"`)
+  }
   if (hits.length) {
     const h = med(hits) * 100
     const want = PREDICTED[slots]
