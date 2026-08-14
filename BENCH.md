@@ -1736,10 +1736,17 @@ interleaved rounds, medians; three separate processes.
 | prefill tok/s | 497 / 467 / 458 | 427 / 423 / 411 | **1.10-1.16x us** |
 | decode tok/s | 71.2 / 65.4 / 62.9 | 78.7 / 76.2 / 74.0 | 0.85-0.90x |
 
-**Prefill is won.** The 0.17x -> 0.35x arc in this file was measured against
-LM Studio's 1,385 tok/s on Qwen3.5-4B; on the same bytes and the same model,
-our chunked prefill with E5 is ahead. Decode remains the gap, unchanged in
-character at ~0.85x.
+**Our prefill is ahead of theirs in this run**, on this model and this machine.
+The 0.17x -> 0.35x arc earlier in this file was measured against LM Studio's
+1,385 tok/s on Qwen3.5-4B; on the same bytes and the same model our chunked
+prefill with E5 leads. Decode remains the gap at ~0.85x.
+
+Read that as a runtime result, NOT a kernel result. Both sides here are whole
+pipelines — theirs carries an HTTP server, their tokenizer, their sampler and
+scheduler; ours carries dawn.node's submit path — and nothing in this table
+isolates a kernel from the runtime around it. "Our GEMM beats MLX's GEMM" is a
+different claim needing a different measurement: matched shapes, both kernels
+timed alone. `scripts/mlx-kernel-ab.py` is that measurement; this is not.
 
 Three defects had to be fixed before any of this meant anything, and each one
 printed a plausible-looking number first:

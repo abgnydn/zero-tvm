@@ -217,7 +217,10 @@ fits. The restore figure is a category difference — our prefix cache is in
 OPFS and survives a reload or a crash, theirs is in RAM and ends with the
 process.
 
-Decode is the axis still behind. Reproduce with:
+Decode is the axis still behind. These are whole-runtime numbers, not kernel
+numbers — LM Studio's arm carries an HTTP server, its own tokenizer and
+sampler; ours carries dawn.node. Neither column isolates a kernel, so nothing
+here says our WGSL beats MLX's Metal. Reproduce with:
 
 ```bash
 MODEL=qwen3mlx GEMM=e5 node --experimental-strip-types \
