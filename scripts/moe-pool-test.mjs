@@ -47,6 +47,7 @@ const ROUNDS = Number(process.env.ROUNDS) || 4
 const TOKENS = Number(process.env.TOKENS) || 64
 const WARMUP = 8
 const FRACTIONS = (process.env.POOLS ?? '0.10,0.25,0.50').split(',').filter(Boolean).map(Number)
+const GEN = process.env.GEN ?? 'pipelined'
 
 let failed = false
 const check = (name, ok, detail) => {
@@ -104,10 +105,20 @@ if (ARM) {
   built.engine.resetKVTracking()
   const t0 = performance.now()
   let tWarm = 0
-  await built.engine.generatePipelined(ids, ARM.tokens, (t) => {
+  const onTok = (t) => {
     out.push(t)
     if (out.length === ARM.warmup) tWarm = performance.now()
-  }, () => false)
+  }
+  // GEN=blocking runs the readback-per-token generate() instead of the
+  // pipelined one. generatePipelined keeps PIPELINE_DEPTH tokens in flight with
+  // argmax chained on-GPU, and the POOLED path has to read B.moeIds back
+  // mid-forward and then overwrite it with slot indices — one buffer, several
+  // tokens in flight. This flag is how that is tested rather than argued about.
+  if (ARM.gen === 'blocking') {
+    await built.engine.generate(ids, 0, ARM.tokens, onTok)
+  } else {
+    await built.engine.generatePipelined(ids, ARM.tokens, onTok, () => false)
+  }
   const t1 = performance.now()
   if (out.length <= ARM.warmup) {
     console.log(JSON.stringify({ error: `generated ${out.length} tokens, need > ${ARM.warmup}` }))
@@ -168,7 +179,7 @@ const prompts = [
 // ---- correctness: token identity, per pool size -------------------------
 const ref = []
 for (let r = 0; r < Math.min(ROUNDS, prompts.length); r++) {
-  ref.push(runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots: 0 }))
+  ref.push(runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots: 0, gen: GEN }))
 }
 check('unpooled arm produced tokens', ref.every((x) => x.tokens.length > WARMUP),
   `${ref[0].tokens.length} tokens/round`)
@@ -179,7 +190,7 @@ for (const slots of sizes) {
   const diverged = []
   const rates = [], hits = []
   for (let r = 0; r < ref.length; r++) {
-    const got = runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots })
+    const got = runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots, gen: GEN })
     rates.push(got.tokS)
     if (got.pool) hits.push(got.pool.hitRate)
     const i = got.tokens.findIndex((t, k) => t !== ref[r].tokens[k])

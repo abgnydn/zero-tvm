@@ -252,3 +252,56 @@ amount of pipelining rescues it. The half pool survives because its miss rate is
 the memory, and the spread depends entirely on whether the engine submits the
 next layer before awaiting the previous readback. The 2.5 GB configuration that
 looked attractive is not usable.
+
+
+## Measured in the engine — 2026-08-14, scripts/moe-pool-test.mjs
+
+The projections above finally met the engine. What held, what did not:
+
+### Correct on the blocking path, broken under generatePipelined
+
+Pooled `generate()` is TOKEN-IDENTICAL to unpooled over 512 tokens, on both
+MoE models — and blocking uses the same recordForwardPooled, the same mid-token
+submits and readbacks, so the cut itself is sound. `generatePipelined` with
+pooling diverges (3 of 4 prompts, at token 116/485/48; deterministic — two
+pooled runs agree with each other). The narrowing that got there, each step a
+run, not an argument:
+
+- unpooled vs unpooled across processes: identical (the harness premise holds
+  — scripts/moe-pool-control.mjs, which now exists to check it)
+- pooled vs pooled: identical, so not a race
+- FULL pool, eviction impossible: still diverges → eviction innocent
+- slab bytes vs stacked bytes (scripts/moe-slab-bytes.mjs, CPU-only): all nine
+  MoE tensors byte-identical → the load paths agree
+- blocking generate: identical → the fault is the interaction with the
+  pipeline's in-flight tokens, most plausibly B.moeIds being read back and
+  overwritten mid-forward while argmax→inputIds chains on-GPU
+
+### Warm hit rates transfer; the cold ones do not
+
+| model | pool | hit rate warm (512 tok) | predicted |
+|---|---|---:|---:|
+| qwen30b | 64/128 | 95.3% | 94.5% |
+| qwen36q3 | 128/256 | 93.5% | — |
+
+24-token runs report 77-81% on both models — that is the empty pool filling,
+not the policy. The replay's scoring reproduces within a point on its own
+model, and the 35B's locality is nearly as good. 128 slots of 256 experts on
+the q3 build is ~8.4 GB of experts+dense against 15.7 GB whole: a 35B that
+fits a 16 GB machine, token-exact on the blocking path.
+
+### The readback is the whole cost, and speculation cannot hide it
+
+Full pool, 97.8% hits, nothing to fetch after warmup: 18-20 t/s against 87-93
+unpooled (pipelined arms, AC). The loss is the per-layer submit + mapAsync and
+nothing else — with zero misses there is no transfer to overlap, and
+"speculation only warms the pool" (engine-core.ts), so expertSpeculate does not
+touch this. The 78.1 t/s pipelined projection above assumed the readback could
+hide behind compute; in the engine the readback IS the stall.
+
+The direction that would fix it: keep the expert→slot map ON the GPU so the
+router's output is translated without a round trip, and surface only MISSES to
+the CPU. At 93.5% hits a token pays ~2-3 actual stalls instead of one per
+pooled layer. That is a redesign of the pooled recorder, not a tune — and it is
+the gate on this whole feature, because every measured configuration is
+readback-bound, not bandwidth-bound.
