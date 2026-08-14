@@ -30,7 +30,7 @@ import { toF16, f16Array } from '../tests/kernels/half.mjs'
 import { int4MatmulWGSL, int4MatmulEntry, int4MatmulSgE5WGSL } from '../src/compiler/shaders/int4_matmul.gen.ts'
 
 const JSON_OUT = process.argv.includes('--json')
-const ITERS = Number(process.env.ITERS) || 20
+const ITERS = Number(process.env.ITERS) || 200
 
 await installShims({ unsafe: true })
 const adapter = await navigator.gpu.requestAdapter()
@@ -90,13 +90,19 @@ for (const { name, K, N } of SHAPES) {
   for (const M of MS) {
     const CAP = Math.max(M, 64)   // E5 stages a 64-row tile whatever M is
     const aB = buf(f16Array(Array.from({ length: CAP * K }, () => toF16(rnd() * 2 - 1))), ST)
-    const oB = device.createBuffer({ size: CAP * N * 2, usage: ST })
+    // ONE OUTPUT PER ROTATION, not one shared. Dispatches that all write the
+    // same buffer are a write-after-write hazard and the driver serializes
+    // them — so a shared output measures single-dispatch LATENCY, while the
+    // engine (and MLX's arm, whose every call returns a fresh array) overlaps
+    // independent work. Sharing one made this read ~39 ms of kernels for a
+    // token the engine decodes in 24.8 ms, which is what exposed it.
+    const oBs = Array.from({ length: COPIES }, () => device.createBuffer({ size: CAP * N * 2, usage: ST }))
     const pod = buf(new Uint32Array([KP, SPR, N, M]), GPUBufferUsage.UNIFORM)
     const wide = M > 1
     const pipe = wide ? e5Pipe : matvecPipe
-    const bgs = wSets.map((ws) => device.createBindGroup({
+    const bgs = wSets.map((ws, bgi) => device.createBindGroup({
       layout: pipe.getBindGroupLayout(0),
-      entries: [oB, aB, ws.scB, ws.wB, pod, ws.biB].map((b, i) => ({ binding: i, resource: { buffer: b } })),
+      entries: [oBs[bgi], aB, ws.scB, ws.wB, pod, ws.biB].map((b, j) => ({ binding: j, resource: { buffer: b } })),
     }))
     const bg = bgs[0]
     const grid = wide
@@ -134,7 +140,7 @@ for (const { name, K, N } of SHAPES) {
       gflops: (2 * M * K * N) / (ms / 1000) / 1e9,
       kernel: wide ? 'int4_matmul_sg_e5_affine' : int4MatmulEntry(MATVEC),
     })
-    aB.destroy(); oB.destroy(); pod.destroy()
+    aB.destroy(); for (const o of oBs) o.destroy(); pod.destroy()
   }
   for (const ws of wSets) { ws.wB.destroy(); ws.scB.destroy(); ws.biB.destroy() }
 }

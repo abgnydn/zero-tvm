@@ -1668,6 +1668,66 @@ Two things this column does NOT yet say:
   Studio is holding 5.98 GB resident on a 32 GB machine, which is the exact
   configuration that froze this Mac once before. Not run unattended.
 
+## Kernel vs kernel: MLX's is faster than ours, everywhere (2026-08-14)
+
+The runtime tables in this file cannot answer "is our WGSL faster than MLX's
+Metal", because both arms in them are whole pipelines. This is the measurement
+that can: one kernel per side, nothing else in the timing loop, matched shapes,
+4-bit / group 64 / affine on both.
+
+`node --experimental-strip-types scripts/kernel-ab.mjs` — alternates the two
+processes round by round and pairs them. Qwen3.5-9B shapes, M2 Max on mains
+power, 200 iterations x 3 rounds:
+
+| shape | M | ours | MLX | **MLX is** | ours | MLX |
+|---|---:|---:|---:|---:|---:|---:|
+| ffn_gate_up | 1 | 0.240 ms | 0.202 ms | **1.19x** | 236 GB/s | 281 |
+| ffn_down | 1 | 0.177 ms | 0.094 ms | **1.89x** | 160 GB/s | 302 |
+| o_proj | 1 | 0.103 ms | 0.045 ms | **2.29x** | 92 GB/s | 210 |
+| c_attn | 1 | 0.129 ms | 0.090 ms | **1.43x** | 183 GB/s | 261 |
+| ffn_gate_up | 256 | 8.748 ms | 6.244 ms | **1.40x** | 5892 GFLOP/s | 8254 |
+| ffn_down | 256 | 4.702 ms | 3.131 ms | **1.50x** | 5480 GFLOP/s | 8230 |
+| o_proj | 256 | 1.607 ms | 1.052 ms | **1.53x** | 5344 GFLOP/s | 8167 |
+| c_attn | 256 | 3.767 ms | 2.704 ms | **1.39x** | 5701 GFLOP/s | 7941 |
+
+**MLX wins every shape.** ~1.4-1.5x on the GEMM and 1.2-2.3x on the matvec.
+MLX also holds ~8.2 TFLOP/s across all four GEMM shapes while ours ranges
+5.3-5.9, and our worst case is the square 4096x4096 matvec, where N/4 = 1024
+workgroups is too little parallelism to fill the machine.
+
+**So the runtime result and the kernel result disagree in sign, and both are
+real.** Our engine beats LM Studio on prefill (1.23x) and sits within 6% on
+decode while running kernels that are 1.4-2.3x slower. Whatever advantage this
+engine has, it is not kernel speed — it is chunked prefill, the prefix cache,
+dispatch structure, and whatever LM Studio's server spends around its own
+kernels. Nothing in this repo should claim otherwise.
+
+### Two setup errors that each produced a confident wrong answer first
+
+- **24 iterations instead of 200.** Fixed per-run overhead dominated and OUR
+  arm read ~2x slow (ffn_down 0.394 ms against a true 0.159). Caught by summing
+  the per-kernel times into a token: 32 layers of FFN came to more time than
+  the engine takes to decode a whole token, which is impossible. **A kernel
+  bench that cannot reproduce the engine's own budget is measuring something
+  else.** `decode-profile-native.mjs qwen35mlx` is the cross-check: ffnGateUp
+  0.188 ms/call in situ against 0.240 here, which is the agreement we want.
+- **One weight matrix, looped.** That measures cache, not DRAM — ffn_down read
+  160 GB/s warm and 64 GB/s cold, and real decode walks a different layer's
+  weights every dispatch. Both arms rotate over enough distinct sets to blow
+  past ~256 MiB. Timing MLX cold against ours warm, or the reverse, would not
+  be a comparison at all.
+
+### Nothing existed to reuse
+
+mlx ships no benchmarks in the wheel. `mlx_lm.benchmark` is model-level tok/s
+and takes no shapes. Upstream's own `benchmarks/python/comparative/bench_mlx.py`
+has `quant_matmul_*` entries, but they build operands with `mx.random.normal`
+and die on `[quantized_matmul] The weight matrix should be uint32 but received
+float32` — they cannot ever have been run. No third-party suite covers
+quantized matmul either. Hence `scripts/mlx-kernel-ab.py`, which is 100 lines
+and documents the three ways to get MLX timing wrong (lazy arrays without
+`mx.eval` read 1500x too fast).
+
 ## Head-to-head vs LM Studio on the 9B (2026-08-14) — THE SAME FILES, not just the same bytes
 
 The 08-13 run below compared Qwen3-4B because that is what both sides could be
