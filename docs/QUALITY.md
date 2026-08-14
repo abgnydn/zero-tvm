@@ -181,6 +181,41 @@ different text are not comparable, and the comparison is the entire point.
 sequence. `mlx_lm.evaluate` (the lm-eval API) is the other half of the ready-made
 tooling and is worth using directly for task benchmarks.
 
+## Task benchmarks — `scripts/task-eval.sh`
+
+Perplexity has no right answer in it. Published work puts the accuracy drop at
+3-bit near **3x** the perplexity drop, so the +10.4% this repo measured on the
+3-bit expert build is consistent with anything from unnoticeable to unusable.
+These tasks resolve that.
+
+```bash
+bash scripts/task-eval.sh .weights-local/Qwen3.6-35B-A3B-MLX-4bit  qwen36-4bit
+bash scripts/task-eval.sh .weights-local/Qwen3.6-35B-A3B-MLX-q3exp qwen36-q3exp
+```
+
+| task | limit | what it needs |
+|---|---:|---|
+| arc_challenge | 400 | grade-school science reasoning |
+| winogrande | 400 | pronoun resolution, real-world modelling |
+| gsm8k | 100 | multi-step arithmetic — where 3-bit is claimed worst |
+| mmlu | 10 x57 | broad knowledge |
+
+Runs on mlx_lm, not our engine, because the question is about the CHECKPOINT —
+and the engine is already pinned to mlx_lm at ratio 1.000-1.005 on identical
+tokens, so a checkpoint result transfers.
+
+`lm-eval` is layered in with `uv run --with` rather than added to
+`~/dev/ml-research`, which is a shared env and not this project's.
+
+**`python -m mlx_lm.evaluate` silently does nothing.** `evaluate.py` has no
+`if __name__ == "__main__"` guard, so `-m` imports the module, calls nothing,
+and exits 0 with no output at all — including for `--help`. The console script
+`mlx_lm.evaluate` is the entry point.
+
+Quote the stderr with any number here. The limits are small on purpose: the
+job is to separate two builds, not to publish an absolute score, and these are
+not comparable to a leaderboard (different shots, limits, harness version).
+
 ## The two corpora
 
 | `--corpus` | what it is | what it answers |
