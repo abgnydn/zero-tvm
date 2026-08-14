@@ -42,7 +42,12 @@
     }
 
     /* ─────────── Chat area ─────────── */
-    .chat-main {
+    /* share.html's guest view is a flex column, not zero-tvm.html's auto/1fr/auto
+   grid — without flex:1 this collapsed to ~56px on an empty room and the
+   composer floated near the top of a blank page. Scoped: on zero-tvm.html the
+   grid row sizes it and #guest-view does not exist. */
+#guest-view .chat-main { flex: 1; min-height: 0; }
+.chat-main {
       overflow-y: auto;
       scroll-behavior: smooth;
       position: relative;
@@ -355,8 +360,12 @@
       padding: 0.5rem 0.5rem 0.5rem 0.9rem;
       transition: border-color 0.15s, background 0.15s;
     }
+    /* border-color used to restate the UNFOCUSED border — a focus style that
+       cancelled itself, leaving a 1.07:1 background shift as the only cue on
+       the product's main control. The accent is the ring every other control
+       already uses. */
     .composer:focus-within {
-      border-color: var(--border-2);
+      border-color: var(--accent);
       background: var(--panel-2);
     }
     .composer textarea {

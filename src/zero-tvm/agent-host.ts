@@ -92,7 +92,7 @@ async function confirmBoot(): Promise<void> {
   if (await isModelCached(spec)) return
   const dlg = document.createElement('dialog')
   dlg.id = 'agent-gate'
-  dlg.style.cssText = 'max-width:32rem;background:#0f1216;color:#d6dbe1;border:1px solid #21262d;'
+  dlg.style.cssText = 'width:calc(100vw - 2rem);max-width:32rem;background:#0f1216;color:#d6dbe1;border:1px solid #21262d;'
     + 'border-radius:10px;padding:1.5rem 1.6rem;font:inherit'
   dlg.innerHTML = `
     <h2 style="font-size:1rem;margin:0 0 .7rem">Run ${spec.id} in this tab?</h2>

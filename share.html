@@ -48,7 +48,7 @@
     /* Consent gate — shown by share.ts before the first weight byte, and only
        when the model is not already cached on this device. */
     #share-gate { border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
-                  color: var(--text); max-width: 30rem; padding: 1.5rem 1.6rem; font: inherit; }
+                  color: var(--text); width: calc(100vw - 2rem); max-width: 30rem; padding: 1.5rem 1.6rem; font: inherit; }
     #share-gate::backdrop { background: rgba(8,8,10,.82); backdrop-filter: blur(10px); }
     #share-gate h2 { font-size: 1.05rem; font-weight: 600; margin-bottom: .7rem; }
     #share-gate p { font-size: .84rem; line-height: 1.6; color: var(--text-dim); margin-bottom: .7rem; }
@@ -107,7 +107,7 @@
       <section class="card">
         <h2>Room link</h2>
         <div class="linkrow">
-          <input id="share-link" readonly value="…">
+          <input id="share-link" readonly value="…" aria-label="Room link">
           <button id="copy-link" type="button">Copy</button>
         </div>
         <p class="hint">Anyone with this link chats with the model running in THIS tab,
@@ -158,7 +158,7 @@
     </main>
     <div class="composer-wrap">
       <form class="composer" id="composer">
-        <textarea id="inp" rows="1" placeholder="Connecting to the host…" disabled></textarea>
+        <textarea id="inp" rows="1" placeholder="Connecting to the host…" aria-label="Message" disabled></textarea>
         <button class="composer-btn" data-variant="send" id="btn" type="submit" disabled aria-label="Send">
           <svg class="icon" viewBox="0 0 24 24"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>
         </button>

@@ -200,6 +200,17 @@ section { padding: 72px 0; }
 
 .mb-stats { display: grid; grid-template-columns: repeat(3, auto); gap: 22px; margin: 20px 0 0; justify-content: start; }
 @media (max-width: 780px) { .mb-stats { justify-content: center; } }
+/* At 390px the three-column stats row set a ~204px min-content floor which,
+   plus slide padding and the two 42px arrows, needed ~368px of a 342px
+   viewport — the body scrolled sideways. Flex-wrap has no min-content floor:
+   each stat drops to the next line instead of pushing the page. min-width: 0
+   on the grid/flex items is what lets the slide actually shrink. */
+@media (max-width: 480px) {
+  .mb-stats { display: flex; flex-wrap: wrap; gap: 10px 20px; }
+  .mb-slide { min-width: 0; padding: 20px 18px; }
+  .mb-art, .mb-info { min-width: 0; }
+  .mb-arrow { width: 34px; height: 34px; font-size: 18px; }
+}
 .mb-stats dt {
   font-family: var(--mono); font-size: var(--step--1); color: var(--dim);
   text-transform: uppercase; letter-spacing: 0.07em;

@@ -334,7 +334,13 @@
         max-height: 40vh; overflow-y: auto;
       }
       main { margin-left: 0; padding: 2rem 1.1rem 4rem; max-width: none; }
-      body { display: block; }
+      /* THE FLEX CONTEXT IS .layout, NOT body. The first version of this
+         query reblocked body — which was already stacked — and left .layout
+         a flex row, so the sidebar stayed a 124px side column of wrapped
+         links beside ~230px of text. Reviewed at 390px; this is the line
+         that actually stacks them. */
+      .layout { display: block; }
+      .topbar { padding: 0 0.8rem; gap: 0.8rem; }
     }
 
     /* ── TABLES ──
