@@ -2,12 +2,14 @@
 
 ## Goal
 
-Full browser-native Phi-3-mini inference on 10 hand-written kernel roles
-(55 WGSL kernels — 37 files + 18 generated int4-matmul variants, counting
-subgroup/tiled/int8 variants) + ~2k lines of
-TypeScript — replacing the 85 TVM-autotuned shaders WebLLM ships. The
+Browser-native LLM inference on hand-written WGSL kernel roles and
+TypeScript — replacing the TVM-autotuned shaders WebLLM ships. The
 pedagogical thesis: the entire LLM forward pass is readable end-to-end
 in a single sitting.
+
+Do NOT publish file, kernel or line counts. They have been wrong on every
+surface that carried them, in both directions, and they rot on every commit.
+"10 kernel roles" is the claim that does not.
 
 Head-to-head vs WebLLM numbers live in `BENCH.md`.
 
@@ -15,12 +17,16 @@ Head-to-head vs WebLLM numbers live in `BENCH.md`.
 
 Vite-built multi-page static site. Each HTML file is a standalone demo:
 
-- `index.html` — marketing essay / hub
-- `zero-tvm.html` — the hand-written Phi-3 chat (157 kB JS bundle)
-- `compiler-chat.html` — WebLLM/TVM reference chat (5.9 MB bundle)
-- `docs.html`, `architecture.html`, `demo.html`, `dump.html`,
-  `shaders.html`, `validate.html`, `webllm-bench.html` — docs, shader
-  viewers, benchmark runner.
+- `index.html` — landing: hero, kernel window, model carousel
+- `zero-tvm.html` — the hand-written chat surface
+- `docs.html`, `validate.html` — docs and the validation harness
+- `share.html` — host a model for other devices; `agent-host.html` — the
+  local agent-server surface (noindex, needs `npm run agent`)
+
+DELETED 2026-08-14 (pre-publish review): `architecture.html`, `demo.html`,
+`compiler-chat.html`, `dump.html`, `shaders.html`, `webllm-bench.html`. All
+were orphaned yet in the sitemap; `dump`/`shaders`/`webllm-bench` started
+multi-GB downloads on page load. Their src/ modules remain, unbuilt.
 - `src/zero-tvm/` — the hand-written engine. There is ONE decode loop:
   `engine-core.ts`'s `buildDecodeEngine(device, weights, kv, opts)`,
   driven by BOTH pages. `validate.html` (via `loading-ui.ts`'s

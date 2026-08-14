@@ -1,0 +1,66 @@
+<meta charset="utf-8">
+<style>
+  @font-face {
+    font-family: 'Fraunces'; font-weight: 700; font-display: block;
+    src: url('file:///Users/ahmetbarisgunaydin/dev/zero-tvm/public/fonts/f1-fraunce.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'Spline Sans'; font-weight: 400; font-display: block;
+    src: url('file:///Users/ahmetbarisgunaydin/dev/zero-tvm/public/fonts/f4-plinean.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'Spline Sans Mono'; font-weight: 500; font-display: block;
+    src: url('file:///Users/ahmetbarisgunaydin/dev/zero-tvm/public/fonts/f6-plineanmono.woff2') format('woff2');
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1200px; height: 630px; }
+  body {
+    background: #05070d;
+    color: #edf0f6;
+    font-family: 'Spline Sans', system-ui, sans-serif;
+    display: flex; flex-direction: column;
+    justify-content: center; align-items: center;
+    padding: 0 92px; text-align: center;
+    position: relative; overflow: hidden;
+  }
+  /* A warm pool behind the wordmark, same amber the site runs on. */
+  .glow {
+    position: absolute; width: 900px; height: 420px; left: 150px; top: 90px;
+    background: radial-gradient(ellipse at center, #f0a86021 0%, transparent 68%);
+    filter: blur(8px);
+  }
+  .eyebrow {
+    position: relative;
+    font-family: 'Spline Sans Mono', ui-monospace, monospace;
+    font-size: 19px; letter-spacing: 0.13em; text-transform: uppercase;
+    color: #f0a860; margin-bottom: 34px;
+  }
+  h1 {
+    position: relative;
+    font-family: 'Fraunces', Georgia, serif; font-weight: 700;
+    font-size: 72px; line-height: 1.08; letter-spacing: -0.015em;
+    max-width: 1016px;
+  }
+  h1 .accent { color: #f0a860; }
+  p {
+    position: relative;
+    margin-top: 34px; font-size: 25px; line-height: 1.5;
+    color: #9aa5b8; max-width: 830px;
+  }
+  .rule {
+    position: relative; margin-top: 40px;
+    width: 120px; height: 3px; border-radius: 2px;
+    background: linear-gradient(90deg, #f0a860, #ffc98f);
+  }
+  .domain {
+    position: absolute; bottom: 34px; left: 0; right: 0;
+    font-family: 'Spline Sans Mono', ui-monospace, monospace;
+    font-size: 20px; letter-spacing: 0.06em; color: #5e6a7e;
+  }
+</style>
+<div class="glow"></div>
+<div class="eyebrow">WebGPU · WGSL · int4 weights</div>
+<h1>LLM inference in the browser,<br><span class="accent">on hand-written WGSL kernels.</span></h1>
+<p>Models from 3.8B to a 35B MoE, running on your own GPU. No frameworks, no ahead-of-time compiler, no WASM.</p>
+<div class="rule"></div>
+<div class="domain">zerotvm.com</div>

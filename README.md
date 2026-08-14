@@ -10,9 +10,8 @@
 
 **[zerotvm.com](https://zerotvm.com)** — pick a model, it runs in your tab.
 
-Zero-TVM is an LLM inference engine for the browser, written by hand: ten
-WGSL kernel roles and ~2,000 lines of TypeScript. No WebLLM, no TVM, no ONNX,
-no WASM runtime.
+Zero-TVM is an LLM inference engine for the browser, written by hand in
+TypeScript and WGSL. No WebLLM, no TVM, no ONNX, no WASM runtime.
 
 - Models from a 3.8B dense to Qwen3.6-35B-A3B, a 256-expert sparse MoE
   (which WebLLM does not ship)
@@ -118,7 +117,7 @@ test-chain.html         → src/compiler/test-chain.ts
 ```
 src/
   zero-tvm/             THE RESULT
-    engine-core.ts        ~1,000 lines — THE decode engine: buildDecodeEngine,
+    engine-core.ts        THE decode engine: buildDecodeEngine,
                           allocKVPages/allocKVPagesInt8, the 32-layer decode
                           loop. No DOM. Parameterized by mode: unfused
                           reference path (validate, 9 dispatches/layer) or
@@ -127,38 +126,38 @@ src/
                           generate/forwardLogits and the pipelined readback
                           ring (generatePipelined). Driven by BOTH chat.ts
                           and validate.ts.
-    chat.ts               ~500 lines — thin chat page: DOM state, boot wiring
+    chat.ts               thin chat page: DOM state, boot wiring
                           (via loading-ui's bootEngine), streaming render.
-    variants.ts           ~160 lines — URL-flag A/B harness (?sg/?matmul=/
+    variants.ts           URL-flag A/B harness (?sg/?matmul=/
                           ?kv8=1 …) and variant→pipeline resolution.
-    markdown.ts           ~170 lines — minimal streaming Markdown renderer.
-    bench-console.ts      ~160 lines — window.bench / benchBatched / specSim
+    markdown.ts           minimal streaming Markdown renderer.
+    bench-console.ts      window.bench / benchBatched / specSim
                           devtools harnesses for the chat page.
-    spec-sim.ts           120 lines — CPU-side prompt-lookup speculative-decoding
+    spec-sim.ts           CPU-side prompt-lookup speculative-decoding
                           acceptance simulator. Used to falsify a speed-up
                           experiment before building shaders.
-    tokenizer.ts          ~280 lines — BPE tokenizer from scratch
-    weight-loader.ts      ~300 lines — direct HuggingFace Phi-3-MLC fetch,
+    tokenizer.ts          BPE tokenizer from scratch
+    weight-loader.ts      direct HuggingFace Phi-3-MLC fetch,
                           OPFS cache, layer-ordered streaming
-    validate.ts           ~320 lines — multi-prompt forward-pass smoke test
-    loading-ui.ts         ~280 lines — shared progress-bar UI + bootEngine
+    validate.ts           multi-prompt forward-pass smoke test
+    loading-ui.ts         shared progress-bar UI + bootEngine
                           flow used by both chat and validate
 
   webllm-bench/
-    main.ts               Head-to-head harness: WebLLM v0.2.80 wired against
+    main.ts               Head-to-head harness: WebLLM wired against
                           /local-weights/* so the comparison runs on identical
                           bits. See BENCH.md.
 
   compiler/             THE SHADERS
-    compiler.ts           ~280 lines — pipeline creation, weight buffer
+    compiler.ts           pipeline creation, weight buffer
                           allocation. Not an optimizing compiler — the name is
                           historical.
-    shader-prelude.ts     ~70 lines — PHI3 model constants (single source of
+    shader-prelude.ts     PHI3 model constants (single source of
                           truth) rendered as a WGSL `const` prelude that is
                           injected into every shader at module creation, so no
                           model-shape literal lives inside the WGSL itself.
-    shaders/              18 hand-written WGSL files (~2,150 lines) + one
-                          generator for the 9-variant int4_matmul family:
+    shaders/              hand-written WGSL, plus a generator for the
+                          int4_matmul variant family:
       add_norm.wgsl              Residual add + RMSNorm fused
       embedding.wgsl
       rms_norm.wgsl
