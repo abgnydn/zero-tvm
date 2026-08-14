@@ -407,3 +407,12 @@ The methodological lesson, third appearance of the class this week: when an
 A/B diverges, first ask what OTHER than the treatment differs between the
 arms. The full-frozen-pool run "still diverging" was read as deepening the
 mystery when it was actually the loudest clue that the pool was innocent.
+
+
+## AC price curve — 2026-08-15 (the readback redesign's baseline)
+
+qwen36q3, blocking, 2×512 tokens, token-identical throughout: 64/256 slots =
+~4.8 GB at 11.7 t/s; 96/256 = ~6.6 GB at 15.0; 128/256 = ~8.4 GB at 15.3;
+unpooled 58.6. The 96→128 step buys 3 hit-rate points and 0.3 t/s — misses
+are not the cost, the per-layer readback is. Whatever the GPU-side slot map
+achieves, judge it against THESE rows.

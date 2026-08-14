@@ -2319,3 +2319,41 @@ Native host boots qwen35 at ctx 65,536 in 6.2 s (warm cache), answers a
 completion correctly (finish_reason stop, 42 tokens, 736 ms wall including
 prefill), pool fingerprint-miss then saves 66 tokens on idle. The `ztvm big`
 preset is safe to hand to pi/Cline against the native host.
+
+## 2026-08-15 — AC measurement round: the pool's price curve, and vec4moe measured to zero
+
+On mains power, blocking path, cross-process arms with chunked prefill pinned
+off on both sides (the pin exists because the 08-14 "pooled pipelined
+diverges" finding was the unpooled arm's chunked prefill, not the pool).
+
+### qwen36q3 pool fractions — 2 rounds × 512 tokens, all token-identical
+
+| pool | resident | warm hit | tok/s | vs whole |
+|---|---:|---:|---:|---:|
+| 64/256 | ~4.8 GB | 83.8% | 11.7 | −80% |
+| 96/256 | ~6.6 GB | 90.4% | 15.0 | −74% |
+| 128/256 | ~8.4 GB | 93.5% | 15.3 | −74% |
+| unpooled | 15.7 GB | — | 58.6 | — |
+
+96→128 buys 3 points of hit rate and 0.3 tok/s: the per-layer readback
+dominates, not the misses — so once the readback tax is paid, the quarter
+pool is nearly free relative to the half. The readback redesign
+(docs/MOE_CHUNK_PLAN.md) is what would move this whole column, and these
+rows are its baseline.
+
+### ?vec4moe=1 A/B — paired, arm order flipped per round, distinct prompts
+
+| model | round ratios (wide/narrow) | median | verdict |
+|---|---|---:|---|
+| qwen30b (gate/up wide, down narrow at K=768) | 0.991, 0.994 | **0.992** | −0.8%, consistent — LOSS |
+| qwen36 (all three wide) | 1.019, 0.989 | **1.004** | inconsistent sign — NOISE |
+
+The prediction (+5–7% from the dense vec4aff analogy: +10% e2e from a 54%
+share, scaled to the experts' 38%) is FALSIFIED. The share argument ignored
+that the moe body pays per-iteration offset arithmetic (inBase/wBase/sBase)
+the dense body does not, and that the expert matmuls' K (512–2048 per-expert
+rows) gives the wide unroll far fewer iterations to amortize setup than the
+dense FFN's K=8192+. The kernel is correct (real-weights.mjs grades it at the
+reference floor, 2.19e-4) and stays SHIPPED OPT-IN for re-testing on other
+GPUs; it does not become a default. One identity flip in each A/B pair is the
+measured tie class (top-2 gap 0.0056 vs logit std 3.843, 08-15).
