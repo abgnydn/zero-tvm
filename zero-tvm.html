@@ -547,6 +547,15 @@
       .welcome-title { font-size: 1.15rem; }
       .suggest-grid { grid-template-columns: 1fr; }
       .badge { padding: 3px 8px; font-size: 0.68rem; }
+      /* The header computed 513px inside a 390px viewport, and body's
+         overflow-x: hidden CLIPPED the excess rather than scrolling — "New
+         chat" and the status badge sat past the right edge, unreachable. The
+         icons and the dot carry the same information; the words are what did
+         not fit. The h1 also gets an ellipsis: "Qwen3.6-35B-A3B" is wider
+         than the slot the flex layout leaves it. */
+      #new-chat-btn span { display: none; }
+      #badge-text { display: none; }
+      .model-info h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42vw; }
       .stats { display: none; }
     }
   </style>

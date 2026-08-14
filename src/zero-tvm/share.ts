@@ -203,6 +203,19 @@ async function confirmDownload(
 
 async function runHost(existingRoom: string | null, stageRange: { start: number; end: number } | null): Promise<void> {
   $('host-view').classList.remove('hidden')
+  // Before the gate, not after it. Without this a Firefox or old-Safari
+  // visitor was shown "Download & host →" for a download whose engine could
+  // never boot — the refusal existed, but only on the far side of the consent
+  // dialog. The guest path stays open: guests need no WebGPU.
+  if (!('gpu' in navigator)) {
+    const top = $('loading-error-top')
+    top.style.display = 'block'
+    top.textContent = 'Hosting needs WebGPU with shader-f16 — Chrome and Edge ship it; Safari from 26. '
+      + 'This browser can still JOIN a room as a guest: guests run nothing locally.'
+    $('badge').className = 'badge error'
+    $('badge-text').textContent = 'No WebGPU'
+    return
+  }
   // Everything GPU-touching is imported HERE, not at module scope — the guest
   // path must run on machines without WebGPU, and weight-loader.ts reads
   // GPUBufferUsage the moment it is imported.

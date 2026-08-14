@@ -57,8 +57,8 @@
       "url": "https://zerotvm.com",
       "domain": "zerotvm.com",
       "name": "zerotvm.com",
-      "tagline": "Phi-3-mini in the browser on 50 hand-written WGSL kernels, no compiler.",
-      "shortDesc": "Phi-3-mini (3.8B) running end-to-end on 50 hand-written WGSL files, replacing the 85 TVM-autotuned shaders WebLLM needs. 69.55 tok/s against WebLLM's 59.95 on identical weights in the same session, +16%.",
+      "tagline": "LLM inference in the browser on hand-written WGSL kernels, no compiler.",
+      "shortDesc": "Models from a 3.8B dense to a 35B sparse MoE running end-to-end on hand-written WebGPU kernels, replacing the TVM-autotuned shaders WebLLM ships. Measured against WebLLM on identical weights in the same session: +16% total on Phi-3, +100% on Qwen3.5-4B.",
       "category": "LLM inference",
       "badge": "applied",
       "githubRepo": "https://github.com/abgnydn/zero-tvm",
@@ -68,12 +68,12 @@
           "label": "kernel roles"
         },
         {
-          "value": "50",
-          "label": "WGSL files"
+          "value": "3.8B–35B",
+          "label": "model range"
         },
         {
-          "value": "69.55",
-          "label": "tok/s (M2 Max)"
+          "value": "+16…+100%",
+          "label": "vs WebLLM (same weights)"
         }
       ],
       "cta": "Run it live →"

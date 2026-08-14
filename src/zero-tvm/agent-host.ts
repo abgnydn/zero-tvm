@@ -120,6 +120,12 @@ async function confirmBoot(): Promise<void> {
 
 async function main(): Promise<void> {
   let flags: VariantFlags | null = null
+  // Same reason as share.ts: say it BEFORE the consent dialog offers a
+  // download the engine could never use.
+  if (!('gpu' in navigator)) {
+    setStatus('cannot boot: this browser has no WebGPU — Chrome and Edge ship it', 'err')
+    return
+  }
   await confirmBoot()
   const boot = await bootEngine({
     spec,
