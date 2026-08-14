@@ -350,10 +350,18 @@ export default defineConfig({
     },
   },
   build: {
-    // Deploy all user-facing entries, including the shader-inspection pages
-    // (dump, shaders) which README documents as part of the build. Dev-only
-    // pages (test-shaders, test-chain) are intentionally excluded — they're
-    // in-repo for debugging and not linked from the site.
+    // Deploy the user-facing entries only. Dev-only pages (test-shaders,
+    // test-chain) are excluded — in-repo for debugging, not linked from the
+    // site.
+    //
+    // Removed 2026-08-14: architecture, demo, compiler-chat, dump, shaders.
+    // Pre-publish review found all five orphaned (no inbound link from any
+    // shipped page) yet still in sitemap.xml, so search was the only way in.
+    // dump and shaders were the worst of it — both call engine.load() at page
+    // open, so landing on one from a search result spent ~2 GB with nothing
+    // clicked (measured: browser storage 0 → 1205 MB). architecture.html also
+    // still described an engine that falls back to TVM kernels, which the
+    // project has not done for a long time.
     rollupOptions: {
       // 10-char content hashes (default 8). Changed once on 2026-08-06 to
       // rotate EVERY asset URL past a poisoned edge-cache entry: the zone had
@@ -374,8 +382,6 @@ export default defineConfig({
         // the deployed page works with weights from the HF CDN. model-smoke
         // stays dev-only; this one is a user-facing surface.
         'agent-host':  resolve(__dirname, 'agent-host.html'),
-        'compiler-chat': resolve(__dirname, 'compiler-chat.html'),
-        demo:          resolve(__dirname, 'demo.html'),
         validate:      resolve(__dirname, 'validate.html'),
         'webllm-bench':resolve(__dirname, 'webllm-bench.html'),
         // wllama-bench and tjs-bench are DEV-ONLY benchmark harnesses. They are
@@ -384,10 +390,7 @@ export default defineConfig({
         // deploy and exceed HuggingFace's 10 MiB non-LFS file limit. bench/run.mjs
         // drives them through the vite DEV server, which serves any root HTML
         // regardless of build inputs, so benchmarking is unaffected.
-        architecture:  resolve(__dirname, 'architecture.html'),
         docs:          resolve(__dirname, 'docs.html'),
-        dump:          resolve(__dirname, 'dump.html'),
-        shaders:       resolve(__dirname, 'shaders.html'),
       },
     },
     chunkSizeWarningLimit: 8000,

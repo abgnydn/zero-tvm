@@ -12,7 +12,13 @@
   <meta property="og:url" content="https://zerotvm.com/">
   <meta property="og:title" content="zero-tvm — LLM inference in the browser, on hand-written WGSL">
   <meta property="og:description" content="An LLM inference engine written by hand in WGSL and TypeScript. Weights download once, cache locally, and inference runs on your own GPU.">
+  <!-- The canonical URL is the one that actually gets posted, and it was the
+       only page declaring summary_large_image without an image to put in it —
+       so every share of https://zerotvm.com/ unfurled as a bare text card
+       while /docs.html unfurled richly. og.png ships already. -->
+  <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:title" content="zero-tvm — LLM inference in the browser, on hand-written WGSL">
   <meta name="twitter:description" content="An LLM inference engine written by hand in WGSL and TypeScript. Weights download once, cache locally, and inference runs on your own GPU.">
 
@@ -63,7 +69,11 @@
     <div class="nav-links">
       <a href="#models">Models</a>
       <a href="share.html">Rooms</a>
-      <a href="agent-host.html">Agent</a>
+      <!-- "Agent" was here. agent-host.html only works against a local
+           agent-server on 127.0.0.1:8017, so a public visitor paid a ~2 GB
+           download for a page that then sat on "booting…" forever. It is a
+           repo workflow (`npm run agent`), documented in the README, not a
+           destination on the site. -->
       <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">Proof</a>
       <a href="docs.html">Docs</a>
       <a href="zero-tvm.html" class="nav-cta">Open chat →</a>

@@ -338,6 +338,9 @@
       color: var(--muted); margin-bottom: 0.5rem;
     }
     .dialog-models .dm-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    /* Only when the picker actually rendered — an empty container must not
+       leave a gap above the link. */
+    .dialog-models .dm-chips:not(:empty) { margin-bottom: 0.7rem; }
     .dialog-models .dm-chip {
       display: flex; flex-direction: column; gap: 1px; flex: 1 1 0; min-width: 96px;
       padding: 7px 10px; border-radius: 8px; text-align: left; cursor: pointer;
@@ -561,7 +564,14 @@
       <div class="dstat"><div class="val">60+ t/s</div><div class="lab">M2 Max</div></div>
       <div class="dstat"><div class="val" id="gate-ctx">&mdash;</div><div class="lab">context</div></div>
     </div>
+    <!-- The chips container carries the id, not the wrapper: renderGateChips
+         clears its host before appending, so putting the id on the wrapper
+         would delete the link below it. It had no id at all until now, so the
+         lookup returned null and bailed — the picker has never rendered, and
+         everyone arriving without ?model= was offered Phi-3 and nothing else.
+         Empty until the JS fills it; the link works regardless. -->
     <div class="dialog-models">
+      <div class="dm-chips" id="dialog-models"></div>
       <a class="dm-change" href="/#models">Pick a different model →</a>
     </div>
     <div class="dialog-notes">
@@ -689,7 +699,7 @@
       </form>
       <div class="composer-hint">
         <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for new line ·
-        <span id="ctx-hint" style="color:var(--text-dim)">Zero TVM · 10 WGSL kernels · 228 dispatches/token</span>
+        <span id="ctx-hint" style="color:var(--text-dim)">Zero TVM · 10 WGSL kernel roles · 228 dispatches/token</span>
       </div>
     </div>
   </div>

@@ -271,7 +271,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     log(`Allocating KV cache (${spec.layers} layers × ${spec.maxPages} pages)`)
     const kvPages = allocKVPages(device, spec)
     setProgress(96, 'Compiling shaders...')
-    log('Compiling 55 WGSL kernels (10 roles; 37 files + 18 generated)')
+    log('Compiling WGSL kernels (10 roles)')
     // A MoE spec has no scalar path — moe_router_topk and the grid-z expert
     // matmul are subgroup-only — so the default boot picks the subgroup
     // variants when the probe passed. If it did not, buildDecodeEngine's

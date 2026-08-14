@@ -37,6 +37,7 @@ import {
   addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
 import { specForParam } from './model-registry.js'
+import type { ModelSpec } from '../compiler/model-spec.js'
 import { serveWeights, fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
 import { serveStage, makeStageClient, type StageReply } from './pipeline-peer.js'
 
@@ -149,6 +150,52 @@ function wireKeepAwake(): void {
 // HOST
 // ============================================================
 
+/**
+ * Ask before spending gigabytes.
+ *
+ * This page booted the engine the moment it opened, so a visitor who clicked
+ * "Rooms" in the site nav was already ~2 GB into a download before reading a
+ * word about it — no button pressed, no size shown. The chat page has gated
+ * this since it shipped; the host path never did.
+ *
+ * Resolves immediately when the weights are already on this device: there is
+ * nothing to consent to then, and a returning host should not be asked twice.
+ * cache-probe pulls in the loaders, which read GPUBufferUsage at module scope,
+ * so it is imported dynamically like everything else GPU-touching here.
+ */
+async function confirmDownload(
+  spec: ModelSpec,
+  brand: { name: string; sizeLabel: string; ramNote?: string },
+): Promise<void> {
+  const { isModelCached } = await import('./cache-probe.js')
+  if (await isModelCached(spec)) return
+
+  const dlg = document.createElement('dialog')
+  dlg.id = 'share-gate'
+  dlg.innerHTML = `
+    <h2>Host ${brand.name} from this tab</h2>
+    <p>
+      Hosting runs the model on THIS machine and serves it to whoever opens
+      your room link. The weights download once (${brand.sizeLabel}) and are
+      cached locally; every later visit starts from disk.
+    </p>
+    ${brand.ramNote ? `<p class="warn">${brand.ramNote}</p>` : ''}
+    <p class="fine">Guests' prompts run on your GPU. You see every request as it arrives.</p>
+    <div class="acts">
+      <a href="/">Not now</a>
+      <button type="button" id="share-gate-go" autofocus>Download &amp; host →</button>
+    </div>`
+  document.body.appendChild(dlg)
+  dlg.showModal()
+  await new Promise<void>((resolve) => {
+    dlg.querySelector<HTMLButtonElement>('#share-gate-go')?.addEventListener('click', () => {
+      dlg.close()
+      dlg.remove()
+      resolve()
+    }, { once: true })
+  })
+}
+
 async function runHost(existingRoom: string | null, stageRange: { start: number; end: number } | null): Promise<void> {
   $('host-view').classList.remove('hidden')
   // Everything GPU-touching is imported HERE, not at module scope — the guest
@@ -172,6 +219,9 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   }
 
   wireKeepAwake()
+
+  // Consent BEFORE the first byte, not after.
+  await confirmDownload(spec, brand)
 
   // Same engine composition as chat.ts — this is the throughput path, not the
   // scalar validation path.
