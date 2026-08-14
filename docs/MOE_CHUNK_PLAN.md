@@ -259,6 +259,7 @@ looked attractive is not usable.
 The projections above finally met the engine. What held, what did not:
 
 ### Correct on the blocking path, broken under generatePipelined
+### — RETRACTED 2026-08-14 (later): the pool was never broken. See the correction below.
 
 Pooled `generate()` is TOKEN-IDENTICAL to unpooled over 512 tokens, on both
 MoE models — and blocking uses the same recordForwardPooled, the same mid-token
@@ -375,3 +376,34 @@ speculative prefetch on. Counters (power-independent); speeds need an AC run.
 - Identical speculation counters across pool sizes are expected: greedy + same
   prompt reproduces the same routing, and prediction quality does not depend
   on pool size.
+
+
+## CORRECTION — 2026-08-14 (later): there was no pipelined pooling bug
+
+The divergence reported above was a HARNESS ASYMMETRY, not an engine bug.
+Under `generatePipelined` the UNPOOLED reference arm prefills CHUNKED (MoE
+chunking shipped 2026-08-13 and `chunkPrefill`'s only call site is
+generatePipelined), while a pooled engine structurally cannot chunk. Chunked
+prefill has never been bit-equal to per-token — the empirical-identity gate
+and `?chunk=0` exist because of that — and the epsilon it leaves in KV flips
+thin-margin argmaxes hundreds of tokens later.
+
+Confirmed by prediction before believing it: two UNPOOLED arms, pipelined
+(chunked) vs blocking (per-token), same prompt, diverge at exactly token 116 —
+the index the pooled comparison had reported, with pooling nowhere in the
+process.
+
+Fix: `createEngineRaw` grew a `chunkedPrefill` option and moe-pool-test pins
+BOTH arms to per-token. Re-run of the originally failing configuration
+(pipelined, half pool, 4 prompts x 512 tokens): token-identical on all four.
+
+**The expert pool is correct on both generate paths.** The valid AC numbers:
+pipelined half-pool 13.4 t/s vs 93.1 unpooled (-86%) — pipelining buys the
+pooled path almost nothing, because the per-layer readback serializes it
+regardless. The readback redesign remains the gate on making pooling fast;
+nothing about its pricing changes.
+
+The methodological lesson, third appearance of the class this week: when an
+A/B diverges, first ask what OTHER than the treatment differs between the
+arms. The full-frozen-pool run "still diverging" was read as deepening the
+mystery when it was actually the loudest clue that the pool was innocent.

@@ -81,11 +81,11 @@ AC power:
 | 128/256 | ~8.4 GB | 15.6 tok/s | 93.5% |
 | 64/256, speculative prefetch on | ~4.8 GB | not measured | 97.9% |
 
-Every pooled configuration is **token-exact**: pooled blocking `generate()` is
-token-identical to unpooled over 512-token generations, and speculative
-prefetch cannot change a token — predicted ids only warm the pool and never
-reach a dispatch. Pooling is blocking-path only today; the pipelined streaming
-path does not support it.
+Every pooled configuration is **token-exact** on both generate paths: pooled
+generation is token-identical to unpooled over 512-token generations
+(verified on the blocking path for this checkpoint and on both paths for the
+30B sibling), and speculative prefetch cannot change a token — predicted ids
+only warm the pool and never reach a dispatch.
 
 Why it is slow today: each MoE layer's router ids must be read back GPU→CPU
 before that layer's experts can be fetched (WebGPU has no GPU-side wait), so

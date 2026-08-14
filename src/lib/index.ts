@@ -80,6 +80,15 @@ export interface CreateEngineOptions {
   expertSpeculate?: boolean
   /** Speculative router width for the coverage measurement (engine specWidth). */
   specWidth?: number
+  /** Chunked prefill on/off (DecodeEngineOptions.chunkedPrefill — the chat
+   *  page's ?chunk=0, which variantQuery does NOT carry). Chunked prefill is
+   *  empirically token-identical to per-token, not bit-equal, so a harness
+   *  comparing token identity across engines must pin BOTH arms to one
+   *  prefill mode. moe-pool-test learned this the hard way: its unpooled
+   *  reference arm chunked while the pooled arm structurally cannot, and the
+   *  epsilon the chunked prefill leaves in KV flipped thin-margin argmaxes
+   *  hundreds of tokens later — which was then reported as a pooling bug. */
+  chunkedPrefill?: boolean
   /** Shader-variant flags as a query string, e.g. '?vec4=0'. Same parser the
    *  chat page uses, so a kernel A/B run here selects what users get. */
   variantQuery?: string
@@ -303,6 +312,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
     ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),
     ...(opts.expertSpeculate ? { expertSpeculate: true } : {}),
     ...(opts.specWidth ? { specWidth: opts.specWidth } : {}),
+    ...(opts.chunkedPrefill === false ? { chunkedPrefill: false } : {}),
   })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs

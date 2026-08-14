@@ -100,7 +100,12 @@ const ARM = process.argv.includes('--arm')
   : null
 
 if (ARM) {
-  const built = await createEngineRaw({ model, ...(ARM.slots ? { expertPool: ARM.slots } : {}), ...(ARM.spec ? { expertSpeculate: true, ...(ARM.spec > 1 ? { specWidth: ARM.spec } : {}) } : {}) })
+  // BOTH arms prefill per-token. Pooling cannot chunk, and chunked prefill is
+  // empirically-not-bit-equal to per-token — leaving the unpooled arm chunked
+  // made the identity gate compare prefill modes, not pooling. The "pooled
+  // pipelined diverges at token 116" finding was exactly this: two UNPOOLED
+  // arms (pipelined chunked vs blocking per-token) diverge at the same 116.
+  const built = await createEngineRaw({ model, chunkedPrefill: false, ...(ARM.slots ? { expertPool: ARM.slots } : {}), ...(ARM.spec ? { expertSpeculate: true, ...(ARM.spec > 1 ? { specWidth: ARM.spec } : {}) } : {}) })
   const out = []
   const ids = built.buildChatPromptFor(
     built.spec, [{ role: 'user', content: ARM.prompt }], built.tokenizer)
