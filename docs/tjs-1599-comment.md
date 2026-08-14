@@ -59,25 +59,27 @@
 
 ---
 
-I think this is already fixed, just not in the repo the issue points at.
-`onnx-community/Qwen3.5-4B-ONNX-OPT` is a re-export of the same model (it's linked as
-`new_version` on the original model card) and it doesn't have the problem.
+This looks like it's already fixed, just not in the repo this issue points at.
+`onnx-community/Qwen3.5-4B-ONNX-OPT` — the re-export @xenova pushed on 2026-04-22 and linked as
+`new_version` on the original card — doesn't have the problem. Posting the measurement and the
+mechanism because the issue was never updated and the `-OPT` card has no description, so nobody
+landing here learns that the swap is the fix or why.
 
 Same machine, same prompt, same runtime — M2 Max, Chrome, onnxruntime-web 1.26.0-dev, 252-token
-prefill, median of 3:
+prefill; two runs, each a median of 3: 13.00 / 12.99 s and 0.85 / 0.93 s.
 
 | | prefill |
 |---|---:|
 | `onnx-community/Qwen3.5-4B-ONNX` | 13.0 s |
 | `onnx-community/Qwen3.5-4B-ONNX-OPT` | **0.9 s** |
 
-~14x, and it reproduced across two runs.
-
 Since the thread never got to a diagnosis, the reason the old export is slow: its 24
 gated-DeltaNet layers are each an ONNX `Scan` — a sequential loop over the prompt, one position
 per iteration. You can see it without downloading any weights, since the graph is only 1.4 MB:
 
 ```python
+# onnx/decoder_model_merged_q4f16.onnx from either repo — 1.4 MB, the weights
+# live in separate .onnx_data files and are not needed here.
 import onnx, collections
 m = onnx.load('decoder_model_merged_q4f16.onnx', load_external_data=False)
 ops = collections.Counter()
@@ -95,18 +97,28 @@ All 24 sit in the `else_branch` of a per-layer `If` on `.../gdn/is_decode`, so o
 pays for them — which is why decode looked much less affected than TTFT. And onnxruntime-web
 has no WebGPU kernel for `Scan`, so it runs on CPU while its body dispatches to the GPU, once
 per position, 24 layers deep. I measured the cost by taking the old decoder and replacing every
-`Scan` with a shape-preserving `Identity`: prefill went 13.99 s -> 1.24 s, so the recurrence
-was ~92% of it.
+`Scan` with shape-preserving `Identity` nodes, then re-running in the same session: prefill went
+13.99 s -> 1.24 s in one run and 13.71 s -> 0.95 s in another, so the recurrence is 91-93% of it.
 
 The OPT export replaces each of those with a single fused `LinearAttention` node, and WebGPU
 *does* have a kernel for that one, so the layer stays on the GPU. It also adds
 `num_logits_to_keep`, so prefill returns `[1, 1, 248320]` instead of `[1, 252, 248320]` and
 skips building a 125 MB logits tensor.
 
-@youqibing — on your question about whether #27780 was related: I think both things were true.
-That PR tunes FlashAttention for MHA/GQA, which is real, but only 8 of these 32 layers are
-attention; the other 24 are gated-DeltaNet and were where the prefill time actually went. The
-fix ended up coming from the export side rather than the kernel side.
+@youqibing — on your question about whether microsoft/onnxruntime#27780 was related: partly.
+It's a real speedup, but it's a vendor-gated FlashAttention prefill path (merged 2026-05-14,
+first shipped in ORT 1.27, so not in the build transformers.js pins today), and only 8 of these
+32 layers are attention at all. The other 24 are gated-DeltaNet, which is where the prefill time
+went. What fixed those was microsoft/onnxruntime#27996 (merged 2026-04-09), which added WebGPU
+kernels for `LinearAttention` and `CausalConvWithState`; the `-OPT` re-export is what emits them.
+So it took both a kernel change and an export change, just not that kernel.
 
-Might be worth pointing the issue at `-OPT` (or closing it) so the next person doesn't land on
-the old repo.
+One catch if anyone swaps the model id: `-OPT` needs an onnxruntime-web that has those kernels.
+4.0.0-next.7, the version in this issue, pins `1.25.0-dev.20260307`, which predates
+onnxruntime#27996 — `LinearAttention` has no kernel there at all. 4.1.0 pins
+`1.26.0-dev.20260410` and is the first release that can load it; 4.2.0 is current. Not the `next`
+tag, which is still 4.0.0-next.11.
+
+The Hub already shows the `new_version` banner on the old card, but this issue doesn't, and
+`-OPT` has no README, so anyone arriving here still lands on the slow repo. Might be worth a note
+on the issue (or closing it) with the minimum version attached.
