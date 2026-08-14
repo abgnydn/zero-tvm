@@ -525,7 +525,7 @@
 
   <div class="callout tip">
     <div class="callout-title">Why?</div>
-    <p>WebLLM and transformers.js both work, but they're black boxes — TVM compiles kernels you never see.
+    <p>WebLLM compiles its kernels with TVM; transformers.js runs ONNX Runtime Web. Both work well. Neither is something you read — this is.
     This project exists to show that you can understand <em>every single step</em> of a modern transformer
     inference pipeline, written at the GPU level, in a browser tab.</p>
   </div>
@@ -541,7 +541,7 @@
     <div class="step-line"><div class="step-dot">1</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Open the chat</h5>
-      <p>Navigate to <code>zero-tvm.html</code>. WebGPU initializes automatically. Requires Chrome 113+, Edge 113+, or Safari 18+.</p>
+      <p>Navigate to <code>zero-tvm.html</code>. WebGPU initializes automatically. Requires WebGPU with shader-f16: Chrome 113+ or Edge 113+. Safari did not enable WebGPU by default until 26, and OPFS — where the weight cache lives — is unavailable there. Subgroups are required for the MoE models.</p>
     </div>
   </div>
   <div class="step-row">
@@ -673,8 +673,10 @@ What is the capital of Australia?&lt;|end|&gt;
 <h2 id="kv-cache">KV cache</h2>
 
 <p>
-  Uses a <strong>paged KV cache</strong> — the same approach as vLLM and PagedAttention.
-  Memory is divided into fixed-size pages (16 slots each). A page table maps logical positions to physical pages.
+  Uses a <strong>paged KV cache</strong> layout. Memory is divided into fixed-size pages (16 slots each)
+  and a page table maps logical positions to physical pages. This is <em>not</em> vLLM-style relocatable
+  blocks: K is RoPE&rsquo;d before the cache write on every path, so a cached page is valid only at the
+  positions it was written at. It is a prefix pool, and cannot become a block pool without moving RoPE.
 </p>
 
 <table>
@@ -747,7 +749,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <!-- SHADERS -->
 <h2 id="shaders">WGSL Kernel Roles</h2>
 
-<p>All shaders live in <code>src/compiler/shaders/</code> — 27 <code>.wgsl</code> files implementing 10 distinct kernel roles. The rest are tiled and subgroup variants of the same role, selectable at runtime via URL flags. The compiler compiles them all at startup into <code>GPUComputePipeline</code> objects.</p>
+<p>All shaders live in <code>src/compiler/shaders/</code>, implementing 10 distinct kernel roles. The rest are tiled and subgroup variants of the same role, selectable at runtime via URL flags. The compiler compiles them all at startup into <code>GPUComputePipeline</code> objects.</p>
 
 <p>Binding convention: <code>@group(0)</code> always. Binding indices are <strong>zero-based</strong> and match the order you pass buffers to <code>bg(device, pipeline, [...bufs])</code>.</p>
 
@@ -1093,7 +1095,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   biases, loaded by byte range — a 5.3&nbsp;GB safetensors shard is never one
   <code>ArrayBuffer</code>), and the first model here with <strong>no WebLLM build to
   benchmark against</strong>. <code>?model=qwen36q3</code> is the 3-bit-expert build
-  (~16.4&nbsp;GB, needs ~20&nbsp;GB free RAM, ~55&nbsp;tok/s on a quiet 32&nbsp;GB
+  (~16.4&nbsp;GB, needs ~20&nbsp;GB free RAM, ~66&nbsp;tok/s on a quiet 32&nbsp;GB
   M2&nbsp;Max); <code>?model=qwen36</code> is full 4-bit (~19.5&nbsp;GB, needs
   ~24&nbsp;GB free RAM). The MoE block runs in 7 dispatches with the expert index in
   grid&nbsp;<code>z</code>; every layer is validated against mlx_lm's own modules
@@ -1210,7 +1212,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
     <tr><td>Dispatches / token</td><td>228 (260 with <code>?int8kv=1</code>)</td><td>342</td></tr>
     <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>85 TVM-generated shaders</td></tr>
-    <tr><td>Shipped JS bundle</td><td>157 kB / 33 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (WebLLM)</td></tr>
+    <tr><td>Shipped JS bundle</td><td>~432 kB / ~116 kB gz (<code>zero-tvm.html</code>)</td><td>5.9 MB / 2.1 MB gz (WebLLM)</td></tr>
     <tr><td>Bandwidth utilization (total / decode)</td><td>~31% / ~37% of the 222 tok/s ceiling</td><td>~27% / ~28% of the same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
     <tr><td>Readable kernels?</td><td>✓ Yes — every .wgsl file is in the repo</td><td>✗ No — emitted by the TVM compiler</td></tr>

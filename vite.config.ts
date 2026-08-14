@@ -354,7 +354,8 @@ export default defineConfig({
     // test-chain) are excluded — in-repo for debugging, not linked from the
     // site.
     //
-    // Removed 2026-08-14: architecture, demo, compiler-chat, dump, shaders.
+    // Removed 2026-08-14: architecture, demo, compiler-chat, dump, shaders,
+    // webllm-bench.
     // Pre-publish review found all five orphaned (no inbound link from any
     // shipped page) yet still in sitemap.xml, so search was the only way in.
     // dump and shaders were the worst of it — both call engine.load() at page
@@ -383,7 +384,6 @@ export default defineConfig({
         // stays dev-only; this one is a user-facing surface.
         'agent-host':  resolve(__dirname, 'agent-host.html'),
         validate:      resolve(__dirname, 'validate.html'),
-        'webllm-bench':resolve(__dirname, 'webllm-bench.html'),
         // wllama-bench and tjs-bench are DEV-ONLY benchmark harnesses. They are
         // deliberately not built or deployed: they pull in llama.cpp's 7.7 MB
         // wasm and ONNX Runtime's >10 MB wasm respectively, which bloat the

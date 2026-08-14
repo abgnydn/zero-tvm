@@ -473,7 +473,24 @@ function flattenRecords(cache: NDArrayCache): FlatRecord[] {
 // Main loader — bounded parallel shard fetch, streaming GPU upload
 // ============================================================
 
-const USAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+/**
+ * Read LAZILY, not at module scope.
+ *
+ * `GPUBufferUsage` is a WebGPU IDL global. On a browser without WebGPU it does
+ * not exist, so evaluating it at import time threw a ReferenceError while this
+ * module was still being evaluated — which took down every importer before any
+ * of their code ran. loading-ui.ts and model-select.ts both import this file
+ * statically and chat.ts imports both, so the chat page died on module
+ * evaluation and sat on its pre-activated "Preparing Zero-TVM / Starting… 0%"
+ * overlay forever, with no error and no way to know why.
+ *
+ * Callers reach this only after a device exists, so by the time it is read the
+ * global is guaranteed present. Making it lazy is what lets the rest of the
+ * codebase import this module normally instead of every caller remembering to
+ * import it dynamically.
+ */
+const usage = (): number =>
+  GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
 
 function opfsStatusLabel(opfs: OPFSDir, persisted: boolean): string {
   if (!opfs) return 'OPFS unavailable'
@@ -510,7 +527,7 @@ function uploadRecord(device: GPUDevice, shard: ArrayBuffer, rec: FlatRecord): G
   }
   const gpuBuf = device.createBuffer({
     size: Math.max(uploadBytes, 4),
-    usage: USAGE,
+    usage: usage(),
     label: rec.name,
   })
   if (bf16AsF32) {
@@ -608,7 +625,7 @@ export async function loadWeights(
       onProgress?.(`expert pool: ${expertPool} slots per layer, slabs from ${mirrorBase ? 'the mirror' : 'OPFS'}`)
     }
     const t0 = performance.now()
-    const lw = await assembleMlx(device, spec, src, locate, USAGE, {
+    const lw = await assembleMlx(device, spec, src, locate, usage(), {
       onProgress,
       cacheRead: (key) => opfsRead(opfs, key),
       cacheHas: (key) => opfsHas(opfs, key),
@@ -750,7 +767,7 @@ export async function loadWeights(
   const packDoomed: GPUBuffer[] = []
   function packGdnProj(rec: Array<{ buf: GPUBuffer; rows: number }>, bytesPerRow: number, label: string): GPUBuffer {
     const totalRows = rec.reduce((s, r) => s + r.rows, 0)
-    const packed = device.createBuffer({ size: totalRows * bytesPerRow, usage: USAGE, label })
+    const packed = device.createBuffer({ size: totalRows * bytesPerRow, usage: usage(), label })
     let off = 0
     for (const r of rec) {
       packEnc.copyBufferToBuffer(r.buf, 0, packed, off, r.rows * bytesPerRow)

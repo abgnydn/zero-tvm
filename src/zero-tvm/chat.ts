@@ -11,7 +11,14 @@
  * wired by bench-console.ts; the streaming Markdown renderer by markdown.ts.
  */
 
-import { isModelCached } from './cache-probe.js'
+// cache-probe is NOT imported here. It pulls in the loaders, which read
+// GPUBufferUsage at module scope, and a static import evaluates that chain
+// before a single line of this file runs — so on a browser without WebGPU the
+// module threw a ReferenceError and the page sat on its pre-activated
+// "Preparing Zero-TVM / Starting… 0%" overlay forever, with no gate, no error
+// and no mention of what would work. That is the site's primary CTA. Every
+// other surface here (landing.ts, share.ts) already imports it dynamically for
+// exactly this reason; the product page was the one that did not.
 import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
 import { initModelSwitcher } from './model-switcher.js'
 import { mountMascot, mascotPalette } from '../mascot.js'
@@ -167,7 +174,7 @@ function showDownloadGate(): Promise<void> {
 async function main(): Promise<void> {
   setBadge('Initializing…', 'loading')
   log(`Zero-TVM ${BRAND.name} — No WebLLM, No TVM`)
-  log('10 hand-written WGSL kernel roles across 55 kernels (37 files + 18 generated)')
+  log('10 hand-written WGSL kernel roles')
   log('')
 
   const boot = await bootEngine({
@@ -592,15 +599,22 @@ function applyModelBranding(): void {
     }
   }
   mountChatMascots()
-  if (SPEC.id === 'phi3-mini') return
-  document.title = `Zero-TVM Chat — ${BRAND.name}`
-  set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
+  // The gate's three stats are derived for EVERY model, Phi-3 included. The
+  // early return used to sit above this block on the theory that the static
+  // markup is already Phi-3's — but the markup carried '60+ t/s' against the
+  // registry's ~70, and shipped the context slot as a bare em-dash. Phi-3 is
+  // the default, so that was what most visitors saw, and '60+' is close enough
+  // to WebLLM's 59.95 to be the one number on this site that must not be
+  // confusable with theirs.
   const statVals = document.querySelectorAll('#start-dialog .dialog-stats .dstat .val')
   if (statVals[0]) statVals[0].textContent = BRAND.sizeLabel   // download size
-  if (statVals[1]) statVals[1].textContent = BRAND.rateLabel   // measured decode rate
+  if (statVals[1]) statVals[1].textContent = BRAND.rateLabel   // total tok/s, M2 Max
   // Context is derived from the spec (maxPages x pageSize), like every other
   // figure on this page. The slot used to read a static 'f16 / WebGPU'.
   set('#gate-ctx', `${Math.round(SPEC.maxContext / 1024)}K`)
+  if (SPEC.id === 'phi3-mini') return
+  document.title = `Zero-TVM Chat — ${BRAND.name}`
+  set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
   set('.model-info h1', BRAND.name)
   set('#welcome .welcome-title', `Chat with ${BRAND.name}`)
 }
@@ -648,7 +662,28 @@ function mountChatMascots(): void {
  *  engine is there when the next token is produced. */
 let liveEngine: import('./engine-core.js').DecodeEngine | null = null
 
+/** Replace the loading overlay with what this browser is missing and why.
+ *  Runs before anything GPU-touching is imported. */
+function showUnsupported(): void {
+  const title = document.getElementById('loading-title')
+  const status = document.getElementById('progress-status')
+  const detail = document.getElementById('progress-detail')
+  if (title) title.textContent = 'This browser cannot run the engine'
+  if (status) {
+    status.textContent = 'zero-tvm needs WebGPU with shader-f16 — Chrome 113+ or Edge 113+. '
+      + 'Firefox and Safari before 26 do not enable it.'
+  }
+  if (detail) detail.textContent = ''
+  document.getElementById('start-dialog')?.remove()
+  document.querySelector('.progress-track')?.remove()
+}
+
 async function boot(): Promise<void> {
+  // BEFORE the gate, not after. The old order was gate → main() → bootEngine()
+  // → navigator.gpu check, so a visitor who cannot run this read "~2 GB",
+  // pressed "Download & start", and only then learned their browser was never
+  // going to work.
+  if (!('gpu' in navigator)) { showUnsupported(); return }
   applyModelBranding()
   initModelSwitcher(SPEC)
   // The gate used to show a generic logo and a second model picker. By the
@@ -686,6 +721,7 @@ async function boot(): Promise<void> {
   // (or visitors who started from compiler-chat) should boot straight in.
   // Remove the static dialog so no hidden #start-btn lingers in the DOM
   // (the gate e2e asserts "#start-btn present iff the gate is showing").
+  const { isModelCached } = await import('./cache-probe.js')
   if (await isModelCached(SPEC)) {
     document.getElementById('start-dialog')?.remove()
   } else {

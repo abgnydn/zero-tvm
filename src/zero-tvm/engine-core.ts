@@ -36,10 +36,14 @@ function createBuf(device: GPUDevice, size: number, usage: number, label?: strin
   return device.createBuffer({ size: Math.max(size, 4), usage, label })
 }
 
-const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+// Lazy: GPUBufferUsage is a WebGPU IDL global and does not exist on a browser
+// without WebGPU. Reading it at module scope threw during evaluation and took
+// down every static importer before their own code ran — see weight-loader.ts.
+const storage = (): number =>
+  GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
 
 function makeBuf(device: GPUDevice, size: number, label: string): GPUBuffer {
-  return createBuf(device, size, STORAGE, label)
+  return createBuf(device, size, storage(), label)
 }
 
 function uniformBuf(device: GPUDevice, data: (number | ArrayBuffer)[]): GPUBuffer {

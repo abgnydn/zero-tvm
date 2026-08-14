@@ -302,7 +302,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
   log(`Warmup forward: ${Math.round(performance.now() - warmupT0)} ms`)
 
   setProgress(100, 'Ready')
-  log('Ready. Zero TVM. 10 kernel roles across 55 WGSL kernels.')
+  log('Ready. Zero TVM. 10 hand-written WGSL kernel roles.')
   setBadge('Ready', 'ready')
 
   return { ok: true, device, tokenizer, weights, engine }

@@ -271,7 +271,9 @@ function createBuf(device: GPUDevice, size: number, usage: number, label?: strin
   })
 }
 
-const STORAGE = GPUBufferUsage.STORAGE
+// Lazy — see weight-loader.ts. Module-scope reads of a WebGPU IDL global
+// throw on browsers without WebGPU, before any importer can run.
+const storage = (): number => GPUBufferUsage.STORAGE
 
 export function compile(
   device: GPUDevice,
@@ -408,16 +410,16 @@ export function allocateLayerWeights(device: GPUDevice, spec: ModelSpec = PHI3):
   return {
     // Weight rows are (out_dim × K/8) u32 words; scales are (out_dim × K/32) f16.
     // K = d for qkv/gate_up, K = qDim for o_proj, K = ffn for down_proj.
-    qkvWeights: createBuf(device, S.qkvDim * S.dPacked * 4, STORAGE),
-    qkvScales: createBuf(device, S.qkvDim * S.dScales * f16, STORAGE),
-    oProjWeights: createBuf(device, S.d * (S.qDim / 8) * 4, STORAGE),
-    oProjScales: createBuf(device, S.d * (S.qDim / 32) * f16, STORAGE),
-    normGamma1: createBuf(device, S.d * f16, STORAGE),
-    normGamma2: createBuf(device, S.d * f16, STORAGE),
-    ffnWeights: createBuf(device, 2 * S.ffn * S.dPacked * 4, STORAGE),
-    ffnScales: createBuf(device, 2 * S.ffn * S.dScales * f16, STORAGE),
-    ffnDownWeights: createBuf(device, S.d * (S.ffn / 8) * 4, STORAGE),
-    ffnDownScales: createBuf(device, S.d * (S.ffn / 32) * f16, STORAGE),
-    kvPages: createBuf(device, S.maxPages * S.kvPageStride * f16, STORAGE),
+    qkvWeights: createBuf(device, S.qkvDim * S.dPacked * 4, storage()),
+    qkvScales: createBuf(device, S.qkvDim * S.dScales * f16, storage()),
+    oProjWeights: createBuf(device, S.d * (S.qDim / 8) * 4, storage()),
+    oProjScales: createBuf(device, S.d * (S.qDim / 32) * f16, storage()),
+    normGamma1: createBuf(device, S.d * f16, storage()),
+    normGamma2: createBuf(device, S.d * f16, storage()),
+    ffnWeights: createBuf(device, 2 * S.ffn * S.dPacked * 4, storage()),
+    ffnScales: createBuf(device, 2 * S.ffn * S.dScales * f16, storage()),
+    ffnDownWeights: createBuf(device, S.d * (S.ffn / 8) * 4, storage()),
+    ffnDownScales: createBuf(device, S.d * (S.ffn / 32) * f16, storage()),
+    kvPages: createBuf(device, S.maxPages * S.kvPageStride * f16, storage()),
   }
 }

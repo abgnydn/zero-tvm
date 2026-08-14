@@ -16,7 +16,10 @@
 
 import { type ModelSpec } from '../compiler/model-spec.js'
 import { modelBranding, SHIPPED_MODELS } from './model-registry.js'
-import { isModelCached } from './cache-probe.js'
+// Dynamic, like every other importer of cache-probe: it reaches the loaders,
+// which read GPUBufferUsage at module scope. chat.ts imports THIS module
+// statically, so a static import here would drag that chain into the chat
+// page's entry and break it on any browser without WebGPU.
 
 const MODELS = SHIPPED_MODELS
 
@@ -82,12 +85,13 @@ export function initModelSwitcher(current: ModelSpec): void {
   renderGateChips(current, cached)
   // Re-render once the OPFS probes land, so labels flip to "cached" without
   // blocking the header on three filesystem round-trips.
-  void Promise.all(
-    MODELS.map(async ({ spec }) => cached.set(spec.id, await isModelCached(spec))),
-  ).then(() => {
+  void import('./cache-probe.js').then(async ({ isModelCached }) => {
+    await Promise.all(
+      MODELS.map(async ({ spec }) => cached.set(spec.id, await isModelCached(spec))),
+    )
     render()
     renderGateChips(current, cached)
-  })
+  }).catch(() => { /* no WebGPU — labels stay as download sizes */ })
 }
 
 /**
