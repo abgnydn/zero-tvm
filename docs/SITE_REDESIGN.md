@@ -122,10 +122,22 @@ Kill list: `architecture.html` (footer still says webgpu-fusion-webllm),
 
 ## Phases
 
-1. **Tokens + landing.** Family tokens, then rebuild `index.html` on the
-   chassis: evergreen hero (kernel window with real syntax color and tabs),
-   capability band, registry-driven model cards, kernel wall, kill list applied
-   to nav, identity footer + JSON-LD. No hand-typed numbers anywhere.
+1. **Tokens + landing. — DONE 2026-08-14.** `public/tokens.css` (family
+   chassis + molten amber), `public/landing.css`, `public/fonts.css`.
+   `index.html` rebuilt: evergreen hero with a three-tab kernel window over
+   real shader source, capability band, registry-driven cards, kernel wall,
+   proof strip, identity footer + JSON-LD `isPartOf`. Nav is the five doors.
+
+   Fonts are SELF-HOSTED (292 KB, `public/fonts/`). The page claims nothing
+   leaves your machine; a webfont request to Google would leak every visitor's
+   IP and make that claim false on the landing page itself.
+
+   Two numbers were removed rather than styled: the meta description's model
+   count, and an "Ten roles" heading over ten tiles — both go stale the day a
+   model or a role is added, which is the rule this phase exists to enforce.
+   The only figures on the page now come from `model-branding` at runtime, and
+   a model with no measured rate renders no rate chip (qwen36 is the live
+   example).
 2. **The chat as instrument.** Restyle `chat-ui.css` to the token set — which
    moves the chat page and the rooms guest together, since they share the
    surface — then add the context gauge, pool system chips, per-turn meta

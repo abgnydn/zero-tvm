@@ -28,24 +28,27 @@ function render(): void {
   for (const { param, spec } of SHIPPED_MODELS) {
     const b = modelBranding(spec)
     const a = document.createElement('a')
-    a.className = 'model-card'
+    a.className = 'card'
     a.href = chatUrl(param)
+    // rateLabel is empty until a measurement exists, and an empty chip is
+    // simply not rendered. That is the landing's rule: a number appears here
+    // because it was measured, or it does not appear.
     a.innerHTML = `
-      <div class="mc-name">${b.name}</div>
-      <div class="mc-params">${b.params}</div>
-      <div class="mc-chips">
-        <span class="mc-chip m">${b.sizeLabel}</span>
-        ${b.rateLabel ? `<span class="mc-chip g">${b.rateLabel}</span>` : ''}
+      <div class="card-name">${b.name}</div>
+      <div class="card-params">${b.params}</div>
+      <div class="chips">
+        <span class="chip">${b.sizeLabel}</span>
+        ${b.rateLabel ? `<span class="chip rate">${b.rateLabel}</span>` : ''}
       </div>
-      ${b.ramNote ? `<div class="mc-ram">${b.ramNote}</div>` : ''}
-      <div class="mc-go">Open chat →<span class="mc-cached" data-model-cached="${spec.id}"></span></div>
+      ${b.ramNote ? `<div class="card-ram">${b.ramNote}</div>` : ''}
+      <div class="card-go">Open chat →<span data-model-cached="${spec.id}"></span></div>
     `
     host.appendChild(a)
   }
 
   if (!webgpu) {
     const note = document.createElement('p')
-    note.className = 'mc-webgpu-note'
+    note.className = 'note'
     note.textContent = 'This browser has no WebGPU — the chat needs Chrome, Edge, or another WebGPU-enabled browser.'
     host.appendChild(note)
   }

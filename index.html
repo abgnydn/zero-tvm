@@ -3,1005 +3,269 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE</title>
-  <meta name="description" content="Ten models, from Phi-3-mini to the Qwen3.6-35B-A3B sparse MoE, decoding in the browser on hand-written WGSL. Ten kernel roles and ~2,000 lines of TypeScript, readable end-to-end, measured against WebLLM and LM Studio.">
-  <meta name="theme-color" content="#0a0a0c">
+  <title>zero-tvm — LLM inference in the browser, on hand-written WGSL</title>
+  <meta name="description" content="zero-tvm is an LLM inference engine written by hand in WGSL and TypeScript. It runs entirely in the browser: weights download once, cache locally, and inference runs on your own GPU.">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="canonical" href="https://zerotvm.com/">
+
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://zerotvm.com/">
-  <meta property="og:title" content="Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE">
-  <meta property="og:description" content="Ten models, up to a 35B sparse MoE, decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. Readable end-to-end, measured against WebLLM and LM Studio.">
-  <meta property="og:image" content="https://zerotvm.com/og.png">
+  <meta property="og:title" content="zero-tvm — LLM inference in the browser, on hand-written WGSL">
+  <meta property="og:description" content="An LLM inference engine written by hand in WGSL and TypeScript. Weights download once, cache locally, and inference runs on your own GPU.">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Zero-TVM — LLMs in your browser on hand-written WebGPU kernels · up to a 35B MoE">
-  <meta name="twitter:description" content="Ten models, up to a 35B sparse MoE, decoding on 10 hand-written WGSL kernel roles and ~2,000 lines of TypeScript. Readable end-to-end, measured against WebLLM and LM Studio.">
-  <meta name="twitter:image" content="https://zerotvm.com/og.png">
-  <link rel="canonical" href="https://zerotvm.com/">
+  <meta name="twitter:title" content="zero-tvm — LLM inference in the browser, on hand-written WGSL">
+  <meta name="twitter:description" content="An LLM inference engine written by hand in WGSL and TypeScript. Weights download once, cache locally, and inference runs on your own GPU.">
+
+  <link rel="preload" href="/fonts/f3-fraunce.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/f4-plinean.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/fonts.css">
+  <link rel="stylesheet" href="/tokens.css">
+  <link rel="stylesheet" href="/landing.css">
+
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
-    "@graph": [
-      {
-        "@type": "SoftwareApplication",
-        "@id": "https://zerotvm.com#app",
-        "name": "Zero-TVM",
-        "url": "https://zerotvm.com",
-        "applicationCategory": "DeveloperApplication",
-        "operatingSystem": "Any (WebGPU browser, Chrome or Edge)",
-        "description": "Ten models, from Phi-3-mini to the Qwen3.6-35B-A3B sparse MoE, decoding in the browser on hand-written WGSL. Ten kernel roles and ~2,000 lines of TypeScript, readable end-to-end, measured against WebLLM and LM Studio.",
-        "author": { "@id": "https://zerotvm.com#author" },
-        "isPartOf": {
-          "@type": "CreativeWork",
-          "name": "Kernel-fusion research line",
-          "url": "https://kernelfusion.dev"
-        }
-      },
-      {
-        "@type": "Person",
-        "@id": "https://zerotvm.com#author",
-        "name": "Ahmet Baris Gunaydin",
-        "url": "https://zerotvm.com",
-        "sameAs": [
-          "https://barisgunaydin.com",
-          "https://kernelfusion.dev",
-          "https://gpubench.dev",
-          "https://zerotvm.com",
-          "https://webgpudna.com",
-          "https://neuropulse.live",
-          "https://webgpu-q.vercel.app",
-          "https://markview.ai",
-          "https://safenpm.dev",
-          "https://fused-lora.pages.dev",
-          "https://github.com/abgnydn",
-          "https://www.linkedin.com/in/abgnydn/"
-        ]
-      },
-      {
-        "@type": "WebSite",
-        "@id": "https://zerotvm.com#site",
-        "url": "https://zerotvm.com",
-        "name": "Zero-TVM",
-        "publisher": { "@id": "https://zerotvm.com#author" }
-      }
-    ]
+    "@type": "SoftwareSourceCode",
+    "name": "zero-tvm",
+    "url": "https://zerotvm.com/",
+    "description": "An LLM inference engine written by hand in WGSL and TypeScript, running entirely in the browser.",
+    "programmingLanguage": ["WGSL", "TypeScript"],
+    "codeRepository": "https://github.com/abgnydn/zero-tvm",
+    "license": "https://opensource.org/licenses/MIT",
+    "isPartOf": {
+      "@type": "Collection",
+      "name": "WebGPU research line",
+      "url": "https://kernelfusion.dev"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Ahmet Barış Günaydın",
+      "url": "https://zerotvm.com/",
+      "sameAs": [
+        "https://github.com/abgnydn",
+        "https://huggingface.co/abgunaydin",
+        "https://kernelfusion.dev"
+      ]
+    }
   }
   </script>
-  <style>
-    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-
-    :root {
-      --bg:      #0a0a0c;
-      --surface: #111114;
-      --border:  #1e1e24;
-      --accent:  #6c63ff;
-      --green:   #00d4aa;
-      --yellow:  #f5c542;
-      --text:    #e8e8ec;
-      --muted:   #666672;
-      --dim:     #3a3a44;
-    }
-
-    html { scroll-behavior: smooth; }
-
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.6;
-      overflow-x: hidden;
-    }
-
-    /* ── NAV ── */
-    nav {
-      position: fixed;
-      top: 0; left: 0; right: 0;
-      z-index: 100;
-      background: rgba(10,10,12,0.85);
-      backdrop-filter: blur(16px);
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      align-items: center;
-      padding: 0 2rem;
-      height: 56px;
-      gap: 2rem;
-    }
-
-    .nav-logo {
-      font-weight: 800;
-      font-size: 1rem;
-      letter-spacing: -0.03em;
-      color: #fff;
-      text-decoration: none;
-    }
-
-    .nav-logo span { color: var(--accent); }
-
-    nav ul {
-      list-style: none;
-      display: flex;
-      gap: 1.75rem;
-      margin-left: auto;
-    }
-
-    nav ul li a {
-      font-size: 0.82rem;
-      color: var(--muted);
-      text-decoration: none;
-      transition: color 0.15s;
-    }
-
-    nav ul li a:hover { color: var(--text); }
-
-    .nav-cta {
-      background: var(--accent) !important;
-      color: #fff !important;
-      padding: 0.4rem 1rem;
-      border-radius: 8px;
-      font-weight: 600 !important;
-    }
-
-    .nav-cta:hover { opacity: 0.85; }
-
-    /* ── HERO ── */
-    .hero {
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      text-align: center;
-      padding: 6rem 1.5rem 4rem;
-      position: relative;
-      overflow: hidden;
-    }
-
-    /* Gradient glow background */
-    .hero::before {
-      content: '';
-      position: absolute;
-      width: 800px; height: 800px;
-      background: radial-gradient(circle, #6c63ff18 0%, transparent 70%);
-      top: 50%; left: 50%;
-      transform: translate(-50%, -60%);
-      pointer-events: none;
-    }
-
-    .hero::after {
-      content: '';
-      position: absolute;
-      width: 500px; height: 500px;
-      background: radial-gradient(circle, #00d4aa0f 0%, transparent 70%);
-      bottom: 10%; right: 10%;
-      pointer-events: none;
-    }
-
-    .hero-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.4rem;
-      background: #6c63ff14;
-      border: 1px solid #6c63ff33;
-      color: var(--accent);
-      padding: 0.3rem 0.85rem;
-      border-radius: 999px;
-      font-size: 0.72rem;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      margin-bottom: 1.75rem;
-    }
-
-    .hero h1 {
-      font-size: clamp(2.5rem, 6vw, 4.5rem);
-      font-weight: 800;
-      letter-spacing: -0.04em;
-      line-height: 1.1;
-      max-width: 800px;
-      margin-bottom: 1.25rem;
-    }
-
-    .hero h1 .accent { color: var(--accent); }
-    .hero h1 .green  { color: var(--green); }
-
-    .hero-sub {
-      font-size: clamp(1rem, 2vw, 1.2rem);
-      color: var(--muted);
-      max-width: 560px;
-      margin-bottom: 2.5rem;
-      line-height: 1.7;
-    }
-
-    .hero-actions {
-      display: flex;
-      gap: 0.75rem;
-      flex-wrap: wrap;
-      justify-content: center;
-    }
-
-    .btn-primary {
-      background: var(--accent);
-      color: #fff;
-      padding: 0.8rem 1.75rem;
-      border-radius: 10px;
-      font-size: 0.95rem;
-      font-weight: 600;
-      text-decoration: none;
-      transition: opacity 0.15s, transform 0.1s;
-    }
-
-    .btn-primary:hover { opacity: 0.85; transform: translateY(-1px); }
-
-    .btn-ghost {
-      background: transparent;
-      color: var(--text);
-      padding: 0.8rem 1.75rem;
-      border-radius: 10px;
-      font-size: 0.95rem;
-      font-weight: 500;
-      text-decoration: none;
-      border: 1px solid var(--border);
-      transition: border-color 0.15s, transform 0.1s;
-    }
-
-    .btn-ghost:hover { border-color: var(--dim); transform: translateY(-1px); }
-
-    /* Hero stats strip */
-    .hero-stats {
-      display: flex;
-      gap: 2.5rem;
-      margin-top: 4rem;
-      flex-wrap: wrap;
-      justify-content: center;
-    }
-
-    .hero-stat { text-align: center; }
-    .hero-stat .val {
-      font-size: 2rem;
-      font-weight: 800;
-      letter-spacing: -0.03em;
-      color: var(--text);
-    }
-    .hero-stat .val.g { color: var(--green); }
-    .hero-stat .val.p { color: var(--accent); }
-    .hero-stat .lbl { font-size: 0.72rem; color: var(--muted); margin-top: 0.1rem; }
-
-    /* ── TERMINAL / demo preview ── */
-    .demo-wrap {
-      padding: 0 1.5rem 5rem;
-      display: flex;
-      justify-content: center;
-    }
-
-    .terminal {
-      width: 100%;
-      max-width: 680px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      overflow: hidden;
-      font-family: 'SF Mono', 'Fira Code', monospace;
-      font-size: 0.8rem;
-    }
-
-    .terminal-bar {
-      background: #18181c;
-      padding: 0.65rem 1rem;
-      display: flex;
-      align-items: center;
-      gap: 0.45rem;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .dot-r { width: 11px; height: 11px; border-radius: 50%; background: #ff5f57; }
-    .dot-y { width: 11px; height: 11px; border-radius: 50%; background: #febc2e; }
-    .dot-g { width: 11px; height: 11px; border-radius: 50%; background: #28c840; }
-    .terminal-title { font-size: 0.7rem; color: var(--muted); margin-left: auto; margin-right: auto; }
-
-    .terminal-body { padding: 1.25rem 1.25rem; line-height: 1.7; }
-    .t-dim    { color: #444; }
-    .t-green  { color: var(--green); }
-    .t-purple { color: var(--accent); }
-    .t-yellow { color: var(--yellow); }
-    .t-white  { color: #ccc; }
-    .t-cursor { display: inline-block; width: 8px; height: 14px; background: var(--green); vertical-align: middle; animation: blink 1s step-end infinite; }
-    @keyframes blink { 50% { opacity: 0; } }
-
-    /* ── SECTION BASE ── */
-    section { padding: 5rem 1.5rem; }
-    .section-inner { max-width: 1100px; margin: 0 auto; }
-
-    .section-label {
-      font-size: 0.7rem;
-      font-weight: 700;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--accent);
-      margin-bottom: 0.75rem;
-    }
-
-    .section-title {
-      font-size: clamp(1.75rem, 3.5vw, 2.5rem);
-      font-weight: 800;
-      letter-spacing: -0.03em;
-      line-height: 1.15;
-      margin-bottom: 1rem;
-    }
-
-    .section-sub {
-      font-size: 1rem;
-      color: var(--muted);
-      max-width: 540px;
-      line-height: 1.7;
-      margin-bottom: 3rem;
-    }
-
-    /* ── HOW IT WORKS ── */
-    .steps {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 1.25rem;
-    }
-
-    .step-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 1.5rem;
-      position: relative;
-    }
-
-    .step-num {
-      font-size: 0.65rem;
-      font-weight: 700;
-      color: var(--accent);
-      letter-spacing: 0.08em;
-      margin-bottom: 0.75rem;
-    }
-
-    .step-icon { font-size: 1.75rem; margin-bottom: 0.75rem; }
-
-    .step-card h3 {
-      font-size: 0.95rem;
-      font-weight: 700;
-      margin-bottom: 0.4rem;
-      color: var(--text);
-    }
-
-    .step-card p { font-size: 0.78rem; color: var(--muted); line-height: 1.6; }
-
-    .step-arrow {
-      position: absolute;
-      right: -1.5rem;
-      top: 50%;
-      transform: translateY(-50%);
-      color: var(--dim);
-      font-size: 1.2rem;
-      z-index: 1;
-    }
-
-    /* ── SHADERS GRID ── */
-    .shaders-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-      gap: 1rem;
-    }
-
-    .shader-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 1.1rem 1.25rem;
-      display: flex;
-      align-items: flex-start;
-      gap: 1rem;
-      transition: border-color 0.15s;
-    }
-
-    .shader-card:hover { border-color: #6c63ff44; }
-
-    .shader-num {
-      font-size: 0.65rem;
-      color: var(--muted);
-      font-weight: 600;
-      width: 18px;
-      flex-shrink: 0;
-      padding-top: 2px;
-    }
-
-    .shader-icon-lg { font-size: 1.5rem; flex-shrink: 0; }
-
-    .shader-card h4 { font-size: 0.88rem; font-weight: 700; color: var(--text); }
-    .shader-card p  { font-size: 0.73rem; color: var(--muted); margin-top: 0.2rem; line-height: 1.5; }
-
-    .shader-tag {
-      display: inline-block;
-      background: #6c63ff14;
-      color: var(--accent);
-      font-size: 0.58rem;
-      font-weight: 600;
-      padding: 0.1rem 0.45rem;
-      border-radius: 4px;
-      margin-top: 0.4rem;
-      letter-spacing: 0.03em;
-    }
-
-    /* ── COMPARISON TABLE ── */
-    .compare-table {
-      width: 100%;
-      border-collapse: collapse;
-      border-radius: 12px;
-      overflow: hidden;
-      border: 1px solid var(--border);
-    }
-
-    .compare-table th {
-      background: var(--surface);
-      padding: 0.85rem 1.25rem;
-      font-size: 0.78rem;
-      font-weight: 700;
-      color: var(--text);
-      text-align: left;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .compare-table th:first-child { width: 30%; }
-
-    .compare-table td {
-      padding: 0.75rem 1.25rem;
-      font-size: 0.8rem;
-      color: var(--muted);
-      border-bottom: 1px solid var(--border);
-      vertical-align: middle;
-    }
-
-    .compare-table tr:last-child td { border-bottom: none; }
-    .compare-table tr:hover td { background: #ffffff04; }
-
-    .compare-table .ours { color: var(--green); font-weight: 600; }
-    .compare-table .col-ours th { color: var(--green); }
-
-    .check { color: var(--green); }
-    .cross { color: #ff5f57; }
-    .neutral { color: var(--muted); }
-
-    /* ── ARCHITECTURE DIAGRAM ── */
-    .arch-flow {
-      display: flex;
-      align-items: center;
-      gap: 0;
-      overflow-x: auto;
-      padding: 1.5rem 0;
-    }
-
-    .arch-box {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 0.75rem 1rem;
-      text-align: center;
-      flex-shrink: 0;
-      min-width: 100px;
-    }
-
-    .arch-box .icon { font-size: 1.25rem; }
-    .arch-box .name { font-size: 0.68rem; font-weight: 600; color: var(--text); margin-top: 0.3rem; }
-    .arch-box .sub  { font-size: 0.58rem; color: var(--muted); margin-top: 0.1rem; }
-    .arch-box.highlight { border-color: var(--accent); background: #6c63ff0d; }
-    .arch-box.highlight .name { color: var(--accent); }
-
-    .arch-arrow {
-      color: var(--dim);
-      font-size: 1.2rem;
-      padding: 0 0.35rem;
-      flex-shrink: 0;
-    }
-
-    /* ── CTA ── */
-    .cta-section {
-      background: linear-gradient(135deg, #6c63ff0d 0%, #00d4aa08 100%);
-      border-top: 1px solid var(--border);
-      border-bottom: 1px solid var(--border);
-      text-align: center;
-    }
-
-    .cta-section h2 {
-      font-size: clamp(1.75rem, 3vw, 2.5rem);
-      font-weight: 800;
-      letter-spacing: -0.03em;
-      margin-bottom: 1rem;
-    }
-
-    .cta-section p { font-size: 1rem; color: var(--muted); max-width: 480px; margin: 0 auto 2rem; line-height: 1.7; }
-
-    /* ── RELATED ── */
-    .related-section {
-      padding: 4rem 1.5rem;
-    }
-
-    .related-grid {
-      display: grid;
-      grid-template-columns: repeat(2, 1fr);
-      gap: 1rem;
-      margin-top: 2rem;
-    }
-
-    .related-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 1.25rem 1.4rem;
-      text-decoration: none;
-      color: inherit;
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-      transition: border-color 0.15s, transform 0.1s;
-    }
-
-    .related-card:hover { border-color: #6c63ff55; transform: translateY(-2px); }
-
-    .related-tag {
-      display: inline-block;
-      background: #6c63ff14;
-      color: var(--accent);
-      font-size: 0.6rem;
-      font-weight: 700;
-      padding: 0.15rem 0.5rem;
-      border-radius: 999px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      align-self: flex-start;
-    }
-
-    .related-card h4 { font-size: 1rem; font-weight: 700; color: var(--text); }
-    .related-card p  { font-size: 0.78rem; color: var(--muted); line-height: 1.55; }
-
-    .related-cta {
-      font-size: 0.72rem;
-      font-weight: 600;
-      color: var(--green);
-      margin-top: auto;
-    }
-
-    @media (max-width: 760px) {
-      .related-grid { grid-template-columns: 1fr; }
-    }
-
-    /* ── FOOTER ── */
-    footer {
-      padding: 2.5rem 1.5rem;
-      border-top: 1px solid var(--border);
-      text-align: center;
-    }
-
-    footer p { font-size: 0.75rem; color: var(--muted); line-height: 1.8; }
-
-    .footer-links {
-      display: flex;
-      gap: 1.25rem;
-      flex-wrap: wrap;
-      justify-content: center;
-      margin-top: 0.75rem;
-      font-size: 0.72rem;
-    }
-
-    .footer-links a {
-      color: var(--muted);
-      text-decoration: none;
-      transition: color 0.15s;
-    }
-
-    .footer-links a:hover { color: var(--text); }
-
-    /* ── MISC ── */
-    .divider {
-      border: none;
-      border-top: 1px solid var(--border);
-      margin: 0;
-    }
-
-    .pill-row {
-      display: flex;
-      gap: 0.5rem;
-      flex-wrap: wrap;
-      margin-bottom: 3rem;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.3rem;
-      padding: 0.2rem 0.6rem;
-      border-radius: 999px;
-      font-size: 0.67rem;
-      font-weight: 600;
-      border: 1px solid;
-    }
-
-    .pill.green  { background: #00d4aa12; color: var(--green);  border-color: #00d4aa30; }
-    .pill.purple { background: #6c63ff12; color: var(--accent); border-color: #6c63ff30; }
-    .pill.yellow { background: #f5c54212; color: var(--yellow); border-color: #f5c54230; }
-    .pill.red    { background: #ff5f5712; color: #ff5f57;       border-color: #ff5f5730; }
-
-    /* ── SHARE MODAL ── */
-    .share-modal {
-      position: fixed; inset: 0;
-      background: rgba(0,0,0,0.7);
-      backdrop-filter: blur(8px);
-      display: none;
-      align-items: center; justify-content: center;
-      z-index: 200;
-      padding: 1rem;
-    }
-    .share-modal.open { display: flex; }
-    .share-panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 1.5rem;
-      max-width: 480px;
-      width: 100%;
-      max-height: 85vh;
-      overflow-y: auto;
-    }
-    .share-panel h3 {
-      font-size: 1.1rem;
-      font-weight: 700;
-      margin-bottom: 1rem;
-      color: var(--text);
-    }
-    .share-option {
-      display: block;
-      padding: 0.85rem 1rem;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      margin-bottom: 0.5rem;
-      text-decoration: none;
-      color: inherit;
-      transition: border-color 0.15s, background 0.15s;
-    }
-    .share-option:hover { border-color: var(--accent); background: #6c63ff0a; }
-    .share-option .platform {
-      display: block;
-      font-size: 0.72rem;
-      font-weight: 700;
-      color: var(--accent);
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      margin-bottom: 0.25rem;
-    }
-    .share-option .msg {
-      font-size: 0.78rem;
-      color: var(--muted);
-      line-height: 1.5;
-      display: block;
-      overflow-wrap: anywhere;
-    }
-    .copied-toast {
-      position: fixed;
-      bottom: 2rem; left: 50%;
-      transform: translateX(-50%);
-      background: var(--green);
-      color: #0a0a0c;
-      padding: 0.6rem 1.25rem;
-      border-radius: 999px;
-      font-size: 0.82rem;
-      font-weight: 700;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.2s;
-      z-index: 300;
-    }
-    .copied-toast.show { opacity: 1; }
-
-    /* ── model picker cards (rendered by src/landing.ts from the registry) ── */
-    .model-cards {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-      gap: 1rem; margin-top: 2.25rem; text-align: left;
-    }
-    .model-card {
-      display: block; padding: 1.1rem 1.2rem; border-radius: 14px;
-      background: var(--surface); border: 1px solid rgba(255,255,255,0.07);
-      text-decoration: none; color: inherit;
-      transition: transform .15s ease, border-color .15s ease;
-    }
-    .model-card:hover { transform: translateY(-2px); border-color: var(--accent); }
-    .mc-name { font-weight: 800; font-size: 1.05rem; letter-spacing: -0.02em; }
-    .mc-params { color: var(--muted); font-size: 0.8rem; margin-top: 0.15rem; }
-    .mc-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.7rem; }
-    .mc-chip {
-      font-size: 0.72rem; padding: 0.16rem 0.55rem; border-radius: 999px;
-      background: rgba(124,108,255,0.14); color: var(--accent); font-weight: 600;
-    }
-    .mc-chip.g { background: rgba(61,220,151,0.12); color: var(--green); }
-    .mc-chip.m { background: rgba(255,255,255,0.06); color: var(--muted); }
-    .mc-ram { color: var(--muted); font-size: 0.72rem; margin-top: 0.5rem; }
-    .mc-go { margin-top: 0.85rem; font-size: 0.85rem; font-weight: 600; color: var(--accent); }
-    .mc-cached { color: var(--green); font-weight: 500; font-size: 0.78rem; }
-    .mc-webgpu-note { grid-column: 1 / -1; color: var(--muted); font-size: 0.85rem; }
-    .why-links { display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: center; margin-top: 2rem; }
-    #why .section-sub { margin-left: auto; margin-right: auto; }
-  </style>
 </head>
 <body>
 
-<!-- ── NAV ── -->
-<nav>
-  <a href="#" class="nav-logo">Zero<span>TVM</span></a>
-  <ul>
-    <li><a href="#models">Models</a></li>
-    <li><a href="#why">About</a></li>
-    <li><a href="#tools">Tools</a></li>
-    <li><a href="docs.html">Docs</a></li>
-    <li><a href="zero-tvm.html" class="nav-cta">Try it →</a></li>
-  </ul>
+<nav class="nav">
+  <div class="wrap nav-in">
+    <a href="/" class="nav-logo">zero<span>-tvm</span></a>
+    <div class="nav-links">
+      <a href="#models">Models</a>
+      <a href="share.html">Rooms</a>
+      <a href="docs.html#agent">Agent</a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">Proof</a>
+      <a href="docs.html">Docs</a>
+      <a href="zero-tvm.html" class="nav-cta">Open chat →</a>
+    </div>
+  </div>
 </nav>
 
-<!-- ── HERO ── -->
-<section class="hero">
-  <h1>
-    LLM inference in the browser,<br>
-    <span class="green">on hand-written WGSL.</span>
-  </h1>
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow"><i class="pulse"></i> WebGPU · WGSL · runs on your GPU</span>
 
-  <p class="hero-sub">
-    zero-tvm is an LLM inference engine written by hand in WGSL and TypeScript.
-    It runs entirely in the browser: weights download once, cache locally, and
-    inference runs on your own GPU. It is measured against WebLLM and against
-    LM Studio, and the protocol, the raw runs and the withdrawn claims are all
-    <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md" style="color:var(--accent);">in BENCH.md</a>.
-  </p>
+    <h1>LLM inference in the browser,<br><em>on hand-written WGSL.</em></h1>
 
-  <div class="hero-actions">
-    <a href="#models" class="btn-primary">Models ↓</a>
-    <a href="https://github.com/abgnydn/zero-tvm" class="btn-ghost" target="_blank" rel="noopener">GitHub ↗</a>
-    <button class="btn-ghost" onclick="document.getElementById('share-modal').classList.add('open')" style="cursor:pointer;font-family:inherit;">Share</button>
+    <p>
+      zero-tvm is an LLM inference engine written by hand in WGSL and
+      TypeScript. It runs entirely in the browser: weights download once,
+      cache locally, and inference runs on your own GPU.
+    </p>
+
+    <div class="hero-actions">
+      <a href="zero-tvm.html" class="btn btn-primary">Open chat</a>
+      <a href="https://github.com/abgnydn/zero-tvm" class="btn">Read the source</a>
+    </div>
+
+    <!-- KERNEL WINDOW. The hero's evidence is the code, because every number
+         this repo produces changes weekly and the shaders do not. -->
+    <div class="kw">
+      <div class="kw-bar">
+        <div class="kw-dots"><i></i><i></i><i></i></div>
+        <div class="kw-tabs" role="tablist" aria-label="Kernel source">
+          <button class="kw-tab" role="tab" aria-selected="true"  aria-controls="k1" id="t1">moe_router_topk.wgsl</button>
+          <button class="kw-tab" role="tab" aria-selected="false" aria-controls="k2" id="t2">attention_sg.wgsl</button>
+          <button class="kw-tab" role="tab" aria-selected="false" aria-controls="k3" id="t3">int4_matmul.gen.ts</button>
+        </div>
+      </div>
+      <div class="kw-body">
+<pre id="k1" role="tabpanel" aria-labelledby="t1"><span class="t-com">// Softmax over every expert, then the top-K survivors. One subgroup,</span>
+<span class="t-com">// eight experts per lane: subgroupMax/subgroupAdd reduce with no barrier.</span>
+<span class="t-key">var</span> m : <span class="t-type">f32</span> = <span class="t-num">-3.0e38</span>;
+<span class="t-key">for</span> (<span class="t-key">var</span> i : <span class="t-type">u32</span> = <span class="t-num">0u</span>; i &lt; PER; i = i + <span class="t-num">1u</span>) {
+  <span class="t-key">let</span> e : <span class="t-type">u32</span> = t * PER + i;
+  <span class="t-com">// Lanes past E must lose every max: -inf, not 0 (logits can be negative).</span>
+  <span class="t-key">let</span> v : <span class="t-type">f32</span> = <span class="t-fn">select</span>(<span class="t-num">-3.0e38</span>, logits[lBase + e], e &lt; E);
+  pv[i] = v;
+  m = <span class="t-fn">max</span>(m, v);
+}
+<span class="t-key">let</span> peak : <span class="t-type">f32</span> = <span class="t-fn">subgroupMax</span>(m);</pre>
+<pre id="k2" role="tabpanel" aria-labelledby="t2" hidden><span class="t-com">// Flash-style attention, one workgroup per (batch, head), scores reduced</span>
+<span class="t-com">// across the subgroup instead of through workgroup memory.</span>
+<span class="t-attr">@compute</span> <span class="t-attr">@workgroup_size</span>(<span class="t-num">32</span>, <span class="t-num">1</span>, <span class="t-num">1</span>)
+<span class="t-key">fn</span> <span class="t-fn">attention_sg</span>(
+  <span class="t-attr">@builtin</span>(workgroup_id) blockIdx : <span class="t-type">vec3</span>&lt;<span class="t-type">u32</span>&gt;,
+  <span class="t-attr">@builtin</span>(local_invocation_id) threadIdx : <span class="t-type">vec3</span>&lt;<span class="t-type">u32</span>&gt;,
+) {
+  <span class="t-key">let</span> batch : <span class="t-type">i32</span> = <span class="t-type">i32</span>(blockIdx.x);
+  <span class="t-key">let</span> head  : <span class="t-type">i32</span> = <span class="t-type">i32</span>(blockIdx.y);
+  <span class="t-key">if</span> (batch &gt;= podArgs.B) { <span class="t-key">return</span>; }
+  <span class="t-key">let</span> kv_head : <span class="t-type">i32</span> = head / GQA_GROUP;</pre>
+<pre id="k3" role="tabpanel" aria-labelledby="t3" hidden><span class="t-com">// The int4 matmul is generated, not hand-copied: one function emits every</span>
+<span class="t-com">// variant, so a fix lands in all of them at once.</span>
+<span class="t-key">export const</span> INT4_MATMUL_VARIANTS: <span class="t-type">Int4MatmulOpts</span>[] = [
+  { subgroups: <span class="t-key">true</span>, rowsPerWG: <span class="t-num">4</span> },              <span class="t-com">// tiled</span>
+  { subgroups: <span class="t-key">true</span>, rowsPerWG: <span class="t-num">4</span>, mDyn: <span class="t-key">true</span> }, <span class="t-com">// chunked prefill</span>
+  { subgroups: <span class="t-key">true</span>, vec4Half: <span class="t-key">true</span>, affine: <span class="t-key">true</span> },
+  { affine: <span class="t-key">true</span>, moe: <span class="t-key">true</span>, subgroups: <span class="t-key">true</span>, rowsPerWG: <span class="t-num">4</span> },
+  <span class="t-com">// ...one entry per shipped shape</span>
+]</pre>
+      </div>
+      <div class="kw-foot">
+        <span>every kernel in this engine is in the repository, unminified</span>
+        <a href="https://github.com/abgnydn/zero-tvm/tree/main/src/compiler/shaders">src/compiler/shaders →</a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <div class="band">
+      <a href="zero-tvm.html">
+        <h3>Chat</h3>
+        <p>Pick a model, wait for the weights once, then talk to it. The tab keeps the cache.</p>
+      </a>
+      <a href="share.html">
+        <h3>Rooms</h3>
+        <p>Serve the model in your tab to another device over WebRTC, or split it across machines.</p>
+      </a>
+      <a href="docs.html#agent">
+        <h3>Agent</h3>
+        <p>An OpenAI-shaped endpoint backed by the browser tab, so coding agents can drive it.</p>
+      </a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">
+        <h3>Proof</h3>
+        <p>Every measurement, the protocol behind it, and the claims that were withdrawn.</p>
+      </a>
+    </div>
   </div>
 </section>
 
-<!-- ── MODELS ── -->
 <section id="models">
-  <div class="section-inner">
-    <div class="section-label">Models</div>
-    <h2 class="section-title">Models</h2>
-    <p class="section-sub">
-      Weights download once and cache in the browser (OPFS); inference runs on your GPU
-      and nothing leaves your machine. This list renders from
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/zero-tvm/model-registry.ts" style="color:var(--accent);">src/zero-tvm/model-registry.ts</a>.
-    </p>
-    <div id="model-cards" class="model-cards">
-      <noscript><p class="mc-webgpu-note">JavaScript required — the cards render from the engine's own model table.</p></noscript>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="eyebrow">Models</span>
+      <h2>Everything the engine ships</h2>
+      <p>
+        This list renders from the engine's own model table, so it cannot
+        disagree with what the code loads. Sizes are the resident weights;
+        rates are measured on an M2 Max and only appear where a measurement
+        exists.
+      </p>
+    </div>
+    <div class="cards" id="model-cards"></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="eyebrow">Kernels</span>
+      <h2>One file per role, written by hand</h2>
+      <p>
+        WebLLM ships shaders emitted by a compiler. These are the roles a
+        forward pass actually needs, each one a file you can read.
+      </p>
+    </div>
+    <div class="wall">
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/embedding.wgsl"><b>embedding</b><span>token → residual</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/rms_norm.wgsl"><b>rms_norm</b><span>normalisation</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/int4_matmul.gen.ts"><b>int4_matmul</b><span>quantised GEMM</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/qkv_fused.wgsl"><b>qkv_fused</b><span>projection + RoPE</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/attention_sg.wgsl"><b>attention</b><span>paged KV, split-K</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/fused_ffn.wgsl"><b>fused_ffn</b><span>gate · up · SiLU</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/gdn_recur.wgsl"><b>gdn_recur</b><span>gated DeltaNet</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/moe_router_topk.wgsl"><b>moe_router</b><span>expert selection</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/mla_scores.wgsl"><b>mla</b><span>latent attention</span></a>
+      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/argmax.wgsl"><b>argmax</b><span>sampling</span></a>
     </div>
   </div>
 </section>
 
-<!-- ── A REAL KERNEL ── -->
-<div class="demo-wrap">
-  <div class="terminal">
-    <div class="terminal-bar">
-      <div class="dot-r"></div>
-      <div class="dot-y"></div>
-      <div class="dot-g"></div>
-      <span class="terminal-title">src/compiler/shaders/rms_norm.wgsl — as shipped, not an illustration</span>
-    </div>
-    <div class="terminal-body">
-      <div><span class="t-dim">// RMSNORM — normalize hidden state. output[i] = (input[i] / rms) * gamma[i]</span></div>
-      <div><span class="t-purple">@compute @workgroup_size</span><span class="t-white">(64, 1, 1)</span></div>
-      <div><span class="t-purple">fn</span> <span class="t-green">rms_norm</span><span class="t-white">(...) {</span></div>
-      <div><span class="t-white">  <span class="t-dim">// Phase 1: sum of squares in f32</span></span></div>
-      <div><span class="t-white">  var sum_sq : f32 = 0.0;</span></div>
-      <div><span class="t-white">  for (var i = 0; i &lt; D / 64; i++) {</span></div>
-      <div><span class="t-white">    let val = f32(input_buf[base + tid * (D / 64) + i]);</span></div>
-      <div><span class="t-white">    sum_sq = sum_sq + val * val;</span></div>
-      <div><span class="t-white">  }</span></div>
-      <div><span class="t-white">  <span class="t-dim">// tree-reduce across 64 threads, then:</span></span></div>
-      <div><span class="t-white">  let rms_inv = 1.0 / sqrt(red_buf[0] / f32(D) + RMS_EPS);</span></div>
-      <div><span class="t-white">  output_buf[base + idx] = f16(val * rms_inv * f32(gamma[idx]));</span></div>
-      <div><span class="t-white">}</span></div>
-      <br>
-      <div><span class="t-dim">// one of the 10 kernel roles. all of them read like this:</span></div>
-      <div><span class="t-white"><a href="https://github.com/abgnydn/zero-tvm/tree/main/src/compiler/shaders" style="color:var(--green);">github.com/abgnydn/zero-tvm/src/compiler/shaders</a></span></div>
-    </div>
-  </div>
-</div>
-
-<hr class="divider">
-
-<!-- ── HOW IT WORKS ── -->
-<section id="why">
-  <div class="section-inner">
-    <div class="section-label">About</div>
-    <h2 class="section-title">What this is</h2>
-    <p class="section-sub" style="margin-left:0;">
-      Zero-TVM is an LLM inference engine for the browser. The standard stacks compile
-      their shaders (WebLLM/TVM emits 85 autotuned kernels behind a WASM scheduler);
-      this engine is written by hand instead.
-    </p>
-    <ul style="max-width:640px;line-height:2;color:var(--muted);list-style:none;padding:0;">
-      <li>10 kernel roles — 42 WGSL files plus a small generator</li>
-      <li>No runtime dependencies: no WebLLM, no TVM, no ONNX, no WASM</li>
-      <li>int4 / int3 quantized weights, loaded by byte range, cached in OPFS</li>
-      <li>Paged KV cache, gated DeltaNet, sparse-MoE routing — all in plain WGSL</li>
-      <li>Layers validated against reference implementations (mlx_lm's own modules)</li>
-      <li>Benchmarked against WebLLM on identical weights; protocol and all numbers in BENCH.md</li>
-      <li>MIT</li>
-    </ul>
-    <div class="why-links" style="justify-content:flex-start;">
-      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm#readme" target="_blank" rel="noopener">README</a>
-      <a class="btn-ghost" href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md" target="_blank" rel="noopener">BENCH.md</a>
-      <a class="btn-ghost" href="validate.html">Validation</a>
-      <a class="btn-ghost" href="docs.html">Docs</a>
+<section>
+  <div class="wrap">
+    <div class="proof">
+      <span class="eyebrow">Measured</span>
+      <h2>The numbers, and the ones that were withdrawn</h2>
+      <p>
+        The engine is benchmarked against WebLLM and llama.cpp in the browser,
+        against LM Studio on the same checkpoint files, and kernel-for-kernel
+        against MLX. BENCH.md carries the protocol, the raw runs, and the
+        claims that were retracted after they failed to reproduce.
+      </p>
+      <p><a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">Read BENCH.md →</a></p>
     </div>
   </div>
 </section>
 
-<section id="tools">
-  <div class="section-inner">
-    <div class="section-label">Explore deeper</div>
-    <h2 class="section-title">Pages</h2>
-    <p class="section-sub">
-      Each page demonstrates one claim. Some are dated snapshots, kept rather than rewritten.
-    </p>
-
-    <div class="shaders-grid">
-      
-      <a class="shader-card" href="webllm-bench.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">📊</span>
-        <div>
-          <h4>WebLLM Bench</h4>
-          <p>Head-to-head against the same Phi-3 Q4F16 weights. Zero-TVM measured +16.0% on total throughput and +31.4% on decode against WebLLM on M2 Max.</p>
-          <span class="shader-tag">/webllm-bench.html</span>
-        </div>
-      </a>
-      <a class="shader-card" href="validate.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">✅</span>
-        <div>
-          <h4>Validate</h4>
-          <p>Multi-prompt smoke test driving <code>engine-core.ts</code> end-to-end, no DOM dependencies.</p>
-          <span class="shader-tag">/validate.html</span>
-        </div>
-      </a>
-      <a class="shader-card" href="compiler-chat.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">🧩</span>
-        <div>
-          <h4>Compiler Chat</h4>
-          <p>The intermediate milestone: captures TVM dispatches, replays 279 of 342 through our shaders.</p>
-          <span class="shader-tag">/compiler-chat.html</span>
-        </div>
-      </a>
-      <a class="shader-card" href="demo.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">🎬</span>
-        <div>
-          <h4>Dispatch Visualization</h4>
-          <p>Interactive timeline of every GPU dispatch of the Phi-3 decode — 342 for WebLLM, 228 for Zero-TVM.</p>
-          <span class="shader-tag">/demo.html</span>
-        </div>
-      </a>
-      <a class="shader-card" href="architecture.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">🗺️</span>
-        <div>
-          <h4>Architecture</h4>
-          <p>Decode pipeline diagram, buffer layout, KV-cache paging, entry-point map.</p>
-          <span class="shader-tag">/architecture.html</span>
-        </div>
-      </a>
-      <a class="shader-card" href="dump.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">📜</span>
-        <div>
-          <h4>TVM Dispatch Dump</h4>
-          <p>Pipeline catalog, dispatch DAG, uniform decoding, buffer flow — full reverse-engineering trace of WebLLM's 342-dispatch decode loop.</p>
-          <span class="shader-tag">/dump.html</span>
-        </div>
-      </a>
-      <a class="shader-card" href="shaders.html" style="text-decoration:none;color:inherit;">
-        <span class="shader-icon-lg">🧬</span>
-        <div>
-          <h4>TVM Shader Source</h4>
-          <p>Raw WGSL source for every one of TVM's 85 generated kernels, captured live from a running WebLLM session. 12,962 lines total.</p>
-          <span class="shader-tag">/shaders.html</span>
-        </div>
-      </a>
-      
-      <a class="shader-card" href="https://github.com/abgnydn/zero-tvm" style="text-decoration:none;color:inherit;" target="_blank" rel="noopener">
-        <span class="shader-icon-lg">⭐</span>
-        <div>
-          <h4>Source on GitHub</h4>
-          <p>Hand-written WGSL and ~2,000 lines of TypeScript. Read it in one sitting.</p>
-          <span class="shader-tag">github.com/abgnydn/zero-tvm</span>
-        </div>
-      </a>
-    </div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<!-- ── RELATED WORK ── -->
-
-
-<hr class="divider">
-
-<!-- ── CTA ── -->
-
-
-<!-- ── FOOTER ── -->
 <footer>
-  <p>
-    Built with WebGPU · hand-written WGSL · models from 3.8B dense to a 35B sparse MoE<br>
-    Weights stream from <a href="https://huggingface.co/abgunaydin" style="color:var(--accent);text-decoration:none;">HuggingFace</a> and cache in your browser · No server. No framework. No TVM.
-  </p>
-  <div class="footer-links">
-    <a href="https://github.com/abgnydn/zero-tvm" target="_blank" rel="noopener" style="color:var(--accent)">★ Star on GitHub</a>
-    <a href="https://www.linkedin.com/in/abgnydn/" target="_blank" rel="noopener">Follow on LinkedIn</a>
-    <a href="https://barisgunaydin.com" target="_blank" rel="noopener">barisgunaydin.com</a>
-    <a href="https://kernelfusion.dev" target="_blank" rel="noopener">kernelfusion.dev</a>
-    <a href="https://gpubench.dev" target="_blank" rel="noopener">gpubench.dev</a>
-    <a href="https://webgpudna.com" target="_blank" rel="noopener">webgpu-dna</a>
-    <a href="https://neuropulse.live" target="_blank" rel="noopener">neuropulse.live</a>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <a href="/" class="nav-logo">zero<span>-tvm</span></a>
+        <p class="foot-about">
+          An LLM inference engine written by hand in WGSL and TypeScript. Part
+          of a research line on WebGPU kernels by Ahmet Barış Günaydın.
+        </p>
+      </div>
+      <div>
+        <h4>This site</h4>
+        <ul>
+          <li><a href="zero-tvm.html">Chat</a></li>
+          <li><a href="share.html">Rooms</a></li>
+          <li><a href="docs.html">Docs</a></li>
+          <li><a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">Proof</a></li>
+          <li><a href="validate.html">Validate</a></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Research line</h4>
+        <ul id="sibling-links">
+          <li><a href="https://kernelfusion.dev">kernelfusion.dev</a></li>
+          <li><a href="https://github.com/abgnydn">github.com/abgnydn</a></li>
+          <li><a href="https://huggingface.co/abgunaydin">huggingface.co/abgunaydin</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>MIT licensed · weights and inference stay on your device</span>
+      <a href="https://github.com/abgnydn/zero-tvm">github.com/abgnydn/zero-tvm ↗</a>
+    </div>
   </div>
 </footer>
 
-<!-- ── SHARE MODAL ── -->
-<div id="share-modal" class="share-modal" onclick="if(event.target===this)this.classList.remove('open')">
-  <div class="share-panel">
-    <h3>Share zero-tvm</h3>
-
-    <a class="share-option" target="_blank" rel="noopener" id="share-x">
-      <span class="platform">X / Twitter</span>
-      <span class="msg">Zero-TVM: a 35B sparse MoE (Qwen3.6-A3B) decoding in a browser tab on hand-written WGSL — a model no compiler stack (WebLLM/TVM) even ships. Same engine beats WebLLM by +100% / +114% on Qwen3.5-4B with identical weights. Forward pass readable in one sitting; every layer validated against mlx_lm's own modules.</span>
-    </a>
-
-    <a class="share-option" target="_blank" rel="noopener" id="share-linkedin">
-      <span class="platform">LinkedIn</span>
-      <span class="msg">I built a from-scratch LLM inference engine that runs models from Phi-3-mini up to Qwen3.6-35B-A3B — a 256-expert sparse MoE — entirely in the browser on hand-written WebGPU kernels and ~2,000 lines of TypeScript. No WebLLM, no TVM, no ONNX, no WASM runtime. The MoE is a model the compiler stacks ship no build of at all: MLX-affine weights loaded by byte range, a 7-dispatch MoE block with the expert index in the GPU grid, 3-bit expert stacks chosen by a block-output cosine of 0.936 against the 4-bit block (~0.79 for 2-bit) &mdash; a fidelity number, not a quality one, and the perplexity comparison that would settle it is still unrun, which docs/QUALITY.md says in as many words; ~55 tok/s on a 32 GB M2 Max. On the models WebLLM does ship, the same engine measures +100% / +114% on Qwen3.5-4B with identical weights. Every layer is validated against the reference implementation's own modules; every claim — including the withdrawn ones — is in BENCH.md.</span>
-    </a>
-
-    <a class="share-option" target="_blank" rel="noopener" id="share-hn">
-      <span class="platform">Hacker News</span>
-      <span class="msg">Zero-TVM: a 35B sparse MoE decoding in the browser on hand-written WGSL (WebLLM ships no build of it)</span>
-    </a>
-
-    <a class="share-option" target="_blank" rel="noopener" id="share-reddit">
-      <span class="platform">Reddit</span>
-      <span class="msg">I replaced TVM's autotuned shader stack with hand-written WGSL — and it now runs Qwen3.6-35B-A3B, a 256-expert MoE, in a browser tab (~55 tok/s on a 32 GB M2 Max, 3-bit experts). On the 4B models WebLLM does ship, it measures +100%/+114% on identical weights.</span>
-    </a>
-
-    <a class="share-option" id="share-copy" style="cursor:pointer;">
-      <span class="platform">Copy link</span>
-      <span class="msg" id="share-url"></span>
-    </a>
-  </div>
-</div>
-
-<div class="copied-toast" id="copied-toast">Link copied</div>
+<script type="module" src="/src/landing.ts"></script>
 
 <script>
-(function() {
-  var url = window.location.origin + '/';
-  var repo = 'https://github.com/abgnydn/zero-tvm';
-
-  var xText = "Zero-TVM: a 35B sparse MoE (Qwen3.6-A3B) decoding in a browser tab on hand-written WGSL — a model no compiler stack even ships. +100%/+114% vs WebLLM on Qwen3.5-4B, identical weights. Readable in one sitting.\n\n" + url;
-  document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(xText);
-
-  document.getElementById('share-linkedin').href = 'https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(url);
-
-  document.getElementById('share-hn').href = 'https://news.ycombinator.com/submitlink?u=' + encodeURIComponent(url) + '&t=' + encodeURIComponent("Zero-TVM: a 35B sparse MoE decoding in the browser on hand-written WGSL (WebLLM ships no build of it)");
-
-  document.getElementById('share-reddit').href = 'https://www.reddit.com/submit?url=' + encodeURIComponent(url) + '&title=' + encodeURIComponent("I replaced TVM's autotuned shader stack with hand-written WGSL — it now runs Qwen3.6-35B-A3B, a 256-expert MoE, in a browser tab (~55 tok/s on a 32 GB M2 Max). +100%/+114% vs WebLLM on the 4B models, same weights.");
-
-  document.getElementById('share-url').textContent = url;
-
-  document.getElementById('share-copy').addEventListener('click', function(e) {
-    e.preventDefault();
-    navigator.clipboard.writeText(url).then(function() {
-      var toast = document.getElementById('copied-toast');
-      toast.classList.add('show');
-      setTimeout(function() { toast.classList.remove('show'); }, 1500);
-    });
-  });
-})();
+  // Kernel window tabs. Plain DOM: the hero must render and switch without
+  // the module bundle, which is gated behind WebGPU feature detection.
+  document.querySelectorAll('.kw-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const win = tab.closest('.kw')
+      win.querySelectorAll('.kw-tab').forEach((t) => {
+        const on = t === tab
+        t.setAttribute('aria-selected', String(on))
+        win.querySelector('#' + t.getAttribute('aria-controls')).hidden = !on
+      })
+    })
+  })
 </script>
-
-  <script type="module" src="/src/landing.ts"></script>
 </body>
 </html>
