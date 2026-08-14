@@ -153,6 +153,23 @@ export function renderMarkdown(src: string): DocumentFragment {
       continue
     }
 
+    // Setext heading — a line of text underlined with = or -.
+    //
+    // Only ATX ('# Title') was handled, so a model that writes the other form
+    // got its rule printed as body text: Llama-3.2-1B answering "name three
+    // primary colours" rendered "Primary Colors ===============", because the
+    // underline is not a block start and the paragraph below simply absorbed
+    // it. Both forms are ordinary model output; which one appears is a
+    // property of the checkpoint, not of the question.
+    const under = i + 1 < lines.length ? lines[i + 1] : ''
+    if (line.trim() !== '' && /^\s*(=+|-{2,})\s*$/.test(under)) {
+      const h = document.createElement(under.includes('=') ? 'h1' : 'h2')
+      renderInline(line.trim(), h)
+      frag.appendChild(h)
+      i += 2
+      continue
+    }
+
     // Paragraph — absorb contiguous non-blank, non-block lines.
     const para: string[] = []
     while (i < lines.length && lines[i].trim() !== '' &&
@@ -160,7 +177,10 @@ export function renderMarkdown(src: string): DocumentFragment {
            !/^#{1,6}\s+/.test(lines[i]) &&
            !/^\s*>\s?/.test(lines[i]) &&
            !/^\s*[-*]\s+/.test(lines[i]) &&
-           !/^\s*\d+\.\s+/.test(lines[i])) {
+           !/^\s*\d+\.\s+/.test(lines[i]) &&
+           // The line after this one underlines it, so this line opens a
+           // setext heading and does not belong to the paragraph.
+           !/^\s*(=+|-{2,})\s*$/.test(lines[i + 1] ?? '')) {
       para.push(lines[i])
       i++
     }

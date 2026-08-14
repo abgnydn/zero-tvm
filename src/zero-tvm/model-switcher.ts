@@ -16,7 +16,7 @@
 
 import { type ModelSpec } from '../compiler/model-spec.js'
 import { modelBranding, SHIPPED_MODELS } from './model-registry.js'
-import { opfsDirFor } from './weight-loader.js'
+import { isModelCached } from './cache-probe.js'
 
 const MODELS = SHIPPED_MODELS
 
@@ -31,21 +31,6 @@ function switchTo(param: string): void {
   if (param) url.searchParams.set('model', param)
   else url.searchParams.delete('model')
   window.location.href = url.toString()
-}
-
-/** True if this spec's weights are already in OPFS (same sentinel as chat.ts). */
-async function isCached(spec: ModelSpec): Promise<boolean> {
-  if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
-  try {
-    const root = await navigator.storage.getDirectory()
-    const dir = await root.getDirectoryHandle(opfsDirFor(spec))
-    // The SPEC's manifest, not a hardcoded name — Qwen3.5 renamed it and the
-    // MLX checkpoints use the safetensors index (same fix as chat.ts).
-    await dir.getFileHandle(spec.manifestName ?? 'ndarray-cache.json')
-    return true
-  } catch {
-    return false
-  }
 }
 
 export function initModelSwitcher(current: ModelSpec): void {
@@ -98,7 +83,7 @@ export function initModelSwitcher(current: ModelSpec): void {
   // Re-render once the OPFS probes land, so labels flip to "cached" without
   // blocking the header on three filesystem round-trips.
   void Promise.all(
-    MODELS.map(async ({ spec }) => cached.set(spec.id, await isCached(spec))),
+    MODELS.map(async ({ spec }) => cached.set(spec.id, await isModelCached(spec))),
   ).then(() => {
     render()
     renderGateChips(current, cached)

@@ -101,10 +101,20 @@
     }
     .msg.ai .role-dot {
       width: 22px; height: 22px; border-radius: 7px;
-      background: linear-gradient(135deg, var(--accent), #8b5cf6);
+      /* Was a fixed violet, so every model's replies were badged in Phi-3's
+         colours. Both stops come from the model's own lane now. */
+      background: linear-gradient(135deg, var(--accent), var(--accent-hi));
       display: inline-flex; align-items: center; justify-content: center;
       font-size: 0.62rem; font-weight: 800; color: #000;
       letter-spacing: -0.05em;
+    }
+    /* One still frame of the model's mascot, captured once at boot and reused
+       by every reply. The letter stays as the fallback for browsers that gave
+       us no mascot to capture. */
+    .has-mascot-avatar .msg.ai .role-dot {
+      background: var(--mascot-avatar) center/cover no-repeat,
+                  linear-gradient(135deg, var(--accent), var(--accent-hi));
+      font-size: 0;
     }
     .msg.ai .body {
       color: var(--text);

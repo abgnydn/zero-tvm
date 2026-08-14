@@ -11,7 +11,7 @@
  * wired by bench-console.ts; the streaming Markdown renderer by markdown.ts.
  */
 
-import { opfsDirFor } from './weight-loader.js'
+import { isModelCached } from './cache-probe.js'
 import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
 import { initModelSwitcher } from './model-switcher.js'
 import { mountMascot, mascotPalette } from '../mascot.js'
@@ -110,23 +110,6 @@ async function registerWeightsSW(): Promise<void> {
   } catch (e) {
     // Best-effort — chat still works, just no shared cache.
     console.warn('[zero-tvm] weight-cache SW registration failed:', e)
-  }
-}
-
-async function hasWeightsCached(): Promise<boolean> {
-  if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
-  try {
-    const root = await navigator.storage.getDirectory()
-    const dir = await root.getDirectoryHandle(opfsDirFor(SPEC))
-    // The sentinel is the SPEC's own manifest, not a hardcoded name. It was
-    // 'ndarray-cache.json' — already wrong for Qwen3.5, whose manifest MLC
-    // renamed to tensor-cache.json, so that model re-showed the download gate
-    // on every visit no matter what was cached. An MLX checkpoint has no
-    // manifest of that shape at all; its index is the safetensors index.
-    await dir.getFileHandle(SPEC.manifestName ?? 'ndarray-cache.json')
-    return true
-  } catch {
-    return false
   }
 }
 
@@ -594,6 +577,21 @@ function applyModelBranding(): void {
   // when they happen to be right is the only way they cannot drift again.
   set('#welcome-quant', `${quantTagFor(SPEC)} · ${BRAND.params}`)
   set('#welcome-ctx', `${Math.round(SPEC.maxContext / 1024)} K context`)
+  // The fourth suggestion asked the model where "a 3.8B model like Phi-3-mini"
+  // falls short, on every model. A 1B answering for a 3.8B is a worse answer
+  // AND a wrong caption, so the size and the name come off the same record the
+  // rest of the page reads. The leading token of `params` is the size in every
+  // row ('1B dense', '35B-A3B MoE · 3-bit experts').
+  {
+    const size = BRAND.params.split(/[\s·]/)[0]
+    const btn = document.querySelector('.suggest[data-prompt*="fall short"]') as HTMLElement | null
+    if (btn) {
+      btn.dataset.prompt = `List four kinds of questions where a ${size} model like ${BRAND.name} `
+        + 'is likely to fall short compared to a frontier LLM, with one-sentence reasons.'
+      set('.suggest[data-prompt*="fall short"] .suggest-hint', `Where a ${size} model falls short`)
+    }
+  }
+  mountChatMascots()
   if (SPEC.id === 'phi3-mini') return
   document.title = `Zero-TVM Chat — ${BRAND.name}`
   set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
@@ -604,18 +602,45 @@ function applyModelBranding(): void {
   // figure on this page. The slot used to read a static 'f16 / WebGPU'.
   set('#gate-ctx', `${Math.round(SPEC.maxContext / 1024)}K`)
   set('.model-info h1', BRAND.name)
-  {
-    const host = document.querySelector('.model-info')
-    if (host && !document.getElementById('header-mascot')) {
-      const c = document.createElement('canvas')
-      c.id = 'header-mascot'
-      c.className = 'header-mascot'
-      c.setAttribute('aria-hidden', 'true')
-      host.parentElement?.insertBefore(c, host)
-      void mountMascot(c, SPEC).then((m) => { if (!m) c.remove() }).catch(() => c.remove())
-    }
-  }
   set('#welcome .welcome-title', `Chat with ${BRAND.name}`)
+}
+
+/**
+ * The model's character on the three surfaces that persist: the header, the
+ * empty state, and every assistant reply.
+ *
+ * The replies get a STILL captured from the welcome canvas rather than a
+ * canvas each — a long conversation would otherwise run one animated WebGPU
+ * surface per message alongside the engine on the same device. Everything
+ * here is additive: no mascot means the lettered tile and the letter avatar
+ * stay exactly as they were, which is also what a browser without WebGPU
+ * gets (and it cannot run the engine either, so it never reaches this page
+ * with a model loaded).
+ */
+function mountChatMascots(): void {
+  const host = document.querySelector('.model-info')
+  if (host && !document.getElementById('header-mascot')) {
+    const c = document.createElement('canvas')
+    c.id = 'header-mascot'
+    c.className = 'header-mascot'
+    c.setAttribute('aria-hidden', 'true')
+    host.parentElement?.insertBefore(c, host)
+    void mountMascot(c, SPEC).then((m) => { if (!m) c.remove() }).catch(() => c.remove())
+  }
+
+  const logo = document.getElementById('welcome-logo')
+  if (logo && !logo.querySelector('canvas')) {
+    const c = document.createElement('canvas')
+    c.setAttribute('aria-hidden', 'true')
+    logo.appendChild(c)
+    logo.classList.add('has-mascot')
+    void mountMascot(c, SPEC).then(async (m) => {
+      if (!m) { c.remove(); logo.classList.remove('has-mascot'); return }
+      const url = await m.snapshot()
+      document.documentElement.style.setProperty('--mascot-avatar', `url("${url}")`)
+      document.documentElement.classList.add('has-mascot-avatar')
+    }).catch(() => { c.remove(); logo.classList.remove('has-mascot') })
+  }
 }
 
 /** Set once the engine exists. The sampling controls read it lazily, so the
@@ -661,7 +686,7 @@ async function boot(): Promise<void> {
   // (or visitors who started from compiler-chat) should boot straight in.
   // Remove the static dialog so no hidden #start-btn lingers in the DOM
   // (the gate e2e asserts "#start-btn present iff the gate is showing").
-  if (await hasWeightsCached()) {
+  if (await isModelCached(SPEC)) {
     document.getElementById('start-dialog')?.remove()
   } else {
     await showDownloadGate()

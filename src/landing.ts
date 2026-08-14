@@ -62,14 +62,14 @@ const CACHED = new Set<string>()
 async function probeCached(repaint: () => void): Promise<void> {
   if (!('gpu' in navigator) || !navigator.storage?.getDirectory) return
   try {
-    const { opfsDirFor } = await import('./zero-tvm/weight-loader.js')
-    const root = await navigator.storage.getDirectory()
+    // Dynamic because the probe pulls in the loaders, which read
+    // `GPUBufferUsage` at module scope — a static import would throw on a
+    // browser with no WebGPU, which is a browser this page still has to render
+    // for. The chat page shares this exact probe: two copies of it disagreed
+    // about every MLX model.
+    const { isModelCached } = await import('./zero-tvm/cache-probe.js')
     for (const { spec } of SHIPPED_MODELS) {
-      try {
-        const dir = await root.getDirectoryHandle(opfsDirFor(spec))
-        await dir.getFileHandle(spec.manifestName ?? 'ndarray-cache.json')
-        CACHED.add(spec.id)
-      } catch { /* not cached */ }
+      if (await isModelCached(spec)) CACHED.add(spec.id)
     }
     repaint()
   } catch { /* no WebGPU / import failed — badges stay hidden */ }
@@ -144,7 +144,7 @@ function render(): void {
     const cached = el<HTMLElement>('.mb-cached')
     cached.hidden = !CACHED.has(v.spec.id)
 
-    mascot?.setSpec(v.spec)
+    mascot?.setSpec(v.spec, CACHED.has(v.spec.id))
   }
 
   function go(nextG: number): void {
@@ -176,7 +176,7 @@ function render(): void {
   void mountMascot(canvas, GROUPS[gi].variants[vi].spec).then((m) => {
     if (!m) { art.style.display = 'none'; return }
     mascot = m
-    m.setSpec(GROUPS[gi].variants[vi].spec)
+    m.setSpec(GROUPS[gi].variants[vi].spec, CACHED.has(GROUPS[gi].variants[vi].spec.id))
   })
 }
 

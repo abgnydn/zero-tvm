@@ -35,7 +35,7 @@ struct U {
   experts: f32, topk: f32, sharedFused: f32, bands: f32,
   ink: f32, eyesOpen: f32, bandShift: f32, _p0: f32,
   hair: vec3<f32>, _p1: f32,
-  iris: vec3<f32>, _p2: f32,
+  iris: vec3<f32>, cached: f32,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -247,6 +247,12 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
   // INK OUTLINE. Weight follows the bit width: a coarser build is drawn with a
   // heavier pen.
   col = mix(col, vec3<f32>(0.04, 0.04, 0.07), smoothstep(1.0 - u.ink, 0.995, fres));
+  // ALREADY ON THIS DEVICE. A cached model is lit — it can start now, where an
+  // uncached one costs a download first. The line under the card says so in
+  // words; this says it before the words are read.
+  if (u.cached > 0.5) {
+    col = col + u.hair * fres * 0.55 + u.hair * 0.06;
+  }
   col = col * (0.94 + 0.14 * u.hover);
   col = pow(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.05));
   return vec4<f32>(col, 1.0);
@@ -254,8 +260,14 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 `
 
 export interface MascotHandle {
-  setSpec: (spec: ModelSpec) => void
+  setSpec: (spec: ModelSpec, cached?: boolean) => void
   setHover: (on: boolean) => void
+  /** One frame as a PNG data URL, for surfaces that want the character
+   *  without a GPU pass of their own — a message avatar appears once per
+   *  reply and would otherwise be a live canvas each. Awaits the queue: read
+   *  before the frame lands and the canvas is still empty, which shows up as
+   *  a blank avatar rather than an error. */
+  snapshot: () => Promise<string>
   destroy: () => void
 }
 
@@ -308,7 +320,7 @@ export function mascotPalette(spec: ModelSpec): { accent: string; accentHi: stri
 }
 
 /** Spec → the numbers the shader draws. Nothing is authored per model. */
-export function mascotParams(spec: ModelSpec): Float32Array<ArrayBuffer> {
+export function mascotParams(spec: ModelSpec, cached = false): Float32Array<ArrayBuffer> {
   const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
   const coil = gdn / Math.max(spec.layers, 1)
   const isMoe = spec.moe != null
@@ -342,7 +354,7 @@ export function mascotParams(spec: ModelSpec): Float32Array<ArrayBuffer> {
     group === 64 ? 0.5 : 0.0,
     0,
     hair[0], hair[1], hair[2], 0,
-    iris[0], iris[1], iris[2], 0,
+    iris[0], iris[1], iris[2], cached ? 1 : 0,
   ])
   return a
 }
@@ -413,13 +425,17 @@ export async function mountMascot(
   frame()
 
   return {
-    setSpec(next) {
-      const p = mascotParams(next)
+    setSpec(next, cached = false) {
+      const p = mascotParams(next, cached)
       p[2] = t
       params = p
       if (still) frame()
     },
     setHover(on) { hover = on ? 1 : 0 },
+    async snapshot() {
+      await device.queue.onSubmittedWorkDone()
+      return canvas.toDataURL('image/png')
+    },
     destroy() { dead = true; cancelAnimationFrame(raf) },
   }
 }
