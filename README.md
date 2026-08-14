@@ -48,7 +48,7 @@ them at `/local-weights/` so nothing re-downloads.
 Every shader is hand-written WGSL in
 [`src/compiler/shaders/`](src/compiler/shaders/), plus one small readable
 generator for the int4/int3 matmul family. There is no compiler and no autotuner. For the other side of the
-argument, [shaders.html](https://zerotvm.com/shaders) browses the TVM-generated
+argument, [`src/tvm-shaders/`](https://github.com/abgnydn/zero-tvm/tree/main/src/tvm-shaders) browses the TVM-generated
 kernels WebLLM ships, captured live from a running session.
 
 ## How it's validated
@@ -91,26 +91,19 @@ The directory layout is the narrative arc of the project. Each page is a milesto
 
 ```
 index.html              (landing page — model picker; cards render from model-registry.ts)
-compiler-chat.html      → src/compiler/chat-v2.ts  (1) WebLLM reference: captures
                                                        dispatches, our shaders replay
                                                        279 of 342 of them
 zero-tvm.html           → src/zero-tvm/chat.ts     (2) The result: all dispatches
                                                        replaced, WebLLM never touched
 validate.html           → src/zero-tvm/validate.ts Multi-prompt smoke test driving
                                                        src/zero-tvm/engine-core.ts
-webllm-bench.html       → src/webllm-bench/main.ts (3) Honesty check: WebLLM driven
                                                        against the same local weights
                                                        for a fair head-to-head
-wllama-bench.html       → src/wllama-bench/main.ts (4) Second honesty check:
                                                        llama.cpp's WebGPU backend via
                                                        wllama. GGUF, NOT the same
                                                        weight bytes — runtime AND
                                                        quantization differ (BENCH.md)
 
-demo.html               → src/demo.ts              Dispatch timeline visualization
-dump.html               → src/dump-tvm.ts          Captures all 85 TVM-emitted WGSL
-shaders.html            → src/dump-shaders.ts      Browses the captured shaders
-test-shaders.html       → src/compiler/test-harness.ts  Per-shader correctness vs TVM
 test-chain.html         → src/compiler/test-chain.ts
 ```
 
@@ -263,7 +256,7 @@ plausible number first, and BENCH.md records what they looked like.
 | Every measured number + protocol | [BENCH.md](BENCH.md) |
 | Engine documentation (per-model commands, flags, gotchas) | [CLAUDE.md](CLAUDE.md) |
 | Shipped model list (the source of truth) | [`src/zero-tvm/model-registry.ts`](src/zero-tvm/model-registry.ts) |
-| Reference docs + diagrams | [docs](https://zerotvm.com/docs) · [architecture](https://zerotvm.com/architecture) |
+| Reference docs + diagrams | [docs](https://zerotvm.com/docs) |
 | Release history | [CHANGELOG.md](CHANGELOG.md) |
 
 ## License

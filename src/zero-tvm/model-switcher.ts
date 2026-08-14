@@ -55,7 +55,7 @@ export function initModelSwitcher(current: ModelSpec): void {
       // Cached entries advertise it; everything else shows the download cost.
       const meta = cached.get(spec.id)
         ? '<span class="mm-meta mm-cached">cached</span>'
-        : `<span class="mm-meta">${brand.sizeLabel} download</span>`
+        : `<span class="mm-meta">${brand.sizeLabel} download${brand.ramNote ? ` · ${brand.ramNote}` : ''}</span>`
       btn.innerHTML = `<span class="mm-name">${brand.name}</span>${meta}`
       if (!isCurrent) {
         btn.addEventListener('click', () => switchTo(param))

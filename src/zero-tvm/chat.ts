@@ -46,15 +46,15 @@ const BRAND = modelBranding(SPEC)
 // the remote guest page shows the same truth.
 const QUANT_TAG = quantTagFor(SPEC)
 setChatIdentity(BRAND.name, QUANT_TAG)
-// Dispatches per decode token: Phi-3 runs the fused path (32×7+4 = 228);
-// qkNorm specs (Qwen3) run unfused with the fused qk_norm+RoPE+append kernel
-// (default ?fuseqk on: 36×8+4 = 292; the reference chain is 10/layer); hybrid
-// (Qwen3.5) mixes GDN layers (10 with the fused input projection) and
-// gated-attention layers (12): 24×10+8×12+4 = 340.
-const GDN_LAYERS = SPEC.layerKinds.filter((k) => k === 'gdn').length
-const DISPATCHES_PER_TOKEN = GDN_LAYERS > 0
-  ? GDN_LAYERS * 10 + (SPEC.layers - GDN_LAYERS) * 12 + 4
-  : SPEC.qkNorm ? SPEC.layers * 8 + 4 : SPEC.layers * 7 + 4
+// No dispatches-per-token figure in the chrome. The formula that used to live
+// here was a hand-derived constant per spec family, and pre-publish review
+// reconstructed the real counts from the recorders: it was wrong for six of
+// the ten shipped models — it modelled the MoE block as one dispatch where the
+// engine runs seven, the affine dense FFN as one where it runs three, and it
+// ignored split-K attention, which has been default-on since 2026-07-27 (so
+// even Phi-3's celebrated 228 is actually 260 on the path everyone runs).
+// A number that needs a per-family derivation to stay true is a number that
+// rots; the kernel-roles claim is the one that does not.
 
 // ============================================================
 // UI helpers
@@ -146,8 +146,8 @@ function showDownloadGate(): Promise<void> {
         <div class="title" style="font-size:1.1rem;font-weight:600;color:#ccc"></div>
         <div class="desc" style="font-size:0.85rem;color:#888;max-width:440px;line-height:1.6">
           First load downloads the ${QUANT_TAG} weights and caches them
-          locally (OPFS). Every subsequent visit — including the WebLLM comparison
-          page — is instant; weights are served from the same shared browser cache.
+          locally (OPFS). Every subsequent visit is instant; weights are
+          served from the on-device cache.
         </div>
         <button id="start-btn" class="start-btn" style="background:#10b981;color:#000;font-weight:600;font-size:0.95rem;padding:0.7rem 2rem;border:none;border-radius:8px;cursor:pointer">Download &amp; Start</button>
         <div class="start-hint" style="font-size:0.68rem;color:#444"></div>
@@ -328,12 +328,12 @@ async function main(): Promise<void> {
     // True ceiling is the KV page table (spec.maxPages × spec.pageSize), which
     // is what the engine enforces — not the model's nominal maxSeq.
     if (!nTokens) {
-      ctxHint.textContent = `Zero TVM · 10 WGSL kernels · ${DISPATCHES_PER_TOKEN} dispatches/token`
+      ctxHint.textContent = 'Zero TVM · 10 WGSL kernel roles'
     } else if (nTokens >= engine.maxContext) {
       ctxHint.textContent = `Context full — ${engine.maxContext} / ${engine.maxContext} tokens · start a new chat`
     } else {
       const pct = Math.round((nTokens / engine.maxContext) * 100)
-      ctxHint.textContent = `Context ${nTokens} / ${engine.maxContext} tokens (${pct}%) · ${DISPATCHES_PER_TOKEN} dispatches/token`
+      ctxHint.textContent = `Context ${nTokens} / ${engine.maxContext} tokens (${pct}%)`
     }
   }
 
@@ -608,10 +608,29 @@ function applyModelBranding(): void {
   // confusable with theirs.
   const statVals = document.querySelectorAll('#start-dialog .dialog-stats .dstat .val')
   if (statVals[0]) statVals[0].textContent = BRAND.sizeLabel   // download size
-  if (statVals[1]) statVals[1].textContent = BRAND.rateLabel   // total tok/s, M2 Max
+  if (statVals[1]) {
+    // An unmeasured model (qwen36's rateLabel is '') used to render an empty
+    // value over an orphaned "M2 Max" caption — honest, but it read as a
+    // rendering fault. The landing card hides the row; the gate now agrees.
+    if (BRAND.rateLabel) statVals[1].textContent = BRAND.rateLabel  // total tok/s, M2 Max
+    else (statVals[1].parentElement as HTMLElement).style.display = 'none'
+  }
   // Context is derived from the spec (maxPages x pageSize), like every other
   // figure on this page. The slot used to read a static 'f16 / WebGPU'.
   set('#gate-ctx', `${Math.round(SPEC.maxContext / 1024)}K`)
+  // The RAM requirement was data the registry carried and no chat surface
+  // showed: a ?model=qwen36 deep link offered a 19.5 GB download without ever
+  // saying "needs ~24 GB free RAM". It is the first note now, ahead of the
+  // cache line, because it is the one a visitor cannot undo by waiting.
+  if (BRAND.ramNote) {
+    const notes = document.querySelector('#start-dialog .dialog-notes ul')
+    if (notes) {
+      const li = document.createElement('li')
+      li.textContent = BRAND.ramNote
+      li.style.color = 'var(--warn, #d9a441)'
+      notes.prepend(li)
+    }
+  }
   if (SPEC.id === 'phi3-mini') return
   document.title = `Zero-TVM Chat — ${BRAND.name}`
   set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
@@ -670,8 +689,8 @@ function showUnsupported(): void {
   const detail = document.getElementById('progress-detail')
   if (title) title.textContent = 'This browser cannot run the engine'
   if (status) {
-    status.textContent = 'zero-tvm needs WebGPU with shader-f16 — Chrome 113+ or Edge 113+. '
-      + 'Firefox and Safari before 26 do not enable it.'
+    status.textContent = 'zero-tvm needs WebGPU with shader-f16. Chrome and Edge ship it; '
+      + 'Safari from 26. The MoE models additionally need GPU subgroups (Chromium).'
   }
   if (detail) detail.textContent = ''
   document.getElementById('start-dialog')?.remove()

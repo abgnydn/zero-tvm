@@ -1,5 +1,5 @@
 # Cloudflare Pages headers (migrated from the old vercel.json).
-# Cross-origin isolation is required for WebGPU + SharedArrayBuffer.
+# Cross-origin isolation is required for SharedArrayBuffer (WebGPU itself does not need it).
 /*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: credentialless

@@ -155,7 +155,7 @@ Fourth model, first MoE and first MLX-format checkpoint: 40 layers (30 GDN +
 lm_head, MLX-affine quantization (`w = s·q + b`, group 64, per-tensor biases).
 `model-select.ts` maps `?model=qwen36` → `QWEN36_35B_A3B` (4-bit, 19.7 GB
 resident, needs ~24 GB free RAM) and `?model=qwen36q3` → `QWEN36_35B_A3B_Q3`
-(3-bit expert stacks, 15.7 GB resident, ~55 t/s on a quiet 32 GB M2 Max).
+(3-bit expert stacks, 15.7 GB resident, ~66 t/s on a quiet 32 GB M2 Max (65.56, protocol round 2026-08-13; supersedes the earlier ~55 single run)).
 
 Engine notes: the MoE block is 7 dispatches (router_logits → router_topk →
 gate/up/silu/down → combine) with the expert index in grid `z` and the shared

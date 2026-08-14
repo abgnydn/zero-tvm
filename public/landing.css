@@ -59,7 +59,10 @@ a:hover { color: var(--accent-hi); }
 }
 .nav-cta:hover { background: var(--accent); color: var(--bg); }
 .nav-links { display: flex; gap: 22px; align-items: center; }
-@media (max-width: 720px) { .nav-links a:not(.nav-cta) { display: none; } }
+/* On phones the nav used to collapse to ONLY "Open chat" — the single action
+   that costs gigabytes — while Docs and everything explanatory vanished. Docs
+   stays; the heavyweight links are the ones that can go. */
+@media (max-width: 720px) { .nav-links a:not(.nav-cta):not([href="docs.html"]) { display: none; } }
 
 /* ── hero ──────────────────────────────────────────────────────────── */
 .hero { padding: 84px 0 64px; }

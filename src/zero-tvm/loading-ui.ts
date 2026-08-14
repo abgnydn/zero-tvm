@@ -222,6 +222,18 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     } else {
       log('subgroups feature: no · path: scalar')
     }
+    // A MoE spec that cannot build must refuse HERE, at 3%, not at 96%.
+    // moe_router_topk and the grid-z expert matmul have no scalar variant, so
+    // buildDecodeEngine throws — but that throw used to land after the full
+    // download, in a log line inside a collapsed <details>: the visitor paid
+    // 16.4 GB for a progress bar frozen at "Compiling shaders…" with no
+    // visible error. The probe already ran; use its answer before any byte.
+    if (spec.moe && !sgSizeOk) {
+      setBadge('GPU unsupported', 'error')
+      setProgress(0, `${spec.id} is a sparse MoE and needs GPU subgroups (a Chromium WebGPU `
+        + 'feature) — this GPU/browser does not expose them. The dense models on the landing page still run.')
+      return { ok: false, reason: 'MoE spec requires the subgroups feature' }
+    }
   }
   setProgress(5, 'Loading tokenizer...')
 

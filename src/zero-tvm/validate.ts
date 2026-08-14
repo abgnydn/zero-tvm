@@ -265,6 +265,13 @@ function renderResult(r: PromptResult): string {
 async function main(): Promise<void> {
   if (!navigator.gpu) {
     setStatus('No WebGPU available')
+    // The start button used to stay live-looking here — this return runs
+    // before its click listener attaches, so clicking did nothing and the only
+    // explanation was 0.7rem grey text in the header. Say it where the eye is.
+    const btn = document.getElementById('start-btn') as HTMLButtonElement | null
+    if (btn) { btn.disabled = true; btn.textContent = 'WebGPU not available in this browser' }
+    const desc = document.querySelector('.start-screen .desc') as HTMLElement | null
+    if (desc) desc.textContent = 'This harness needs WebGPU with shader-f16 — Chrome and Edge ship it; Safari from 26.'
     return
   }
 

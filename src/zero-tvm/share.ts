@@ -168,7 +168,11 @@ async function confirmDownload(
   brand: { name: string; sizeLabel: string; ramNote?: string },
 ): Promise<void> {
   const { isModelCached } = await import('./cache-probe.js')
-  if (await isModelCached(spec)) return
+  const cached = await isModelCached(spec)
+  // Cached used to mean no dialog at all — so a returning visitor who clicked
+  // "Rooms" in the nav was serving a room to anyone with the link the moment
+  // the page finished loading. The download question disappears when the
+  // weights are local; the HOSTING question never does.
 
   const dlg = document.createElement('dialog')
   dlg.id = 'share-gate'
@@ -176,14 +180,15 @@ async function confirmDownload(
     <h2>Host ${brand.name} from this tab</h2>
     <p>
       Hosting runs the model on THIS machine and serves it to whoever opens
-      your room link. The weights download once (${brand.sizeLabel}) and are
-      cached locally; every later visit starts from disk.
+      your room link. ${cached
+        ? 'The weights are already cached on this device.'
+        : `The weights download once (${brand.sizeLabel}) and are cached locally; every later visit starts from disk.`}
     </p>
     ${brand.ramNote ? `<p class="warn">${brand.ramNote}</p>` : ''}
     <p class="fine">Guests' prompts run on your GPU. You see every request as it arrives.</p>
     <div class="acts">
       <a href="/">Not now</a>
-      <button type="button" id="share-gate-go" autofocus>Download &amp; host →</button>
+      <button type="button" id="share-gate-go" autofocus>${cached ? 'Start hosting →' : 'Download &amp; host →'}</button>
     </div>`
   document.body.appendChild(dlg)
   dlg.showModal()
@@ -251,6 +256,13 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     warmup: stageRange ? async (e) => { await e.pipelineStep({ tokenId: 1 }, 0) } : undefined,
   })
   if (!boot.ok) {
+    // OUTSIDE #progress-wrap: that container is display:none until a download
+    // starts, so a boot refused before any download (no WebGPU, MoE without
+    // subgroups) wrote its reason into a hidden element and the page just sat
+    // there with a "No WebGPU" badge and an empty room card.
+    const top = $('loading-error-top')
+    top.style.display = 'block'
+    top.textContent = boot.reason
     $('loading-error').textContent = boot.reason
     return
   }
@@ -632,7 +644,10 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
     // at position 0 again and overwrites it.
     warmup: async (e) => { await e.pipelineStep({ residual: new ArrayBuffer(spec.d * 2) }, 0) },
   })
-  if (!boot.ok) { $('loading-error').textContent = boot.reason; return }
+  if (!boot.ok) {
+    const top = $('loading-error-top'); top.style.display = 'block'; top.textContent = boot.reason
+    $('loading-error').textContent = boot.reason; return
+  }
 
   const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
   const pc = new RTCPeerConnection(ICE)
@@ -730,7 +745,7 @@ async function runGuest(roomId: string): Promise<void> {
     if (msg.type === 'info') {
       setChatIdentity(msg.name, msg.tag)
       $('guest-model').textContent = `${msg.name} — remote`
-      setStatus(`${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''} · runs on the host machine; this page holds only the conversation.`)
+      setStatus(`${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''} · runs on the host machine — the host can read what you send; this page holds only the conversation.`)
       setBadge('Ready', 'ready')
       inp.disabled = false
       inp.placeholder = 'Message the remote model…'

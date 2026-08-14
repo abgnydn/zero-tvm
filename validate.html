@@ -21,14 +21,14 @@
       justify-content: center; flex: 1; gap: 1.25rem; text-align: center;
     }
     .start-screen .title { font-size: 1.1rem; font-weight: 600; color: #ccc; }
-    .start-screen .desc { font-size: 0.85rem; color: #555; max-width: 480px; line-height: 1.6; }
+    .start-screen .desc { font-size: 0.85rem; color: #a9b3c6; max-width: 480px; line-height: 1.6; }
     .start-btn {
       background: #10b981; color: #000; font-weight: 600; font-size: 0.95rem;
       padding: 0.7rem 2rem; border: none; border-radius: 8px; cursor: pointer;
     }
     .start-btn:hover { background: #34d399; }
     .start-btn:disabled { background: #1a1a1a; color: #444; cursor: default; }
-    .start-hint { font-size: 0.68rem; color: #333; }
+    .start-hint { font-size: 0.72rem; color: #8a94a6; }
 
     /* Shared loading UI — same markup chat.ts uses, so loading-ui.ts can drive
        both pages. */
@@ -48,12 +48,12 @@
     }
     .progress-detail {
       font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-      font-size: 0.7rem; color: #333;
+      font-size: 0.7rem; color: #8a94a6;
     }
     .progress-log {
       width: 100%; max-height: 120px; overflow-y: auto;
       font-family: ui-monospace, 'SF Mono', Menlo, monospace;
-      font-size: 0.65rem; color: #2a2a2a; text-align: left;
+      font-size: 0.65rem; color: #8a94a6; text-align: left;
       padding: 0.5rem; background: #0d0d0d; border-radius: 6px;
       border: 1px solid #151515; white-space: pre-wrap;
     }
@@ -138,7 +138,7 @@
           Runs the full Zero-TVM forward pass on a battery of diverse prompts and
           shows the top-10 next tokens + a short greedy continuation for each.
           Pair this with the kernel suites in the repo (<code>npm run test:kernels</code>)
-          to convince yourself the live chat path generalizes beyond a single
+          to check that the live chat path generalizes beyond a single
           memorized prompt.
         </div>
         <button id="start-btn" class="start-btn">Run Validation</button>

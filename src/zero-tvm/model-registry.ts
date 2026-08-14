@@ -162,7 +162,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // f32: cosine 0.999985, greedy token-exact through the stop id. (Against
   // mlx's own bf16 forward it scores 0.9978 — that is bf16's error, not the
   // engine's; see the dtype note in scripts/mlx-ref.py.)
-  [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~16.0 GB', rateLabel: '~75 t/s', ramNote: 'needs ~20 GB free RAM' },  // 74.96 total, M2 Max (BENCH.md 2026-08-13)
+  [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~17.2 GB', rateLabel: '~75 t/s', ramNote: 'needs ~20 GB free RAM' },  // 74.96 total, M2 Max (BENCH.md 2026-08-13); size = index.json total_size 17.17 GB — the old ~16.0 was short by 1.2 GB
   // Not a chat model. Its output is the pooled hidden state, so rateLabel stays
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },

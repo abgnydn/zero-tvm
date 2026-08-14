@@ -4,17 +4,17 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Docs — Zero-TVM</title>
-  <meta name="description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. Phi-3-mini in the browser on 10 hand-written WGSL kernels.">
+  <meta name="description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser on 10 hand-written WGSL kernel roles.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="article">
   <meta property="og:url" content="https://zerotvm.com/docs.html">
   <meta property="og:title" content="Docs — Zero-TVM">
-  <meta property="og:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. Phi-3-mini in the browser on 10 hand-written WGSL kernels.">
+  <meta property="og:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser on 10 hand-written WGSL kernel roles.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Docs — Zero-TVM">
-  <meta name="twitter:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. Phi-3-mini in the browser on 10 hand-written WGSL kernels.">
+  <meta name="twitter:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser on 10 hand-written WGSL kernel roles.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -542,7 +542,7 @@
   <p>
     This project implements the full Phi-3-mini-4k-instruct transformer forward pass using only
     WebGPU compute shaders written by hand in WGSL. Weights are loaded directly from HuggingFace
-    in MLC Q4F16_1 format (or from the browser Cache API if WebLLM was used previously).
+    in MLC Q4F16_1 format (cached in OPFS after the first load).
     The tokenizer is implemented in pure TypeScript — no SentencePiece WASM.
   </p>
 
@@ -564,14 +564,14 @@
     <div class="step-line"><div class="step-dot">1</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Open the chat</h5>
-      <p>Navigate to <code>zero-tvm.html</code>. WebGPU initializes automatically. Requires WebGPU with shader-f16: Chrome 113+ or Edge 113+. Safari did not enable WebGPU by default until 26, and OPFS — where the weight cache lives — is unavailable there. Subgroups are required for the MoE models.</p>
+      <p>Navigate to <code>zero-tvm.html</code>. WebGPU initializes automatically. Requires WebGPU with shader-f16: Chrome 113+ or Edge 113+. Safari did not enable WebGPU by default until 26, and the writable OPFS API the weight cache needs (createWritable) is missing before then. Subgroups are required for the MoE models.</p>
     </div>
   </div>
   <div class="step-row">
     <div class="step-line"><div class="step-dot">2</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Wait for weights</h5>
-      <p>First load downloads ~2 GB. Subsequent loads are instant from browser Cache API. Progress shown per shard in the log panel.</p>
+      <p>First load downloads ~2 GB. Subsequent loads are instant from OPFS. On a small machine, <code>?ctx=</code> shrinks the context window and with it the KV allocation (~1.5 GB at Phi-3’s default 4K). Progress shown per shard in the log panel.</p>
     </div>
   </div>
   <div class="step-row">
@@ -606,12 +606,12 @@
   <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
 </ol>
 
-<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>228 dispatches per token</strong> in the default f16-KV path (260 with the <code>?kv8=1</code> flag) — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token using 85 distinct shaders.</p>
+<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — split-K attention has been on by default since 2026-07-27 and adds a combine dispatch per layer; <code>?splitk=0</code> runs the 228-dispatch reference chain — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token using 85 distinct shaders.</p>
 
 <!-- ARCHITECTURE -->
 <h2 id="overview">Architecture overview</h2>
 
-<p>Four source files make up the engine:</p>
+<p>The engine’s main source files:</p>
 
 <div class="table-scroll"><table>
   <thead><tr><th>File</th><th>Role</th></tr></thead>
@@ -634,7 +634,8 @@
 
 <h3>Fetch priority</h3>
 <ol>
-  <li><strong>Browser Cache API</strong> — if a prior WebLLM session cached the shards, they load instantly</li>
+  <li><strong>OPFS</strong> — where this engine caches; a returning visitor loads from here</li>
+  <li><strong>Browser Cache API</strong> — read-only leftover from prior WebLLM sessions</li>
   <li><strong>HuggingFace</strong> — direct HTTPS fetch from <code>huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC</code></li>
 </ol>
 
@@ -868,7 +869,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <div id="shader-oproj">
   <div class="shader-doc-card">
     <h4>✖️ 5 · int4 Matmul (output projection + LM head) <span class="pill purple">int4_matmul.wgsl</span></h4>
-    <p>General-purpose dequantize-on-the-fly int4 × f16 matmul. Used for the attention <em>output projection</em> (3072 → 3072) and the <em>LM head</em> (3072 → 32064). Weights are Q4F16_1: <code>N</code> output rows × 384 u32 columns (each u32 = 8 int4 values = 32 elements, group_size=32). The <code>int4_matmul_tiled.wgsl</code> / <code>_tiled8</code> / <code>_sg</code> variants in the same directory add shared-memory tiling and subgroup reductions; the runtime picks one via the <code>?matmul=</code> URL flag.</p>
+    <p>General-purpose dequantize-on-the-fly int4 × f16 matmul. Used for the attention <em>output projection</em> (3072 → 3072) and the <em>LM head</em> (3072 → 32064). Weights are Q4F16_1: <code>N</code> output rows × 384 u32 columns (each u32 = 8 int4 values = 32 elements, group_size=32). The tiled / subgroup / vec4 variants are emitted by one generator beside it (<code>int4_matmul.gen.ts</code>); the runtime picks one via the <code>?matmul=</code> URL flag.</p>
     <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Uniform field</th><th>Value</th></tr></thead>
       <tbody>
@@ -886,7 +887,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>🔀 6 · Fused FFN (Gate · Up · SiLU · Mul · Down) <span class="pill purple">fused_ffn.wgsl</span></h4>
     <p>
-      Full SwiGLU FFN block in a single dispatch: the gate and up projections (both int4 matmuls sharing the 16,384-row <code>gate_up_proj</code> weight matrix), the SiLU activation, the elementwise multiply, and the final int4 down projection back to 3,072 dims. Intermediate 8,192-dim hidden state is kept in workgroup-shared memory across the two matmul stages.
+      Gate and up projections (both int4 matmuls sharing the 16,384-row <code>gate_up_proj</code> weight matrix), the SiLU activation and the elementwise multiply, in one dispatch. The down projection back to 3,072 dims is its own <code>int4_matmul</code> dispatch — which is why a layer costs 7 dispatches, not 6.
     </p>
     <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
@@ -1224,7 +1225,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <!-- VS WEBLLM -->
 <h2 id="vs-webllm">vs WebLLM</h2>
 
-<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same session, same browser (Chrome 150 with WebGPU), Apple M2 Max — <code>npm run bench</code>, 128-token target × 5 runs, median, 2026-07-30 corrected protocol (latest run recorded in <code>bench/results.json</code>). Every run pays a full prefill on both sides, and both metrics are reported: <em>total</em> is wall-clock throughput including prefill, <em>decode</em> excludes it.</p>
+<p>Head-to-head on Phi-3-mini-4k-instruct Q4F16_1, same weights, same session, same browser (Chrome 150 with WebGPU), Apple M2 Max, WebLLM 0.2.80 (the Qwen pairs below ran against 0.2.84) — <code>npm run bench</code>, 128-token target × 5 runs, median, 2026-07-30 corrected protocol (latest run recorded in <code>bench/results.json</code>). Every run pays a full prefill on both sides, and both metrics are reported: <em>total</em> is wall-clock throughput including prefill, <em>decode</em> excludes it.</p>
 
 <div class="table-scroll"><table>
   <thead><tr><th></th><th>Zero-TVM</th><th>WebLLM</th></tr></thead>
@@ -1233,10 +1234,10 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Decode only</td><td>83.10 tok/s</td><td>63.23 tok/s (self-reported)</td></tr>
     <tr><td>Time to first token (~35-token prompt)</td><td>291 ms</td><td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM ahead</td></tr>
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
-    <tr><td>Dispatches / token</td><td>228 (260 with <code>?kv8=1</code>)</td><td>342</td></tr>
+    <tr><td>Dispatches / token</td><td>260 default (228 with <code>?splitk=0</code>)</td><td>342</td></tr>
     <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>85 TVM-generated shaders</td></tr>
     <tr><td>Shipped JS bundle</td><td>~432 kB / ~116 kB gz (<code>zero-tvm.html</code>)</td><td>~6.0 MB / ~2.2 MB gz (@mlc-ai/web-llm 0.2.84)</td></tr>
-    <tr><td>Bandwidth utilization (total / decode)</td><td>~31% / ~37% of the 222 tok/s ceiling</td><td>~27% / ~28% of the same ceiling</td></tr>
+    <tr><td>Bandwidth utilization (total / decode)</td><td>~36% / ~44% of the 191 tok/s ceiling</td><td>~31% / ~33% of the same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
     <tr><td>Readable kernels?</td><td>✓ Yes — every .wgsl file is in the repo</td><td>✗ No — emitted by the TVM compiler</td></tr>
   </tbody>
@@ -1263,7 +1264,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   </tbody>
 </table></div>
 
-<p>The reading that fits: compiler stacks have had less time to tune newer architectures, so there is more headroom for a hand-written kernel set to take. That is an <strong>observation across three points</strong>, not a proven law — one machine, one browser, one day, no mechanism isolated, and no control for how differently each model stresses the two engines. Worth testing on a fourth model.</p>
+<p>The reading that fits: compiler stacks have had less time to tune newer architectures, so there is more headroom for a hand-written kernel set to take. That is an <strong>observation across three points</strong>, not a proven law — one machine, one browser, one day, no mechanism isolated, no control for how differently each model stresses the two engines — and the baseline is not constant across the rows (WebLLM 0.2.80 for Phi-3, 0.2.84 for both Qwen rows). Worth testing on a fourth model.</p>
 
 <h3>Where we lose: time to first token on short prompts</h3>
 
@@ -1280,10 +1281,10 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <li><strong>vec4 loads, now default</strong>. Re-declaring weight + activation buffers as <code>array&lt;vec4&lt;u32&gt;&gt;</code> in the int4 matmuls and <code>qkv_fused</code> measured +7.1% on M2 Max; opt out with <code>?vec4=0</code> / <code>?vec4qkv=0</code>.</li>
   <li><strong>Tiled + subgroup kernels</strong>. The 4-row tiled subgroup FFN and the <code>_sg</code> matmul/attention/argmax variants are the default path on Apple sg32 hardware.</li>
 </ul>
-<p>Still default since 2026-07-27 (`?splitk=0` to disable): split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured opt-in config of that era (<code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code>, 68.36 tok/s on 2026-07-25) is now simply the default path. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (228 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
+<p>Still default since 2026-07-27 (`?splitk=0` to disable): split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured opt-in config of that era (<code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code>, 68.36 tok/s on 2026-07-25) is now simply the default path. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (260 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
 
 <h3>The memory-bandwidth ceiling</h3>
-<p>Phi-3-mini Q4F16_1 touches ~1.8 GB of weights per decode token. On M2 Max's 400 GB/s memory bus that's ~4.5 ms/token, or ~222 tok/s theoretical max. Zero-TVM's measured decode-only median sits at roughly 37% of that ceiling (31% on total, which pays prefill too); WebLLM's at roughly 28% decode-only / 27% total (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
+<p>Phi-3-mini Q4F16_1 touches ~2.09 GB of weights per decode token (the weight-shape table above, summed: 32 layers plus the LM head; the embedding contributes one row). On M2 Max's 400 GB/s memory bus that's ~5.2 ms/token, or ~191 tok/s theoretical max. Zero-TVM's measured decode-only median sits at roughly 44% of that ceiling (36% on total, which pays prefill too); WebLLM's at roughly 33% decode-only / 31% total (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
 
 </main>
 </div>
