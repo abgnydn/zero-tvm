@@ -25,6 +25,7 @@ import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
 import { reuseStart, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
+import { ExpertPool } from './expert-pool.js'
 
 // ============================================================
 // GPU helpers
@@ -259,6 +260,11 @@ export interface DecodeEngine {
   /** The expert ids the router chose on the LAST forward pass, laid out
    *  [layer][slot]. Null unless the engine was built with `traceMoe`. */
   readMoeTrace(): Promise<{ ids: Uint32Array; steps: number; stride: number } | null>
+  /** Expert-slot pool counters summed over every MoE layer (see
+   *  DecodeEngineOptions.expertPool). Null unless the engine is pooling.
+   *  A pinned shared expert is charged as a request and a hit on every token,
+   *  which is what ExpertPool counts — read the rate with that in mind. */
+  getPoolStats(): { hits: number; requests: number; hitRate: number } | null
   /**
    * Free every GPU buffer this engine ALLOCATED — activations, GDN state,
    * uniforms, readbacks, chunk-prefill scratch. Deliberately not the two things
@@ -354,6 +360,27 @@ export interface DecodeEngineOptions {
    *  scripts/moe-trace.mjs. Costs one small buffer copy per MoE layer and one
    *  readback per token, so it is opt-in and never on in a served engine. */
   traceMoe?: boolean
+  /**
+   * Expert-slot pooling: hold this many experts PER LAYER instead of all
+   * `experts + 1`, and resolve the rest on demand (src/zero-tvm/expert-pool.ts).
+   * Off by default; MoE specs only, and a value below top-K + 1 throws rather
+   * than corrupting a token whose experts cannot all be resident at once.
+   *
+   * The kernel does not change: int4_matmul's moe variant already reads its row
+   * base from `ids[]` × the row stride, so a buffer of SLOTS experts with
+   * `ids[]` holding SLOT indices is the code path it already runs.
+   *
+   * The cost is one ROUND TRIP per MoE layer per token — the router's ids must
+   * reach JS before its experts can be fetched, and WebGPU has no GPU-side
+   * wait — so the forward pass splits into one submit per MoE layer. See
+   * docs/MOE_CHUNK_PLAN.md "Expert residency": at a half pool the miss rate is
+   * 6% and the transfer hides under compute; small pools do not survive.
+   *
+   * THIS FIRST VERSION KEEPS THE FULL STACKS RESIDENT as the backing store, so
+   * it saves nothing yet — it proves token identity and prices the split. The
+   * disk-backed source lands separately.
+   */
+  expertPool?: number
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -699,6 +726,133 @@ export function buildDecodeEngine(
     ? uniformBuf(device, [i32(S.moeSlots), i32(Math.ceil(S.moeSlots * S.ffn / 256))])
     : null
   const moeCombU = S.moe ? uniformBuf(device, [u32(S.d), u32(S.moeSlots)]) : null
+
+  // ============================================================
+  // Expert-slot pool (opts.expertPool) — docs/MOE_CHUNK_PLAN.md
+  //
+  // Nine stacked tensors per MoE layer (gate/up/down × weights/scales/biases)
+  // get a POOL sibling of SLOTS rows beside the full [experts+1] stack, and
+  // `ids[]` carries slot indices instead of expert indices. The expert matmul
+  // is untouched: it computes its row base as id × N × K_PACKED for weights
+  // and id × N × SCALES_PER_ROW for scales and biases, which is exactly the
+  // per-expert byte stride of each stack — so those two products are the only
+  // layout knowledge this needs, and they are the same ones moeGateU/moeDownU
+  // already carry.
+  //
+  // Only the DECODE path pools. Chunked prefill keeps binding the full stacks:
+  // the backing store is resident anyway in this version, and a 256-token chunk
+  // touches most of the experts, which no pool of this size can hold.
+  // ============================================================
+  const EXPERT_ROWS = S.moe ? S.moe.experts + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
+  const POOL_SLOTS = opts.expertPool ?? 0
+  if (POOL_SLOTS > 0 && !S.moe) {
+    throw new Error(`buildDecodeEngine: expertPool is a sparse-MoE feature and spec ${S.id} has no experts`)
+  }
+  // The floor comes from the pool, not from arithmetic restated here. A pinned
+  // shared expert occupies a slot the request cannot use, so `topK + 1` is only
+  // enough while the shared expert is always IN the request — true of every
+  // shipped spec, and an accident rather than a guarantee.
+  const POOL_MIN = S.moe
+    ? ExpertPool.minSlots(S.moeSlots, S.sharedExpertIndex >= 0 ? 1 : 0)
+    : 0
+  if (POOL_SLOTS > 0 && S.moe && POOL_SLOTS < POOL_MIN) {
+    // Below this a single token needs more slots than the pool has, and the
+    // pool would evict an expert it is about to read — wrong output, not a
+    // slow one. ExpertPool throws in that case; refusing here names the option.
+    throw new Error(
+      `buildDecodeEngine: expertPool ${POOL_SLOTS} is below the pool's minimum ` +
+      `${POOL_MIN} (${S.moeSlots} slots per token` +
+      `${S.sharedExpertIndex >= 0 ? ' + 1 pinned shared expert' : ''}) — ` +
+      `one token's experts could not all be resident at once`)
+  }
+  const pooling = POOL_SLOTS > 0 && !!S.moe
+  type MoeWeights = NonNullable<LoadedWeights['layers'][number]['moe']>
+  type SlabField = 'gateWeights' | 'gateScales' | 'gateBiases'
+    | 'upWeights' | 'upScales' | 'upBiases'
+    | 'downWeights' | 'downScales' | 'downBiases'
+  interface LayerPool {
+    pool: ExpertPool
+    /** One entry per stacked tensor: where a row comes from, where it lands. */
+    slabs: { full: GPUBuffer; slot: GPUBuffer; stride: number }[]
+    /** The pool buffers by field name — what the MoE bind groups bind. */
+    bufs: Record<SlabField, GPUBuffer>
+  }
+  // Bytes one expert occupies in each stack. Weights are u32 words, scales and
+  // biases f16 — one per quantization group of 64.
+  const SLAB_STRIDES: readonly (readonly [SlabField, number])[] = S.moe
+    ? (() => {
+        const wGateUp = S.ffn * ((S.d * moeBits) / 32) * 4
+        const sGateUp = S.ffn * (S.d / 64) * 2
+        const wDown = S.d * ((S.ffn * moeBits) / 32) * 4
+        const sDown = S.d * (S.ffn / 64) * 2
+        return [
+          ['gateWeights', wGateUp], ['gateScales', sGateUp], ['gateBiases', sGateUp],
+          ['upWeights', wGateUp], ['upScales', sGateUp], ['upBiases', sGateUp],
+          ['downWeights', wDown], ['downScales', sDown], ['downBiases', sDown],
+        ] as const
+      })()
+    : []
+  function makeLayerPool(m: MoeWeights, L: number): LayerPool {
+    const slabs: LayerPool['slabs'] = []
+    const bufs = {} as Record<SlabField, GPUBuffer>
+    for (const [field, stride] of SLAB_STRIDES) {
+      const full = m[field]
+      // The stride is DERIVED from the spec, so disagreeing with the loader's
+      // real layout would copy a misaligned window of somebody else's expert
+      // and still produce tokens. Check it once, here, per tensor.
+      if (full.size !== EXPERT_ROWS * stride) {
+        throw new Error(
+          `buildDecodeEngine: layer ${L} ${field} is ${full.size} B, not ` +
+          `${EXPERT_ROWS} experts × ${stride} B — expertPool cannot address it`)
+      }
+      if (stride % 4 !== 0) throw new Error(`buildDecodeEngine: ${field} stride ${stride} is not a multiple of 4`)
+      const slot = makeBuf(device, POOL_SLOTS * stride, `pool_${field}_${L}`)
+      slabs.push({ full, slot, stride })
+      bufs[field] = slot
+    }
+    // The shared expert runs on EVERY token, so it is pinned rather than left
+    // to the LRU. Pinning means resolve() never reports it as a miss, so its
+    // rows are uploaded once, below, instead of on first use.
+    const pin = S.sharedExpertIndex >= 0 ? [S.sharedExpertIndex] : []
+    return { pool: new ExpertPool(POOL_SLOTS, { pin }), slabs, bufs }
+  }
+  const layerPools: (LayerPool | null)[] = []
+  if (pooling) {
+    for (let L = L0; L < L1; L++) {
+      const m = weights.layers[L].moe
+      layerPools.push(m ? makeLayerPool(m, L) : null)
+    }
+    const enc = device.createCommandEncoder()
+    for (const lp of layerPools) {
+      if (!lp || S.sharedExpertIndex < 0) continue
+      const slot = lp.pool.slotFor(S.sharedExpertIndex)
+      for (const s of lp.slabs) {
+        enc.copyBufferToBuffer(s.full, S.sharedExpertIndex * s.stride, s.slot, slot * s.stride, s.stride)
+      }
+    }
+    device.queue.submit([enc.finish()])
+    // ON TOP OF the full stacks, which stay resident as the backing store until
+    // the disk source lands — so this version costs memory rather than saving
+    // it, and printing the number is how that stays impossible to miss.
+    const poolBytes = layerPools.reduce((n, lp) =>
+      n + (lp ? lp.slabs.reduce((m, s) => m + POOL_SLOTS * s.stride, 0) : 0), 0)
+    console.log(
+      `[engine] expert pool: ${POOL_SLOTS}/${EXPERT_ROWS} slots per layer, ` +
+      `+${(poolBytes / 1e9).toFixed(2)} GB beside the full stacks`)
+  }
+  // One round trip per MoE layer per token, so the staging buffers are a RING:
+  // a mapped buffer must never be a copy destination, and the next layer's copy
+  // is recorded while the previous slot may still be unmapping.
+  const MOE_ID_BYTES = S.moeSlots * 4
+  const moeIdRing: GPUBuffer[] = pooling
+    ? [0, 1].map((i) => device.createBuffer({
+        size: MOE_ID_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: `moeIdsRead_${i}`,
+      }))
+    : []
+  let moeIdCursor = 0
+  /** Slot ids on their way back to B.moeIds — one buffer, rewritten per layer. */
+  const moeSlotScratch = new Uint32Array(S.moeSlots)
+
   // MoE routing trace. One row per layer, written straight after that layer's
   // top-k so the record is exactly what the expert matmul then read.
   // A RING over many decode steps, not one pass. The buffer is overwritten
@@ -1345,7 +1499,12 @@ export function buildDecodeEngine(
     // B.hidden2 (what addNorm2 consumes) — exactly the dense FFN's contract,
     // which is why nothing around it changes.
     const m = lw.moe
-    const moeBG = S.moe && m
+    // Pooling swaps the six expert-matmul stacks for their SLOTS-row siblings
+    // and nothing else: the router is [experts+1, d] int8 and stays whole, and
+    // every uniform is unchanged because id × stride is the same arithmetic
+    // whether the id names an expert or a slot.
+    const mw = layerPools[L - L0]?.bufs ?? m
+    const moeBG = S.moe && m && mw
       ? {
           // An unquantized router has no scales or biases to bind, and its
           // module declares neither — passing six buffers to a four-binding
@@ -1359,14 +1518,14 @@ export function buildDecodeEngine(
           // reads. The bind OFFSET must stay 256-aligned — ffn*2 = 1024 here.
           gate: bg(device, moeMM!, [
             { buffer: B.moeGateUp!, offset: 0, size: S.moeSlots * 2 * S.ffn * 2 },
-            B.hidden1, m.gateScales, m.gateWeights, moeGateU!, m.gateBiases, B.moeIds!]),
+            B.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, B.moeIds!]),
           up: bg(device, moeMM!, [
             { buffer: B.moeGateUp!, offset: S.ffn * 2, size: S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
-            B.hidden1, m.upScales, m.upWeights, moeGateU!, m.upBiases, B.moeIds!]),
+            B.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, B.moeIds!]),
           silu: bg(device, P.siluMul, [B.moeH!, B.moeGateUp!, moeSiluU!]),
           down: bg(device, moeMM!, [
             { buffer: B.moeDown!, offset: 0, size: S.moeSlots * S.d * 2 },
-            B.moeH!, m.downScales, m.downWeights, moeDownU!, m.downBiases, B.moeIds!]),
+            B.moeH!, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, B.moeIds!]),
           combine: bg(device, P.moeCombine, [B.hidden2, B.moeDown!, B.moeScores!, moeCombU!]),
         }
       : undefined
@@ -1437,12 +1596,26 @@ export function buildDecodeEngine(
    * Record one full forward pass (embedding → all layers → LM head → argmax)
    * into `enc`. Both generate styles and profileStep share this recorder, so
    * dispatch order is identical everywhere.
+   *
+   * The four pieces below exist because the POOLED path (expertPool) has to cut
+   * the pass open at each MoE router and submit — see recordForwardPooled. The
+   * default path composes them in the one order it always ran.
    */
   /** `position` is a PARAMETER, not a closure read: mla_scores' grid is the
    *  one dispatch whose size depends on how much cache exists, and a stale
    *  closure value would score against the wrong number of positions while
    *  still filling the buffer. */
   function recordForward(enc: GPUCommandEncoder, position: number): void {
+    recordPrologue(enc)
+    for (let L = L0; L < L1; L++) {
+      const blk = layerBGs[L - L0]
+      recordAttn(enc, blk, position)
+      recordFfnTail(enc, L, blk)
+    }
+    recordEpilogue(enc)
+  }
+
+  function recordPrologue(enc: GPUCommandEncoder): void {
     // --- EMBEDDING → B.residual (ping) ---
     // Pipeline stages past the first have no embedding table and no token to
     // look up: B.residual already holds the state handed over by the previous
@@ -1452,148 +1625,169 @@ export function buildDecodeEngine(
     dispatch(enc, P.rmsNorm, bgInitNorm, 1, 1, 1, 'rmsNorm_init')
 
     if (moeTraceBuf) moeTraceIdx++
-    // --- TRANSFORMER LAYERS ---
-    // Residual ping-pong is encoded into the cached bind groups: addNorm1 reads
-    // residual / writes residual2; addNorm2 reads residual2 / writes residual.
-    // Unfused: 9 dispatches/layer (10 for qkNorm specs — Qwen3 inserts the
-    // per-head Q/K RMSNorm between qkv matmul and rope; 8 with ?fuseqk, which
-    // fuses qkNorm+rope+kvAppend into one pass). Fused f16: 7. Fused int8: 8
-    // (adds a kv_quantize pass between qkv_fused_scratch and attention_int8).
-    for (let L = L0; L < L1; L++) {
-      const blk = layerBGs[L - L0]
+  }
 
-      // Attention on the f16 KV layout — split-K (?splitk=N) turns the one
-      // WG-per-head dispatch into a partial pass over N partitions per head
-      // plus a per-head combine over the partials scratch.
-      const attentionF16 = () => {
-        if (splitK) {
-          dispatch(enc, R.attentionSplitK!, blk.attn!, splitK, S.heads, 1, 'attention')
-          dispatch(enc, R.attentionCombine!, bgAttnCombine!, 1, S.heads, 1, 'attnCombine')
-        } else {
-          dispatch(enc, R.attention, blk.attn!, 1, S.heads, 1, 'attention')
-        }
-      }
-
-      if (blk.mla) {
-        // Ten dispatches, then the shared addNorm1 -> FFN -> addNorm2 tail with
-        // no change. Grid y is the HEAD COUNT on qLat/scores/oHead: swapping x
-        // and y still runs, still fills the buffer, and computes the wrong
-        // (t, head) pairs.
-        const M = S.mla!
-        const m = blk.mla
-        dispatch(enc, R.matmul, m.qProj, S.mlaQProjRows / R.matmulRowsPerWG, 1, 1, 'mlaQProj')
-        dispatch(enc, R.matmul, m.kvaProj, S.mlaKvaRows / R.matmulRowsPerWG, 1, 1, 'mlaKvaProj')
-        dispatch(enc, P.mlaQSplit, m.qSplit, S.heads, 1, 1, 'mlaQSplit')
-        dispatch(enc, P.mlaKvWrite, m.kvWrite, 1, 1, 1, 'mlaKvWrite')
-        dispatch(enc, P.mlaProj, m.qLat, Math.ceil(M.kvLoraRank / 64), S.heads, 1, 'mlaQLat')
-        // The only position-dependent grid in the recorder. A static
-        // maxContext x heads grid is also correct — mla_scores guards t >= T —
-        // but launches ~540k workgroups per layer per token at full context.
-        dispatch(enc, P.mlaScores, m.scores, position + 1, S.heads, 1, 'mlaScores')
-        dispatch(enc, P.mlaCombine, m.combine, S.heads, 1, 1, 'mlaCombine')
-        dispatch(enc, P.mlaNarrow, m.narrow, Math.ceil((S.heads * M.kvLoraRank) / 256), 1, 1, 'mlaNarrow')
-        dispatch(enc, P.mlaProj, m.oHead, Math.ceil(M.vHeadDim / 64), S.heads, 1, 'mlaOHead')
-        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
-      } else if (blk.gdn) {
-        // GatedDeltaNet layer (Qwen3.5 linear_attn): ONE fused input
-        // projection (qkv‖z‖a‖b rows packed at load time — replaces the 4
-        // separate matmul dispatches), then conv → gates → recurrence →
-        // gated norm.
-        const g = blk.gdn
-        dispatch(enc, R.matmul, g.proj, Math.ceil(S.gdnProjRows / R.matmulRowsPerWG), 1, 1, 'gdnProjMatmul')
-        dispatch(enc, P.gdnConv, g.conv, GDN_CONV_WGS, 1, 1, 'gdnConv')
-        dispatch(enc, P.gdnGates, g.gates, 1, 1, 1, 'gdnGates')
-        dispatch(enc, P.gdnRecur, g.recur, S.gdnVHeads, 1, 1, 'gdnRecur')
-        dispatch(enc, P.gdnNormOut, g.normOut, S.gdnVHeads, 1, 1, 'gdnNormOut')
-        // out_proj: B.gdnNormed → B.hidden2 (K = GDN_V_DIM instance)
-        dispatch(enc, matmulGdnOut!, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'gdnOutProj')
-      } else if (hybrid) {
-        // Gated attention layer (Qwen3.5): c_attn → per-head [Q|gate] split →
-        // qk_norm → partial RoPE → KV append → attention → sigmoid gate.
-        dispatch(enc, R.matmul, blk.qkv!, S.cAttnDim / R.matmulRowsPerWG, 1, 1, 'cAttnMatmul')
-        dispatch(enc, P.gatedQkvSplit, blk.gatedSplit!, C_ATTN_WGS, 1, 1, 'gatedQkvSplit')
-        if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
-        dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
-        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
-        attentionF16()
-        dispatch(enc, P.attnGate, blk.attnGate!, ATTN_GATE_WGS, 1, 1, 'attnGate')
-        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
-      } else if (!fused) {
-        // QKV matmul: B.hidden1 → B.qkvOut
-        dispatch(enc, R.matmul, blk.qkv!, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
-        if (blk.qkFused) {
-          // ?fuseqk: fused qk_norm+RoPE+append — B.qkvOut → B.qOut + kvPages[L]
-          // in one dispatch (replaces the qkNorm/rope/kvAppend chain below).
-          dispatch(enc, P.qkNormRopeAppend, blk.qkFused, QK_FUSE_WGS, 1, 1, 'qkNormRopeAppend')
-        } else {
-          // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
-          if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
-          // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
-          dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
-          // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
-          dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
-        }
-        // Attention: Q + kvPages[L] → B.attnOut
-        attentionF16()
-        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
-      } else if (int8Mode) {
-        dispatch(enc, P.qkvFusedScratch, blk.qkv!, S.qkvPairs, 1, 1, 'qkvFused')
-        dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
-        dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
-        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+  /**
+   * One layer's ATTENTION half (or its GDN / MLA replacement).
+   *
+   * Residual ping-pong is encoded into the cached bind groups: addNorm1 reads
+   * residual / writes residual2; addNorm2 reads residual2 / writes residual.
+   * Unfused: 9 dispatches/layer (10 for qkNorm specs — Qwen3 inserts the
+   * per-head Q/K RMSNorm between qkv matmul and rope; 8 with ?fuseqk, which
+   * fuses qkNorm+rope+kvAppend into one pass). Fused f16: 7. Fused int8: 8
+   * (adds a kv_quantize pass between qkv_fused_scratch and attention_int8).
+   */
+  function recordAttn(enc: GPUCommandEncoder, blk: LayerBG, position: number): void {
+    // Attention on the f16 KV layout — split-K (?splitk=N) turns the one
+    // WG-per-head dispatch into a partial pass over N partitions per head
+    // plus a per-head combine over the partials scratch.
+    const attentionF16 = () => {
+      if (splitK) {
+        dispatch(enc, R.attentionSplitK!, blk.attn!, splitK, S.heads, 1, 'attention')
+        dispatch(enc, R.attentionCombine!, bgAttnCombine!, 1, S.heads, 1, 'attnCombine')
       } else {
-        // Fused QKV+RoPE+KV-append: B.hidden1 → B.qOut + kvPages[L]
-        dispatch(enc, R.qkvFused, blk.qkv!, S.qkvPairs / R.qkvPairsPerWG, 1, 1, 'qkvFused')
-        attentionF16()
-        dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
-      }
-      if (R.ffnPrologue) {
-        // ?fuseprologue=1: no addNorm1 dispatch. The FFN kernel computes
-        // rIn + hidden2 and its RMSNorm in its own prologue; ffnDown lands
-        // in hidden3; add3_norm merges rIn + hidden2 + hidden3 at the tail.
-        dispatch(enc, R.ffn, blk.ffn!, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
-        dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
-        dispatch(enc, P.add3Norm, blk.addNorm2, 1, 1, 1, 'addNorm2')
-      } else {
-        // AddNorm (attention): residual += hidden2; hidden1 = RMSNorm(residual)
-        dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
-        if (blk.moe) {
-          // Sparse MoE, seven dispatches, B.hidden1 → B.hidden2. Every slot —
-          // the top-K routed experts, plus the shared one at index E when the
-          // checkpoint has one — rides in grid z, so the expert count costs
-          // dispatches, not the top-k.
-          dispatch(enc, moeRouterPipe, blk.moe.routerLogits, MOE_ROUTER_ROWS, 1, 1, 'moeRouterLogits')
-          dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, 1, 1, 1, 'moeRouterTopk')
-          if (moeTraceBuf) {
-            const base = (moeTraceIdx % TRACE_CAP) * traceStride + L * TRACE_ROW
-            enc.copyBufferToBuffer(B.moeIds!, 0, moeTraceBuf, base, TRACE_ROW)
-          }
-          const rows = S.ffn / MOE_RPW
-          dispatch(enc, moeMM!, blk.moe.gate, rows, 1, S.moeSlots, 'moeGate')
-          dispatch(enc, moeMM!, blk.moe.up, rows, 1, S.moeSlots, 'moeUp')
-          dispatch(enc, P.siluMul, blk.moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
-          dispatch(enc, moeMM!, blk.moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
-          dispatch(enc, P.moeCombine, blk.moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
-        } else if (blk.ffnSilu) {
-          // Affine dense FFN: gate_up matmul (2·ffn rows, K=d) → silu_mul →
-          // down matmul. Three dispatches where MLC runs two — the price of
-          // fused_ffn having no affine sibling.
-          dispatch(enc, R.matmul, blk.ffn!, (2 * S.ffn) / R.matmulRowsPerWG, 1, 1, 'ffnGateUp')
-          dispatch(enc, P.siluMul, blk.ffnSilu, Math.ceil(S.ffn / 256), 1, 1, 'ffnSilu')
-          dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
-        } else {
-        // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
-        dispatch(enc, R.ffn, blk.ffn!, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
-        // FFN down: B.ffnOut → B.hidden2 (K = ffn instance)
-        dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
-        }
-        // AddNorm (FFN): residual += hidden2; hidden1 = RMSNorm(residual)
-        //   For last layer the bind group binds finalNormGamma instead of next
-        //   layer's normGamma1, so hidden1 is ready for the LM head.
-        dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+        dispatch(enc, R.attention, blk.attn!, 1, S.heads, 1, 'attention')
       }
     }
 
+    if (blk.mla) {
+      // Ten dispatches, then the shared addNorm1 -> FFN -> addNorm2 tail with
+      // no change. Grid y is the HEAD COUNT on qLat/scores/oHead: swapping x
+      // and y still runs, still fills the buffer, and computes the wrong
+      // (t, head) pairs.
+      const M = S.mla!
+      const m = blk.mla
+      dispatch(enc, R.matmul, m.qProj, S.mlaQProjRows / R.matmulRowsPerWG, 1, 1, 'mlaQProj')
+      dispatch(enc, R.matmul, m.kvaProj, S.mlaKvaRows / R.matmulRowsPerWG, 1, 1, 'mlaKvaProj')
+      dispatch(enc, P.mlaQSplit, m.qSplit, S.heads, 1, 1, 'mlaQSplit')
+      dispatch(enc, P.mlaKvWrite, m.kvWrite, 1, 1, 1, 'mlaKvWrite')
+      dispatch(enc, P.mlaProj, m.qLat, Math.ceil(M.kvLoraRank / 64), S.heads, 1, 'mlaQLat')
+      // The only position-dependent grid in the recorder. A static
+      // maxContext x heads grid is also correct — mla_scores guards t >= T —
+      // but launches ~540k workgroups per layer per token at full context.
+      dispatch(enc, P.mlaScores, m.scores, position + 1, S.heads, 1, 'mlaScores')
+      dispatch(enc, P.mlaCombine, m.combine, S.heads, 1, 1, 'mlaCombine')
+      dispatch(enc, P.mlaNarrow, m.narrow, Math.ceil((S.heads * M.kvLoraRank) / 256), 1, 1, 'mlaNarrow')
+      dispatch(enc, P.mlaProj, m.oHead, Math.ceil(M.vHeadDim / 64), S.heads, 1, 'mlaOHead')
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else if (blk.gdn) {
+      // GatedDeltaNet layer (Qwen3.5 linear_attn): ONE fused input
+      // projection (qkv‖z‖a‖b rows packed at load time — replaces the 4
+      // separate matmul dispatches), then conv → gates → recurrence →
+      // gated norm.
+      const g = blk.gdn
+      dispatch(enc, R.matmul, g.proj, Math.ceil(S.gdnProjRows / R.matmulRowsPerWG), 1, 1, 'gdnProjMatmul')
+      dispatch(enc, P.gdnConv, g.conv, GDN_CONV_WGS, 1, 1, 'gdnConv')
+      dispatch(enc, P.gdnGates, g.gates, 1, 1, 1, 'gdnGates')
+      dispatch(enc, P.gdnRecur, g.recur, S.gdnVHeads, 1, 1, 'gdnRecur')
+      dispatch(enc, P.gdnNormOut, g.normOut, S.gdnVHeads, 1, 1, 'gdnNormOut')
+      // out_proj: B.gdnNormed → B.hidden2 (K = GDN_V_DIM instance)
+      dispatch(enc, matmulGdnOut!, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'gdnOutProj')
+    } else if (hybrid) {
+      // Gated attention layer (Qwen3.5): c_attn → per-head [Q|gate] split →
+      // qk_norm → partial RoPE → KV append → attention → sigmoid gate.
+      dispatch(enc, R.matmul, blk.qkv!, S.cAttnDim / R.matmulRowsPerWG, 1, 1, 'cAttnMatmul')
+      dispatch(enc, P.gatedQkvSplit, blk.gatedSplit!, C_ATTN_WGS, 1, 1, 'gatedQkvSplit')
+      if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
+      dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
+      dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+      attentionF16()
+      dispatch(enc, P.attnGate, blk.attnGate!, ATTN_GATE_WGS, 1, 1, 'attnGate')
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else if (!fused) {
+      // QKV matmul: B.hidden1 → B.qkvOut
+      dispatch(enc, R.matmul, blk.qkv!, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
+      if (blk.qkFused) {
+        // ?fuseqk: fused qk_norm+RoPE+append — B.qkvOut → B.qOut + kvPages[L]
+        // in one dispatch (replaces the qkNorm/rope/kvAppend chain below).
+        dispatch(enc, P.qkNormRopeAppend, blk.qkFused, QK_FUSE_WGS, 1, 1, 'qkNormRopeAppend')
+      } else {
+        // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
+        if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
+        // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
+        dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
+        // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
+        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+      }
+      // Attention: Q + kvPages[L] → B.attnOut
+      attentionF16()
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else if (int8Mode) {
+      dispatch(enc, P.qkvFusedScratch, blk.qkv!, S.qkvPairs, 1, 1, 'qkvFused')
+      dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
+      dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else {
+      // Fused QKV+RoPE+KV-append: B.hidden1 → B.qOut + kvPages[L]
+      dispatch(enc, R.qkvFused, blk.qkv!, S.qkvPairs / R.qkvPairsPerWG, 1, 1, 'qkvFused')
+      attentionF16()
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    }
+  }
+
+  /** The router's two dispatches — the point at which the pooled path must
+   *  stop and read the chosen experts back. The trace copy sits here so it
+   *  records EXPERT ids: pooling overwrites B.moeIds with slot ids only after
+   *  this encoder is submitted. */
+  function recordMoeRouter(enc: GPUCommandEncoder, L: number, moe: NonNullable<LayerBG['moe']>): void {
+    dispatch(enc, moeRouterPipe, moe.routerLogits, MOE_ROUTER_ROWS, 1, 1, 'moeRouterLogits')
+    dispatch(enc, P.moeRouterTopk!, moe.routerTopk, 1, 1, 1, 'moeRouterTopk')
+    if (moeTraceBuf) {
+      const base = (moeTraceIdx % TRACE_CAP) * traceStride + L * TRACE_ROW
+      enc.copyBufferToBuffer(B.moeIds!, 0, moeTraceBuf, base, TRACE_ROW)
+    }
+  }
+
+  /** The five dispatches after the router. Every slot — the top-K routed
+   *  experts, plus the shared one at index E when the checkpoint has one —
+   *  rides in grid z, so the expert count costs dispatches, not the top-k. */
+  function recordMoeExperts(enc: GPUCommandEncoder, moe: NonNullable<LayerBG['moe']>): void {
+    const rows = S.ffn / MOE_RPW
+    dispatch(enc, moeMM!, moe.gate, rows, 1, S.moeSlots, 'moeGate')
+    dispatch(enc, moeMM!, moe.up, rows, 1, S.moeSlots, 'moeUp')
+    dispatch(enc, P.siluMul, moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
+    dispatch(enc, moeMM!, moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
+    dispatch(enc, P.moeCombine, moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
+  }
+
+  /** One layer's FFN half: addNorm1 → dense FFN or the sparse MoE block →
+   *  addNorm2 (or, with ?fuseprologue=1, the three-dispatch fused tail). */
+  function recordFfnTail(enc: GPUCommandEncoder, L: number, blk: LayerBG): void {
+    if (R.ffnPrologue) {
+      // ?fuseprologue=1: no addNorm1 dispatch. The FFN kernel computes
+      // rIn + hidden2 and its RMSNorm in its own prologue; ffnDown lands
+      // in hidden3; add3_norm merges rIn + hidden2 + hidden3 at the tail.
+      dispatch(enc, R.ffn, blk.ffn!, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+      dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+      dispatch(enc, P.add3Norm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    } else {
+      // AddNorm (attention): residual += hidden2; hidden1 = RMSNorm(residual)
+      dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
+      if (blk.moe) {
+        // Sparse MoE, seven dispatches, B.hidden1 → B.hidden2.
+        recordMoeRouter(enc, L, blk.moe)
+        recordMoeExperts(enc, blk.moe)
+      } else if (blk.ffnSilu) {
+        // Affine dense FFN: gate_up matmul (2·ffn rows, K=d) → silu_mul →
+        // down matmul. Three dispatches where MLC runs two — the price of
+        // fused_ffn having no affine sibling.
+        dispatch(enc, R.matmul, blk.ffn!, (2 * S.ffn) / R.matmulRowsPerWG, 1, 1, 'ffnGateUp')
+        dispatch(enc, P.siluMul, blk.ffnSilu, Math.ceil(S.ffn / 256), 1, 1, 'ffnSilu')
+        dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+      } else {
+      // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
+      dispatch(enc, R.ffn, blk.ffn!, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+      // FFN down: B.ffnOut → B.hidden2 (K = ffn instance)
+      dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+      }
+      // AddNorm (FFN): residual += hidden2; hidden1 = RMSNorm(residual)
+      //   For last layer the bind group binds finalNormGamma instead of next
+      //   layer's normGamma1, so hidden1 is ready for the LM head.
+      dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    }
+  }
+
+  function recordEpilogue(enc: GPUCommandEncoder): void {
     // A stage that does not end the model stops here: B.residual is the
     // hand-off, and there is no LM head on this device to run.
     if (L1 !== S.layers) return
@@ -1621,6 +1815,95 @@ export function buildDecodeEngine(
     } else {
       dispatch(enc, R.argmax, bgArgmax!, 1, 1, 1, 'argmax')
     }
+  }
+
+  /** The whole pass in ONE encoder, unsubmitted — what every caller got before
+   *  pooling existed and still gets when it is off. */
+  function recordWholeForward(position: number): GPUCommandEncoder {
+    const enc = device.createCommandEncoder()
+    if (position === 0) clearGdnState(enc)
+    recordForward(enc, position)
+    return enc
+  }
+
+  /**
+   * POOLED forward pass: the same dispatches, cut open at every MoE router.
+   *
+   * The router's ids have to reach JS before the expert matmuls can be bound to
+   * slots, and WebGPU has no fence, semaphore or event with which the GPU could
+   * wait on the host — so each MoE layer ends its encoder, submits, and reads
+   * ~36 bytes back. That round trip is the whole cost of this feature
+   * (docs/MOE_CHUNK_PLAN.md prices it at 0.199 ms).
+   *
+   * SUBMIT FIRST, THEN AWAIT. Everything recorded since the previous split —
+   * the layer's whole attention half, and on the first MoE layer the embedding
+   * too — is in the submit that carries the readback copy, so it runs while the
+   * round trip is in flight. The rest of the layer cannot join it: the expert
+   * matmuls are precisely what the ids decide. Overlapping the NEXT layer needs
+   * next-layer speculation (the doc's "pipelined" column, and a wrong guess is
+   * a stall), which is not this change.
+   *
+   * Returns the encoder holding the tail, still unsubmitted, so the caller
+   * appends its own readback copies exactly as in the unpooled path.
+   */
+  async function recordForwardPooled(position: number): Promise<GPUCommandEncoder> {
+    let enc = device.createCommandEncoder()
+    if (position === 0) clearGdnState(enc)
+    recordPrologue(enc)
+    for (let L = L0; L < L1; L++) {
+      const blk = layerBGs[L - L0]
+      const lp = layerPools[L - L0]
+      recordAttn(enc, blk, position)
+      // A dense layer of a MoE stack (DeepSeek's layer 0) has no pool and no
+      // router — it is recorded whole, like every layer of a dense spec.
+      if (!blk.moe || !lp) {
+        recordFfnTail(enc, L, blk)
+        continue
+      }
+      // These two dispatches bracket the MoE block in recordFfnTail; the split
+      // is in the middle of it, so this path names them itself.
+      dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
+      recordMoeRouter(enc, L, blk.moe)
+      const staging = moeIdRing[moeIdCursor]
+      moeIdCursor = (moeIdCursor + 1) % moeIdRing.length
+      enc.copyBufferToBuffer(B.moeIds!, 0, staging, 0, MOE_ID_BYTES)
+      device.queue.submit([enc.finish()])
+
+      await staging.mapAsync(GPUMapMode.READ)
+      // slice() before unmap — the mapped range dies with it.
+      const experts = new Uint32Array(staging.getMappedRange().slice(0))
+      staging.unmap()
+      const { slots, misses } = lp.pool.resolve(experts)
+
+      enc = device.createCommandEncoder()
+      for (const { expert, slot } of misses) {
+        for (const s of lp.slabs) {
+          enc.copyBufferToBuffer(s.full, expert * s.stride, s.slot, slot * s.stride, s.stride)
+        }
+      }
+      // Queue-ordered: this lands after the submit above (which is what the
+      // trace copy read) and before the copies just recorded, which is every
+      // ordering this needs. The matmul now reads slot indices out of the same
+      // binding the router wrote expert indices into.
+      moeSlotScratch.set(slots)
+      device.queue.writeBuffer(B.moeIds!, 0, moeSlotScratch)
+      recordMoeExperts(enc, blk.moe)
+      dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    }
+    recordEpilogue(enc)
+    return enc
+  }
+
+  function getPoolStats(): { hits: number; requests: number; hitRate: number } | null {
+    if (!pooling) return null
+    let hits = 0
+    let requests = 0
+    for (const lp of layerPools) {
+      if (!lp) continue
+      hits += lp.pool.hits
+      requests += lp.pool.requests
+    }
+    return { hits, requests, hitRate: requests ? hits / requests : 0 }
   }
 
   /**
@@ -1710,9 +1993,7 @@ export function buildDecodeEngine(
       writeStepState(input.tokenId, position)
     }
 
-    const enc = device.createCommandEncoder()
-    if (position === 0) clearGdnState(enc)
-    recordForward(enc, position)
+    const enc = pooling ? await recordForwardPooled(position) : recordWholeForward(position)
     const last = L1 === S.layers
     if (last) enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     else enc.copyBufferToBuffer(B.residual, 0, residualReadBuf!, 0, S.d * 2)
@@ -1743,9 +2024,7 @@ export function buildDecodeEngine(
     }
     writeStepState(tokenId, position)
 
-    const enc = device.createCommandEncoder()
-    if (position === 0) clearGdnState(enc)
-    recordForward(enc, position)
+    const enc = pooling ? await recordForwardPooled(position) : recordWholeForward(position)
     // Fold the argmax readback into the same command encoder → one submit per token.
     enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     device.queue.submit([enc.finish()])
@@ -2683,11 +2962,10 @@ export function buildDecodeEngine(
     position: number,
     wantReadback: boolean
   ): Promise<number> | null {
+    if (pooling) return submitStepPooled(writeInputId, position, wantReadback)
     writeStepState(writeInputId, position)
 
-    const enc = device.createCommandEncoder()
-    if (position === 0) clearGdnState(enc)
-    recordForward(enc, position)
+    const enc = recordWholeForward(position)
     // GPU chain: next decode step reads inputIds[0] without a CPU round-trip.
     enc.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
 
@@ -2709,6 +2987,52 @@ export function buildDecodeEngine(
     gdnStatePos = position + 1
     if (writeInputId !== null) noteAbsorbed(position, writeInputId)
     return null
+  }
+
+  /**
+   * submitStep for a pooled engine, with the same signature: returns as soon as
+   * the step is QUEUED, with a promise for the token when one is wanted.
+   *
+   * Recording a pooled pass has to await the GPU (one readback per MoE layer),
+   * so the steps run on a chain rather than synchronously. That costs nothing
+   * generatePipelined was actually getting: its PIPELINE_DEPTH tokens in flight
+   * exist so the CPU can run ahead of the GPU, and a pooled pass cannot — the
+   * router of every layer of token t+1 is downstream of all of token t.
+   *
+   * The readback ring slot is claimed HERE, synchronously, so slots are used in
+   * call order however the chain interleaves.
+   */
+  let pooledChain: Promise<void> = Promise.resolve()
+  function submitStepPooled(
+    writeInputId: number | null,
+    position: number,
+    wantReadback: boolean
+  ): Promise<number> | null {
+    const slot = wantReadback ? readRing[readCursor] : null
+    if (slot) readCursor = (readCursor + 1) % readRing.length
+
+    const done = pooledChain.then(async () => {
+      writeStepState(writeInputId, position)
+      const enc = await recordForwardPooled(position)
+      enc.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
+      if (slot) enc.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
+      device.queue.submit([enc.finish()])
+      gdnStatePos = position + 1
+      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+    })
+    // A failed step must not poison the ORDERING of the ones behind it, and a
+    // fire-and-forget step has no caller to see its rejection — so it is logged
+    // here. A step with a readback rejects the promise below instead.
+    pooledChain = done.catch((err) => {
+      if (!wantReadback) console.error('[engine] pooled prefill step failed', err)
+    })
+    if (!slot) return null
+    return done.then(async () => {
+      await slot.mapAsync(GPUMapMode.READ)
+      const id = new DataView(slot.getMappedRange()).getInt32(0, true)
+      slot.unmap()
+      return id
+    })
   }
 
   async function generatePipelined(
@@ -2851,6 +3175,11 @@ export function buildDecodeEngine(
   // creation — the caller prints a hint in that case.
   async function profileStep(warmupIds: number[]): Promise<KernelProfile | null> {
     if (!(device.features as ReadonlySet<string>).has('timestamp-query')) return null
+    // The profiled pass is recorded as ONE encoder, which a pooled engine's
+    // decode is not: the per-layer round trip and the miss copies are outside
+    // every number below. Said out loud rather than left to be misread as the
+    // pooled token cost.
+    if (pooling) console.warn('[engine] profileStep measures the dispatches only — expertPool\'s readback and copies are not in this profile')
 
     // Warmup: run prefill + a handful of decode steps without profile, so
     // shader compilation, texture caches, etc. are warm when we measure.
@@ -3192,7 +3521,8 @@ export function buildDecodeEngine(
       mlaScoresU, mlaCombineU,
       attnU, attnSkU, combineU, attnI8U,
       residualReadBuf, readBuf, logitsReadBuf, hiddenReadBuf,
-      moeTraceBuf, moeTraceRead,
+      moeTraceBuf, moeTraceRead, ...moeIdRing,
+      ...layerPools.flatMap((lp) => lp ? lp.slabs.map((s) => s.slot) : []),
     ]
     for (const b of owned) b?.destroy()
     chunkPrefill?.destroy()
@@ -3212,6 +3542,7 @@ export function buildDecodeEngine(
     generatePipelined: guard('generatePipelined', generatePipelined),
     forwardLogits: guard('forwardLogits', forwardLogits),
     readMoeTrace,
+    getPoolStats,
     forwardEmbedding: guard('forwardEmbedding', forwardEmbedding),
     scoreSequence: guard('scoreSequence', scoreSequence),
     pipelineStep: guard('pipelineStep', pipelineStep),

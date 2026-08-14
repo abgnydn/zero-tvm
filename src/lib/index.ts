@@ -69,6 +69,10 @@ export interface CreateEngineOptions {
   chunkGemm?: import('../zero-tvm/engine-core.js').DecodeEngineOptions['chunkGemm']
   /** Capture per-layer router choices for scripts/moe-trace.mjs. */
   traceMoe?: boolean
+  /** Expert slots held per MoE layer instead of all of them — see
+   *  DecodeEngineOptions.expertPool. MoE models only; below top-K + 1 the
+   *  engine throws. Off by default. */
+  expertPool?: number
   /** Shader-variant flags as a query string, e.g. '?vec4=0'. Same parser the
    *  chat page uses, so a kernel A/B run here selects what users get. */
   variantQuery?: string
@@ -284,6 +288,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   const engine = buildDecodeEngine(device, weights, allocKVPages(device, spec), {
     spec, variants, fused, ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
     ...(opts.traceMoe ? { traceMoe: true } : {}),
+    ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),
   })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs

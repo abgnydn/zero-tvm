@@ -49,9 +49,20 @@ describe('ExpertPool', () => {
     expect(r.evicted).toEqual([])
   })
 
+  it('states a minimum that accounts for pinned slots', () => {
+    // The naive floor is the request size. With anything pinned that is wrong,
+    // and it only shows up on a token whose experts exclude the pinned one.
+    expect(ExpertPool.minSlots(9, 0)).toBe(9)
+    expect(ExpertPool.minSlots(9, 1)).toBe(10)
+    const tooSmall = new ExpertPool(9, { pin: [99] })
+    expect(() => tooSmall.resolve([1, 2, 3, 4, 5, 6, 7, 8, 9])).toThrow(/pinned/)
+    const ok = new ExpertPool(ExpertPool.minSlots(9, 1), { pin: [99] })
+    expect(() => ok.resolve([1, 2, 3, 4, 5, 6, 7, 8, 9])).not.toThrow()
+  })
+
   it('refuses a request larger than the pool instead of silently corrupting it', () => {
     const p = new ExpertPool(2)
-    expect(() => p.resolve([1, 2, 3])).toThrow(/cannot satisfy/)
+    expect(() => p.resolve([1, 2, 3])).toThrow(/cannot serve/)
   })
 
   it('keeps a pinned expert resident under pressure', () => {

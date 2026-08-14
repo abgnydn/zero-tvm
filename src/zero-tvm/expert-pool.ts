@@ -31,6 +31,21 @@ export interface PoolResolution {
 }
 
 export class ExpertPool {
+  /**
+   * Smallest pool that can serve a request of `perRequest` distinct experts
+   * while holding `pinned` of them permanently.
+   *
+   * The naive floor is the request size, and it is wrong whenever anything is
+   * pinned: a pinned slot is not available to the request, so a token whose
+   * experts do not include the pinned one needs one more. On the shipped
+   * shared-expert specs the shared expert IS always in the request, so the
+   * naive floor happens to work — which is exactly the kind of accident that
+   * holds until a checkpoint routes differently. Callers size against this.
+   */
+  static minSlots(perRequest: number, pinned = 0): number {
+    return perRequest + pinned
+  }
+
   readonly slots: number
   /** Expert currently in each slot, -1 when the slot has never been filled. */
   private readonly expertOf: Int32Array
@@ -117,9 +132,12 @@ export class ExpertPool {
       if (this.usedAt[s] < oldest) { oldest = this.usedAt[s]; victim = s }
     }
     if (victim < 0) {
-      // Every slot is either pinned or in use by this very request.
+      // Every slot is either pinned or in use by this very request. Name the
+      // pins: a pool sized to the request size looks big enough until you
+      // notice a pinned slot was never available to it.
       throw new Error(
-        `expert pool of ${this.slots} cannot satisfy a request needing more slots than it has`)
+        `expert pool of ${this.slots} slots (${this.pinned.size} pinned) cannot serve this `
+        + `request — size it with ExpertPool.minSlots(perRequest, pinned)`)
     }
     evicted.push(this.expertOf[victim])
     this.slotOf.delete(this.expertOf[victim])
