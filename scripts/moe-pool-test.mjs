@@ -48,6 +48,8 @@ const TOKENS = Number(process.env.TOKENS) || 64
 const WARMUP = 8
 const FRACTIONS = (process.env.POOLS ?? '0.10,0.25,0.50').split(',').filter(Boolean).map(Number)
 const GEN = process.env.GEN ?? 'pipelined'
+const SPEC_W = Number(process.env.SPEC) || 0   // 1 = on at top-K; >K = coverage width
+const SPECULATE = SPEC_W >= 1
 
 let failed = false
 const check = (name, ok, detail) => {
@@ -98,7 +100,7 @@ const ARM = process.argv.includes('--arm')
   : null
 
 if (ARM) {
-  const built = await createEngineRaw({ model, ...(ARM.slots ? { expertPool: ARM.slots } : {}) })
+  const built = await createEngineRaw({ model, ...(ARM.slots ? { expertPool: ARM.slots } : {}), ...(ARM.spec ? { expertSpeculate: true, ...(ARM.spec > 1 ? { specWidth: ARM.spec } : {}) } : {}) })
   const out = []
   const ids = built.buildChatPromptFor(
     built.spec, [{ role: 'user', content: ARM.prompt }], built.tokenizer)
@@ -190,9 +192,15 @@ for (const slots of sizes) {
   const diverged = []
   const rates = [], hits = []
   for (let r = 0; r < ref.length; r++) {
-    const got = runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots, gen: GEN })
+    const got = runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots, gen: GEN, spec: SPEC_W })
     rates.push(got.tokS)
     if (got.pool) hits.push(got.pool.hitRate)
+    if (SPECULATE && got.pool?.speculation) {
+      const sp = got.pool.speculation
+      console.log(`      speculation r${r}: slot ${(sp.accuracy * 100).toFixed(1)}% · `
+        + `top1 ${(sp.top1Rate * 100).toFixed(1)}% · COVERAGE ${(sp.setRate * 100).toFixed(1)}% `
+        + `(${sp.steps} steps)`)
+    }
     const i = got.tokens.findIndex((t, k) => t !== ref[r].tokens[k])
     if (got.tokens.length !== ref[r].tokens.length || i >= 0) {
       same = false

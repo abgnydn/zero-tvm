@@ -78,6 +78,8 @@ export interface CreateEngineOptions {
   /** Run the next MoE layer's router a layer early and prefetch what it names
    *  (DecodeEngineOptions.expertSpeculate). Needs expertPool. */
   expertSpeculate?: boolean
+  /** Speculative router width for the coverage measurement (engine specWidth). */
+  specWidth?: number
   /** Shader-variant flags as a query string, e.g. '?vec4=0'. Same parser the
    *  chat page uses, so a kernel A/B run here selects what users get. */
   variantQuery?: string
@@ -300,6 +302,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
     ...(opts.traceMoe ? { traceMoe: true } : {}),
     ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),
     ...(opts.expertSpeculate ? { expertSpeculate: true } : {}),
+    ...(opts.specWidth ? { specWidth: opts.specWidth } : {}),
   })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs

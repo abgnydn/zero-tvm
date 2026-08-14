@@ -305,3 +305,50 @@ the CPU. At 93.5% hits a token pays ~2-3 actual stalls instead of one per
 pooled layer. That is a redesign of the pooled recorder, not a tune — and it is
 the gate on this whole feature, because every measured configuration is
 readback-bound, not bandwidth-bound.
+
+
+## Speculation measured — 2026-08-14, and the coverage curve that prices the redesign
+
+The readback-removal design needs the speculative router to be right. Measured
+(SPEC=<M> GEN=blocking, qwen30b, half pool, 2 x 512 tokens, ~25k scored steps
+per round; counters are power-independent):
+
+| spec width M | per-slot precision | top-1 | coverage (real top-8 ⊆ predicted M) |
+|---|---:|---:|---:|
+| 8 (exact set) | 85-88% | 72% | **25-32%** |
+| 16 | ~49% | 72% | 85-91% |
+| 32 (kernel cap) | ~25% | 72% | **96.8-97.8%** |
+
+- **Speculative recording (record L+1 from the predicted set, replay on
+  mismatch) is DEAD**: exact-set match is 25-32%, so ~70% of layers replay.
+  HOBBIT's 96% top-1 does not transfer — this model measures 72%.
+- **Coverage recording (predict top-M ⊇ real top-8, real scores select within
+  them on-GPU) is REAL but pays in compute**: coverage rises slower than M,
+  and decode expert matmuls are weight-read-bound, so M slots cost ~M/9 the
+  MoE block's traffic. M=16 (~5.8 replays/token, 1.9x block) and M=32 (~1.2
+  replays, 3.7x block) both land in an estimated ~33-45 t/s band on qwen30b —
+  about 2x today's measured blocking-pooled 15-20 t/s, still half of unpooled.
+- Side results: speculation's prefetch lifts the warm hit rate 95.3 → 98-99%;
+  token identity holds at every width (prediction never reaches a dispatch);
+  per-slot precision COLLAPSES as M grows (49% at 16, 25% at 32) — the
+  router's tail is noise seen from the previous layer's hidden state, which is
+  why coverage saturates.
+- The 35B has NOT been measured: 256 experts against the same M=32 kernel cap
+  means predicting 1/8 of the experts rather than 1/4 — expect worse coverage.
+  Measure before assuming transfer.
+
+Engine support added for the measurement (all warm-only): DecodeEngineOptions
+.specWidth, a spec-pass top-k uniform at K=M, PoolStats.speculation.setRate
+(coverage), SPEC=<M> in moe-pool-test.mjs.
+
+### Where this leaves the feature
+
+Three priced options, worst first:
+1. Ship pooled as-is on the blocking path: half memory at 15-20 t/s. Works
+   today, token-exact.
+2. Build coverage recording (M=16-24 + per-layer checkpoints + async validate
+   + replay): est. ~40 t/s at half memory. Days of engine work; the replay
+   machinery (GDN state snapshots, KV rollback, re-record) is the risk.
+3. Wait for the platform: one GPU-waits-on-host primitive (what MTLSharedEvent
+   gives llama.cpp's Metal build) removes the whole problem. WebGPU has no
+   fence/event today — verified against the API surface earlier in this file.

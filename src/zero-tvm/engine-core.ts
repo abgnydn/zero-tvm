@@ -318,6 +318,10 @@ export interface PoolStats {
     accuracy: number
     /** Steps whose highest-scored expert matched the real highest-scored one. */
     top1: number
+    /** Steps whose predicted routed SET equals the real one — the fraction of
+     *  layers a speculative-recording design would NOT replay. */
+    setMatch: number
+    setRate: number
     top1Rate: number
   } | null
 }
@@ -433,6 +437,14 @@ export interface DecodeEngineOptions {
    * so speculation cannot change a token, only when its weights arrived.
    */
   expertSpeculate?: boolean
+  /** Width of the speculative router's top-M (default: the spec's top-K).
+   *  MEASUREMENT KNOB for the coverage-recording design: exact set-match came
+   *  in at 25-32% on qwen30b — dead for speculative recording — but per-slot
+   *  accuracy was 85-88%, so the live question is whether the real top-K is
+   *  CONTAINED in a wider predicted top-M. scoreSpeculation reports coverage
+   *  when this exceeds the spec's K. Capped at 32 (the kernel ceiling) and at
+   *  E. Prediction stays warm-only: nothing it writes reaches a dispatch. */
+  specWidth?: number
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -764,6 +776,9 @@ export function buildDecodeEngine(
     ? uniformBuf(device, [u32(S.moe.experts), u32(S.moe.topK), u32(S.moe.normTopkProb ? 1 : 0),
                           u32(S.sharedExpertIndex >= 0 ? 1 : 0)])
     : null
+  /** The speculative pass's own top-k uniform: same shape, K = SPEC_M. Created
+   *  lazily below because SPEC_M is derived after the option block. */
+  let specTopkU: GPUBuffer | null = null
   // K_PACKED is words per weight row: K*bits/32 (4-bit: K/8, 3-bit: 3K/32).
   const moeBits = S.moe?.bits ?? 4
   const moeGateU = S.moe
@@ -985,9 +1000,17 @@ export function buildDecodeEngine(
   // a mapped buffer must never be a copy destination, and the next layer's copy
   // is recorded while the previous slot may still be unmapping.
   const MOE_ID_BYTES = S.moeSlots * 4
-  // Speculation rides the SAME round trip: layer L's real ids in the first half
-  // of the slot, layer L+1's predicted ids in the second. Two copies, one map.
-  const MOE_READ_BYTES = MOE_ID_BYTES * (speculate ? 2 : 1)
+  // The speculative top-M may be WIDER than the real top-K (specWidth) — the
+  // coverage measurement. Its ids ride the same staging slot, so the slot is
+  // sized for the wider of the two.
+  const SPEC_M = speculate
+    ? Math.min(Math.max(opts.specWidth ?? (S.moe!.topK), S.moe!.topK), 32, S.moe!.experts)
+    : 0
+  const SPEC_SLOTS = speculate ? SPEC_M + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
+  const SPEC_ID_BYTES = SPEC_SLOTS * 4
+  // Speculation rides the SAME round trip: layer L's real ids in the first
+  // part of the slot, layer L+1's predicted ids after. Two copies, one map.
+  const MOE_READ_BYTES = MOE_ID_BYTES + (speculate ? SPEC_ID_BYTES : 0)
   const moeIdRing: GPUBuffer[] = pooling
     ? [0, 1].map((i) => device.createBuffer({
         size: MOE_READ_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: `moeIdsRead_${i}`,
@@ -999,8 +1022,8 @@ export function buildDecodeEngine(
   // The speculative router's own outputs. Separate buffers, never bound by the
   // expert matmuls: a prediction must not be able to reach a dispatch.
   const specLogits = speculate ? makeBuf(device, MOE_ROUTER_ROWS * 4, 'specRouterLogits') : null
-  const specIds = speculate ? makeBuf(device, MOE_ID_BYTES, 'specIds') : null
-  const specScores = speculate ? makeBuf(device, MOE_ID_BYTES, 'specScores') : null
+  const specIds = speculate ? makeBuf(device, SPEC_ID_BYTES, 'specIds') : null
+  const specScores = speculate ? makeBuf(device, SPEC_ID_BYTES, 'specScores') : null
 
   // MoE routing trace. One row per layer, written straight after that layer's
   // top-k so the record is exactly what the expert matmul then read.
@@ -1745,7 +1768,9 @@ export function buildDecodeEngine(
             routerLogits: bg(device, moeRouterPipe, routerBits === 16
               ? [specLogits!, B.hidden1, m.routerWeights, moeRouterU!]
               : [specLogits!, B.hidden1, m.routerWeights, m.routerScales, m.routerBiases, moeRouterU!]),
-            routerTopk: bg(device, P.moeRouterTopk!, [specIds!, specScores!, specLogits!, moeTopkU!]),
+            routerTopk: bg(device, P.moeRouterTopk!, [specIds!, specScores!, specLogits!,
+              (specTopkU ??= uniformBuf(device, [u32(S.moe!.experts), u32(SPEC_M),
+                u32(S.moe!.normTopkProb ? 1 : 0), u32(S.sharedExpertIndex >= 0 ? 1 : 0)]))]),
           }
         : null)
     }
@@ -2033,6 +2058,7 @@ export function buildDecodeEngine(
   // layer a free point, which is exactly how a 96% claim gets reproduced by
   // accident.
   let specSteps = 0
+  let specSetMatch = 0
   let specPredicted = 0
   let specMatched = 0
   let specTop1 = 0
@@ -2049,6 +2075,18 @@ export function buildDecodeEngine(
     // moe_router_topk writes in descending score order, so slot 0 is the top-1
     // routed expert on both sides — the quantity HOBBIT reports 96% for.
     if (predicted[0] === real[0]) specTop1++
+    // COVERAGE — the number the coverage-recording design turns on: is every
+    // REAL routed expert inside the PREDICTED set? With M == K this equals
+    // exact set match (equal-cardinality distinct sets); with a widened
+    // speculative top-M it is the weaker condition that actually gates
+    // correctness — a layer whose real top-K is covered by the predicted M
+    // could have had its expert matmuls recorded from the prediction, with
+    // the real router's scores selecting within them, and no replay.
+    const predictedSet = new Set<number>()
+    for (const e of predicted) if (e !== S.sharedExpertIndex) predictedSet.add(e)
+    let covered = true
+    for (const e of routed) if (!predictedSet.has(e)) { covered = false; break }
+    if (covered) specSetMatch++
   }
 
   /**
@@ -2126,7 +2164,7 @@ export function buildDecodeEngine(
       const staging = moeIdRing[moeIdCursor]
       moeIdCursor = (moeIdCursor + 1) % moeIdRing.length
       enc.copyBufferToBuffer(B.moeIds!, 0, staging, 0, MOE_ID_BYTES)
-      if (ahead >= 0) enc.copyBufferToBuffer(specIds!, 0, staging, MOE_ID_BYTES, MOE_ID_BYTES)
+      if (ahead >= 0) enc.copyBufferToBuffer(specIds!, 0, staging, MOE_ID_BYTES, SPEC_ID_BYTES)
       device.queue.submit([enc.finish()])
 
       await staging.mapAsync(GPUMapMode.READ)
@@ -2152,7 +2190,7 @@ export function buildDecodeEngine(
       // Started BEFORE awaiting this layer's own reads, so both layers' slabs
       // are in flight together.
       if (ahead >= 0) {
-        const ids = back.slice(S.moeSlots, 2 * S.moeSlots)
+        const ids = back.slice(S.moeSlots, S.moeSlots + SPEC_SLOTS)
         const fetched = prefetchLayer(layerPools[ahead - L0]!, ids)
         // The await that reports a failed prefetch is a layer away; this only
         // stops Node calling it an unhandled rejection in between.
@@ -2199,6 +2237,8 @@ export function buildDecodeEngine(
             accuracy: specPredicted ? specMatched / specPredicted : 0,
             top1: specTop1,
             top1Rate: specSteps ? specTop1 / specSteps : 0,
+            setMatch: specSetMatch,
+            setRate: specSteps ? specSetMatch / specSteps : 0,
           }
         : null,
     }
