@@ -26,6 +26,7 @@ import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
 import { reuseStart, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
 import { ExpertPool } from './expert-pool.js'
+import type { SlabKind, SlabProj } from './slab-source.js'
 
 // ============================================================
 // GPU helpers
@@ -264,7 +265,7 @@ export interface DecodeEngine {
    *  DecodeEngineOptions.expertPool). Null unless the engine is pooling.
    *  A pinned shared expert is charged as a request and a hit on every token,
    *  which is what ExpertPool counts — read the rate with that in mind. */
-  getPoolStats(): { hits: number; requests: number; hitRate: number } | null
+  getPoolStats(): PoolStats | null
   /**
    * Free every GPU buffer this engine ALLOCATED — activations, GDN state,
    * uniforms, readbacks, chunk-prefill scratch. Deliberately not the two things
@@ -289,6 +290,32 @@ export interface DecodeEngine {
     iters: number,
     target?: 'ffnDown' | 'oproj',
   ): Promise<BatchedBenchResult | null>
+}
+
+export interface PoolStats {
+  hits: number
+  requests: number
+  hitRate: number
+  /**
+   * Next-layer router speculation (DecodeEngineOptions.expertSpeculate), null
+   * when it is off. `accuracy` is over ROUTED slots — how often a predicted
+   * expert really was in the next layer's top-K — and `top1Rate` is the
+   * quantity HOBBIT reports 96% for. Exposed so that number can be CHECKED on
+   * the model in front of you rather than assumed from the paper: the whole
+   * value of speculating is that the prediction is usually right, and a
+   * prefetch that is usually wrong is pure waste that still looks correct.
+   */
+  speculation: {
+    /** Predictions that reached the layer they were made for. */
+    steps: number
+    /** Routed slots predicted, summed over those steps. */
+    predicted: number
+    matched: number
+    accuracy: number
+    /** Steps whose highest-scored expert matched the real highest-scored one. */
+    top1: number
+    top1Rate: number
+  } | null
 }
 
 export interface DecodeEngineOptions {
@@ -376,11 +403,32 @@ export interface DecodeEngineOptions {
    * docs/MOE_CHUNK_PLAN.md "Expert residency": at a half pool the miss rate is
    * 6% and the transfer hides under compute; small pools do not survive.
    *
-   * THIS FIRST VERSION KEEPS THE FULL STACKS RESIDENT as the backing store, so
-   * it saves nothing yet — it proves token identity and prices the split. The
-   * disk-backed source lands separately.
+   * THE WEIGHTS MUST BE LOADED THE SAME WAY (`loadWeights(…, expertPool)`).
+   * That is what leaves the [experts+1, N, K] stacks unallocated and hands over
+   * the SlabSource a miss reads from; the engine refuses to pool without it,
+   * because pooling beside resident stacks costs memory rather than saving it.
+   *
+   * Chunked prefill is off while pooling — it binds these same buffers with no
+   * per-token slot resolution, and one chunk routes to more experts than any
+   * pool of this size holds.
    */
   expertPool?: number
+  /**
+   * Run each MoE layer's router ONE LAYER EARLY, on the previous layer's hidden
+   * state, and prefetch the experts it names into the pool (requires
+   * expertPool). HOBBIT measures that prediction at 96% top-1; getPoolStats()
+   * reports what it is measuring here, because the paper's number is about the
+   * paper's model.
+   *
+   * It buys the one thing the pool cannot: a miss otherwise cannot start until
+   * its own layer's router has come back, which is why the readback is ~9.6 ms
+   * of every token and pooling caps near 32 tok/s instead of 78.
+   *
+   * A wrong prediction costs a wasted read and nothing else. The predicted ids
+   * never reach a dispatch — every layer resolves against its own real ids —
+   * so speculation cannot change a token, only when its weights arrived.
+   */
+  expertSpeculate?: boolean
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -731,17 +779,25 @@ export function buildDecodeEngine(
   // Expert-slot pool (opts.expertPool) — docs/MOE_CHUNK_PLAN.md
   //
   // Nine stacked tensors per MoE layer (gate/up/down × weights/scales/biases)
-  // get a POOL sibling of SLOTS rows beside the full [experts+1] stack, and
-  // `ids[]` carries slot indices instead of expert indices. The expert matmul
-  // is untouched: it computes its row base as id × N × K_PACKED for weights
-  // and id × N × SCALES_PER_ROW for scales and biases, which is exactly the
-  // per-expert byte stride of each stack — so those two products are the only
-  // layout knowledge this needs, and they are the same ones moeGateU/moeDownU
-  // already carry.
+  // hold SLOTS expert rows instead of all `experts + 1`, and `ids[]` carries
+  // slot indices instead of expert indices. The expert matmul is untouched: it
+  // computes its row base as id × N × K_PACKED for weights and id × N ×
+  // SCALES_PER_ROW for scales and biases, which is exactly the per-expert byte
+  // stride of each stack — so those two products are the only layout knowledge
+  // this needs, and they are the same ones moeGateU/moeDownU already carry.
   //
-  // Only the DECODE path pools. Chunked prefill keeps binding the full stacks:
-  // the backing store is resident anyway in this version, and a 256-token chunk
-  // touches most of the experts, which no pool of this size can hold.
+  // THE FULL STACKS ARE NEVER ALLOCATED. loadWeights(..., expertPool) hands
+  // back SLOTS-row buffers and a SlabSource; a miss reads one expert's slab
+  // (1.3-2.5 MiB) and writeBuffers it into the slot. The first version of this
+  // feature kept the stacks resident as a GPU-side backing store and copied
+  // from them, which proved token identity and priced the split but saved
+  // nothing — the pool was pure overhead on top of the model.
+  //
+  // Only the DECODE path pools, and with the stacks gone that is now a
+  // REQUIREMENT rather than a preference: chunked prefill binds these same
+  // buffers with no per-token slot resolution, and a 256-token chunk routes to
+  // most of the experts anyway — far more than any pool of this size holds. So
+  // pooling turns chunked prefill off (see the chunkPrefill construction).
   // ============================================================
   const EXPERT_ROWS = S.moe ? S.moe.experts + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
   const POOL_SLOTS = opts.expertPool ?? 0
@@ -766,92 +822,181 @@ export function buildDecodeEngine(
       `one token's experts could not all be resident at once`)
   }
   const pooling = POOL_SLOTS > 0 && !!S.moe
+  // Next-layer router speculation. Only ever warms the pool — every layer still
+  // resolves its own REAL ids — so it is meaningless without one.
+  if (opts.expertSpeculate && !pooling) {
+    throw new Error('buildDecodeEngine: expertSpeculate prefetches into an expert pool — set expertPool as well')
+  }
+  const speculate = pooling && !!opts.expertSpeculate
+  const slabSource = weights.moeSlabs?.source ?? null
+  if (pooling && !slabSource) {
+    throw new Error(
+      'buildDecodeEngine: expertPool needs weights loaded with the same option — ' +
+      'loadWeights(device, …, spec, layerRange, expertPool) is what leaves the stacked ' +
+      'expert tensors out of GPU memory and returns the slab source a miss reads from. ' +
+      'Pooling over full stacks would cost memory rather than save it.')
+  }
+  // The mirror image, and it is the dangerous one: these weights hold SLOTS
+  // expert rows, so an engine that does not pool would bind them as full stacks
+  // and read whichever slot the router's expert index happened to land on —
+  // fluent text, wrong model, no error anywhere.
+  if (!pooling && weights.moeSlabs) {
+    throw new Error(
+      `buildDecodeEngine: these weights were loaded with expertPool ${weights.moeSlabs.slots} ` +
+      'and hold that many expert rows per layer — this engine must pool too')
+  }
+  if (pooling && weights.moeSlabs!.slots !== POOL_SLOTS) {
+    throw new Error(
+      `buildDecodeEngine: weights were loaded with ${weights.moeSlabs!.slots} expert slots ` +
+      `and this engine asks for ${POOL_SLOTS} — the buffers are the loader's size`)
+  }
   type MoeWeights = NonNullable<LoadedWeights['layers'][number]['moe']>
   type SlabField = 'gateWeights' | 'gateScales' | 'gateBiases'
     | 'upWeights' | 'upScales' | 'upBiases'
     | 'downWeights' | 'downScales' | 'downBiases'
   interface LayerPool {
     pool: ExpertPool
-    /** One entry per stacked tensor: where a row comes from, where it lands. */
-    slabs: { full: GPUBuffer; slot: GPUBuffer; stride: number }[]
-    /** The pool buffers by field name — what the MoE bind groups bind. */
-    bufs: Record<SlabField, GPUBuffer>
+    /** Absolute layer index — what SlabSource.read() is keyed by. */
+    layer: number
+    /** One entry per stacked tensor: the SLOTS-row buffer the MoE bind groups
+     *  bind, its per-expert stride, and which slab a miss reads. */
+    slabs: { buf: GPUBuffer; stride: number; proj: SlabProj; kind: SlabKind }[]
   }
   // Bytes one expert occupies in each stack. Weights are u32 words, scales and
   // biases f16 — one per quantization group of 64.
-  const SLAB_STRIDES: readonly (readonly [SlabField, number])[] = S.moe
+  const SLAB_TENSORS: readonly { field: SlabField; proj: SlabProj; kind: SlabKind; stride: number }[] = S.moe
     ? (() => {
         const wGateUp = S.ffn * ((S.d * moeBits) / 32) * 4
         const sGateUp = S.ffn * (S.d / 64) * 2
         const wDown = S.d * ((S.ffn * moeBits) / 32) * 4
         const sDown = S.d * (S.ffn / 64) * 2
         return [
-          ['gateWeights', wGateUp], ['gateScales', sGateUp], ['gateBiases', sGateUp],
-          ['upWeights', wGateUp], ['upScales', sGateUp], ['upBiases', sGateUp],
-          ['downWeights', wDown], ['downScales', sDown], ['downBiases', sDown],
+          { field: 'gateWeights', proj: 'gate', kind: 'w', stride: wGateUp },
+          { field: 'gateScales', proj: 'gate', kind: 's', stride: sGateUp },
+          { field: 'gateBiases', proj: 'gate', kind: 'b', stride: sGateUp },
+          { field: 'upWeights', proj: 'up', kind: 'w', stride: wGateUp },
+          { field: 'upScales', proj: 'up', kind: 's', stride: sGateUp },
+          { field: 'upBiases', proj: 'up', kind: 'b', stride: sGateUp },
+          { field: 'downWeights', proj: 'down', kind: 'w', stride: wDown },
+          { field: 'downScales', proj: 'down', kind: 's', stride: sDown },
+          { field: 'downBiases', proj: 'down', kind: 'b', stride: sDown },
         ] as const
       })()
     : []
   function makeLayerPool(m: MoeWeights, L: number): LayerPool {
     const slabs: LayerPool['slabs'] = []
-    const bufs = {} as Record<SlabField, GPUBuffer>
-    for (const [field, stride] of SLAB_STRIDES) {
-      const full = m[field]
-      // The stride is DERIVED from the spec, so disagreeing with the loader's
-      // real layout would copy a misaligned window of somebody else's expert
-      // and still produce tokens. Check it once, here, per tensor.
-      if (full.size !== EXPERT_ROWS * stride) {
+    for (const t of SLAB_TENSORS) {
+      const buf = m[t.field]
+      // Two independent derivations of one number, checked against each other
+      // because a wrong stride does not fault: it uploads a real expert's real
+      // bytes at the wrong offset and the model keeps generating fluent text.
+      // `stride` comes from the SPEC; slabBytes comes from the CHECKPOINT's own
+      // safetensors header.
+      const declared = slabSource!.slabBytes(L, t.proj, t.kind)
+      if (declared !== t.stride) {
         throw new Error(
-          `buildDecodeEngine: layer ${L} ${field} is ${full.size} B, not ` +
-          `${EXPERT_ROWS} experts × ${stride} B — expertPool cannot address it`)
+          `buildDecodeEngine: layer ${L} ${t.field} is ${t.stride} B per expert by the spec ` +
+          `and ${declared} B in the checkpoint`)
       }
-      if (stride % 4 !== 0) throw new Error(`buildDecodeEngine: ${field} stride ${stride} is not a multiple of 4`)
-      const slot = makeBuf(device, POOL_SLOTS * stride, `pool_${field}_${L}`)
-      slabs.push({ full, slot, stride })
-      bufs[field] = slot
+      if (buf.size !== POOL_SLOTS * t.stride) {
+        throw new Error(
+          `buildDecodeEngine: layer ${L} ${t.field} is ${buf.size} B, not ${POOL_SLOTS} slots × ` +
+          `${t.stride} B` + (buf.size === EXPERT_ROWS * t.stride
+            ? ' — that is the FULL stack, so these weights were loaded without expertPool'
+            : ' — the loader and the engine disagree about the layout'))
+      }
+      if (t.stride % 4 !== 0) throw new Error(`buildDecodeEngine: ${t.field} stride ${t.stride} is not a multiple of 4`)
+      slabs.push({ buf, stride: t.stride, proj: t.proj, kind: t.kind })
     }
     // The shared expert runs on EVERY token, so it is pinned rather than left
     // to the LRU. Pinning means resolve() never reports it as a miss, so its
-    // rows are uploaded once, below, instead of on first use.
+    // rows are uploaded once, at construction, instead of on first use.
     const pin = S.sharedExpertIndex >= 0 ? [S.sharedExpertIndex] : []
-    return { pool: new ExpertPool(POOL_SLOTS, { pin }), slabs, bufs }
+    return { pool: new ExpertPool(POOL_SLOTS, { pin }), slabs, layer: L }
   }
+
+  /**
+   * Fill one layer's missed slots from the checkpoint.
+   *
+   * ONE PASS PER LAYER, and what that does and does not overlap:
+   *   - OVERLAPPED: the reads of every slab of every miss in this layer are
+   *     issued together, so a fetch source has all of them in flight at once,
+   *     and all of them run against the submit already executing on the GPU
+   *     (the pooled recorder submits BEFORE it awaits the router ids).
+   *   - NOT OVERLAPPED: a read with its own upload. `writeBuffer` snapshots its
+   *     source, so the copy cannot begin until the bytes exist and the next
+   *     read cannot reuse that memory until the copy returns — measured at
+   *     1.007 ms chained against 0.174 + 0.318 apart (docs/MOE_CHUNK_PLAN.md,
+   *     "Repriced 2026-08-14"). Uploading only after every read has landed is
+   *     what keeps the reads from being serialized behind copies.
+   *   - NOT OVERLAPPED, and this one is structural: the misses of layer L+1
+   *     cannot start until its router has run. That is what `expertSpeculate`
+   *     attacks, and it is the difference between ~32 and ~78 tok/s.
+   * Peak host memory is one layer's misses — 9 slabs per miss, so ~22 MB at a
+   * full 8-way miss on qwen30b, not the model.
+   */
+  async function fillSlots(lp: LayerPool, misses: readonly { expert: number; slot: number }[]): Promise<void> {
+    if (misses.length === 0) return
+    const reads = misses.flatMap(({ expert, slot }) => lp.slabs.map(
+      (s) => slabSource!.read(lp.layer, s.proj, s.kind, expert).then((bytes) => ({ s, slot, bytes }))))
+    for (const { s, slot, bytes } of await Promise.all(reads)) {
+      // SlabSource.read is declared over a plain Uint8Array, which TS widens to
+      // "possibly SharedArrayBuffer-backed"; both sources allocate their own.
+      device.queue.writeBuffer(s.buf, slot * s.stride, bytes as Uint8Array<ArrayBuffer>)
+    }
+  }
+
   const layerPools: (LayerPool | null)[] = []
+  /** The pinned shared expert's upload. Every pooled pass awaits it — this
+   *  constructor is synchronous and a slab read is not. */
+  let poolReady: Promise<void> = Promise.resolve()
   if (pooling) {
     for (let L = L0; L < L1; L++) {
       const m = weights.layers[L].moe
       layerPools.push(m ? makeLayerPool(m, L) : null)
     }
-    const enc = device.createCommandEncoder()
-    for (const lp of layerPools) {
-      if (!lp || S.sharedExpertIndex < 0) continue
-      const slot = lp.pool.slotFor(S.sharedExpertIndex)
-      for (const s of lp.slabs) {
-        enc.copyBufferToBuffer(s.full, S.sharedExpertIndex * s.stride, s.slot, slot * s.stride, s.stride)
-      }
+    if (S.sharedExpertIndex >= 0) {
+      poolReady = Promise.all(layerPools.map((lp) => lp
+        ? fillSlots(lp, [{ expert: S.sharedExpertIndex, slot: lp.pool.slotFor(S.sharedExpertIndex) }])
+        : null)).then(() => {})
+      // The await in recordForwardPooled is what reports a failure; this only
+      // keeps a boot that is never generated from printing an unhandled
+      // rejection instead.
+      poolReady.catch(() => {})
     }
-    device.queue.submit([enc.finish()])
-    // ON TOP OF the full stacks, which stay resident as the backing store until
-    // the disk source lands — so this version costs memory rather than saving
-    // it, and printing the number is how that stays impossible to miss.
-    const poolBytes = layerPools.reduce((n, lp) =>
-      n + (lp ? lp.slabs.reduce((m, s) => m + POOL_SLOTS * s.stride, 0) : 0), 0)
+    // RESIDENT BYTES SAVED, which is the whole point of the feature and so is
+    // printed rather than claimed: every MoE layer holds POOL_SLOTS rows of
+    // each of the nine stacked tensors where it used to hold EXPERT_ROWS.
+    const perExpert = SLAB_TENSORS.reduce((n, t) => n + t.stride, 0)
+    const moeLayers = layerPools.filter(Boolean).length
+    const saved = moeLayers * (EXPERT_ROWS - POOL_SLOTS) * perExpert
     console.log(
-      `[engine] expert pool: ${POOL_SLOTS}/${EXPERT_ROWS} slots per layer, ` +
-      `+${(poolBytes / 1e9).toFixed(2)} GB beside the full stacks`)
+      `[engine] expert pool: ${POOL_SLOTS}/${EXPERT_ROWS} slots per layer` +
+      `${speculate ? ', next-layer speculation on' : ''} — ` +
+      `${((moeLayers * POOL_SLOTS * perExpert) / 1e9).toFixed(2)} GB resident, ` +
+      `${(saved / 1e9).toFixed(2)} GB never allocated ` +
+      `(${moeLayers} layers × ${EXPERT_ROWS - POOL_SLOTS} experts × ${(perExpert / 1024 ** 2).toFixed(2)} MiB)`)
   }
   // One round trip per MoE layer per token, so the staging buffers are a RING:
   // a mapped buffer must never be a copy destination, and the next layer's copy
   // is recorded while the previous slot may still be unmapping.
   const MOE_ID_BYTES = S.moeSlots * 4
+  // Speculation rides the SAME round trip: layer L's real ids in the first half
+  // of the slot, layer L+1's predicted ids in the second. Two copies, one map.
+  const MOE_READ_BYTES = MOE_ID_BYTES * (speculate ? 2 : 1)
   const moeIdRing: GPUBuffer[] = pooling
     ? [0, 1].map((i) => device.createBuffer({
-        size: MOE_ID_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: `moeIdsRead_${i}`,
+        size: MOE_READ_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: `moeIdsRead_${i}`,
       }))
     : []
   let moeIdCursor = 0
   /** Slot ids on their way back to B.moeIds — one buffer, rewritten per layer. */
   const moeSlotScratch = new Uint32Array(S.moeSlots)
+  // The speculative router's own outputs. Separate buffers, never bound by the
+  // expert matmuls: a prediction must not be able to reach a dispatch.
+  const specLogits = speculate ? makeBuf(device, MOE_ROUTER_ROWS * 4, 'specRouterLogits') : null
+  const specIds = speculate ? makeBuf(device, MOE_ID_BYTES, 'specIds') : null
+  const specScores = speculate ? makeBuf(device, MOE_ID_BYTES, 'specScores') : null
 
   // MoE routing trace. One row per layer, written straight after that layer's
   // top-k so the record is exactly what the expert matmul then read.
@@ -1499,11 +1644,12 @@ export function buildDecodeEngine(
     // B.hidden2 (what addNorm2 consumes) — exactly the dense FFN's contract,
     // which is why nothing around it changes.
     const m = lw.moe
-    // Pooling swaps the six expert-matmul stacks for their SLOTS-row siblings
-    // and nothing else: the router is [experts+1, d] int8 and stays whole, and
-    // every uniform is unchanged because id × stride is the same arithmetic
-    // whether the id names an expert or a slot.
-    const mw = layerPools[L - L0]?.bufs ?? m
+    // Pooling changes the SIZE of the nine stacked expert tensors and nothing
+    // else here: the loader allocated them at SLOTS rows, the router is
+    // [experts+1, d] and stays whole, and every uniform is unchanged because
+    // id × stride is the same arithmetic whether the id names an expert or a
+    // slot. Which is why there is no pooled sibling to bind — `m` IS the pool.
+    const mw = m
     const moeBG = S.moe && m && mw
       ? {
           // An unquantized router has no scales or biases to bind, and its
@@ -1556,6 +1702,58 @@ export function buildDecodeEngine(
       moe: moeBG,
       addNorm2: bg(device, P.addNorm, [B.hidden2, B.residual2, nextGamma, B.hidden1, B.residual, normU]),
     })
+  }
+
+  // ============================================================
+  // Next-layer speculation (opts.expertSpeculate) — docs/MOE_CHUNK_PLAN.md
+  //
+  // Layer L+1's router is downstream of layer L's experts, so a pooled pass
+  // cannot submit L+1 while L's readback is in flight: the readback is ~9.6 ms
+  // of every token (48 × 0.199) against 11.3 ms of compute, and that is what
+  // caps pooling near 32 tok/s instead of 78.
+  //
+  // HOBBIT's finding is that layer L+1's router run on layer L's hidden state
+  // agrees with the real thing 96% of the time. So the speculative router runs
+  // one layer EARLY, on the hidden state layer L's own router just read, and
+  // its ids ride layer L's existing round trip. The engine then starts the
+  // predicted layer's misses immediately, a whole layer before it needs them.
+  //
+  // A WRONG PREDICTION CANNOT BE WRONG OUTPUT. These bind groups write their
+  // own buffers, no expert matmul is ever bound to them, and layer L+1 resolves
+  // against its own real ids when it gets there — a mispredicted expert was
+  // simply a wasted read, and one it needed is fetched then, at full price.
+  // Speculation only warms the pool.
+  //
+  // Cost when it is on: two extra dispatches per MoE layer (router matmul +
+  // top-k, ~7.5% of a MoE step by the profile in docs/MOE_CHUNK_PLAN.md) and
+  // one perturbation of LRU order, since a prefetch touches the pool.
+  // ============================================================
+  /** Per layer: the router pair that PREDICTS this layer, run against whatever
+   *  is in B.hidden1 at the time. Indexed like layerBGs. */
+  const specBGs: ({ routerLogits: GPUBindGroup; routerTopk: GPUBindGroup } | null)[] = []
+  /** Per layer: the next layer with a pool to speculate for, or -1. */
+  const nextPooled: number[] = []
+  if (speculate) {
+    for (let L = L0; L < L1; L++) {
+      const m = weights.layers[L].moe
+      specBGs.push(m && layerPools[L - L0]
+        ? {
+            routerLogits: bg(device, moeRouterPipe, routerBits === 16
+              ? [specLogits!, B.hidden1, m.routerWeights, moeRouterU!]
+              : [specLogits!, B.hidden1, m.routerWeights, m.routerScales, m.routerBiases, moeRouterU!]),
+            routerTopk: bg(device, P.moeRouterTopk!, [specIds!, specScores!, specLogits!, moeTopkU!]),
+          }
+        : null)
+    }
+    // Usually L+1. A stack whose next layer is dense (DeepSeek's layer 0) or
+    // whose next layer is another device's (a pipeline stage) predicts the next
+    // one it will actually run, and the accuracy counter is what says whether
+    // reaching further still pays.
+    let next = -1
+    for (let L = L1 - 1; L >= L0; L--) {
+      nextPooled[L - L0] = next
+      if (specBGs[L - L0]) next = L
+    }
   }
 
   // Profile handle — null unless profileStep() is currently running.
@@ -1826,6 +2024,47 @@ export function buildDecodeEngine(
     return enc
   }
 
+  // Speculation counters. `predicted`/`matched` are over ROUTED slots only: a
+  // pinned shared expert is in both lists by construction and would hand every
+  // layer a free point, which is exactly how a 96% claim gets reproduced by
+  // accident.
+  let specSteps = 0
+  let specPredicted = 0
+  let specMatched = 0
+  let specTop1 = 0
+
+  function scoreSpeculation(predicted: Uint32Array, real: Uint32Array): void {
+    specSteps++
+    const routed = new Set<number>()
+    for (const e of real) if (e !== S.sharedExpertIndex) routed.add(e)
+    for (const e of predicted) {
+      if (e === S.sharedExpertIndex) continue
+      specPredicted++
+      if (routed.has(e)) specMatched++
+    }
+    // moe_router_topk writes in descending score order, so slot 0 is the top-1
+    // routed expert on both sides — the quantity HOBBIT reports 96% for.
+    if (predicted[0] === real[0]) specTop1++
+  }
+
+  /**
+   * Warm one layer's pool with a PREDICTION, without pretending it was a request.
+   *
+   * The pool's hit/request counters are restored afterwards: a prefetch is not
+   * something the model asked for, and counting it would inflate the very hit
+   * rate the offline replay is being checked against. What it does leave behind
+   * is LRU order — that IS the warming, and it is the one way speculation can
+   * change the hit rate of the layers after it.
+   */
+  function prefetchLayer(lp: LayerPool, predicted: Uint32Array): Promise<void> {
+    const hits = lp.pool.hits
+    const requests = lp.pool.requests
+    const { misses } = lp.pool.resolve(predicted)
+    lp.pool.hits = hits
+    lp.pool.requests = requests
+    return fillSlots(lp, misses)
+  }
+
   /**
    * POOLED forward pass: the same dispatches, cut open at every MoE router.
    *
@@ -1833,23 +2072,31 @@ export function buildDecodeEngine(
    * slots, and WebGPU has no fence, semaphore or event with which the GPU could
    * wait on the host — so each MoE layer ends its encoder, submits, and reads
    * ~36 bytes back. That round trip is the whole cost of this feature
-   * (docs/MOE_CHUNK_PLAN.md prices it at 0.199 ms).
+   * (docs/MOE_CHUNK_PLAN.md prices it at 0.199 ms, ×48 layers = 9.6 ms).
    *
    * SUBMIT FIRST, THEN AWAIT. Everything recorded since the previous split —
    * the layer's whole attention half, and on the first MoE layer the embedding
    * too — is in the submit that carries the readback copy, so it runs while the
    * round trip is in flight. The rest of the layer cannot join it: the expert
-   * matmuls are precisely what the ids decide. Overlapping the NEXT layer needs
-   * next-layer speculation (the doc's "pipelined" column, and a wrong guess is
-   * a stall), which is not this change.
+   * matmuls are precisely what the ids decide.
+   *
+   * With `expertSpeculate` the NEXT pooled layer's router rides that same
+   * submit and the same map, and its predicted misses start fetching here,
+   * a layer before they are needed. The prediction is awaited before that
+   * layer's real resolve — not for correctness of the ids (the real ones are
+   * always used) but because an upload still in flight could otherwise land in
+   * a slot the real resolve has already given to someone else.
    *
    * Returns the encoder holding the tail, still unsubmitted, so the caller
    * appends its own readback copies exactly as in the unpooled path.
    */
   async function recordForwardPooled(position: number): Promise<GPUCommandEncoder> {
+    await poolReady
     let enc = device.createCommandEncoder()
     if (position === 0) clearGdnState(enc)
     recordPrologue(enc)
+    /** The prediction made one pooled layer ago, waiting for its layer. */
+    let pending: { layer: number; ids: Uint32Array; fetched: Promise<void> } | null = null
     for (let L = L0; L < L1; L++) {
       const blk = layerBGs[L - L0]
       const lp = layerPools[L - L0]
@@ -1864,37 +2111,72 @@ export function buildDecodeEngine(
       // is in the middle of it, so this path names them itself.
       dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
       recordMoeRouter(enc, L, blk.moe)
+      // The speculative router reads the SAME B.hidden1 this layer's own router
+      // just read — that is the whole trick — and writes only its own buffers.
+      const ahead = speculate ? nextPooled[L - L0] : -1
+      if (ahead >= 0) {
+        const sb = specBGs[ahead - L0]!
+        dispatch(enc, moeRouterPipe, sb.routerLogits, MOE_ROUTER_ROWS, 1, 1, 'moeRouterLogits')
+        dispatch(enc, P.moeRouterTopk!, sb.routerTopk, 1, 1, 1, 'moeRouterTopk')
+      }
       const staging = moeIdRing[moeIdCursor]
       moeIdCursor = (moeIdCursor + 1) % moeIdRing.length
       enc.copyBufferToBuffer(B.moeIds!, 0, staging, 0, MOE_ID_BYTES)
+      if (ahead >= 0) enc.copyBufferToBuffer(specIds!, 0, staging, MOE_ID_BYTES, MOE_ID_BYTES)
       device.queue.submit([enc.finish()])
 
       await staging.mapAsync(GPUMapMode.READ)
       // slice() before unmap — the mapped range dies with it.
-      const experts = new Uint32Array(staging.getMappedRange().slice(0))
+      const back = new Uint32Array(staging.getMappedRange().slice(0))
       staging.unmap()
+      const experts = back.subarray(0, S.moeSlots)
+      // Every prefetched upload for THIS layer has to have landed before the
+      // real resolve reassigns slots, or a write for a predicted expert arrives
+      // after its slot was given away and puts one expert's bytes under
+      // another's id. That is the one way speculation could change the output,
+      // and it is closed here rather than reasoned about.
+      if (pending) {
+        await pending.fetched
+        // Always awaited, scored only when it was for this layer — nextPooled
+        // makes the mismatch unreachable, and awaiting anyway is what keeps
+        // "unreachable" from meaning "a live upload with no one waiting".
+        if (pending.layer === L) scoreSpeculation(pending.ids, experts)
+        pending = null
+      }
       const { slots, misses } = lp.pool.resolve(experts)
+      const filled = fillSlots(lp, misses)
+      // Started BEFORE awaiting this layer's own reads, so both layers' slabs
+      // are in flight together.
+      if (ahead >= 0) {
+        const ids = back.slice(S.moeSlots, 2 * S.moeSlots)
+        const fetched = prefetchLayer(layerPools[ahead - L0]!, ids)
+        // The await that reports a failed prefetch is a layer away; this only
+        // stops Node calling it an unhandled rejection in between.
+        fetched.catch(() => {})
+        pending = { layer: ahead, ids, fetched }
+      }
+      await filled
 
       enc = device.createCommandEncoder()
-      for (const { expert, slot } of misses) {
-        for (const s of lp.slabs) {
-          enc.copyBufferToBuffer(s.full, expert * s.stride, s.slot, slot * s.stride, s.stride)
-        }
-      }
-      // Queue-ordered: this lands after the submit above (which is what the
-      // trace copy read) and before the copies just recorded, which is every
-      // ordering this needs. The matmul now reads slot indices out of the same
-      // binding the router wrote expert indices into.
+      // Queue-ordered: the slab uploads above and this write land after the
+      // submit that carried the router (which is what the trace copy read) and
+      // before the dispatches recorded below, which is every ordering this
+      // needs. The matmul now reads slot indices out of the same binding the
+      // router wrote expert indices into.
       moeSlotScratch.set(slots)
       device.queue.writeBuffer(B.moeIds!, 0, moeSlotScratch)
       recordMoeExperts(enc, blk.moe)
       dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
     }
+    // A prediction for a layer this pass never reached (there is none today —
+    // the last pooled layer predicts nothing) must still be settled before the
+    // pass returns, or its upload would race the next token's resolve.
+    if (pending) await pending.fetched
     recordEpilogue(enc)
     return enc
   }
 
-  function getPoolStats(): { hits: number; requests: number; hitRate: number } | null {
+  function getPoolStats(): PoolStats | null {
     if (!pooling) return null
     let hits = 0
     let requests = 0
@@ -1903,7 +2185,19 @@ export function buildDecodeEngine(
       hits += lp.pool.hits
       requests += lp.pool.requests
     }
-    return { hits, requests, hitRate: requests ? hits / requests : 0 }
+    return {
+      hits, requests, hitRate: requests ? hits / requests : 0,
+      speculation: speculate
+        ? {
+            steps: specSteps,
+            predicted: specPredicted,
+            matched: specMatched,
+            accuracy: specPredicted ? specMatched / specPredicted : 0,
+            top1: specTop1,
+            top1Rate: specSteps ? specTop1 / specSteps : 0,
+          }
+        : null,
+    }
   }
 
   /**
@@ -2931,13 +3225,19 @@ export function buildDecodeEngine(
   // and an MLA spec has none of those weights, so it is excluded HERE rather
   // than left to fail at bind time. Until 2026-08-13 `!S.moe` covered it by
   // accident — DeepSeek-V2-Lite is both — and accident is not a guard.
+  // POOLING excludes it, and structurally: the chunk path binds the expert
+  // stacks straight and resolves no slots, so with the stacks unallocated its
+  // ids[] would name experts in a buffer that holds slots. It could not be
+  // rescued by resolving per chunk either — one 256-token chunk routes to most
+  // of the experts in the layer, which is more than the pool holds by design.
   const chunkPrefill: ChunkPrefill | null =
-    !partial && !S.mla && (opts.chunkedPrefill ?? true) && dynReady
+    !partial && !S.mla && !pooling && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
   {
     const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''})`
       : S.mla ? 'off (per-token — MLA has no chunked attention path)'
+      : pooling ? 'off (per-token — expertPool holds slots, and a chunk routes past them)'
       : !dynReady ? 'off (per-token — no subgroups, so no batched GEMM)'
       : 'off (per-token)'
     console.log(`[engine] chunked prefill: ${why}`)
@@ -3179,7 +3479,7 @@ export function buildDecodeEngine(
     // decode is not: the per-layer round trip and the miss copies are outside
     // every number below. Said out loud rather than left to be misread as the
     // pooled token cost.
-    if (pooling) console.warn('[engine] profileStep measures the dispatches only — expertPool\'s readback and copies are not in this profile')
+    if (pooling) console.warn('[engine] profileStep measures the dispatches only — expertPool\'s readback, slab reads and uploads are not in this profile')
 
     // Warmup: run prefill + a handful of decode steps without profile, so
     // shader compilation, texture caches, etc. are warm when we measure.
@@ -3522,7 +3822,10 @@ export function buildDecodeEngine(
       attnU, attnSkU, combineU, attnI8U,
       residualReadBuf, readBuf, logitsReadBuf, hiddenReadBuf,
       moeTraceBuf, moeTraceRead, ...moeIdRing,
-      ...layerPools.flatMap((lp) => lp ? lp.slabs.map((s) => s.slot) : []),
+      specLogits, specIds, specScores,
+      // NOT the pool buffers: they are the loader's, they arrived inside
+      // `weights`, and two engines over one weight load share them — the same
+      // reason this frees no other weight buffer.
     ]
     for (const b of owned) b?.destroy()
     chunkPrefill?.destroy()

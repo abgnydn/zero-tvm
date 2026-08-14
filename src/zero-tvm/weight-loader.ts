@@ -13,6 +13,9 @@
 
 import { PHI3, type ModelSpec } from '../compiler/model-spec.js'
 import { openMlxCheckpoint, assembleMlx, planModel, type MlxSource } from './weight-loader-mlx.js'
+import {
+  fetchSlabSource, opfsSlabSource, type SlabDirectory, type SlabSource,
+} from './slab-source.js'
 import { mapLimited, backoffMs } from './map-limited.js'
 
 // ============================================================
@@ -159,6 +162,18 @@ async function opfsRead(dir: OPFSDir, dataPath: string): Promise<ArrayBuffer | n
     return await file.arrayBuffer()
   } catch {
     return null
+  }
+}
+
+/** Existence only. `opfsRead` would answer the same question by pulling the
+ *  whole buffer — 400 MB for one expert stack — off disk to throw it away. */
+async function opfsHas(dir: OPFSDir, dataPath: string): Promise<boolean> {
+  if (!dir) return false
+  try {
+    await dir.getFileHandle(opfsKey(dataPath))
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -523,9 +538,24 @@ export async function loadWeights(
    * so skipping layers would save no download.
    */
   layerRange?: { start: number; end: number },
+  /**
+   * EXPERT STREAMING — hold this many experts per MoE layer instead of all of
+   * them (DecodeEngineOptions.expertPool, which must be given the same number).
+   * The stacked expert tensors are then never uploaded: each gets a buffer of
+   * `expertPool` rows, and the engine fills a row from the checkpoint when the
+   * router asks for an expert that is not resident. This is where the memory
+   * saving lives — the engine alone can only pool ON TOP of the full stacks.
+   */
+  expertPool?: number,
 ): Promise<LoadedWeights> {
   if (layerRange && spec.weightFormat !== 'mlx-safetensors') {
     throw new Error(`loadWeights: layerRange needs an MLX checkpoint; ${spec.id} ships MLC shards`)
+  }
+  // Streaming an expert means reading one slice of one stacked tensor. The MLC
+  // path fetches whole shards and has no record-level geometry to slice by, so
+  // the option would be accepted and then quietly do nothing.
+  if (expertPool && spec.weightFormat !== 'mlx-safetensors') {
+    throw new Error(`loadWeights: expertPool needs an MLX checkpoint; ${spec.id} ships MLC shards`)
   }
   const baseUrl = modelBaseUrl(spec)
   const opfsDir = opfsDirFor(spec)
@@ -557,10 +587,32 @@ export async function loadWeights(
     const { locate, shards } = await openMlxCheckpoint(src)
     const total = planModel(spec, layerRange).length
     onProgress?.(`${shards.length} shards, ${total} buffers to build`)
+    // WHICH SLAB SOURCE is not a guess — it is the same rule `cacheWrite` five
+    // lines below follows. Serving from the dev mirror means this load writes
+    // no OPFS copy, so a miss reads the shards through the very same ranged
+    // reader; otherwise the built buffers ARE the OPFS entries this load wrote,
+    // and reading them back is a local file read rather than a network one.
+    let moeSlabs: LoadedWeights['moeSlabs']
+    if (expertPool) {
+      if (!spec.moe) {
+        throw new Error(`loadWeights: expertPool is a sparse-MoE feature and ${spec.id} has no experts`)
+      }
+      if (!mirrorBase && !opfs) {
+        throw new Error('loadWeights: expertPool has nowhere to read an expert slab from — '
+          + 'no dev mirror, and OPFS is unavailable in this runtime')
+      }
+      const source: SlabSource = mirrorBase
+        ? fetchSlabSource(spec, locate, src)
+        : opfsSlabSource(spec, locate, opfs as unknown as SlabDirectory)
+      moeSlabs = { source, slots: expertPool }
+      onProgress?.(`expert pool: ${expertPool} slots per layer, slabs from ${mirrorBase ? 'the mirror' : 'OPFS'}`)
+    }
     const t0 = performance.now()
     const lw = await assembleMlx(device, spec, src, locate, USAGE, {
       onProgress,
       cacheRead: (key) => opfsRead(opfs, key),
+      cacheHas: (key) => opfsHas(opfs, key),
+      ...(moeSlabs ? { expertPool: { slots: moeSlabs.slots, source: moeSlabs.source } } : {}),
       // Not when serving from the dev mirror: the bytes are already on local
       // disk and OPFS-caching them would write a second 19.5 GB copy.
       cacheWrite: mirrorBase ? undefined
@@ -584,6 +636,7 @@ export async function loadWeights(
     }, layerRange)
     await Promise.all(pendingWrites)
     onProgress?.(`Weights ready (${((performance.now() - t0) / 1000).toFixed(0)}s)`)
+    if (moeSlabs) (lw as Record<string, unknown>).moeSlabs = moeSlabs
     return lw as unknown as LoadedWeights
   }
 
@@ -867,4 +920,12 @@ export interface LoadedWeights {
       downBiases: GPUBuffer
     }
   }>
+  /**
+   * Present iff this load was given `expertPool`. The six stacked expert
+   * tensors above then hold `slots` rows instead of `experts + 1` and arrived
+   * EMPTY; `source` is where the engine reads the row for an expert it has to
+   * page in. buildDecodeEngine refuses to pool without this, because pooling
+   * over the full stacks costs memory instead of saving it.
+   */
+  moeSlabs?: { source: SlabSource; slots: number }
 }

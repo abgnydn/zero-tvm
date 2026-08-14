@@ -29,6 +29,9 @@ import {
   parseSafetensorsHeader, planLayer, planGlobal, buildBuffer, planBytes,
   type BufferPlan, type TensorInfo,
 } from './mlx-weights.ts'
+// TYPE-ONLY, and it has to stay that way: slab-source.ts imports planKey from
+// this module at RUNTIME, so a value import here would close the cycle.
+import type { SlabKind, SlabProj, SlabSource } from './slab-source.ts'
 
 /** Where a record lives: which shard, and its byte range within the file. */
 interface RecordLoc {
@@ -229,8 +232,38 @@ export interface MlxLoadHooks {
    *  bf16 conversion, which is why the cache is keyed by plan and not shard. */
   cacheRead?: (key: string) => Promise<ArrayBuffer | null>
   cacheWrite?: (key: string, data: ArrayBuffer) => void
+  /** Is this key already cached? Asked only about the streamed expert stacks
+   *  below, where nothing reads the bytes and `cacheRead` would pull a 400 MB
+   *  buffer off disk to answer a yes/no question. */
+  cacheHas?: (key: string) => Promise<boolean>
+  /**
+   * EXPERT STREAMING — the loader half of DecodeEngineOptions.expertPool.
+   *
+   * Each stacked MoE tensor gets a buffer of `slots` expert rows instead of
+   * `experts + 1`, and its bytes are never uploaded: the engine fills a slot
+   * from `source` when the router asks for an expert that is not resident.
+   * That is where the memory saving comes from — pooling on top of the full
+   * stacks costs memory rather than saving it.
+   *
+   * The CALLER supplies the source because only it knows which one this model
+   * is being served from, and it must be the one whose bytes are really there
+   * (weight-loader.ts picks by the same rule it picks `cacheWrite` by).
+   */
+  expertPool?: { slots: number; source: SlabSource }
   onProgress?: (msg: string) => void
   onBuffer?: (done: number, total: number, bytes: number) => void
+}
+
+/**
+ * Is this plan one of the nine stacked MoE tensors, and which slab is it?
+ *
+ * The name is taken apart exactly the way `slabGeometry` puts it together
+ * (`moe_${proj}_proj_${kind}`), so the buffer this leaves unbuilt and the slab
+ * the engine later reads can never be two different tensors.
+ */
+function slabPlanOf(name: string): [SlabProj, SlabKind] | null {
+  const m = /^moe_(gate|up|down)_proj_([wsb])$/.exec(name)
+  return m ? [m[1] as SlabProj, m[2] as SlabKind] : null
 }
 
 /**
@@ -241,6 +274,11 @@ export interface MlxLoadHooks {
  * There is no concurrency here on purpose — 19.5 GB of GPU allocation is the
  * scarce resource, not request parallelism, and overlapping fetches would hold
  * several host copies alive at once.
+ *
+ * With `hooks.expertPool` the nine stacked MoE tensors per layer are the
+ * exception: they are allocated at `slots` expert rows and never uploaded (see
+ * that hook). Everything else — router, attention, norms, embeddings — loads
+ * exactly as it does without it.
  */
 export async function assembleMlx(
   device: GPUDevice,
@@ -262,6 +300,39 @@ export async function assembleMlx(
     const slot = SLOTS[plan.name]
     if (!slot) throw new Error(`assembleMlx: no LoadedWeights slot for plan '${plan.name}'`)
     const key = planKey(plan, layer)
+    const place = (buf: GPUBuffer): void => {
+      const [group, field] = slot
+      if (group === 'root') root[field] = buf
+      else if (layer === null) throw new Error(`assembleMlx: '${plan.name}' is a layer plan with no layer`)
+      else if (group === 'layer') layers[layer][field] = buf
+      else {
+        const sub = (layers[layer][group] ??= {}) as Record<string, unknown>
+        sub[field] = buf
+      }
+    }
+
+    // --- streamed expert stack: allocate SLOTS rows, upload nothing ---------
+    const streamed = layer !== null && hooks.expertPool ? slabPlanOf(plan.name) : null
+    if (streamed && hooks.expertPool) {
+      const { slots, source } = hooks.expertPool
+      const stride = source.slabBytes(layer!, streamed[0], streamed[1])
+      // The DISK copy still has to exist for opfsSlabSource to read, and this
+      // load is the only thing that would ever write it — so where the loader
+      // caches (a browser, no dev mirror) the bytes are still fetched and
+      // written, they are simply never uploaded. Where it does not cache (the
+      // dev mirror) they are not even read: the shards are already on local
+      // disk and fetchSlabSource reads them where they lie.
+      if (hooks.cacheWrite && !(await hooks.cacheHas?.(key))) {
+        const built = await buildPlan(plan, locate, src)
+        hooks.cacheWrite(key, built.buffer.slice(built.byteOffset, built.byteOffset + built.byteLength))
+      }
+      const pooled = device.createBuffer({ size: slots * stride, usage, label: `${key}.slots` })
+      place(pooled)
+      bytes += slots * stride
+      done++
+      hooks.onBuffer?.(done, plans.length, bytes)
+      continue
+    }
 
     let data: Uint8Array<ArrayBuffer>
     const cached = await hooks.cacheRead?.(key)
@@ -278,14 +349,7 @@ export async function assembleMlx(
     done++
     hooks.onBuffer?.(done, plans.length, bytes)
 
-    const [group, field] = slot
-    if (group === 'root') root[field] = buf
-    else if (layer === null) throw new Error(`assembleMlx: '${plan.name}' is a layer plan with no layer`)
-    else if (group === 'layer') layers[layer][field] = buf
-    else {
-      const sub = (layers[layer][group] ??= {}) as Record<string, unknown>
-      sub[field] = buf
-    }
+    place(buf)
   }
 
   root.layers = layers

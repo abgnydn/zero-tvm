@@ -71,8 +71,13 @@ export interface CreateEngineOptions {
   traceMoe?: boolean
   /** Expert slots held per MoE layer instead of all of them — see
    *  DecodeEngineOptions.expertPool. MoE models only; below top-K + 1 the
-   *  engine throws. Off by default. */
+   *  engine throws. Off by default. Passed to the LOADER as well as the
+   *  engine: the stacked expert tensors are then never allocated, which is
+   *  where the memory saving comes from. */
   expertPool?: number
+  /** Run the next MoE layer's router a layer early and prefetch what it names
+   *  (DecodeEngineOptions.expertSpeculate). Needs expertPool. */
+  expertSpeculate?: boolean
   /** Shader-variant flags as a query string, e.g. '?vec4=0'. Same parser the
    *  chat page uses, so a kernel A/B run here selects what users get. */
   variantQuery?: string
@@ -277,6 +282,11 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
       bytesTotal: s.totalBytes,
     }),
     spec,
+    // No pipeline split here, and the pool has to reach the LOADER: the engine
+    // alone can only pool beside the full stacks, which costs memory instead of
+    // saving it. The two numbers must agree, and buildDecodeEngine checks.
+    undefined,
+    opts.expertPool,
   )
 
   report({ stage: 'engine', message: 'Compiling shaders' })
@@ -289,6 +299,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
     spec, variants, fused, ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
     ...(opts.traceMoe ? { traceMoe: true } : {}),
     ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),
+    ...(opts.expertSpeculate ? { expertSpeculate: true } : {}),
   })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs
