@@ -89,6 +89,9 @@ export interface CreateEngineOptions {
    *  epsilon the chunked prefill leaves in KV flipped thin-margin argmaxes
    *  hundreds of tokens later — which was then reported as a pooling bug. */
   chunkedPrefill?: boolean
+  /** Chunk capacity in tokens (DecodeEngineOptions.chunkCap; default 256 with
+   *  the matrix unit, 64 without). Exposed for the CHUNK_CAP sweep. */
+  chunkCap?: number
   /** Shader-variant flags as a query string, e.g. '?vec4=0'. Same parser the
    *  chat page uses, so a kernel A/B run here selects what users get. */
   variantQuery?: string
@@ -313,6 +316,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
     ...(opts.expertSpeculate ? { expertSpeculate: true } : {}),
     ...(opts.specWidth ? { specWidth: opts.specWidth } : {}),
     ...(opts.chunkedPrefill === false ? { chunkedPrefill: false } : {}),
+    ...(opts.chunkCap ? { chunkCap: opts.chunkCap } : {}),
   })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs

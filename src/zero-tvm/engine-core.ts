@@ -2828,7 +2828,16 @@ export function buildDecodeEngine(
   // drop the engine to the 64 the non-subgroup fallback uses.
   const sgmatAvail = (AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat) != null
     && ['sgmat', 'e5'].includes(opts.chunkGemm ?? 'sgmat')
-  const CHUNK_CAP = opts.chunkCap ?? (sgmatAvail ? 256 : 64)
+  // 1024 since 2026-08-15: the cap was chosen at an 800-token prompt, where
+  // 512 read +3.6% and was left unshipped — but agent prompts run 4k-24k, and
+  // at 4,096 tokens the sweep reads monotonic gains (64: -25%, 512: +10.2%,
+  // 1024: +15.1% over 256; scripts/chunk-cap-sweep.mjs, AC, medians of 3).
+  // Token-identical vs cap 256 on all three chunk families (llama32 dense
+  // affine, qwen35 hybrid GDN, qwen30b MoE; 2,600-token prompts). Chunk
+  // workspace is C-linear — worst buffer ~38 MB at 1024 — with no C×context
+  // term. The non-matrix-unit fallback stays at 64: the sweep ran on E5, and
+  // that path was never measured at these caps.
+  const CHUNK_CAP = opts.chunkCap ?? (sgmatAvail ? 1024 : 64)
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
   interface ChunkPrefill {

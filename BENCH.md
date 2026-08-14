@@ -2357,3 +2357,21 @@ dense FFN's K=8192+. The kernel is correct (real-weights.mjs grades it at the
 reference floor, 2.19e-4) and stays SHIPPED OPT-IN for re-testing on other
 GPUs; it does not become a default. One identity flip in each A/B pair is the
 measured tie class (top-2 gap 0.0056 vs logit std 3.843, 08-15).
+
+### CHUNK_CAP 256 → 1024 (matrix-unit path) — the cap was tuned at the wrong length
+
+scripts/chunk-cap-sweep.mjs, llama32, 4,096-token prompt, AC, medians of 3,
+caps interleaved round-robin, fresh engine per (cap, round):
+
+| cap | prefill tok/s | vs 256 |
+|---|---:|---:|
+| 64 | 630.1 | −25.4% |
+| 256 (old default) | 844.7 | — |
+| 512 | 931.3 | +10.2% |
+| 1024 (new default) | 972.1 | **+15.1%** |
+
+The 256 default came from an 800-token measurement where 512 read +3.6%.
+Monotonic at 4k — the tile finally has rows to amortize. Token identity at
+1024 vs 256 held on all three chunk families (llama32, qwen35, qwen30b —
+2,600-token prompts, 64 generated, zero divergence). Non-sgmat machines stay
+at 64: unmeasured there. createEngineRaw exposes chunkCap for re-sweeps.
