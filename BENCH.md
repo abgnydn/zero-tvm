@@ -1815,6 +1815,16 @@ interleaved rounds, medians.
 | prefill tok/s | 307 / 302 / 298 | 254 / 245 / 240 | **1.23x us** |
 | decode tok/s | 40.4 / 42.1 / 39.9 | 43.8 / 42.8 / 42.1 | **0.94x** |
 
+**WITHDRAWN 2026-08-14: the context ratio.** Every table in this file that
+carried "context 262,144 vs 198,400, 1.32x us" was wrong in our favour.
+262,144 is `spec.maxSeq`, the model's native window — NOT what the engine
+allocates. The allocation is `maxContext = maxPages x pageSize`, which for
+Qwen3.5-9B is **32,768**, and the largest context ever booted and gated here is
+65,536 (qwen35). What survives is KV cost per token: ~32 KiB against their
+~101 KiB, because KV lives on 8 of 32 layers. That is structural and checkable
+in the spec, and it is what would let a given budget hold more tokens — it is
+not itself a measured ceiling comparison, and it was published as one.
+
 Both axes moved our way against the 4B run below (prefill 1.10-1.16x, decode
 0.85-0.90x), which is what the affine wide-load kernel predicted — it landed
 between the two runs and is worth ~10% decode on exactly this quant family.

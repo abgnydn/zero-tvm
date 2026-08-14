@@ -58,7 +58,7 @@
     <div class="nav-links">
       <a href="#models">Models</a>
       <a href="share.html">Rooms</a>
-      <a href="docs.html#agent">Agent</a>
+      <a href="agent-host.html">Agent</a>
       <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">Proof</a>
       <a href="docs.html">Docs</a>
       <a href="zero-tvm.html" class="nav-cta">Open chat →</a>
@@ -68,7 +68,7 @@
 
 <header class="hero">
   <div class="wrap">
-    <span class="eyebrow"><i class="pulse"></i> WebGPU · WGSL · runs on your GPU</span>
+    <span class="eyebrow"><i class="pulse"></i> WebGPU · WGSL · int4 weights</span>
 
     <h1>LLM inference in the browser,<br><em>on hand-written WGSL.</em></h1>
 
@@ -128,35 +128,12 @@
 ]</pre>
       </div>
       <div class="kw-foot">
-        <span>every kernel in this engine is in the repository, unminified</span>
+        <span>every kernel this engine dispatches is in the repository; the int4 matmul family is emitted by one generator beside them</span>
         <a href="https://github.com/abgnydn/zero-tvm/tree/main/src/compiler/shaders">src/compiler/shaders →</a>
       </div>
     </div>
   </div>
 </header>
-
-<section>
-  <div class="wrap">
-    <div class="band">
-      <a href="zero-tvm.html">
-        <h3>Chat</h3>
-        <p>Pick a model, wait for the weights once, then talk to it. The tab keeps the cache.</p>
-      </a>
-      <a href="share.html">
-        <h3>Rooms</h3>
-        <p>Serve the model in your tab to another device over WebRTC, or split it across machines.</p>
-      </a>
-      <a href="docs.html#agent">
-        <h3>Agent</h3>
-        <p>An OpenAI-shaped endpoint backed by the browser tab, so coding agents can drive it.</p>
-      </a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">
-        <h3>Proof</h3>
-        <p>Every measurement, the protocol behind it, and the claims that were withdrawn.</p>
-      </a>
-    </div>
-  </div>
-</section>
 
 <section id="models">
   <div class="wrap">
@@ -164,54 +141,14 @@
       <span class="eyebrow">Models</span>
       <h2>Everything the engine ships</h2>
       <p>
-        This list renders from the engine's own model table, so it cannot
-        disagree with what the code loads. Sizes are the resident weights;
-        rates are measured on an M2 Max and only appear where a measurement
-        exists.
+        This section renders from the engine's own model table, so the size,
+        context window and measured rate on each screen are the same rows the
+        loader reads. The arrows and the arrow keys move between models. Where
+        a model ships at more than one quantisation, the picker switches
+        between them.
       </p>
     </div>
-    <div class="cards" id="model-cards"></div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="sec-head">
-      <span class="eyebrow">Kernels</span>
-      <h2>One file per role, written by hand</h2>
-      <p>
-        WebLLM ships shaders emitted by a compiler. These are the roles a
-        forward pass actually needs, each one a file you can read.
-      </p>
-    </div>
-    <div class="wall">
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/embedding.wgsl"><b>embedding</b><span>token → residual</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/rms_norm.wgsl"><b>rms_norm</b><span>normalisation</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/int4_matmul.gen.ts"><b>int4_matmul</b><span>quantised GEMM</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/qkv_fused.wgsl"><b>qkv_fused</b><span>projection + RoPE</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/attention_sg.wgsl"><b>attention</b><span>paged KV, split-K</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/fused_ffn.wgsl"><b>fused_ffn</b><span>gate · up · SiLU</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/gdn_recur.wgsl"><b>gdn_recur</b><span>gated DeltaNet</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/moe_router_topk.wgsl"><b>moe_router</b><span>expert selection</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/mla_scores.wgsl"><b>mla</b><span>latent attention</span></a>
-      <a href="https://github.com/abgnydn/zero-tvm/blob/main/src/compiler/shaders/argmax.wgsl"><b>argmax</b><span>sampling</span></a>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="proof">
-      <span class="eyebrow">Measured</span>
-      <h2>The numbers, and the ones that were withdrawn</h2>
-      <p>
-        The engine is benchmarked against WebLLM and llama.cpp in the browser,
-        against LM Studio on the same checkpoint files, and kernel-for-kernel
-        against MLX. BENCH.md carries the protocol, the raw runs, and the
-        claims that were retracted after they failed to reproduce.
-      </p>
-      <p><a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">Read BENCH.md →</a></p>
-    </div>
+    <div id="model-browser"></div>
   </div>
 </section>
 
@@ -245,7 +182,7 @@
       </div>
     </div>
     <div class="foot-bottom">
-      <span>MIT licensed · weights and inference stay on your device</span>
+      <span>MIT licensed · weights are fetched once from HuggingFace and cached in your browser; prompts and generation stay on your machine</span>
       <a href="https://github.com/abgnydn/zero-tvm">github.com/abgnydn/zero-tvm ↗</a>
     </div>
   </div>

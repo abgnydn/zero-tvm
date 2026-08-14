@@ -206,14 +206,22 @@ decode tokens, three interleaved rounds, medians, one M2 Max.
 
 | | zero-tvm | LM Studio | |
 |---|---:|---:|---|
-| context | 262,144 tokens | 198,400 | **1.32x us** |
 | cold prefix restore | ~0.4 s from disk | rebuilt each start | **~35x us** |
 | prefill | 307 / 302 / 298 tok/s | 254 / 245 / 240 | **1.23x us** |
 | decode | 40.4 / 42.1 / 39.9 tok/s | 43.8 / 42.8 / 42.1 | 0.94x |
 
-Context is structural rather than tuning: KV lives on 8 of 32 layers, so a
-token costs ~32 KiB against their ~101 KiB and the model's full native window
-fits. The restore figure is a category difference — our prefix cache is in
+**The context row is WITHDRAWN.** It read "262,144 tokens vs 198,400, 1.32x us"
+and it was wrong in our favour: 262,144 is the model's native window
+(`spec.maxSeq`), not what this engine allocates. `maxContext` is
+`maxPages x pageSize`, and for Qwen3.5-9B that is **32,768**. The largest
+context actually booted and gated here is 65,536 (qwen35). What survives is the
+per-token cost below, which is structural and checkable in the spec; the
+ceiling comparison needs both sides configured deliberately and re-run.
+
+KV cost per token is structural rather than tuning: it lives on 8 of 32 layers,
+so a token costs ~32 KiB against their ~101 KiB. That ratio is what lets a given
+KV budget hold more tokens; it is not itself a measured context comparison.
+The restore figure is a category difference — our prefix cache is in
 OPFS and survives a reload or a crash, theirs is in RAM and ends with the
 process.
 

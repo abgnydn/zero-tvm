@@ -154,25 +154,64 @@ section { padding: 72px 0; }
 }
 .sec-head p { color: var(--muted); margin: 12px 0 0; max-width: 66ch; }
 
-/* ── model cards ───────────────────────────────────────────────────── */
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: 14px; }
-.card {
-  display: block; padding: 18px; border: 1px solid var(--border); border-radius: var(--rad);
-  background: var(--surface); color: inherit;
+/* ── model browser ─────────────────────────────────────────────────── */
+#model-browser:focus-visible { outline: none; }
+.mb-stage { display: flex; align-items: center; gap: 8px; }
+.mb-arrow {
+  flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%;
+  background: var(--surface); border: 1px solid var(--border); color: var(--muted);
+  font-size: 22px; line-height: 1; cursor: pointer; font-family: var(--body);
 }
-.card:hover { border-color: var(--accent); background: var(--surface-2); color: inherit; }
-.card-name { font-family: var(--display); font-size: var(--step-1); }
-.card-params { font-family: var(--mono); font-size: var(--step--1); color: var(--dim); margin-top: 2px; }
-.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
-.chip {
-  font-family: var(--mono); font-size: var(--step--1); padding: 2px 8px;
-  border-radius: 99px; border: 1px solid var(--border-hi); color: var(--muted);
+.mb-arrow:hover { border-color: var(--accent); color: var(--accent); }
+.mb-slide {
+  flex: 1 1 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 32px;
+  align-items: center; min-height: 380px;
+  border: 1px solid var(--border); border-radius: var(--rad);
+  background: linear-gradient(180deg, var(--surface-2), var(--surface));
+  padding: 28px 32px;
 }
-.chip.rate { border-color: var(--accent); color: var(--accent); }
-.card-ram { font-size: var(--step--1); color: var(--warn); margin-top: 10px; }
-.card-go { font-size: var(--step--1); color: var(--dim); margin-top: 14px; }
-.card:hover .card-go { color: var(--accent); }
-.note { color: var(--muted); font-size: var(--step--1); grid-column: 1 / -1; }
+@media (max-width: 780px) {
+  .mb-slide { grid-template-columns: 1fr; text-align: center; min-height: 0; }
+  .mb-stats { justify-items: center; }
+  .mb-variants, .mb-info { justify-content: center; align-items: center; }
+}
+.mb-art { position: relative; }
+.mb-mascot { display: block; width: 100%; height: 320px; }
+@media (max-width: 780px) { .mb-mascot { height: 220px; } }
+
+.mb-info { display: flex; flex-direction: column; gap: 4px; }
+.mb-name { font-family: var(--display); font-size: var(--step-2); line-height: 1.1; }
+.mb-params { font-family: var(--mono); font-size: var(--step--1); color: var(--dim); }
+
+.mb-variants { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px; }
+.mb-variant {
+  font-family: var(--mono); font-size: var(--step--1); cursor: pointer;
+  padding: 5px 12px; border-radius: 99px;
+  border: 1px solid var(--border-hi); background: transparent; color: var(--muted);
+}
+.mb-variant:hover { color: var(--text); border-color: var(--accent); }
+.mb-variant[aria-selected="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+.mb-stats { display: grid; grid-template-columns: repeat(3, auto); gap: 22px; margin: 20px 0 0; justify-content: start; }
+@media (max-width: 780px) { .mb-stats { justify-content: center; } }
+.mb-stats dt {
+  font-family: var(--mono); font-size: var(--step--1); color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.07em;
+}
+.mb-stats dd { margin: 4px 0 0; font-family: var(--mono); font-size: var(--step-0); color: var(--text); }
+.mb-hw { color: var(--dim); font-size: var(--step--1); }
+.mb-ram { color: var(--warn); font-size: var(--step--1); margin: 14px 0 0; }
+.mb-cta { align-self: start; margin-top: 22px; text-align: center; }
+@media (max-width: 780px) { .mb-cta { align-self: center; } }
+
+.mb-dots { display: flex; gap: 8px; justify-content: center; margin-top: 18px; }
+.mb-dot {
+  width: 8px; height: 8px; padding: 0; border-radius: 50%; cursor: pointer;
+  background: var(--border-hi); border: 0;
+}
+.mb-dot:hover { background: var(--muted); }
+.mb-dot[aria-selected="true"] { background: var(--accent); }
+.note { color: var(--muted); font-size: var(--step--1); margin-top: 16px; }
 
 /* ── kernel wall ───────────────────────────────────────────────────── */
 /* Five columns so the ten tiles fill exactly two rows — auto-fill left a
