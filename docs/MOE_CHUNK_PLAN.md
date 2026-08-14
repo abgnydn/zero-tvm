@@ -352,3 +352,26 @@ Three priced options, worst first:
 3. Wait for the platform: one GPU-waits-on-host primitive (what MTLSharedEvent
    gives llama.cpp's Metal build) removes the whole problem. WebGPU has no
    fence/event today — verified against the API surface earlier in this file.
+
+
+## The 35B measured — 2026-08-14 pool-fraction sweep and coverage
+
+qwen36q3 (256 experts, top-8 + shared), SPEC=32 GEN=blocking, 512 tokens,
+speculative prefetch on. Counters (power-independent); speeds need an AC run.
+
+| pool | resident (q3exp) | warm hit rate | identity |
+|---|---:|---:|---|
+| 64/256 | ~4.8 GB | 97.9% | token-exact, 512 tok |
+| 96/256 | ~6.6 GB | 98.4% | token-exact |
+| 128/256 | ~8.4 GB | 98.9% | token-exact |
+
+- Half pool WITHOUT speculative prefetch measured 93.5% earlier the same day —
+  prefetch is worth ~5 points, and at the quarter pool it is what holds 97.9%.
+- Earlier AC-valid speed at the half pool, no prefetch: 15.6 tok/s vs 51.2
+  unpooled, blocking path.
+- 35B coverage at M=32: 92.5% (vs the 30B's 96.8-97.8) — predicting 32 of 256
+  instead of 32 of 128, as expected. Coverage recording on the 35B prices at
+  ~3 replays/token.
+- Identical speculation counters across pool sizes are expected: greedy + same
+  prompt reproduces the same routing, and prediction quality does not depend
+  on pool size.
