@@ -15,7 +15,7 @@
 // (loading-ui's progress bars, chat.ts) has no business in the host, and a
 // loud crash beats a silent fake.
 
-import { mkdirSync, existsSync } from 'node:fs'
+import { mkdirSync, existsSync, openSync, readSync, closeSync, fstatSync } from 'node:fs'
 import { open, readFile, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -69,12 +69,34 @@ export async function installShims({ viteBase = 'http://localhost:5173', unsafe 
             async close() { await fh.close() },
           }
         },
+        // The path slab-source.ts prefers, and the only one that can read ONE
+        // expert out of a multi-GB built buffer. Without it the loader fell
+        // back to getFile(), which here returns a plain object with no
+        // slice() — and which reads the entire file into memory to hand back
+        // 2.5 MiB of it.
+        async createSyncAccessHandle() {
+          const fd = openSync(p, 'r')
+          return {
+            getSize() { return fstatSync(fd).size },
+            read(into, opts = {}) {
+              return readSync(fd, into, 0, into.byteLength, opts.at ?? 0)
+            },
+            close() { closeSync(fd) },
+          }
+        },
         async getFile() {
           const buf = await readFile(p)
           const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)
           return {
             size: buf.byteLength,
             async arrayBuffer() { return ab },
+            // Blob.slice, so a caller that wants a window does not have to
+            // materialise the whole file. The browser's File has this; the
+            // stand-in must too, or code that works in a tab throws here.
+            slice(begin = 0, end = buf.byteLength) {
+              const part = ab.slice(begin, end)
+              return { size: part.byteLength, async arrayBuffer() { return part } }
+            },
             async text() { return new TextDecoder().decode(ab) },
           }
         },
