@@ -67,6 +67,8 @@ export interface CreateEngineOptions {
    *  prefill rate, and the only honest comparison is two engines over the same
    *  buffers in one process. Default: the engine's own ladder. */
   chunkGemm?: import('../zero-tvm/engine-core.js').DecodeEngineOptions['chunkGemm']
+  /** Capture per-layer router choices for scripts/moe-trace.mjs. */
+  traceMoe?: boolean
   /** Shader-variant flags as a query string, e.g. '?vec4=0'. Same parser the
    *  chat page uses, so a kernel A/B run here selects what users get. */
   variantQuery?: string
@@ -281,6 +283,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   const fused = !spec.qkNorm && spec.weightFormat !== 'mlx-safetensors'
   const engine = buildDecodeEngine(device, weights, allocKVPages(device, spec), {
     spec, variants, fused, ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
+    ...(opts.traceMoe ? { traceMoe: true } : {}),
   })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs

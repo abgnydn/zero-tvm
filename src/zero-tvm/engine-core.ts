@@ -256,6 +256,9 @@ export interface DecodeEngine {
   }>
   /** Stats from the most recent generatePipelined prefill (reuse + chunking). */
   getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null
+  /** The expert ids the router chose on the LAST forward pass, laid out
+   *  [layer][slot]. Null unless the engine was built with `traceMoe`. */
+  readMoeTrace(): Promise<{ ids: Uint32Array; steps: number; stride: number } | null>
   /**
    * Free every GPU buffer this engine ALLOCATED — activations, GDN state,
    * uniforms, readbacks, chunk-prefill scratch. Deliberately not the two things
@@ -347,6 +350,10 @@ export interface DecodeEngineOptions {
    *  faster in isolation at M=256, opt-in pending an in-engine A/B), 'tiled',
    *  'matvec'. Default: sgmat when its pipelines exist, else matvec. */
   chunkGemm?: 'sgmat' | 'e5' | 'tiled' | 'matvec'
+  /** Capture the router's expert choice per layer per token, for
+   *  scripts/moe-trace.mjs. Costs one small buffer copy per MoE layer and one
+   *  readback per token, so it is opt-in and never on in a served engine. */
+  traceMoe?: boolean
   /**
    * Run only layers [start, end) — pipeline parallelism, one stage per device.
    *
@@ -692,6 +699,22 @@ export function buildDecodeEngine(
     ? uniformBuf(device, [i32(S.moeSlots), i32(Math.ceil(S.moeSlots * S.ffn / 256))])
     : null
   const moeCombU = S.moe ? uniformBuf(device, [u32(S.d), u32(S.moeSlots)]) : null
+  // MoE routing trace. One row per layer, written straight after that layer's
+  // top-k so the record is exactly what the expert matmul then read.
+  // A RING over many decode steps, not one pass. The buffer is overwritten
+  // every token, so a single-pass trace yields one sample per generation —
+  // nowhere near enough to score a cache policy. Capacity is tokens; the
+  // forward recorder advances the write slot.
+  const TRACE_ROW = S.moeSlots * 4
+  const TRACE_CAP = opts.traceMoe ? 2048 : 0
+  const traceStride = TRACE_ROW * S.layers
+  let moeTraceIdx = 0
+  const moeTraceBuf = (opts.traceMoe && S.moe)
+    ? makeBuf(device, traceStride * TRACE_CAP, 'moeTrace') : null
+  const moeTraceRead = moeTraceBuf
+    ? device.createBuffer({ size: traceStride * TRACE_CAP, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    : null
+
   const ffnDnU = uniformBuf(device, [u32(FFN_DN_K_PACKED), u32(FFN_DN_SCALES), u32(S.d)])
 
   // Affine dense gate_up: a K=d matmul instance over 2·ffn rows (same shape
@@ -1428,6 +1451,7 @@ export function buildDecodeEngine(
     // --- INITIAL RMSNORM: B.residual → B.hidden1 (layer L0's normGamma1) ---
     dispatch(enc, P.rmsNorm, bgInitNorm, 1, 1, 1, 'rmsNorm_init')
 
+    if (moeTraceBuf) moeTraceIdx++
     // --- TRANSFORMER LAYERS ---
     // Residual ping-pong is encoded into the cached bind groups: addNorm1 reads
     // residual / writes residual2; addNorm2 reads residual2 / writes residual.
@@ -1540,6 +1564,10 @@ export function buildDecodeEngine(
           // dispatches, not the top-k.
           dispatch(enc, moeRouterPipe, blk.moe.routerLogits, MOE_ROUTER_ROWS, 1, 1, 'moeRouterLogits')
           dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, 1, 1, 1, 'moeRouterTopk')
+          if (moeTraceBuf) {
+            const base = (moeTraceIdx % TRACE_CAP) * traceStride + L * TRACE_ROW
+            enc.copyBufferToBuffer(B.moeIds!, 0, moeTraceBuf, base, TRACE_ROW)
+          }
           const rows = S.ffn / MOE_RPW
           dispatch(enc, moeMM!, blk.moe.gate, rows, 1, S.moeSlots, 'moeGate')
           dispatch(enc, moeMM!, blk.moe.up, rows, 1, S.moeSlots, 'moeUp')
@@ -2018,6 +2046,21 @@ export function buildDecodeEngine(
       sumAbs += d
     }
     return { startPos, promptLen: promptIds.length, maxAbsDiff: maxAbs, meanAbsDiff: sumAbs / fresh.length }
+  }
+
+  /** Copy the trace out. One readback per call, after the submit that filled
+   *  it — callers await a generated token first, which guarantees ordering. */
+  async function readMoeTrace(): Promise<{ ids: Uint32Array; steps: number; stride: number } | null> {
+    if (!moeTraceBuf || !moeTraceRead) return null
+    const enc = device.createCommandEncoder()
+    enc.copyBufferToBuffer(moeTraceBuf, 0, moeTraceRead, 0, moeTraceRead.size)
+    device.queue.submit([enc.finish()])
+    await moeTraceRead.mapAsync(GPUMapMode.READ)
+    const out = new Uint32Array(moeTraceRead.getMappedRange().slice(0))
+    moeTraceRead.unmap()
+    // Report how many slots actually hold data, so a short run is not read as
+    // 2048 steps of zeros routing everything to expert 0.
+    return { ids: out, steps: Math.min(moeTraceIdx, TRACE_CAP), stride: traceStride / 4 }
   }
 
   function getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null {
@@ -3149,6 +3192,7 @@ export function buildDecodeEngine(
       mlaScoresU, mlaCombineU,
       attnU, attnSkU, combineU, attnI8U,
       residualReadBuf, readBuf, logitsReadBuf, hiddenReadBuf,
+      moeTraceBuf, moeTraceRead,
     ]
     for (const b of owned) b?.destroy()
     chunkPrefill?.destroy()
@@ -3167,6 +3211,7 @@ export function buildDecodeEngine(
     generate: guard('generate', generate),
     generatePipelined: guard('generatePipelined', generatePipelined),
     forwardLogits: guard('forwardLogits', forwardLogits),
+    readMoeTrace,
     forwardEmbedding: guard('forwardEmbedding', forwardEmbedding),
     scoreSequence: guard('scoreSequence', scoreSequence),
     pipelineStep: guard('pipelineStep', pipelineStep),

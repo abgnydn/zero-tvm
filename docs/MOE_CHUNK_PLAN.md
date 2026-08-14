@@ -137,3 +137,74 @@ compare against — the per-token path is the reference.
 `paging-test.mjs` and the kernel suites must stay green; the router change
 touches `moe_router_logits`/`moe_router_topk`, which `real-weights.mjs` covers
 against a JS reference at both router widths.
+
+
+## Expert residency — measured 2026-08-14, before building anything
+
+93% of the 35B is expert weights and only top-8 of 257 run per token, so the
+idle 249 are the obvious thing to stop holding. `scripts/moe-trace.mjs` records
+what the router really chose (via the engine's own `traceMoe` flag, copying
+`moeIds` straight after each layer's top-k), `scripts/moe-stream-probe.mjs`
+measures the two costs, and `scripts/moe-replay.mjs` scores policies offline.
+
+### Skew is weak; locality is what works
+
+qwen30b, 1827 decode steps: **all 128 experts get used**, and the top 10% take
+13.7% of requests against 10% for uniform routing. This does not work because a
+few experts dominate. It works because of temporal locality inside a
+generation.
+
+| pool | LRU | LFU | LFRU | Belady |
+|---|---:|---:|---:|---:|
+| 13/128 | 50.0% | 16.2% | 49.0% | 68.9% |
+| 32/128 | 77.8% | 36.1% | 76.5% | 87.6% |
+| 64/128 | **94.5%** | 57.3% | 92.9% | 95.3% |
+
+**LFU loses badly**, which contradicts the paper claiming activation is skewed
+rather than time-local — on these models it is the other way round. LRU, the
+simple thing llama.cpp shipped, is right. And LRU sits within 0.8 points of
+Belady at the half pool, so better prediction has almost nothing left to buy.
+
+Longer generations barely move it: 243 steps and 1827 steps agree within a
+point everywhere except the half pool, which improves from 90.2% to 94.5%.
+
+### The binding cost is the readback, not bandwidth
+
+Both measured on this machine, not carried over:
+
+- `writeBuffer` at the real slab size: **8.19 GB/s** at 2.53 MiB, 9.10 at 1.31.
+  An earlier projection used 2.4 GB/s from a range measured at a different
+  size and was 3.5x too pessimistic.
+- router-id readback: **0.199 ms** per round trip, x48 layers = **9.6 ms of
+  every token**, against 11.3 ms of compute.
+
+WebGPU has no GPU-waits-on-host primitive — verified against the API surface,
+which contains no fence, semaphore or event — so each layer's ids must reach JS
+before its experts can be fetched. That is exactly what llama.cpp's Metal build
+avoids with `MTLSharedEvent`.
+
+| pool | resident | miss | serial | overlapped | pipelined |
+|---|---:|---:|---:|---:|---:|
+| 13/128 | 2.5 GB | 50% | 12.0 t/s | 13.9 t/s | 16.1 t/s |
+| 32/128 | 4.8 GB | 22% | 20.6 t/s | 26.9 t/s | 36.2 t/s |
+| 64/128 | 8.6 GB | 6% | 36.0 t/s | 47.9 t/s | 88.4 t/s |
+
+Serial is the naive build. Overlapped hides the fetch behind compute. Pipelined
+additionally hides the READBACK, which is possible only because per-layer
+compute (0.236 ms) just exceeds a round trip (0.199 ms) — it needs next-layer
+speculation to be right, and a wrong guess is a stall. Treat it as a ceiling.
+
+### What was tried and does not work
+
+Prefetching from the PREVIOUS TOKEN's ids would need one readback per token
+instead of 48. Token-to-token overlap is **43.1%** (per layer 11-62%), and that
+is not the useful 43%: an expert the previous token used is recent, so LRU
+already holds it. The misses are precisely the experts the previous token did
+NOT choose, which is what this cannot predict.
+
+### Verdict
+
+Worth building. 8.6 GB at 36-48 t/s against 16 GB at 88 t/s, and 4.6 GB for the
+35B. The order is: slot pool + OPFS streaming first (LRU, nothing cleverer),
+then next-layer speculation, which is worth more here than any policy change
+because it attacks the readback rather than the hit rate.

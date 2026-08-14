@@ -5,25 +5,30 @@
  * specific chrome (header, welcome, gate, overlay) stays inline per page.
  * Companion module: src/zero-tvm/chat-ui.ts. */
 
+    /* ALIAS LAYER onto the family tokens (public/tokens.css), which must be
+     * linked BEFORE this file. The chat surface kept its own palette — a green
+     * accent on a different ground — so the instrument and the landing page
+     * looked like two products. Only the names this file does not share with
+     * tokens.css are redefined here; --bg, --border, --text, --accent and
+     * --mono come straight through.
+     *
+     * --muted is the exception and must be restated: this file uses it for the
+     * DIMMEST text, where the token set uses it for mid-tone. Letting the token
+     * value through would brighten every caption on the page. */
     :root {
-      --bg:        #0a0a0c;
-      --panel:     #111114;
-      --panel-2:   #16161b;
-      --border:    #1e1e26;
-      --border-2:  #2a2a34;
-      --text:      #e8e8ec;
-      --text-dim:  #a0a0aa;
-      --muted:     #6b6b78;
-      --accent:    #10b981;
-      --accent-2:  #34d399;
-      --accent-tint: rgba(16, 185, 129, 0.12);
-      --user-bubble: #1a1a22;
-      --danger:    #ef4444;
-      --radius:    12px;
+      --panel:       var(--surface);
+      --panel-2:     var(--surface-2);
+      --border-2:    var(--border-hi);
+      --text-dim:    #a9b3c6;
+      --muted:       var(--dim);
+      --accent-2:    var(--accent-hi);
+      --accent-tint: var(--accent-dim);
+      --user-bubble: var(--surface-2);
+      --danger:      var(--err);
+      --radius:      12px;
       --composer-max: 760px;
-      --msg-max:     760px;
-      --font: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, sans-serif;
-      --mono: 'SF Mono', ui-monospace, 'Fira Code', 'Menlo', monospace;
+      --msg-max:      760px;
+      --font:        var(--body);
     }
 
     /* ─────────── Chat area ─────────── */
