@@ -52,6 +52,20 @@ function buildGroups(): Group[] {
 
 const GROUPS = buildGroups()
 
+/** Class sigils — one per architecture lane, same circuit-rune language as
+ *  the /entrance assets. currentColor, so they sit in the accent for free. */
+const LANE_SIGIL: Record<string, string> = {
+  moe: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3 3-3 3-3-3zM5 9l2.4 2.4L5 13.8 2.6 11.4zM19 9l2.4 2.4L19 13.8l-2.4-2.4zM12 16l3 3-3 3-3-3z" opacity="0.9"/><circle cx="12" cy="11.4" r="1.6"/></svg>',
+  hybrid: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 9c3 0 3-4 6-4s3 4 6 4 3-4 6-4"/><path d="M2 16h6l3-5 3 8 2-3h6" opacity="0.85"/></svg>',
+  dense: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1" opacity="0.55"/><rect x="4" y="13" width="7" height="7" rx="1" opacity="0.55"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>',
+  mla: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 9-8 9-8-9z"/><path d="M12 8l4 4-4 4-4-4z" fill="currentColor" stroke="none" opacity="0.7"/></svg>',
+  embed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12c2.5-4 6-6 9-6s6.5 2 9 6c-2.5 4-6 6-9 6s-6.5-2-9-6z"/><path d="M8 12h8" opacity="0.8"/></svg>',
+}
+function laneOf(spec: ModelSpec): string {
+  return spec.embeddingOnly ? 'embed' : spec.mla ? 'mla' : spec.moe ? 'moe'
+    : spec.layerKinds.some((k) => k === 'gdn') ? 'hybrid' : 'dense'
+}
+
 /** Spec ids whose weights are already in OPFS. Filled asynchronously; the
  *  picker renders without waiting, and a model that turns out to be cached
  *  simply gains a line when the probe lands. Restoring this — the carousel
@@ -99,7 +113,7 @@ function render(): void {
     <div class="cs-dust" aria-hidden="true"></div>
     <div class="mb-plate">
       <div class="mb-name"></div>
-      <div class="mb-params"></div>
+      <div class="mb-params"><span class="mb-sigil" aria-hidden="true"></span><span class="mb-params-text"></span></div>
     </div>
     <div class="mb-stage">
       <button class="mb-arrow" data-dir="-1" aria-label="Previous model">&lsaquo;</button>
@@ -123,6 +137,8 @@ function render(): void {
     <div class="cs-roster-head" aria-hidden="true">Roster · ${GROUPS.length}</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
+    <div class="cs-corner cs-corner-l" aria-hidden="true">registry-rendered · numbers are measured</div>
+    <div class="cs-corner cs-corner-r" aria-hidden="true">WebGPU · hand-written WGSL</div>
     ${'gpu' in navigator ? '' :
       '<p class="note cs-note">This browser has no WebGPU — the chat needs Chrome, Edge, or another WebGPU-enabled browser.</p>'}
   `
@@ -182,7 +198,8 @@ function render(): void {
     const b = modelBranding(v.spec)
 
     el('.mb-name').textContent = g.name
-    el('.mb-params').textContent = g.params
+    el('.mb-params-text').textContent = g.params
+    el('.mb-sigil').innerHTML = LANE_SIGIL[laneOf(v.spec)] ?? ''
     // Class-coloured chrome: the pedestal, plate and CTA take the lane accent
     // of the model on stage — the same colour its chat page runs.
     const pal = mascotPalette(v.spec)
@@ -230,11 +247,24 @@ function render(): void {
     mascot?.setSpec(v.spec, CACHED.has(v.spec.id), mode ? poolFracOf(v.spec, mode.slots) : 0)
   }
 
+  /** Selection transition: retrigger the stage flash + plate/sheet entrance
+   *  animations by yanking the class off for a frame. */
+  function selectFx(): void {
+    for (const sel of ['.mb-art', '.mb-plate', '.mb-panel']) {
+      const n = root.querySelector<HTMLElement>(sel)
+      if (!n) continue
+      n.classList.remove('cs-in')
+      void n.offsetWidth
+      n.classList.add('cs-in')
+    }
+  }
+
   function go(nextG: number): void {
     gi = (nextG + GROUPS.length) % GROUPS.length
     vi = 0
     mi = 0
     paint()
+    selectFx()
   }
 
   host.addEventListener('click', (e) => {
@@ -257,7 +287,24 @@ function render(): void {
   art.addEventListener('mouseenter', () => mascot?.setHover(true))
   art.addEventListener('mouseleave', () => mascot?.setHover(false))
 
+  // Depth: the fog and dust track the pointer at different rates — the cheap
+  // half of a camera. Skipped entirely under reduced motion.
+  if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    const fog = root.querySelector<HTMLElement>('.cs-fog')
+    const dust = root.querySelector<HTMLElement>('.cs-dust')
+    const art = root.querySelector<HTMLElement>('.mb-art')
+    root.addEventListener('pointermove', (e) => {
+      const r = root.getBoundingClientRect()
+      const x = (e.clientX - r.left) / r.width - 0.5
+      const y = (e.clientY - r.top) / r.height - 0.5
+      if (fog) fog.style.transform = `translate(${x * 26}px, ${y * 10}px)`
+      if (dust) dust.style.transform = `translate(${x * 12}px, ${y * 5}px)`
+      if (art) art.style.transform = `translate(${x * -7}px, ${y * -3}px)`
+    })
+  }
+
   paint()
+  selectFx()
   void probeCached(() => { paint(); void paintRoster() })
   void mountMascot(canvas, GROUPS[gi].variants[vi].spec).then((m) => {
     if (!m) { art.style.display = 'none'; return }

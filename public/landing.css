@@ -609,3 +609,95 @@ footer li a:hover { color: var(--accent); }
   #models .mb-dot { width: auto; min-width: 168px; flex: 0 0 auto; }
   #models .cs-enter .mb-cta { min-width: 0; width: 100%; }
 }
+
+
+/* ══ ROUND TWO: depth, transitions, identity ═══════════════════════════════ */
+
+/* The floor reflection — Chromium's box-reflect, which is the browser class
+   the engine requires anyway. Elsewhere it simply does not draw. */
+#models .mb-mascot {
+  -webkit-box-reflect: below -6px linear-gradient(transparent 62%, rgba(255,255,255,0.10));
+}
+
+/* Selection transition. go() re-arms .cs-in, so switching characters flashes
+   the pedestal and walks the plate and sheet back in — selection FEELS like
+   selection. Names are transform/opacity only; nothing relayouts. */
+#models .mb-art.cs-in .mb-pedestal::after { animation: ringFlash 0.7s ease-out, ringPulse 5s ease-in-out 0.7s infinite; }
+@keyframes ringFlash {
+  0% { opacity: 1; transform: scale(0.92); filter: brightness(2.2); }
+  100% { opacity: 0.85; transform: scale(1); filter: brightness(1); }
+}
+#models .mb-art.cs-in .mb-mascot { animation: charIn 0.5s cubic-bezier(0.2, 1.4, 0.4, 1); }
+@keyframes charIn {
+  0% { opacity: 0; transform: translateY(14px) scale(0.965); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+#models .mb-plate.cs-in .mb-name { animation: plateIn 0.45s ease both; }
+#models .mb-plate.cs-in .mb-params { animation: plateIn 0.45s ease 0.08s both; }
+@keyframes plateIn {
+  0% { opacity: 0; transform: translateY(-8px); letter-spacing: 0.08em; }
+  100% { opacity: 1; transform: translateY(0); }
+}
+#models .mb-panel.cs-in > * { animation: rowIn 0.4s ease both; }
+#models .mb-panel.cs-in > *:nth-child(2) { animation-delay: 0.05s; }
+#models .mb-panel.cs-in > *:nth-child(3) { animation-delay: 0.10s; }
+#models .mb-panel.cs-in > *:nth-child(4) { animation-delay: 0.15s; }
+#models .mb-panel.cs-in > *:nth-child(5) { animation-delay: 0.20s; }
+#models .mb-panel.cs-in > *:nth-child(n+6) { animation-delay: 0.25s; }
+@keyframes rowIn {
+  0% { opacity: 0; transform: translateX(-10px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+
+/* Class sigil beside the class line. */
+#models .mb-params { display: inline-flex; align-items: center; gap: 8px; justify-content: center; }
+.mb-sigil { display: inline-flex; width: 16px; height: 16px; }
+.mb-sigil svg { width: 100%; height: 100%; }
+
+/* Realm corners: tiny mono statements, both literally true. */
+.cs-corner {
+  position: absolute; bottom: 10px; z-index: 1;
+  font-family: var(--mono); font-size: 0.58rem; letter-spacing: 0.14em;
+  text-transform: uppercase; color: color-mix(in srgb, var(--dim) 70%, transparent);
+  pointer-events: none;
+}
+.cs-corner-l { left: 16px; }
+.cs-corner-r { right: 16px; }
+
+/* READY glint: a light pass over the tag every few seconds — unlocked should
+   glimmer. Masked to the tag only. */
+#models .mb-dot[data-cached]::after { overflow: hidden; }
+#models .mb-dot[data-cached] { isolation: isolate; }
+#models .mb-dot[data-cached]::before {
+  content: ''; position: absolute; top: 3px; right: 5px; width: 44px; height: 14px;
+  background: linear-gradient(110deg, transparent 30%, #ffffff2e 50%, transparent 70%) no-repeat;
+  background-size: 200% 100%;
+  animation: readyGlint 4.5s ease-in-out infinite;
+  pointer-events: none; z-index: 1;
+}
+@keyframes readyGlint {
+  0%, 72% { background-position: 180% 0; }
+  92%, 100% { background-position: -80% 0; }
+}
+
+/* Enter: charge on hover, visible keyboard focus. */
+#models .cs-enter .mb-cta { transition: transform 0.18s ease, filter 0.18s ease, box-shadow 0.18s ease; }
+#models .cs-enter .mb-cta:hover {
+  transform: translateY(-1px) scale(1.015);
+  box-shadow: 0 14px 44px color-mix(in srgb, var(--cs-accent, var(--accent)) 55%, transparent),
+              inset 0 1px 0 #ffffff77;
+}
+#models .cs-enter .mb-cta:focus-visible {
+  outline: 2px solid #fff; outline-offset: 3px;
+}
+
+/* Parallax layers move on transform — give them will-change and keep the
+   fog's own drift composed with the pointer offset via nesting (the <i>
+   children animate, the container translates). */
+.cs-fog, .cs-dust, #models .mb-art { will-change: transform; transition: transform 0.3s ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  #models .mb-art.cs-in .mb-mascot,
+  #models .mb-plate.cs-in .mb-name, #models .mb-plate.cs-in .mb-params,
+  #models .mb-panel.cs-in > *, #models .mb-dot[data-cached]::before { animation: none; }
+}
