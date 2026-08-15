@@ -85,7 +85,18 @@ function render(): void {
   // sheet on the left, ENTER CHAT bottom-centre. The splash is the logo
   // opening — once per session, skipped for reduced-motion.
   host.innerHTML = `
-    <div class="cs-splash" aria-hidden="true"><span>zero<b>-tvm</b></span></div>
+    <div class="cs-splash" aria-hidden="true">
+      <svg class="cs-emblem" viewBox="0 0 96 96" fill="none">
+        <path d="M48 6 L90 48 L48 90 L6 48 Z" stroke="currentColor" stroke-width="3"/>
+        <path d="M48 20 L76 48 L48 76 L20 48 Z" stroke="currentColor" stroke-width="1.4" opacity="0.55"/>
+        <path d="M30 48 h12 l6 -10 l6 20 l6 -10 h6" stroke="currentColor" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+        <path d="M48 2 l4 4 l-4 4 l-4 -4 Z M48 86 l4 4 l-4 4 l-4 -4 Z M2 48 l4 -4 l4 4 l-4 4 Z M86 48 l4 -4 l4 4 l-4 4 Z" fill="currentColor"/>
+      </svg>
+      <span class="cs-logo">zero<b>-tvm</b></span>
+      <span class="cs-sub">LLM inference in the browser · hand-written WGSL</span>
+    </div>
+    <div class="cs-fog" aria-hidden="true"><i></i><i></i></div>
+    <div class="cs-dust" aria-hidden="true"></div>
     <div class="mb-plate">
       <div class="mb-name"></div>
       <div class="mb-params"></div>
@@ -109,6 +120,7 @@ function render(): void {
         <p class="mb-ram"></p>
       </div>
     </aside>
+    <div class="cs-roster-head" aria-hidden="true">Roster · ${GROUPS.length}</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
     ${'gpu' in navigator ? '' :
@@ -209,6 +221,8 @@ function render(): void {
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
+      const gSpec = GROUPS[Number(d.dataset.i)].variants[0].spec
+      d.toggleAttribute('data-cached', CACHED.has(gSpec.id))
     }
     const cached = el<HTMLElement>('.mb-cached')
     cached.hidden = !CACHED.has(v.spec.id)
