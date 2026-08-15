@@ -416,3 +416,52 @@ qwen36q3, blocking, 2×512 tokens, token-identical throughout: 64/256 slots =
 unpooled 58.6. The 96→128 step buys 3 hit-rate points and 0.3 t/s — misses
 are not the cost, the per-layer readback is. Whatever the GPU-side slot map
 achieves, judge it against THESE rows.
+
+
+## The optimistic recorder — designed and priced 2026-08-15 (scripts/moe-optimistic-probe.mjs)
+
+The readback redesign's floors, measured on this machine (40 layers, medians
+of 30, AC):
+
+| mechanism | ms/token |
+|---|---:|
+| current pattern: submit + await per layer | 7.98 |
+| fire-and-forget copy wave, one await at token end | **1.57** |
+| first readback lands after fire | 0.77 |
+| 30 × 1 MiB GDN-state checkpoints | 0.25 |
+
+The wave overlaps (5×), so the design is alive — and it simplifies past the
+original sketch: with no per-layer awaits there is no reason to cut the
+encoder at all. ONE SUBMIT PER TOKEN, like the unpooled path:
+
+1. A tiny per-layer TRANSLATE kernel maps the router's expert ids through a
+   GPU-resident expert→slot buffer (updated only by CPU writeBuffer between
+   submits). Misses translate to an arbitrary slot — their compute is wrong
+   and will be replayed; nothing needs a GPU-side flag.
+2. Each layer's raw expert ids are copied to a staging ring inside the same
+   encoder. After submit, ONE Promise.all await (~1.6 ms) delivers the whole
+   token's routing.
+3. The CPU resolves all 40 layers against its mirror of the map (exact LRU,
+   since it now sees the full trace). Zero misses: the token is already
+   correct. Misses: upload the slabs, restore the first missed layer's
+   checkpoint (GDN + conv state; KV appends are idempotent on replay — same
+   inputs, same positions), re-record from there. The replay wave is usually
+   clean because its misses were just uploaded; pathological thrash at tiny
+   pools gets a replay cap and a serial-path fallback.
+
+Cost model against the measured half-pool baseline (15.3 t/s, 65 ms/token,
+~48 ms overhead): clean token ≈ 17 ms + ~2 ms; with prefetch-warm 98.9% hits,
+~4 misses/token → ~1.5 passes/token → **~26 ms ≈ 35-40 t/s projected at
+~8.4 GB**. Quarter pool stays miss-transfer-bound (~58 misses/token at 83.8%)
+— expect ~18-20 t/s there, not 40.
+
+Where the other ~40 ms of today's overhead lives, for honesty: ~23 ms is miss
+transfer at the unprefetched 93.5% (23 misses × 1.007 ms), ~8 ms the readback
+pattern, the rest submit fragmentation and per-layer JS. The one-submit
+design removes the second and third; prefetch and replay-batching attack the
+first.
+
+Implementation order (next session): translate kernel + map buffer; the
+one-submit recorder with staged copies; CPU mirror + post-token resolve;
+checkpoints + replay; the gate is moe-pool-test GEN=pipelined token identity
+plus tok/s against the AC price curve above.
