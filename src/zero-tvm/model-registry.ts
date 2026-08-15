@@ -116,6 +116,12 @@ export interface ModelBrand {
   rateLabel: string
   /** Present when the model needs more memory than a typical machine has. */
   ramNote?: string
+  /** Memory builds for the landing character screen — expert-pool presets,
+   *  measured where a measurement exists (BENCH.md 2026-08-15 AC price
+   *  curve; est = derived from the expert fraction, not measured). slots=0
+   *  is the full model. ONE source for every page: the landing renders these
+   *  and the chat boots them via ?pool=, so the two cannot disagree. */
+  poolModes?: readonly { slots: number; label: string; note?: string }[]
 }
 
 /** Page-facing copy per spec id (gate dialog, header, landing cards).
@@ -135,12 +141,22 @@ const BRANDINGS: Record<string, ModelBrand> = {
     // 19 GB, which is the difference between running and not running on a
     // 32 GB machine. See docs/QUALITY.md.
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · 3-bit experts',
-    sizeLabel: '~16.4 GB', rateLabel: '~66 t/s',   // 65.56 total, M2 Max (BENCH.md 2026-08-13)
+    sizeLabel: '~16.4 GB', rateLabel: '~66 t/s',
+    poolModes: [
+      { slots: 0, label: 'Full · 15.7 GB · ~66 t/s' },
+      { slots: 128, label: 'Half · ~8.4 GB · ~15 t/s' },
+      { slots: 64, label: 'Quarter · ~4.8 GB · ~12 t/s', note: 'long prompts run token-by-token' },
+    ],   // 65.56 total, M2 Max (BENCH.md 2026-08-13)
     ramNote: 'needs ~20 GB free RAM',
   },
   [QWEN36_35B_A3B.id]: {
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · full 4-bit',
-    sizeLabel: '~19.5 GB', rateLabel: '',
+    sizeLabel: '~19.5 GB',
+    poolModes: [
+      { slots: 0, label: 'Full · 19.7 GB' },
+      { slots: 128, label: 'Half · ~11 GB est · ~15 t/s' },
+      { slots: 64, label: 'Quarter · ~6 GB est', note: 'long prompts run token-by-token' },
+    ], rateLabel: '',
     ramNote: 'needs ~24 GB free RAM (64 GB Mac recommended)',
   },
   // THESE THREE ARE FROM AN OLDER BUILD (2026-07-30) than the labels below it,
@@ -162,7 +178,12 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // f32: cosine 0.999985, greedy token-exact through the stop id. (Against
   // mlx's own bf16 forward it scores 0.9978 — that is bf16's error, not the
   // engine's; see the dtype note in scripts/mlx-ref.py.)
-  [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~17.2 GB', rateLabel: '~75 t/s', ramNote: 'needs ~20 GB free RAM' },  // 74.96 total, M2 Max (BENCH.md 2026-08-13); size = index.json total_size 17.17 GB — the old ~16.0 was short by 1.2 GB
+  [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~17.2 GB', rateLabel: '~75 t/s', ramNote: 'needs ~20 GB free RAM',
+    poolModes: [
+      { slots: 0, label: 'Full · ~17 GB · ~75 t/s' },
+      { slots: 96, label: '¾ · ~13 GB est · ~15 t/s' },
+      { slots: 64, label: 'Half · ~9.5 GB est · ~15 t/s', note: 'long prompts run token-by-token' },
+    ] },  // 74.96 total, M2 Max (BENCH.md 2026-08-13); size = index.json total_size 17.17 GB — the old ~16.0 was short by 1.2 GB
   // Not a chat model. Its output is the pooled hidden state, so rateLabel stays
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },

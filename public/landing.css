@@ -190,6 +190,10 @@ section { padding: 72px 0; }
 .mb-params { font-family: var(--mono); font-size: var(--step--1); color: var(--dim); }
 
 .mb-variants { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px; }
+/* Memory builds — the character screen's loadout row. Same pill grammar as
+   the quantisation picker: a build is a choice about THIS character, and the
+   selected one re-poses the figure (leaner, streamed experts drifting out). */
+.mb-modes { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
 .mb-variant {
   font-family: var(--mono); font-size: var(--step--1); cursor: pointer;
   padding: 5px 12px; border-radius: 99px;

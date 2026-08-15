@@ -56,72 +56,19 @@ function poolFromSearch(): number {
 }
 let POOL_SLOTS_UI = poolFromSearch()
 
-/**
- * Memory-mode labels, measured where a measurement exists (BENCH.md
- * 2026-08-15 AC price curve; est = derived from the expert fraction, not
- * measured). Chat throughput only — the saving is RAM while running; the
- * DOWNLOAD is the full checkpoint either way, streamed from OPFS on demand.
- */
-const POOL_PRESETS: Record<string, { slots: number; label: string; note?: string }[]> = {
-  'qwen36-35b-a3b-q3': [
-    { slots: 0, label: 'Full — 15.7 GB · ~66 tok/s' },
-    { slots: 128, label: 'Half the experts — ~8.4 GB · ~15 tok/s' },
-    { slots: 64, label: 'Quarter — ~4.8 GB · ~12 tok/s', note: 'long prompts run token-by-token in this mode' },
-  ],
-  'qwen36-35b-a3b': [
-    { slots: 0, label: 'Full — 19.7 GB · unmeasured' },
-    { slots: 128, label: 'Half the experts — ~11 GB est · ~15 tok/s' },
-    { slots: 64, label: 'Quarter — ~6 GB est', note: 'long prompts run token-by-token in this mode' },
-  ],
-  'qwen3-30b-a3b-4bit': [
-    { slots: 0, label: 'Full — ~17 GB · ~75 tok/s' },
-    { slots: 96, label: '96 of 128 experts — ~13 GB est · ~15 tok/s' },
-    { slots: 64, label: 'Half — ~9.5 GB est · ~15 tok/s', note: 'long prompts run token-by-token in this mode' },
-  ],
-}
-
-/** The memory-mode radios in the download gate. MoE chat models only; the
- *  selection feeds bootEngine directly (the gate runs before boot, so no
- *  reload is needed) and is mirrored into ?pool= so the link is shareable.
- *  Output is token-identical in every mode — the measured cost is speed. */
-function mountMemoryPicker(): void {
-  const presets = POOL_PRESETS[SPEC.id]
-  if (!presets) return
-  const host = document.querySelector('#start-dialog .dialog-notes')
-  if (!host) return
-  const wrap = document.createElement('div')
-  wrap.id = 'memory-picker'
-  wrap.style.cssText = 'padding:0.4rem 0 0.2rem;border-top:1px solid var(--border);margin-top:0.6rem'
-  const title = document.createElement('div')
-  title.textContent = 'Memory'
-  title.style.cssText = 'font-size:0.66rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--muted);margin-bottom:0.4rem'
-  wrap.appendChild(title)
-  const noteEl = document.createElement('div')
-  noteEl.style.cssText = 'font-size:0.7rem;color:var(--warn,#d9a441);margin-top:0.25rem;min-height:1em'
-  for (const p of presets) {
-    const row = document.createElement('label')
-    row.style.cssText = 'display:flex;gap:0.5rem;align-items:center;font-size:0.78rem;cursor:pointer;padding:2px 0'
-    const radio = document.createElement('input')
-    radio.type = 'radio'
-    radio.name = 'memory-mode'
-    radio.value = String(p.slots)
-    radio.checked = p.slots === POOL_SLOTS_UI
-    radio.addEventListener('change', () => {
-      POOL_SLOTS_UI = p.slots
-      if (SPEC.moe) gateMascot?.setSpec(SPEC, false, p.slots ? p.slots / (SPEC.moe.experts + 1) : 0)
-      const url = new URL(location.href)
-      if (p.slots) url.searchParams.set('pool', String(p.slots))
-      else url.searchParams.delete('pool')
-      history.replaceState(null, '', url)
-      noteEl.textContent = p.note ?? (p.slots ? 'Same output, token for token — the cost is speed. Download size is unchanged.' : '')
-    })
-    const span = document.createElement('span')
-    span.textContent = p.label
-    row.append(radio, span)
-    wrap.appendChild(row)
-  }
-  wrap.appendChild(noteEl)
-  host.appendChild(wrap)
+/** The gate no longer asks about memory — the landing's character screen
+ *  already did, and ?pool= carries the answer. The gate just SAYS what was
+ *  chosen, from the same registry row the landing rendered. */
+function noteMemoryMode(): void {
+  if (!POOL_SLOTS_UI) return
+  const mode = (BRAND.poolModes ?? []).find((m2) => m2.slots === POOL_SLOTS_UI)
+  const notes = document.querySelector('#start-dialog .dialog-notes ul')
+  if (!notes) return
+  const li = document.createElement('li')
+  li.textContent = `Memory build: ${mode ? mode.label : `${POOL_SLOTS_UI} expert slots`}`
+    + (mode?.note ? ` — ${mode.note}` : '')
+  li.style.color = 'var(--warn, #d9a441)'
+  notes.prepend(li)
 }
 // Quant label for the message header + gate copy — derived in chat-ui.ts so
 // the remote guest page shows the same truth.
@@ -718,7 +665,7 @@ function applyModelBranding(): void {
       notes.prepend(li)
     }
   }
-  mountMemoryPicker()
+  noteMemoryMode()
   if (SPEC.id === 'phi3-mini') return
   document.title = `Zero-TVM Chat — ${BRAND.name}`
   set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
@@ -741,7 +688,6 @@ function applyModelBranding(): void {
 /** The header mascot's handle, kept so generation can drive its heartbeat —
  *  one pulse() per real token, so the bounce IS the measured cadence. */
 let headerMascot: import('../mascot.js').MascotHandle | null = null
-let gateMascot: import('../mascot.js').MascotHandle | null = null
 
 function mountChatMascots(): void {
   const host = document.querySelector('.model-info')
@@ -830,10 +776,8 @@ async function boot(): Promise<void> {
     if (canvas) {
       void mountMascot(canvas, SPEC).then((m) => {
         if (!m) { canvas.remove(); return }
-        gateMascot = m
-        // The picker's radios re-pose this figure live: choose less memory,
-        // watch the character lean and the streamed experts drift out. The
-        // choice and its meaning in the same glance.
+        // Posed to the build the landing chose (?pool=) — the same lean the
+        // character screen showed is the one the gate confirms.
         if (POOL_SLOTS_UI && SPEC.moe) m.setSpec(SPEC, false, POOL_SLOTS_UI / (SPEC.moe.experts + 1))
       }).catch(() => canvas.remove())
     }

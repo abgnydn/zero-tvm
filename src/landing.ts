@@ -90,6 +90,7 @@ function render(): void {
           <div class="mb-params"></div>
           <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
           <dl class="mb-stats"></dl>
+          <div class="mb-modes" role="tablist" aria-label="Memory build"></div>
           <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
           <p class="mb-ram"></p>
           <a class="mb-cta btn btn-primary">Open chat</a>
@@ -107,7 +108,12 @@ function render(): void {
   const dots = el<HTMLElement>('.mb-dots')
   let gi = 0
   let vi = 0
+  /** Selected memory build (index into the spec's poolModes; 0 = full). Reset
+   *  on every model/variant change — a build belongs to a character. */
+  let mi = 0
   let mascot: MascotHandle | null = null
+  const poolFracOf = (spec: ModelSpec, slots: number): number =>
+    slots && spec.moe ? slots / (spec.moe.experts + 1) : 0
 
   dots.innerHTML = GROUPS.map((g, i) =>
     `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}"></button>`).join('')
@@ -119,7 +125,16 @@ function render(): void {
 
     el('.mb-name').textContent = g.name
     el('.mb-params').textContent = g.params
-    el<HTMLAnchorElement>('.mb-cta').href = chatUrl(v.param)
+    // The CHARACTER SCREEN contract: the chat link carries the chosen build,
+    // so what you picked here is what boots there — ?pool= is the same number
+    // the registry row and the engine read.
+    const modes = b.poolModes ?? []
+    const mode = modes[mi] ?? modes[0]
+    el<HTMLAnchorElement>('.mb-cta').href =
+      chatUrl(v.param) + (mode && mode.slots ? `${v.param ? '&' : '?'}pool=${mode.slots}` : '')
+
+    el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
+      `<button class="mb-variant mb-mode" data-m="${i}" role="tab" aria-selected="${i === mi}">${x.label}</button>`).join('')
 
     el('.mb-variants').innerHTML = g.variants.length < 2 ? '' : g.variants.map((x, i) =>
       `<button class="mb-variant" data-v="${i}" role="tab" aria-selected="${i === vi}">${x.label}</button>`).join('')
@@ -135,8 +150,10 @@ function render(): void {
       `<div><dt>${k}</dt><dd>${val}</dd></div>`).join('')
 
     const ram = el<HTMLElement>('.mb-ram')
-    ram.textContent = b.ramNote ?? ''
-    ram.hidden = !b.ramNote
+    // A pooled build's note replaces the full model's RAM warning — picking
+    // less memory IS the answer to that warning.
+    ram.textContent = mode && mode.slots ? (mode.note ?? '') : (b.ramNote ?? '')
+    ram.hidden = !(mode && mode.slots ? mode.note : b.ramNote)
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
@@ -144,12 +161,13 @@ function render(): void {
     const cached = el<HTMLElement>('.mb-cached')
     cached.hidden = !CACHED.has(v.spec.id)
 
-    mascot?.setSpec(v.spec, CACHED.has(v.spec.id))
+    mascot?.setSpec(v.spec, CACHED.has(v.spec.id), mode ? poolFracOf(v.spec, mode.slots) : 0)
   }
 
   function go(nextG: number): void {
     gi = (nextG + GROUPS.length) % GROUPS.length
     vi = 0
+    mi = 0
     paint()
   }
 
@@ -159,8 +177,10 @@ function render(): void {
     if (arrow) { go(gi + Number(arrow.dataset.dir)); return }
     const dot = t.closest<HTMLElement>('.mb-dot')
     if (dot) { go(Number(dot.dataset.i)); return }
+    const modeBtn = t.closest<HTMLElement>('.mb-mode')
+    if (modeBtn) { mi = Number(modeBtn.dataset.m); paint(); return }
     const variant = t.closest<HTMLElement>('.mb-variant')
-    if (variant) { vi = Number(variant.dataset.v); paint() }
+    if (variant) { vi = Number(variant.dataset.v); mi = 0; paint() }
   })
   host.tabIndex = 0
   host.addEventListener('keydown', (e) => {

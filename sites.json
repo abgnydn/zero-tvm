@@ -57,7 +57,7 @@
       "url": "https://zerotvm.com",
       "domain": "zerotvm.com",
       "name": "zerotvm.com",
-      "tagline": "Phi-3-mini in the browser on 51 hand-written WGSL kernels, no compiler.",
+      "tagline": "Phi-3-mini in the browser on hand-written WGSL kernels, no compiler.",
       "shortDesc": "Phi-3-mini running end-to-end in the browser on hand-written WGSL, replacing the TVM-autotuned shader set WebLLM compiles. 69.55 tok/s against WebLLM's 59.95 on identical weights in the same session, +16%.",
       "category": "LLM inference",
       "badge": "applied",
