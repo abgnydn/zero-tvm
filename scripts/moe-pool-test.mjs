@@ -49,6 +49,7 @@ const WARMUP = 8
 const FRACTIONS = (process.env.POOLS ?? '0.10,0.25,0.50').split(',').filter(Boolean).map(Number)
 const GEN = process.env.GEN ?? 'pipelined'
 const SPEC_W = Number(process.env.SPEC) || 0   // 1 = on at top-K; >K = coverage width
+const POPT = process.env.POPT === '1'   // optimistic recorder on the pooled arms
 const SPECULATE = SPEC_W >= 1
 
 let failed = false
@@ -105,7 +106,7 @@ if (ARM) {
   // made the identity gate compare prefill modes, not pooling. The "pooled
   // pipelined diverges at token 116" finding was exactly this: two UNPOOLED
   // arms (pipelined chunked vs blocking per-token) diverge at the same 116.
-  const built = await createEngineRaw({ model, chunkedPrefill: false, ...(ARM.vq ? { variantQuery: ARM.vq } : {}), ...(ARM.slots ? { expertPool: ARM.slots } : {}), ...(ARM.spec ? { expertSpeculate: true, ...(ARM.spec > 1 ? { specWidth: ARM.spec } : {}) } : {}) })
+  const built = await createEngineRaw({ model, chunkedPrefill: false, ...(ARM.vq ? { variantQuery: ARM.vq } : {}), ...(ARM.slots ? { expertPool: ARM.slots } : {}), ...(ARM.popt ? { poolOptimistic: true } : {}), ...(ARM.spec ? { expertSpeculate: true, ...(ARM.spec > 1 ? { specWidth: ARM.spec } : {}) } : {}) })
   const out = []
   const ids = built.buildChatPromptFor(
     built.spec, [{ role: 'user', content: ARM.prompt }], built.tokenizer)
@@ -197,7 +198,7 @@ for (const slots of sizes) {
   const diverged = []
   const rates = [], hits = []
   for (let r = 0; r < ref.length; r++) {
-    const got = runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots, gen: GEN, spec: SPEC_W })
+    const got = runArm({ prompt: prompts[r], tokens: TOKENS, warmup: WARMUP, slots, gen: GEN, spec: SPEC_W, popt: POPT })
     rates.push(got.tokS)
     if (got.pool) hits.push(got.pool.hitRate)
     if (SPECULATE && got.pool?.speculation) {

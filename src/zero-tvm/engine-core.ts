@@ -437,6 +437,12 @@ export interface DecodeEngineOptions {
    * so speculation cannot change a token, only when its weights arrived.
    */
   expertSpeculate?: boolean
+  /** The optimistic pooled recorder (docs/MOE_CHUNK_PLAN.md 2026-08-15): one
+   *  submit per token, expert→slot translation on the GPU, routing read back
+   *  as a fire-and-forget wave, checkpoint+replay on the tokens whose wave
+   *  reveals a miss. Requires expertPool; does not compose with
+   *  expertSpeculate (prefetch is per-layer CPU work this design removes). */
+  poolOptimistic?: boolean
   /** Width of the speculative router's top-M (default: the spec's top-K).
    *  MEASUREMENT KNOB for the coverage-recording design: exact set-match came
    *  in at 25-32% on qwen30b — dead for speculative recording — but per-slot
@@ -850,6 +856,17 @@ export function buildDecodeEngine(
       `one token's experts could not all be resident at once`)
   }
   const pooling = POOL_SLOTS > 0 && !!S.moe
+  const optimistic = pooling && !!opts.poolOptimistic
+  if (opts.poolOptimistic && !pooling) {
+    throw new Error('buildDecodeEngine: poolOptimistic is the pooled recorder — set expertPool as well')
+  }
+  if (optimistic && opts.traceMoe) {
+    throw new Error('buildDecodeEngine: poolOptimistic replays layers, which would double-write the MoE trace — run traceMoe on the serial pooled path')
+  }
+  if (optimistic && opts.expertSpeculate) {
+    throw new Error('buildDecodeEngine: poolOptimistic does not compose with expertSpeculate — '
+      + 'prefetch is per-layer CPU work the one-submit design removes; the post-token uploads are its warmth')
+  }
   // Next-layer router speculation. Only ever warms the pool — every layer still
   // resolves its own REAL ids — so it is meaningless without one.
   if (opts.expertSpeculate && !pooling) {
@@ -889,6 +906,12 @@ export function buildDecodeEngine(
     /** One entry per stacked tensor: the SLOTS-row buffer the MoE bind groups
      *  bind, its per-expert stride, and which slab a miss reads. */
     slabs: { buf: GPUBuffer; stride: number; proj: SlabProj; kind: SlabKind }[]
+    /** Optimistic recorder only: the device-resident expert→slot map the
+     *  translate kernel reads, and its CPU mirror. 0xffffffff = not resident.
+     *  The mirror is the source of truth; the buffer is a copy pushed by
+     *  writeBuffer whenever a resolve changes it. */
+    mapBuf: GPUBuffer | null
+    cpuMap: Uint32Array<ArrayBuffer> | null
   }
   // Bytes one expert occupies in each stack. Weights are u32 words, scales and
   // biases f16 — one per quantization group of 64.
@@ -940,7 +963,16 @@ export function buildDecodeEngine(
     // to the LRU. Pinning means resolve() never reports it as a miss, so its
     // rows are uploaded once, at construction, instead of on first use.
     const pin = S.sharedExpertIndex >= 0 ? [S.sharedExpertIndex] : []
-    return { pool: new ExpertPool(POOL_SLOTS, { pin }), slabs, layer: L }
+    const pool = new ExpertPool(POOL_SLOTS, { pin })
+    let mapBuf: GPUBuffer | null = null
+    let cpuMap: Uint32Array<ArrayBuffer> | null = null
+    if (optimistic) {
+      cpuMap = new Uint32Array(new ArrayBuffer(EXPERT_ROWS * 4)).fill(0xffffffff)
+      for (const e of pin) cpuMap[e] = pool.slotFor(e)
+      mapBuf = makeBuf(device, EXPERT_ROWS * 4, `moeSlotMap_${L}`)
+      device.queue.writeBuffer(mapBuf, 0, cpuMap)
+    }
+    return { pool, slabs, layer: L, mapBuf, cpuMap }
   }
 
   /**
@@ -1033,6 +1065,40 @@ export function buildDecodeEngine(
   const specLogits = speculate ? makeBuf(device, MOE_ROUTER_ROWS * 4, 'specRouterLogits') : null
   const specIds = speculate ? makeBuf(device, SPEC_ID_BYTES, 'specIds') : null
   const specScores = speculate ? makeBuf(device, SPEC_ID_BYTES, 'specScores') : null
+  // ── Optimistic recorder state ─────────────────────────────────────────────
+  // optSlotIds: the translate kernel's output, bound by the expert matmuls in
+  // place of B.moeIds. One buffer reused across layers — the encoder orders
+  // the overwrites. optStaging: one MAP_READ buffer per pooled layer; the
+  // whole token's routing is copied out inside the single submit and awaited
+  // as a wave afterwards (measured 1.57 ms for 40 layers against 7.98 serial —
+  // scripts/moe-optimistic-probe.mjs). Checkpoints: what a replay from layer L
+  // must restore — the residual/hidden pair at L's entry, and every GDN
+  // layer's conv+recur state from before ITS mutation this token (30 × 1 MiB
+  // measured at 0.25 ms). KV appends are idempotent on replay: same inputs,
+  // same positions.
+  const optSlotIds = optimistic ? makeBuf(device, S.moeSlots * 4, 'optSlotIds') : null
+  const optTranslateU = optimistic ? uniformBuf(device, [u32(S.moeSlots)]) : null
+  const optStaging: (GPUBuffer | null)[] = []
+  const ckptResidual: (GPUBuffer | null)[] = []
+  const ckptHidden: (GPUBuffer | null)[] = []
+  const ckptConv: (GPUBuffer | null)[] = []
+  const ckptRecur: (GPUBuffer | null)[] = []
+  if (optimistic) {
+    for (let L = 0; L < S.layers; L++) {
+      const inRange = L >= L0 && L < L1
+      const lp = inRange ? layerPools[L - L0] : null
+      optStaging.push(lp ? device.createBuffer({
+        size: MOE_ID_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        label: `optIdsRead_${L}`,
+      }) : null)
+      ckptResidual.push(inRange ? makeBuf(device, S.d * 2, `ckptResidual_${L}`) : null)
+      ckptHidden.push(inRange ? makeBuf(device, S.d * 2, `ckptHidden_${L}`) : null)
+      if (inRange && gdnConvState[L]) {
+        ckptConv.push(makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `ckptConv_${L}`))
+        ckptRecur.push(makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `ckptRecur_${L}`))
+      } else { ckptConv.push(null); ckptRecur.push(null) }
+    }
+  }
 
   // MoE routing trace. One row per layer, written straight after that layer's
   // top-k so the record is exactly what the expert matmul then read.
@@ -1480,6 +1546,13 @@ export function buildDecodeEngine(
       silu: GPUBindGroup
       down: GPUBindGroup
       combine: GPUBindGroup
+      /** Optimistic recorder only: the translate dispatch and the expert
+       *  matmuls re-bound to its OUTPUT (optSlotIds). B.moeIds keeps the raw
+       *  expert ids for the staging copy the CPU resolves after the token. */
+      translate?: GPUBindGroup
+      gateO?: GPUBindGroup
+      upO?: GPUBindGroup
+      downO?: GPUBindGroup
     }
     addNorm2: GPUBindGroup      // post-FFN: reads residual2, writes residual (prologue mode: add3_norm)
   }
@@ -1709,6 +1782,19 @@ export function buildDecodeEngine(
             { buffer: B.moeDown!, offset: 0, size: S.moeSlots * S.d * 2 },
             B.moeH!, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, B.moeIds!]),
           combine: bg(device, P.moeCombine, [B.hidden2, B.moeDown!, B.moeScores!, moeCombU!]),
+          ...(optimistic ? {
+            translate: bg(device, P.moeSlotTranslate,
+              [optSlotIds!, B.moeIds!, layerPools[L - L0]!.mapBuf!, optTranslateU!]),
+            gateO: bg(device, moeMMGate!, [
+              { buffer: B.moeGateUp!, offset: 0, size: S.moeSlots * 2 * S.ffn * 2 },
+              B.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, optSlotIds!]),
+            upO: bg(device, moeMMGate!, [
+              { buffer: B.moeGateUp!, offset: S.ffn * 2, size: S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
+              B.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, optSlotIds!]),
+            downO: bg(device, moeMMDown!, [
+              { buffer: B.moeDown!, offset: 0, size: S.moeSlots * S.d * 2 },
+              B.moeH!, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, optSlotIds!]),
+          } : {}),
         }
       : undefined
 
@@ -1984,6 +2070,151 @@ export function buildDecodeEngine(
     dispatch(enc, P.siluMul, moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
     dispatch(enc, moeMMDown!, moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
     dispatch(enc, P.moeCombine, moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
+  }
+
+  /** recordMoeExperts with the matmuls re-bound to the translate kernel's
+   *  output — the raw expert ids in B.moeIds stay untouched for the staging
+   *  copy the CPU resolves after the token. */
+  function recordMoeExpertsOpt(enc: GPUCommandEncoder, moe: NonNullable<LayerBG['moe']>): void {
+    const rows = S.ffn / MOE_RPW
+    dispatch(enc, moeMMGate!, moe.gateO!, rows, 1, S.moeSlots, 'moeGate')
+    dispatch(enc, moeMMGate!, moe.upO!, rows, 1, S.moeSlots, 'moeUp')
+    dispatch(enc, P.siluMul, moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
+    dispatch(enc, moeMMDown!, moe.downO!, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
+    dispatch(enc, P.moeCombine, moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
+  }
+
+  /**
+   * THE OPTIMISTIC RECORDER (docs/MOE_CHUNK_PLAN.md, "The optimistic recorder
+   * — designed and priced 2026-08-15").
+   *
+   * One submit per token. Every MoE layer's router output is translated to
+   * pool slots ON the GPU (moe_slot_translate against the layer's resident
+   * map) and its raw expert ids are copied to a per-layer staging buffer
+   * inside the same encoder. After the submit, ONE wave await delivers the
+   * whole token's routing (measured 1.57 ms for 40 layers vs 7.98 serial);
+   * the CPU then replays the routing against its mirror of each map. A token
+   * whose every id was resident is already correct. A token with a miss is
+   * wrong from that layer on: the missing experts are uploaded, the maps
+   * pushed, the first missed layer's entry state restored from checkpoints
+   * taken in the same encoder (residual+hidden 4 KB each; GDN conv+recur per
+   * layer, 0.25 ms for 30 MiB), and the tail of the token re-recorded. The
+   * replay resolves against the UPDATED maps, so a second replay needs a
+   * fresh eviction inside the replay itself — the per-layer pool holds a full
+   * token by construction (POOL_MIN), so the loop converges; the cap is
+   * paranoia, not policy.
+   */
+  function recordOptimisticRange(enc: GPUCommandEncoder, position: number, from: number): void {
+    for (let L = from; L < L1; L++) {
+      const blk = layerBGs[L - L0]
+      const lp = layerPools[L - L0]
+      // Checkpoints BEFORE the layer mutates anything. Residual/hidden are the
+      // layer's entry state (addNorm2 of L-1 wrote both); the GDN pair is the
+      // recurrent state a replay must rewind, because gdn_recur is the one
+      // dispatch in the pass that is not idempotent.
+      enc.copyBufferToBuffer(B.residual, 0, ckptResidual[L]!, 0, S.d * 2)
+      enc.copyBufferToBuffer(B.hidden1, 0, ckptHidden[L]!, 0, S.d * 2)
+      if (gdnConvState[L]) {
+        enc.copyBufferToBuffer(gdnConvState[L]!, 0, ckptConv[L]!, 0, ckptConv[L]!.size)
+        enc.copyBufferToBuffer(gdnRecurState[L]!, 0, ckptRecur[L]!, 0, ckptRecur[L]!.size)
+      }
+      recordAttn(enc, blk, position)
+      if (!blk.moe || !lp) { recordFfnTail(enc, L, blk); continue }
+      dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
+      recordMoeRouter(enc, L, blk.moe)
+      enc.copyBufferToBuffer(B.moeIds!, 0, optStaging[L]!, 0, MOE_ID_BYTES)
+      dispatch(enc, P.moeSlotTranslate, blk.moe.translate!, 1, 1, 1, 'moeSlotTranslate')
+      recordMoeExpertsOpt(enc, blk.moe)
+      dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    }
+  }
+
+  /** Rewind to layer `from`'s entry: its residual/hidden pair, and every GDN
+   *  state at or past it (each snapshot holds the value from before THIS
+   *  token's mutation). KV appends are idempotent and need no rewind. */
+  function restoreCheckpoints(enc: GPUCommandEncoder, from: number): void {
+    enc.copyBufferToBuffer(ckptResidual[from]!, 0, B.residual, 0, S.d * 2)
+    enc.copyBufferToBuffer(ckptHidden[from]!, 0, B.hidden1, 0, S.d * 2)
+    for (let L = from; L < L1; L++) {
+      if (gdnConvState[L]) {
+        enc.copyBufferToBuffer(ckptConv[L]!, 0, gdnConvState[L]!, 0, ckptConv[L]!.size)
+        enc.copyBufferToBuffer(ckptRecur[L]!, 0, gdnRecurState[L]!, 0, ckptRecur[L]!.size)
+      }
+    }
+  }
+
+  async function stepOptimistic(position: number, tail: (enc: GPUCommandEncoder) => void): Promise<void> {
+    await poolReady
+    let from = L0
+    // A miss CASCADES: the missed layer's garbage output changes every
+    // downstream layer's routing, so a replay that fixes layer L routinely
+    // uncovers fresh misses at L+1 — each attempt is guaranteed strict
+    // progress (the restored entry state makes layer `from` deterministic, so
+    // once uploaded it cannot re-miss), but convergence can need one attempt
+    // per pooled layer. A cold pool pays exactly that once, at the first
+    // prefill token; warm decode settles in 1-3. The cap is the layer count
+    // because that is the mathematical worst case, not a tunable.
+    const maxAttempts = (L1 - L0) + 2
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const enc = device.createCommandEncoder()
+      if (attempt === 0) {
+        if (position === 0) clearGdnState(enc)
+        recordPrologue(enc)
+      } else {
+        restoreCheckpoints(enc, from)
+      }
+      recordOptimisticRange(enc, position, from)
+      recordEpilogue(enc)
+      tail(enc)
+      device.queue.submit([enc.finish()])
+
+      // The wave: every staged copy from `from` on, one await.
+      const layers: number[] = []
+      const maps: Promise<void>[] = []
+      for (let L = from; L < L1; L++) {
+        if (optStaging[L]) { layers.push(L); maps.push(optStaging[L]!.mapAsync(GPUMapMode.READ)) }
+      }
+      await Promise.all(maps)
+
+      // Resolve in layer order. "The GPU was wrong" is membership in the map
+      // AS OF SUBMIT — checked against cpuMap BEFORE this resolve mutates it.
+      // The live resolve's misses are the uploads; its evictions age the maps
+      // for the next token. On a replay pass, layers re-resolve as pure hits —
+      // recency double-counts, which inflates stats and changes no slot.
+      let firstBad = -1
+      const uploads: Promise<void>[] = []
+      const changed: LayerPool[] = []
+      for (const L of layers) {
+        const st = optStaging[L]!
+        const experts = new Uint32Array(st.getMappedRange().slice(0))
+        st.unmap()
+        const lp = layerPools[L - L0]!
+        let bad = false
+        for (let i2 = 0; i2 < S.moeSlots; i2++) {
+          if (lp.cpuMap![experts[i2]] === 0xffffffff) { bad = true; break }
+        }
+        const { misses, evicted } = lp.pool.resolve(experts.subarray(0, S.moeSlots))
+        if (misses.length > 0 || evicted.length > 0) {
+          for (const ev of evicted) lp.cpuMap![ev] = 0xffffffff
+          for (const m of misses) lp.cpuMap![m.expert] = m.slot
+          changed.push(lp)
+        }
+        if (misses.length > 0) uploads.push(fillSlots(lp, misses))
+        if (bad && firstBad < 0) firstBad = L
+      }
+      if (uploads.length > 0) await Promise.all(uploads)
+      // Queue-ordered: these land before any later submit's dispatches.
+      for (const lp of changed) device.queue.writeBuffer(lp.mapBuf!, 0, lp.cpuMap!)
+      if (firstBad < 0) return
+      if (attempt > 0 && firstBad <= from) {
+        // Progress is the convergence proof. A repeat at the same layer means
+        // the restored state or the map push is wrong — fail loudly rather
+        // than burn the cap on a correctness bug.
+        throw new Error(`poolOptimistic: layer ${firstBad} missed twice — replay restore or map push is broken`)
+      }
+      from = firstBad
+    }
+    throw new Error('poolOptimistic: token did not settle — replay thrash past the layer-count cap')
   }
 
   /** One layer's FFN half: addNorm1 → dense FFN or the sparse MoE block →
@@ -2371,6 +2602,15 @@ export function buildDecodeEngine(
     }
     writeStepState(tokenId, position)
 
+    if (optimistic) {
+      await stepOptimistic(position, (e) => e.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4))
+      gdnStatePos = position + 1
+      noteAbsorbed(position, tokenId)
+      await readBuf.mapAsync(GPUMapMode.READ)
+      const r = new DataView(readBuf.getMappedRange()).getInt32(0, true)
+      readBuf.unmap()
+      return r
+    }
     const enc = pooling ? await recordForwardPooled(position) : recordWholeForward(position)
     // Fold the argmax readback into the same command encoder → one submit per token.
     enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
@@ -3324,6 +3564,7 @@ export function buildDecodeEngine(
     position: number,
     wantReadback: boolean
   ): Promise<number> | null {
+    if (optimistic) return submitStepOptimistic(writeInputId, position, wantReadback)
     if (pooling) return submitStepPooled(writeInputId, position, wantReadback)
     writeStepState(writeInputId, position)
 
@@ -3365,6 +3606,38 @@ export function buildDecodeEngine(
    * call order however the chain interleaves.
    */
   let pooledChain: Promise<void> = Promise.resolve()
+  /** submitStepPooled's shape over the optimistic recorder: the chain still
+   *  serialises tokens (a pooled pass is inherently GPU-then-CPU-then-GPU on
+   *  a miss), but a CLEAN token is one submit and one 1.6 ms wave instead of
+   *  one submit and one round trip per MoE layer. */
+  function submitStepOptimistic(
+    writeInputId: number | null,
+    position: number,
+    wantReadback: boolean
+  ): Promise<number> | null {
+    const slot = wantReadback ? readRing[readCursor] : null
+    if (slot) readCursor = (readCursor + 1) % readRing.length
+    const done = pooledChain.then(async () => {
+      writeStepState(writeInputId, position)
+      await stepOptimistic(position, (e) => {
+        e.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
+        if (slot) e.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
+      })
+      gdnStatePos = position + 1
+      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+    })
+    pooledChain = done.catch((err) => {
+      if (!wantReadback) console.error('[engine] optimistic prefill step failed', err)
+    })
+    if (!slot) return null
+    return done.then(async () => {
+      await slot.mapAsync(GPUMapMode.READ)
+      const id = new DataView(slot.getMappedRange()).getInt32(0, true)
+      slot.unmap()
+      return id
+    })
+  }
+
   function submitStepPooled(
     writeInputId: number | null,
     position: number,

@@ -80,6 +80,10 @@ export interface CreateEngineOptions {
   expertSpeculate?: boolean
   /** Speculative router width for the coverage measurement (engine specWidth). */
   specWidth?: number
+  /** The optimistic pooled recorder (DecodeEngineOptions.poolOptimistic):
+   *  one submit per token, GPU-side slot translation, checkpoint+replay on a
+   *  miss. Requires expertPool. */
+  poolOptimistic?: boolean
   /** Chunked prefill on/off (DecodeEngineOptions.chunkedPrefill — the chat
    *  page's ?chunk=0, which variantQuery does NOT carry). Chunked prefill is
    *  empirically token-identical to per-token, not bit-equal, so a harness
@@ -315,6 +319,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
     ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),
     ...(opts.expertSpeculate ? { expertSpeculate: true } : {}),
     ...(opts.specWidth ? { specWidth: opts.specWidth } : {}),
+    ...(opts.poolOptimistic ? { poolOptimistic: true } : {}),
     ...(opts.chunkedPrefill === false ? { chunkedPrefill: false } : {}),
     ...(opts.chunkCap ? { chunkCap: opts.chunkCap } : {}),
   })

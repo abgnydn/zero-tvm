@@ -465,3 +465,40 @@ Implementation order (next session): translate kernel + map buffer; the
 one-submit recorder with staged copies; CPU mirror + post-token resolve;
 checkpoints + replay; the gate is moe-pool-test GEN=pipelined token identity
 plus tok/s against the AC price curve above.
+
+
+## The optimistic recorder — BUILT, CORRECT, and FALSIFIED (2026-08-15, later)
+
+Built end to end: moe_slot_translate.wgsl, per-layer device-resident slot
+maps, one-submit recording with staged id copies, per-layer checkpoints
+(residual/hidden + GDN conv/recur), wave await, CPU post-hoc resolve,
+checkpoint replay. Token-identical to unpooled over 512 x 2 pipelined tokens
+at the half pool. `?` none — createEngineRaw({poolOptimistic:true}) /
+moe-pool-test POPT=1.
+
+Measured: **11.4 t/s against the serial pooled path's 15.3** (qwen30b, half
+pool, AC). The design loses, and the mechanism is one the sketch missed:
+
+**MISSES CASCADE.** A missed layer's garbage output changes every downstream
+layer's ROUTING, so a replay that fixes layer L routinely uncovers fresh
+misses at L+1 — each replay makes strict progress (a restored layer is
+deterministic and cannot re-miss) but convergence needs up to one attempt per
+layer, and at 97.8% request hits a token still carries ~8 misses across ~7
+layers. P(fully clean token) = 0.978^384 ≈ 0.02%: essentially every token
+replays several times, and the 6.4 ms/token the wave saves buys back a
+fraction of what the replays cost. The convergence cap is the layer count
+(mathematical worst case), with a loud assert on stalled progress.
+
+Side-finding worth keeping: the cascade's uploads-from-garbage-routing act as
+accidental prefetch — the optimistic arm's hit rate measured 97.8% against
+the serial arm's 93.5% on the same workload. Better warmth, still slower.
+
+**The readback wall now stands proven from two directions**: speculation
+cannot predict around it (set match 25-32%), and optimism cannot replay
+around it (cascades). Per-layer CPU involvement is irreducible on this API
+surface at these routing entropies. The serial pooled path remains the
+memory mode — ~15 t/s at half pool, token-exact — until WebGPU grows a
+GPU-side wait or a model ships with meaningfully higher routing locality.
+The code stays as an opt-in: it is correct, and a platform where submits or
+readbacks are cheaper, or a checkpoint with top-1-dominant routing, changes
+the arithmetic.

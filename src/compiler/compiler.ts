@@ -21,6 +21,7 @@ import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
 import moeRouterLogitsF16Src from './shaders/moe_router_logits_f16.wgsl?raw'
 import moeRouterTopkSrc from './shaders/moe_router_topk.wgsl?raw'
 import moeCombineSrc from './shaders/moe_combine.wgsl?raw'
+import moeSlotTranslateSrc from './shaders/moe_slot_translate.wgsl?raw'
 import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
 import addNormSrc from './shaders/add_norm.wgsl?raw'
 import ropeSrc from './shaders/rope.wgsl?raw'
@@ -216,6 +217,9 @@ export interface Pipelines {
    *  MATMUL where K % 512 == 0 (?vec4moe=1, opt-in awaiting measurement). */
   moeMatmulWide: GPUComputePipeline | null
   moeCombine: GPUComputePipeline
+  /** Expert id → pool slot id through a device-resident map — the optimistic
+   *  pooled recorder's hit path (docs/MOE_CHUNK_PLAN.md 2026-08-15). */
+  moeSlotTranslate: GPUComputePipeline
   // ── Multi-head latent attention (DeepSeek-V2). Six dispatches replacing the
   // rope/kv_append/attention chain, and the only attention family in the repo
   // that caches something other than K and V: one 512-wide latent plus one
@@ -391,6 +395,7 @@ export function compile(
     moeMatmulQ3: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, q3: true }) : null,
     moeMatmulWide: subgroups ? mm({ affine: true, moe: true, subgroups: true, rowsPerWG: 4, vec4Half: true }) : null,
     moeCombine: createPipeline(device, moeCombineSrc, 'moe_combine'),
+    moeSlotTranslate: createPipeline(device, moeSlotTranslateSrc, 'moe_slot_translate'),
     mlaQSplit: createPipeline(device, mlaQSplitSrc, 'mla_q_split'),
     mlaKvWrite: createPipeline(device, mlaKvWriteSrc, 'mla_kv_write'),
     mlaProj: createPipeline(device, mlaProjSrc, 'mla_proj'),
