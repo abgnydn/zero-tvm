@@ -181,19 +181,49 @@ section { padding: 72px 0; }
   .mb-stats { justify-items: center; }
   .mb-variants, .mb-info { justify-content: center; align-items: center; }
 }
-.mb-art { position: relative; }
-.mb-mascot { display: block; width: 100%; height: 320px; }
+.mb-art { position: relative; padding-bottom: 66px; }
+.mb-mascot { display: block; width: 100%; height: 320px; position: relative; z-index: 1; }
 @media (max-width: 780px) { .mb-mascot { height: 220px; } }
+/* The pedestal: a class-coloured light pool under the figure — the character
+   stands ON something, which is most of what makes a select screen read as a
+   stage rather than a card. */
+.mb-pedestal {
+  position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%);
+  width: 78%; height: 64px; border-radius: 50%;
+  background: radial-gradient(ellipse at center,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 34%, transparent) 0%,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 10%, transparent) 55%,
+    transparent 72%);
+  filter: blur(2px);
+}
+/* Nameplate under the stage, class-coloured keyline. */
+.mb-plate {
+  position: absolute; left: 50%; bottom: 0; transform: translateX(-50%);
+  text-align: center; padding: 8px 22px 10px; min-width: 60%;
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 45%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 7%, var(--surface));
+}
+.mb-panel {
+  border: 1px solid var(--border); border-radius: 12px;
+  background: linear-gradient(180deg, var(--surface-2), transparent);
+  padding: 16px 18px 14px;
+}
+.mb-row-label {
+  font-family: var(--mono); font-size: var(--step--1); color: var(--dim);
+  text-transform: uppercase; letter-spacing: 0.09em; margin: 10px 0 6px;
+}
+.mb-row-label:first-child { margin-top: 0; }
 
-.mb-info { display: flex; flex-direction: column; gap: 4px; }
+.mb-info { display: flex; flex-direction: column; gap: 14px; }
 .mb-name { font-family: var(--display); font-size: var(--step-2); line-height: 1.1; }
-.mb-params { font-family: var(--mono); font-size: var(--step--1); color: var(--dim); }
+.mb-params { font-family: var(--mono); font-size: var(--step--1); color: var(--dim); margin-top: 2px; }
 
-.mb-variants { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px; }
+.mb-variants { display: flex; gap: 6px; flex-wrap: wrap; }
 /* Memory builds — the character screen's loadout row. Same pill grammar as
    the quantisation picker: a build is a choice about THIS character, and the
    selected one re-poses the figure (leaner, streamed experts drifting out). */
-.mb-modes { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.mb-modes { display: flex; gap: 6px; flex-wrap: wrap; }
 .mb-variant {
   font-family: var(--mono); font-size: var(--step--1); cursor: pointer;
   padding: 5px 12px; border-radius: 99px;
@@ -202,7 +232,7 @@ section { padding: 72px 0; }
 .mb-variant:hover { color: var(--text); border-color: var(--accent); }
 .mb-variant[aria-selected="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
 
-.mb-stats { display: grid; grid-template-columns: repeat(3, auto); gap: 22px; margin: 20px 0 0; justify-content: start; }
+.mb-stats { display: grid; grid-template-columns: repeat(3, auto); gap: 22px; margin: 14px 0 4px; justify-content: start; }
 @media (max-width: 780px) { .mb-stats { justify-content: center; } }
 /* At 390px the three-column stats row set a ~204px min-content floor which,
    plus slide padding and the two 42px arrows, needed ~368px of a 342px
@@ -223,16 +253,41 @@ section { padding: 72px 0; }
 .mb-hw { color: var(--dim); font-size: var(--step--1); }
 .mb-cached { color: var(--ok); font-size: var(--step--1); margin: 14px 0 0; }
 .mb-ram { color: var(--warn); font-size: var(--step--1); margin: 14px 0 0; }
-.mb-cta { align-self: start; margin-top: 22px; text-align: center; }
+.mb-cta {
+  align-self: stretch; text-align: center; font-size: var(--step-0);
+  padding: 0.85rem 1.2rem;
+  background: var(--cs-accent, var(--accent));
+  border-color: var(--cs-accent, var(--accent));
+}
+.mb-cta:hover { filter: brightness(1.12); }
 @media (max-width: 780px) { .mb-cta { align-self: center; } }
 
-.mb-dots { display: flex; gap: 8px; justify-content: center; margin-top: 18px; }
+/* The roster rail — party lineup instead of dots. Each slot carries the
+   character's own snapshotted face (--thumb, painted async); cached models
+   were snapshotted lit, which is the visual for "unlocked". */
+.mb-dots { display: flex; gap: 10px; justify-content: center; margin-top: 22px; flex-wrap: wrap; }
 .mb-dot {
-  width: 8px; height: 8px; padding: 0; border-radius: 50%; cursor: pointer;
-  background: var(--border-hi); border: 0;
+  width: 64px; height: 76px; padding: 0 0 4px; cursor: pointer;
+  border: 1px solid var(--border-hi); border-radius: 10px;
+  background:
+    var(--thumb, radial-gradient(circle at 50% 40%, var(--border-hi) 0%, transparent 60%))
+    center 2px / 58px 58px no-repeat,
+    var(--surface);
+  display: flex; align-items: flex-end; justify-content: center;
+  transition: border-color 0.15s, transform 0.15s;
 }
-.mb-dot:hover { background: var(--muted); }
-.mb-dot[aria-selected="true"] { background: var(--accent); }
+.mb-dot:hover { border-color: var(--muted); transform: translateY(-2px); }
+.mb-dot[aria-selected="true"] {
+  border-color: var(--cs-accent, var(--accent));
+  box-shadow: 0 0 0 1px var(--cs-accent, var(--accent)),
+              0 6px 18px color-mix(in srgb, var(--cs-accent, var(--accent)) 25%, transparent);
+}
+.mb-dot-name {
+  font-family: var(--mono); font-size: 9px; color: var(--dim);
+  max-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mb-dot[aria-selected="true"] .mb-dot-name { color: var(--text); }
+@media (max-width: 480px) { .mb-dot { width: 52px; height: 64px; } .mb-dot-name { font-size: 8px; } }
 .note { color: var(--muted); font-size: var(--step--1); margin-top: 16px; }
 
 /* ── kernel wall ───────────────────────────────────────────────────── */

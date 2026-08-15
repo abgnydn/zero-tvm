@@ -19,7 +19,7 @@
 
 import { SHIPPED_MODELS, modelBranding } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
-import { mountMascot, type MascotHandle } from './mascot.js'
+import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 
 interface Variant { param: string; spec: ModelSpec; label: string }
 interface Group { name: string; params: string; variants: Variant[] }
@@ -84,21 +84,30 @@ function render(): void {
     <div class="mb-stage">
       <button class="mb-arrow" data-dir="-1" aria-label="Previous model">&lsaquo;</button>
       <div class="mb-slide">
-        <div class="mb-art"><canvas class="mb-mascot" aria-hidden="true"></canvas></div>
+        <div class="mb-art">
+          <div class="mb-pedestal" aria-hidden="true"></div>
+          <canvas class="mb-mascot" aria-hidden="true"></canvas>
+          <div class="mb-plate">
+            <div class="mb-name"></div>
+            <div class="mb-params"></div>
+          </div>
+        </div>
         <div class="mb-info">
-          <div class="mb-name"></div>
-          <div class="mb-params"></div>
-          <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
-          <dl class="mb-stats"></dl>
-          <div class="mb-modes" role="tablist" aria-label="Memory build"></div>
-          <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
-          <p class="mb-ram"></p>
-          <a class="mb-cta btn btn-primary">Open chat</a>
+          <div class="mb-panel">
+            <div class="mb-row-label">Quantisation</div>
+            <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
+            <dl class="mb-stats"></dl>
+            <div class="mb-row-label mb-modes-label" hidden>Memory build</div>
+            <div class="mb-modes" role="tablist" aria-label="Memory build"></div>
+            <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
+            <p class="mb-ram"></p>
+          </div>
+          <a class="mb-cta btn btn-primary">Enter chat ▸</a>
         </div>
       </div>
       <button class="mb-arrow" data-dir="1" aria-label="Next model">&rsaquo;</button>
     </div>
-    <div class="mb-dots" role="tablist" aria-label="Models"></div>
+    <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     ${'gpu' in navigator ? '' :
       '<p class="note">This browser has no WebGPU — the chat needs Chrome, Edge, or another WebGPU-enabled browser.</p>'}
   `
@@ -116,7 +125,29 @@ function render(): void {
     slots && spec.moe ? slots / (spec.moe.experts + 1) : 0
 
   dots.innerHTML = GROUPS.map((g, i) =>
-    `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}"></button>`).join('')
+    `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}"><span class="mb-dot-name">${g.name.replace(/-Instruct.*$/, '')}</span></button>`).join('')
+
+  /** Roster portraits: one hidden mascot cycles the roster and snapshots each
+   *  face — eight PNGs, not eight live render loops. Re-run when the cache
+   *  probe lands so unlocked (cached) characters get their lit portrait. */
+  async function paintRoster(): Promise<void> {
+    const off = document.createElement('canvas')
+    off.style.cssText = 'position:absolute;left:-9999px;width:96px;height:96px'
+    document.body.appendChild(off)
+    const m = await mountMascot(off, GROUPS[0].variants[0].spec)
+    if (!m) { off.remove(); return }
+    for (let i = 0; i < GROUPS.length; i++) {
+      const spec = GROUPS[i].variants[0].spec
+      m.setSpec(spec, CACHED.has(spec.id))
+      await new Promise((r) => setTimeout(r, 40))
+      const url = await m.snapshot()
+      const dot = root.querySelector<HTMLElement>(`.mb-dot[data-i="${i}"]`)
+      if (dot) dot.style.setProperty('--thumb', `url("${url}")`)
+    }
+    m.destroy()
+    off.remove()
+  }
+  void paintRoster()
 
   function paint(): void {
     const g = GROUPS[gi]
@@ -125,6 +156,11 @@ function render(): void {
 
     el('.mb-name').textContent = g.name
     el('.mb-params').textContent = g.params
+    // Class-coloured chrome: the pedestal, plate and CTA take the lane accent
+    // of the model on stage — the same colour its chat page runs.
+    const pal = mascotPalette(v.spec)
+    root.style.setProperty('--cs-accent', pal.accent)
+    root.style.setProperty('--cs-accent-hi', pal.accentHi)
     // The CHARACTER SCREEN contract: the chat link carries the chosen build,
     // so what you picked here is what boots there — ?pool= is the same number
     // the registry row and the engine read.
@@ -135,6 +171,7 @@ function render(): void {
 
     el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
       `<button class="mb-variant mb-mode" data-m="${i}" role="tab" aria-selected="${i === mi}">${x.label}</button>`).join('')
+    ;(el('.mb-modes-label') as HTMLElement).hidden = modes.length < 2
 
     el('.mb-variants').innerHTML = g.variants.length < 2 ? '' : g.variants.map((x, i) =>
       `<button class="mb-variant" data-v="${i}" role="tab" aria-selected="${i === vi}">${x.label}</button>`).join('')
@@ -192,7 +229,7 @@ function render(): void {
   art.addEventListener('mouseleave', () => mascot?.setHover(false))
 
   paint()
-  void probeCached(paint)
+  void probeCached(() => { paint(); void paintRoster() })
   void mountMascot(canvas, GROUPS[gi].variants[vi].spec).then((m) => {
     if (!m) { art.style.display = 'none'; return }
     mascot = m
