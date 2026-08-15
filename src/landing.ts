@@ -61,6 +61,21 @@ const LANE_SIGIL: Record<string, string> = {
   mla: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 9-8 9-8-9z"/><path d="M12 8l4 4-4 4-4-4z" fill="currentColor" stroke="none" opacity="0.7"/></svg>',
   embed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12c2.5-4 6-6 9-6s6.5 2 9 6c-2.5 4-6 6-9 6s-6.5-2-9-6z"/><path d="M8 12h8" opacity="0.8"/></svg>',
 }
+/** One line of lore per character — every clause computed from the spec, so
+ *  the flavour text is as registry-true as the stat rows. */
+function loreOf(spec: ModelSpec): string {
+  if (spec.embeddingOnly) return 'Returns a vector. It does not speak.'
+  if (spec.mla) return 'Attends through a compressed latent — the cache is 7× smaller than it looks.'
+  if (spec.moe) {
+    const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
+    return `Routes every token through ${spec.moe.topK} of ${spec.moe.experts} experts`
+      + (gdn > 0 ? `, ${gdn} of ${spec.layers} layers recurrent.` : '.')
+  }
+  const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
+  if (gdn > 0) return `${gdn} recurrent layers, ${spec.layers - gdn} attention — memory that does not grow.`
+  return `${spec.layers} layers straight through, ${spec.heads} heads each.`
+}
+
 function laneOf(spec: ModelSpec): string {
   return spec.embeddingOnly ? 'embed' : spec.mla ? 'mla' : spec.moe ? 'moe'
     : spec.layerKinds.some((k) => k === 'gdn') ? 'hybrid' : 'dense'
@@ -114,6 +129,7 @@ function render(): void {
     <div class="mb-plate">
       <div class="mb-name"></div>
       <div class="mb-params"><span class="mb-sigil" aria-hidden="true"></span><span class="mb-params-text"></span></div>
+      <div class="cs-lore"></div>
     </div>
     <div class="mb-stage">
       <button class="mb-arrow" data-dir="-1" aria-label="Previous model">&lsaquo;</button>
@@ -137,6 +153,7 @@ function render(): void {
     <div class="cs-roster-head" aria-hidden="true">Roster · ${GROUPS.length}</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
+    <div class="cs-live" aria-live="polite"></div>
     <div class="cs-corner cs-corner-l" aria-hidden="true">registry-rendered · numbers are measured</div>
     <div class="cs-corner cs-corner-r" aria-hidden="true">WebGPU · hand-written WGSL</div>
     ${'gpu' in navigator ? '' :
@@ -200,6 +217,16 @@ function render(): void {
     el('.mb-name').textContent = g.name
     el('.mb-params-text').textContent = g.params
     el('.mb-sigil').innerHTML = LANE_SIGIL[laneOf(v.spec)] ?? ''
+    el('.cs-lore').textContent = loreOf(v.spec)
+    // Aura tempo from the measured rate — the same number the mascot's idle
+    // clock uses. Unmeasured models get 1.0 rather than a guess.
+    const rate2 = parseFloat(b.rateLabel.replace(/[^0-9.]/g, ''))
+    root.style.setProperty('--cs-tempo', String(Number.isFinite(rate2) ? Math.min(2.2, 0.7 + rate2 / 140) : 1))
+    // A cached character's summoning circle is ARMED: the ring gains a
+    // rotating highlight. Real OPFS state, same source as the READY tag.
+    el('.mb-art').toggleAttribute('data-armed', CACHED.has(v.spec.id))
+    const live = root.querySelector<HTMLElement>('.cs-live')
+    if (live) live.textContent = `${g.name}, ${g.params}`
     // Class-coloured chrome: the pedestal, plate and CTA take the lane accent
     // of the model on stage — the same colour its chat page runs.
     const pal = mascotPalette(v.spec)
@@ -229,6 +256,26 @@ function render(): void {
     if (b.rateLabel) rows.push(['Speed', `${b.rateLabel} <span class="mb-hw">M2 Max</span>`])
     el('.mb-stats').innerHTML = rows.map(([k, val]) =>
       `<div><dt>${k}</dt><dd>${val}</dd></div>`).join('')
+    // Count-up: numbers roll to their real value in ~300 ms. The final frame
+    // is always the exact registry string; the roll is presentation only.
+    if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      for (const dd of root.querySelectorAll<HTMLElement>('.mb-stats dd')) {
+        const final = dd.innerHTML
+        const m2 = /^([^0-9]*)([0-9]+(?:\.[0-9]+)?)([\s\S]*)$/.exec(dd.textContent ?? '')
+        if (!m2) continue
+        const target = parseFloat(m2[2])
+        const dec = m2[2].includes('.') ? 1 : 0
+        const t0 = performance.now()
+        const tick = (): void => {
+          const f = Math.min(1, (performance.now() - t0) / 300)
+          const eased = 1 - (1 - f) * (1 - f)
+          dd.textContent = `${m2[1]}${(target * (0.4 + 0.6 * eased)).toFixed(dec)}${m2[3]}`
+          if (f < 1) requestAnimationFrame(tick)
+          else dd.innerHTML = final
+        }
+        requestAnimationFrame(tick)
+      }
+    }
 
     const ram = el<HTMLElement>('.mb-ram')
     // A pooled build's note replaces the full model's RAM warning — picking
@@ -280,8 +327,11 @@ function render(): void {
   })
   host.tabIndex = 0
   host.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowRight') go(gi + 1)
-    else if (e.key === 'ArrowLeft') go(gi - 1)
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); go(gi + 1) }
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); go(gi - 1) }
+    else if (e.key === 'Enter' && (e.target as HTMLElement).tagName !== 'BUTTON' && (e.target as HTMLElement).tagName !== 'A') {
+      root.querySelector<HTMLAnchorElement>('.mb-cta')?.click()
+    }
   })
   const art = el<HTMLElement>('.mb-art')
   art.addEventListener('mouseenter', () => mascot?.setHover(true))
@@ -302,6 +352,19 @@ function render(): void {
       if (art) art.style.transform = `translate(${x * -7}px, ${y * -3}px)`
     })
   }
+
+  // The realm line is the REAL adapter. adapter.info ships in current
+  // Chromium; anywhere it does not, the static truth stays.
+  void (async () => {
+    try {
+      const ad = await navigator.gpu?.requestAdapter()
+      const info = (ad as { info?: { vendor?: string; architecture?: string } } | null)?.info
+      const cornerR = root.querySelector<HTMLElement>('.cs-corner-r')
+      if (cornerR && info && (info.vendor || info.architecture)) {
+        cornerR.textContent = `realm: ${[info.vendor, info.architecture].filter(Boolean).join(' · ')} — online`
+      }
+    } catch { /* the static line stands */ }
+  })()
 
   paint()
   selectFx()

@@ -701,3 +701,79 @@ footer li a:hover { color: var(--accent); }
   #models .mb-plate.cs-in .mb-name, #models .mb-plate.cs-in .mb-params,
   #models .mb-panel.cs-in > *, #models .mb-dot[data-cached]::before { animation: none; }
 }
+
+
+/* ══ ROUNDS 3-6: the aura, the juice, the frame ════════════════════════════ */
+
+/* The aura: motes of the class light rising off the pedestal, their pace set
+   by the model's measured rate (--cs-tempo — the same number the mascot's
+   idle clock reads). A fast little model boils; a 35B smoulders. */
+.cs-aura { position: absolute; left: 50%; bottom: 8%; width: min(480px, 70%); height: 60%;
+  transform: translateX(-50%); pointer-events: none; z-index: 1; }
+.cs-aura i {
+  position: absolute; bottom: 0; width: 4px; height: 4px; border-radius: 50%;
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff);
+  opacity: 0;
+  animation: mote calc(5.2s / var(--cs-tempo, 1)) ease-in infinite;
+}
+.cs-aura i:nth-child(1)  { left: 6%;  animation-delay: 0.0s; }
+.cs-aura i:nth-child(2)  { left: 16%; animation-delay: 1.1s; width: 3px; height: 3px; }
+.cs-aura i:nth-child(3)  { left: 27%; animation-delay: 2.3s; }
+.cs-aura i:nth-child(4)  { left: 38%; animation-delay: 0.6s; width: 5px; height: 5px; }
+.cs-aura i:nth-child(5)  { left: 50%; animation-delay: 1.7s; width: 3px; height: 3px; }
+.cs-aura i:nth-child(6)  { left: 61%; animation-delay: 2.9s; }
+.cs-aura i:nth-child(7)  { left: 70%; animation-delay: 0.3s; }
+.cs-aura i:nth-child(8)  { left: 80%; animation-delay: 1.9s; width: 3px; height: 3px; }
+.cs-aura i:nth-child(9)  { left: 89%; animation-delay: 2.6s; }
+.cs-aura i:nth-child(10) { left: 95%; animation-delay: 1.3s; width: 5px; height: 5px; }
+@keyframes mote {
+  0% { opacity: 0; transform: translateY(0) scale(1); }
+  12% { opacity: 0.9; }
+  100% { opacity: 0; transform: translateY(-46vh) scale(0.4); }
+}
+
+/* ARMED: a cached character's circle runs a rotating highlight — the same
+   OPFS truth as the READY tag, drawn as ceremony. Conic light clipped by the
+   very ring mask. */
+#models .mb-art[data-armed] .mb-pedestal::before {
+  content: ''; position: absolute; inset: 0;
+  background: conic-gradient(from 0deg,
+    transparent 0deg, transparent 290deg,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 90%, #fff) 330deg,
+    transparent 360deg);
+  -webkit-mask: url('/entrance/ring.svg') center bottom / 100% auto no-repeat;
+  mask: url('/entrance/ring.svg') center bottom / 100% auto no-repeat;
+  animation: armedSpin 6s linear infinite;
+}
+@keyframes armedSpin { to { transform: rotate(360deg); } }
+
+/* Lore under the nameplate: computed from the spec, styled as inscription. */
+.cs-lore {
+  margin-top: 8px; font-size: 0.8rem; font-style: italic;
+  color: color-mix(in srgb, var(--text) 62%, transparent);
+  letter-spacing: 0.02em;
+}
+
+/* Juice: chips stamp when chosen, roster cards press, ENTER presses. */
+#models .mb-variant[aria-selected="true"] { animation: stamp 0.22s ease; }
+@keyframes stamp { 0% { transform: scale(1.08); } 100% { transform: scale(1); } }
+#models .mb-dot:active { transform: translateX(-2px) scale(0.98); }
+#models .cs-enter .mb-cta:active { transform: translateY(1px) scale(0.995); box-shadow: 0 6px 20px color-mix(in srgb, var(--cs-accent, var(--accent)) 35%, transparent); }
+
+/* The cinematic frame: a breath of dark at the top and bottom edges, so the
+   scene reads composed rather than cropped. */
+#models .cs-root::before, #models .cs-root::after {
+  content: ''; position: absolute; left: 0; right: 0; height: 90px;
+  pointer-events: none; z-index: 2;
+}
+#models .cs-root::before { top: 0; background: linear-gradient(180deg, #05070dcc, transparent); }
+#models .cs-root::after { bottom: 0; background: linear-gradient(0deg, #05070d99, transparent); }
+
+/* Screen-reader announcer. */
+.cs-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+@media (prefers-reduced-motion: reduce) {
+  .cs-aura i, #models .mb-art[data-armed] .mb-pedestal::before,
+  #models .mb-variant[aria-selected="true"] { animation: none; }
+  .cs-aura i { opacity: 0.35; transform: translateY(-8vh); }
+}
