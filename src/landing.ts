@@ -42,6 +42,10 @@ function splitParams(s: string): { family: string; variant: string } {
 function buildGroups(): Group[] {
   const out = new Map<string, Group>()
   for (const { param, spec } of SHIPPED_MODELS) {
+    // The entrance is a CHAT roster. The embedding model returns a vector and
+    // does not speak — it stays in the registry (validate + ?model= still
+    // work) but earns no place on a character-select screen for conversation.
+    if (spec.embeddingOnly) continue
     const b = modelBranding(spec)
     const { family, variant } = splitParams(b.params)
     let g = out.get(b.name)
@@ -198,7 +202,7 @@ function render(): void {
     if (!m) { off.remove(); return }
     for (let i = 0; i < GROUPS.length; i++) {
       const spec = GROUPS[i].variants[0].spec
-      m.setSpec(spec, CACHED.has(spec.id))
+      m.setSpec(spec, GROUPS[i].variants.some((x) => CACHED.has(x.spec.id)))
       await new Promise((r) => setTimeout(r, 40))
       const url = await m.snapshot()
       const dot = root.querySelector<HTMLElement>(`.mb-dot[data-i="${i}"] .mb-dot-face`)
@@ -246,7 +250,8 @@ function render(): void {
     ;(el('.mb-modes-label') as HTMLElement).hidden = modes.length < 2
 
     el('.mb-variants').innerHTML = g.variants.length < 2 ? '' : g.variants.map((x, i) =>
-      `<button class="mb-variant" data-v="${i}" role="tab" aria-selected="${i === vi}">${x.label}</button>`).join('')
+      `<button class="mb-variant" data-v="${i}" role="tab" aria-selected="${i === vi}"`
+      + `${CACHED.has(x.spec.id) ? ' data-cached' : ''}>${x.label}</button>`).join('')
 
     // Every figure is read from the spec or from a measured rate label. A model
     // with no measurement renders no speed row rather than a guess.
@@ -298,8 +303,11 @@ function render(): void {
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
-      const gSpec = GROUPS[Number(d.dataset.i)].variants[0].spec
-      d.toggleAttribute('data-cached', CACHED.has(gSpec.id))
+      // ANY variant counts: the user who downloaded the 3-bit 35B has the
+      // group ready even though variants[0] is the 4-bit — keying the badge
+      // to variants[0] alone hid exactly the downloads worth showing.
+      const grp = GROUPS[Number(d.dataset.i)]
+      d.toggleAttribute('data-cached', grp.variants.some((x) => CACHED.has(x.spec.id)))
     }
     const cached = el<HTMLElement>('.mb-cached')
     cached.hidden = !CACHED.has(v.spec.id)

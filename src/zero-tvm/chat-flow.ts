@@ -226,7 +226,12 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     console.error('[zero-tvm] chat UI elements missing'); return
   }
 
-  const SYSTEM_PROMPT = 'You are a helpful, concise assistant. Use Markdown (numbered lists, **bold**, and fenced ```code``` blocks with a language tag) when it clarifies the answer.'
+  // The second paragraph is why "What is zero-tvm?" is a suggested question a
+  // 1B model can answer truthfully: none of these models saw zerotvm.com in
+  // training, so the facts ride in the system prompt. Claims kept to the ones
+  // that do not rot (no counts — the kernel-roles claim is the stable one).
+  const SYSTEM_PROMPT = 'You are a helpful, concise assistant. Use Markdown (numbered lists, **bold**, and fenced ```code``` blocks with a language tag) when it clarifies the answer.\n\n'
+    + 'You are running inside zero-tvm (zerotvm.com): an LLM inference engine written by hand in WGSL and TypeScript, running entirely in this browser tab on the user\'s own GPU through WebGPU — no server, no WebLLM, no TVM. Model weights download once from Hugging Face and cache on this device; prompts, generated tokens and the KV cache never leave the machine. The whole forward pass is 10 hand-written WGSL kernel roles, readable end-to-end. If asked what zero-tvm is, answer from this paragraph.'
   /** A history entry. Assistant turns also keep the exact token ids the model
    *  produced — re-encoding the rendered text is not guaranteed to reproduce
    *  them (BPE re-segments at the cut), and the resume path needs the ids to
@@ -237,6 +242,44 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
   ]
   let generating = false
   let stopRequested = false
+
+  // ── History persistence ── the conversation survives a reload the way the
+  // weights do. localStorage, keyed by model — on-device only, the same
+  // privacy story as the OPFS weight cache. Assistant ids ride along so
+  // Continue and regenerate still work on a restored conversation.
+  const STORE_KEY = `zt-chat-${SPEC.id}`
+  function persist(): void {
+    try {
+      const turns = history.filter((t) => t.role !== 'system').slice(-40)
+      localStorage.setItem(STORE_KEY, JSON.stringify(turns))
+    } catch { /* quota / private mode — chat still works, just not across reloads */ }
+  }
+  /** Rebuild the message surface and history from the stored conversation.
+   *  The system prompt is NOT stored — it is always this build's, so prompt
+   *  changes apply to old conversations too. */
+  function restoreHistory(): void {
+    let turns: Turn[] = []
+    try { turns = JSON.parse(localStorage.getItem(STORE_KEY) ?? '[]') as Turn[] } catch { return }
+    if (!Array.isArray(turns) || turns.length === 0) return
+    turns.forEach((t, i) => {
+      if (t.role === 'user' && typeof t.content === 'string') {
+        history.push({ role: 'user', content: t.content })
+        addUserMsg(t.content)
+      } else if (t.role === 'assistant' && typeof t.content === 'string') {
+        const entry: Turn = { role: 'assistant', content: t.content,
+          ids: Array.isArray(t.ids) ? t.ids : undefined }
+        history.push(entry)
+        addAiMsg().finish({
+          fullText: t.content,
+          tokens: entry.ids?.length ?? 0,
+          tokPerS: 0,  // a restored reply has no rate to claim
+          // Regenerate only offered where it acts — on the last reply.
+          ...(i === turns.length - 1 ? { onRegenerate: () => { void regenerate() } } : {}),
+        })
+      }
+    })
+    updateCtxHint(buildChatPromptFor(SPEC, history, tokenizer).length)
+  }
 
   function updateSendEnabled() {
     if (!inp || !sendBtn) return
@@ -271,6 +314,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     if (generating) return
     history.length = 0
     history.push({ role: 'system', content: SYSTEM_PROMPT })
+    try { localStorage.removeItem(STORE_KEY) } catch { /* private mode */ }
     const msgs = $('messages')
     if (msgs) msgs.replaceChildren()
     welcome?.classList.remove('hidden')
@@ -288,6 +332,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
   updateSendEnabled()
   updateCtxHint()
   wireScrollFab()
+  restoreHistory()
   inp.focus()
 
   inp.addEventListener('input', () => { autoGrow(inp); updateSendEnabled() })
@@ -436,6 +481,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     const r = await runGeneration(ai, promptIds, [], () => { void continueTurn(entry, ai) })
     entry.content = r.text
     entry.ids = r.ids
+    persist()
     setBusy(false); stopRequested = false
     updateSendEnabled()
     inp?.focus()
@@ -470,6 +516,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     const r = await runGeneration(ai, promptIds, entry.ids, () => { void continueTurn(entry, ai) })
     entry.content = r.text
     entry.ids = r.ids
+    persist()
     setBusy(false); stopRequested = false
     updateSendEnabled()
     inp?.focus()
@@ -483,6 +530,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     autoGrow(inp)
     addUserMsg(text)
     history.push({ role: 'user', content: text })
+    persist()  // the question survives a reload even if generation dies
     await runTurn()
   }
 
@@ -490,6 +538,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     if (generating) return
     if (history.length === 0 || history[history.length - 1].role !== 'assistant') return
     history.pop()
+    persist()
     $('messages')?.querySelector('.msg.ai:last-child')?.remove()
     await runTurn()
   }

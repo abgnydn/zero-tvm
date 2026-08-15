@@ -34,7 +34,11 @@ struct U {
   res: vec2<f32>, time: f32, hover: f32,
   headR: f32, spikes: f32, coil: f32, kvh: f32,
   experts: f32, topk: f32, sharedFused: f32, bands: f32,
-  ink: f32, eyesOpen: f32, bandShift: f32, _p0: f32,
+  // mood: what the model is DOING right now — 0 idle, 1 thinking (prefill),
+  // 2 talking (streaming). Thinking is a face (irises up, mouth pursed, ears
+  // perked); talking routes the per-token beat into the MOUTH instead of a
+  // body bob, so the flap rate is the real token cadence.
+  ink: f32, eyesOpen: f32, bandShift: f32, mood: f32,
   hair: vec3<f32>, _p1: f32,
   iris: vec3<f32>, cached: f32,
   // tempo: idle-clock multiplier from the model's MEASURED rate — a 256 tok/s
@@ -68,7 +72,11 @@ fn sdCap(p: vec3<f32>, h: f32, r: f32) -> f32 {
 fn map2(pIn: vec3<f32>) -> vec2<f32> {
   var p = pIn;
   let T = u.time * u.tempo;
-  p.y = p.y - sin(T * 1.2) * 0.018 - u.beat * 0.020; // idle bob + token pulse
+  let talking = step(1.5, u.mood);
+  let thinking = step(0.5, u.mood) * (1.0 - talking);
+  // Idle bob always; the token pulse bobs the BODY only when not talking —
+  // while talking the same beat drives the mouth instead (below).
+  p.y = p.y - sin(T * 1.2) * 0.018 - u.beat * 0.020 * (1.0 - talking);
   let m = rot(sin(T * 0.4) * 0.42);                  // sway, never a full spin
   let xz = m * vec2<f32>(p.x, p.z);
   p = vec3<f32>(xz.x, p.y, xz.y);
@@ -111,11 +119,16 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
     let spike = sdCap((p - tip) * vec3<f32>(1.0, 0.70, 1.0), R * 0.26, R * 0.115);
     hair = smin(hair, spike, R * 0.16);
   }
-  // Ear tufts, from the KV head count.
+  // Ear tufts, from the KV head count. They sit ON TOP of the head — the old
+  // placement (R*0.88 sideways) was INSIDE the R*1.06 hair shell, so the ears
+  // existed in the field and never in the picture. Length still follows
+  // kvHeads and the context ceiling; attention (hover) and thinking perk them.
   {
-    let t = sdEllip(q - vec3<f32>(R * 0.88, hy + R * 0.30, 0.0),
-                    vec3<f32>(R * 0.16, R * 0.30 * clamp(u.kvh / 16.0, 0.4, 1.4) * (0.8 + 0.5 * u.earCtx), R * 0.16));
-    hair = smin(hair, t, R * 0.05);
+    let perk = 1.0 + 0.35 * max(u.hover, thinking);
+    let eh = R * 0.42 * clamp(u.kvh / 16.0, 0.65, 1.2) * (0.8 + 0.5 * u.earCtx) * perk;
+    let t = sdEllip(q - vec3<f32>(R * 0.58, hy + R * 0.92 + eh * 0.35, 0.0),
+                    vec3<f32>(R * 0.19, eh, R * 0.16));
+    hair = smin(hair, t, R * 0.10);
   }
   if (hair < d) { d = hair; mat = 1.0; }
 
@@ -138,7 +151,9 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
     let ec = vec3<f32>(R * 0.38, hy - R * 0.22, R * 0.74);
     let white = sdEllip(q - ec, vec3<f32>(R * 0.30, R * 0.38, R * 0.20));
     if (white < d) { d = white; mat = 2.0; }
-    let iris = sdEllip(q - (ec + vec3<f32>(0.0, -R * 0.04, R * 0.11)),
+    // Thinking face: the irises drift up — the classic looking-for-the-word.
+    let lookUp = thinking * R * 0.10;
+    let iris = sdEllip(q - (ec + vec3<f32>(0.0, -R * 0.04 + lookUp, R * 0.11)),
                        vec3<f32>(R * 0.23, R * 0.30, R * 0.17));
     if (iris < d) { d = iris; mat = 3.0; }
   } else {
@@ -148,12 +163,22 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
     if (lash < d) { d = lash; mat = 3.0; }
   }
 
-  // A small mouth. Anime faces are eyes plus almost nothing, but "almost
-  // nothing" is not "nothing".
+  // The mouth. Anime faces are eyes plus almost nothing, but "almost nothing"
+  // is not "nothing" — and it is the one feature that ACTS: while talking the
+  // per-token beat opens it (each flap is a real emitted token), while
+  // thinking it purses to a dot. Material is a negative sentinel so it can
+  // never collide with the sprite id range.
   if (u.eyesOpen > 0.5) {
-    let mo = sdEllip(p - vec3<f32>(0.0, hy - R * 0.62, R * 0.80),
-                     vec3<f32>(R * 0.11, R * 0.055, R * 0.08));
-    if (mo < d) { d = mo; mat = 5.0; }
+    // Envelope is the decaying per-token beat (real signal: no tokens, mouth
+    // closes); the 12 Hz chatter under it is what makes an open mouth read as
+    // SPEAKING rather than surprise. At high token rates beat alone pins the
+    // mouth open — the chatter is the flap.
+    let open = clamp(u.beat * 1.5, 0.0, 1.0) * talking * (0.30 + 0.70 * abs(sin(u.time * 12.0)));
+    let mw = R * mix(mix(0.11, 0.055, thinking), 0.085, open);
+    let mh = R * (mix(0.055, 0.025, thinking) + 0.11 * open);
+    let mo = sdEllip(p - vec3<f32>(0.0, hy - R * 0.62 - open * R * 0.04, R * 0.80),
+                     vec3<f32>(mw, mh, R * 0.08));
+    if (mo < d) { d = mo; mat = -1.0; }
   }
 
   // Expert sprites in orbit.
@@ -170,7 +195,11 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
     let sprR = mix(R * 0.045, R * 0.075, resident);
     let c = p - vec3<f32>(cos(ang) * orbitR, hy + sin(i * 2.0) * R * 0.35, sin(ang) * orbitR);
     let s = length(c) - sprR;
-    if (s < d) { d = s; mat = 4.0 + i; }
+    // Wrap the sector index into [0, n) before it becomes a material id —
+    // atan2 makes i negative on half the circle, and 4+i walked into the
+    // eye/iris ids there (and past the old mouth id on the other half).
+    let id = i - n * floor(i / n);
+    if (s < d) { d = s; mat = 4.0 + id; }
   }
   return vec2<f32>(d, mat);
 }
@@ -235,8 +264,9 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
   let SKIN = vec3<f32>(0.98, 0.86, 0.80);
   var col: vec3<f32>;
 
-  if (mat >= 5.0) {
-    col = vec3<f32>(0.42, 0.22, 0.24);
+  if (mat < -0.5) {
+    // Mouth: dark interior, darker the wider it opens.
+    col = vec3<f32>(0.42, 0.22, 0.24) * (1.0 - 0.5 * clamp(u.beat, 0.0, 1.0));
   } else if (mat >= 4.0) {
     let id = mat - 4.0;
     let n = min(u.experts, 24.0);
@@ -281,6 +311,10 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 export interface MascotHandle {
   setSpec: (spec: ModelSpec, cached?: boolean, poolFrac?: number) => void
   setHover: (on: boolean) => void
+  /** What the model is doing, as a face: 'thinking' purses the mouth, drifts
+   *  the irises up and perks the ears; 'talking' routes pulse() into the
+   *  mouth instead of a body bob. Persists across setSpec. */
+  setMood: (mood: 'idle' | 'thinking' | 'talking') => void
   /** One generated token — bumps the heartbeat, which decays over ~a third of
    *  a second. Driven by the chat page's onToken, so the bounce IS the real
    *  cadence rather than an animation pretending to be one. */
@@ -430,6 +464,7 @@ export async function mountMascot(
   const still = matchMedia('(prefers-reduced-motion: reduce)').matches
   let hover = 0, t = 0, raf = 0, dead = false
   let beat = 0
+  let mood = 0
 
   const frame = (): void => {
     if (dead) return
@@ -441,6 +476,8 @@ export async function mountMascot(
     params[1] = canvas.height
     params[2] = t
     params[3] = hover
+    // Written per frame (not in mascotParams) so setSpec cannot reset them.
+    params[15] = mood
     params[25] = beat
     beat *= 0.90
     device.queue.writeBuffer(ubo, 0, params)
@@ -467,6 +504,10 @@ export async function mountMascot(
       if (still) frame()
     },
     setHover(on) { hover = on ? 1 : 0 },
+    setMood(m) {
+      mood = m === 'talking' ? 2 : m === 'thinking' ? 1 : 0
+      if (still) frame()
+    },
     async snapshot() {
       await device.queue.onSubmittedWorkDone()
       return canvas.toDataURL('image/png')

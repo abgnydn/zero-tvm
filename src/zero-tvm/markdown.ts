@@ -51,6 +51,54 @@ function renderInline(text: string, into: Node): void {
   if (last < text.length) into.appendChild(document.createTextNode(text.slice(last)))
 }
 
+const ICON_PLAY = '<svg class="icon" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4"/></svg>'
+
+/** Languages the CANVAS can run: html renders as a document, svg is centred
+ *  on a plain ground, js runs with console piped to the page. */
+const CANVAS_LANGS = new Set(['html', 'svg', 'js', 'javascript'])
+
+/**
+ * THE CANVAS — model-written code, actually run. A sandboxed iframe overlay:
+ * `sandbox="allow-scripts"` ONLY, so the code executes in an opaque origin —
+ * no cookies, no localStorage, no OPFS weight cache, no navigating this page.
+ * It can compute and draw; it cannot reach.
+ */
+function openCanvas(code: string, lang: string): void {
+  document.getElementById('code-canvas')?.remove()
+  const host = document.createElement('div')
+  host.id = 'code-canvas'
+  host.innerHTML = `
+    <div class="canvas-frame" role="dialog" aria-label="Code preview">
+      <div class="canvas-head">
+        <span class="canvas-title">canvas · ${lang}</span>
+        <button type="button" class="canvas-close" aria-label="Close preview">✕ close</button>
+      </div>
+      <iframe class="canvas-view" sandbox="allow-scripts" title="Code preview"></iframe>
+    </div>`
+  const close = (): void => { host.remove(); window.removeEventListener('keydown', onKey) }
+  const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') close() }
+  host.addEventListener('click', (e) => {
+    const t = e.target as HTMLElement
+    if (t === host || t.closest('.canvas-close')) close()
+  })
+  window.addEventListener('keydown', onKey)
+  // `</script` inside model-written js would end the wrapper tag early —
+  // cosmetic under this sandbox, but broken previews look like our bug.
+  const safe = code.replace(/<\/script/gi, '<\\/script')
+  const doc = lang === 'html'
+    ? code
+    : lang === 'svg'
+      ? `<!doctype html><body style="margin:0;display:grid;place-items:center;min-height:100vh;background:#fff">${code}`
+      : `<!doctype html><body style="margin:0;padding:14px;background:#fff;color:#111;font:13px/1.5 ui-monospace,monospace"><pre id="out"></pre><script>
+var out=document.getElementById('out');
+var log=function(){out.textContent+=Array.prototype.map.call(arguments,function(x){return typeof x==='object'?JSON.stringify(x):String(x)}).join(' ')+'\\n'};
+console.log=console.info=console.warn=console.error=log;
+window.addEventListener('error',function(e){log('Error:',e.message)});
+<\/script><script>${safe}<\/script>`
+  ;(host.querySelector('.canvas-view') as HTMLIFrameElement).srcdoc = doc
+  document.body.appendChild(host)
+}
+
 function makeCodeBlock(code: string, lang: string): HTMLElement {
   const wrap = document.createElement('div')
   wrap.className = 'code-block'
@@ -60,6 +108,15 @@ function makeCodeBlock(code: string, lang: string): HTMLElement {
   langEl.className = 'code-lang'
   langEl.textContent = lang || 'code'
   head.appendChild(langEl)
+  const norm = (lang || '').toLowerCase()
+  if (CANVAS_LANGS.has(norm)) {
+    const run = document.createElement('button')
+    run.type = 'button'
+    run.className = 'code-run'
+    run.innerHTML = `${ICON_PLAY}<span>Canvas</span>`
+    run.addEventListener('click', () => openCanvas(code, norm))
+    head.appendChild(run)
+  }
   const btn = document.createElement('button')
   btn.type = 'button'
   btn.className = 'code-copy'

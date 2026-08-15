@@ -314,8 +314,9 @@ async function fetchBufWithRetry(
 // cold-start e2e testing instant without re-downloading 2 GB over the network.
 const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
 
-/** Dev-mirror base for a spec: /local-weights/<repo-name>/ (null in prod). */
-function localMirrorBase(spec: ModelSpec): string | null {
+/** Dev-mirror base for a spec: /local-weights/<repo-name>/ (null in prod).
+ *  Exported for cache-probe: a primed mirror counts as "on this device". */
+export function localMirrorBase(spec: ModelSpec): string | null {
   return DEV ? `/local-weights/${spec.hfRepo.split('/')[1]}/` : null
 }
 

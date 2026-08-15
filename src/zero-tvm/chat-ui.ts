@@ -175,10 +175,16 @@ export function addAiMsg(): AiMsgHandle {
         actions.appendChild(regen)
       }
 
-      const stats = document.createElement('span')
-      stats.className = 'msg-stats'
-      stats.textContent = `${tokens} tok · ${tokPerS.toFixed(1)} tok/s`
-      actions.appendChild(stats)
+      // A restored (or refused) reply has no rate to claim — show only what
+      // is true: the count when there is one, the rate when it was measured.
+      if (tokens > 0) {
+        const stats = document.createElement('span')
+        stats.className = 'msg-stats'
+        stats.textContent = tokPerS > 0
+          ? `${tokens} tok · ${tokPerS.toFixed(1)} tok/s`
+          : `${tokens} tok`
+        actions.appendChild(stats)
+      }
 
       // .actions is hover-revealed; the cut-short banner must not be, so it
       // gets its own always-visible row between the body and the actions.

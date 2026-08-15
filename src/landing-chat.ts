@@ -72,6 +72,7 @@ function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, p
           <div class="cs-welcome-title">Speak with ${brand.name}</div>
           <div class="cs-welcome-lore">${loreOf(spec)} Prompts, tokens and the KV cache stay in this tab.</div>
           <div class="cs-sug-grid" id="suggest-grid">
+            <button class="suggest" data-prompt="What is zero-tvm, and what makes it different from other ways of running an LLM in a browser?">What is zero-tvm?</button>
             <button class="suggest" data-prompt="Explain WebGPU compute shaders in three sentences.">Explain WebGPU compute shaders</button>
             <button class="suggest" data-prompt="Write a TypeScript memoized fibonacci with a short test block that prints fib(10), fib(20), and fib(30).">Write a memoized fibonacci in TypeScript</button>
             <button class="suggest" data-prompt="Summarize how a transformer decode step works, focusing on what the KV cache actually stores.">What does the KV cache actually store?</button>
@@ -128,9 +129,10 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   })
 
   // ── Stagecraft ─────────────────────────────────────────────
-  // The character's pulse is real: during the summoning and while thinking it
-  // is a steady heartbeat; while generating, every bounce is one emitted
-  // token, so the cadence on stage is the measured rate and nothing else.
+  // The character ACTS the phase: summoning is a slow heartbeat on the ring;
+  // thinking is a face (irises up, pursed mouth, perked ears — setMood, no
+  // fake pulse); talking routes every real token's pulse() into the mouth,
+  // so the flap envelope is the measured cadence and nothing else.
   let heart = 0
   const stage = (phase: 'summon' | ChatPhase): void => {
     clearInterval(heart)
@@ -138,8 +140,8 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     root.classList.toggle('cs-thinking', phase === 'thinking')
     root.classList.toggle('cs-generating', phase === 'generating')
     mascot?.setHover(phase === 'thinking')
+    mascot?.setMood(phase === 'generating' ? 'talking' : phase === 'thinking' ? 'thinking' : 'idle')
     if (phase === 'summon') heart = window.setInterval(() => mascot?.pulse(), 640)
-    if (phase === 'thinking') heart = window.setInterval(() => mascot?.pulse(), 320)
   }
   stage('summon')
 

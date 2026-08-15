@@ -196,9 +196,11 @@ async function main(): Promise<void> {
     spec: SPEC,
     tokenizer,
     engine,
-    // One pulse per real token — the header character's bounce IS the
-    // measured cadence.
+    // One pulse per real token — while talking the pulse drives the header
+    // character's MOUTH, so the flap envelope IS the measured cadence.
     onToken: () => headerMascot?.pulse(),
+    onPhase: (p) => headerMascot?.setMood(
+      p === 'generating' ? 'talking' : p === 'thinking' ? 'thinking' : 'idle'),
     log,
   })
 }

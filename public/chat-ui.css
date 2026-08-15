@@ -427,3 +427,67 @@
       font-size: 0.62rem;
     }
 
+
+    /* ─────────── The Canvas (model-written code, actually run) ─────────── */
+    /* Run button beside copy; the lang pill pushes both right so the pair
+       stays grouped even though .code-head is space-between. */
+    .msg.ai .body .code-head .code-lang { margin-right: auto; }
+    .msg.ai .body .code-head { gap: 6px; }
+    .msg.ai .body .code-run {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      color: var(--accent);
+      font-size: 0.68rem;
+      font-weight: 600;
+      transition: background 0.15s, color 0.15s;
+    }
+    .msg.ai .body .code-run:hover { background: var(--accent-tint); }
+    .msg.ai .body .code-run .icon { width: 11px; height: 11px; stroke-width: 2.3; }
+
+    #code-canvas {
+      position: fixed;
+      inset: 0;
+      z-index: 120;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4vh 4vw;
+      background: rgba(5, 7, 13, 0.72);
+      backdrop-filter: blur(5px);
+    }
+    .canvas-frame {
+      width: min(940px, 100%);
+      height: min(660px, 100%);
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+      border: 1px solid var(--border-2);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+    }
+    .canvas-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px 8px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.7rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .canvas-close {
+      padding: 3px 9px;
+      border-radius: 6px;
+      color: var(--text-dim);
+      font-size: 0.7rem;
+      transition: background 0.15s, color 0.15s;
+    }
+    .canvas-close:hover { background: var(--panel-2); color: var(--text); }
+    /* The iframe ground is white on purpose: model-written pages assume a
+       default (light) document, and an unstyled preview should look like one. */
+    .canvas-view { flex: 1; width: 100%; border: 0; background: #fff; }

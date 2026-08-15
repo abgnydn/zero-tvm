@@ -659,6 +659,16 @@
           </div>
           <div class="welcome-sub">Running on your own GPU through hand-written WGSL kernels. Prompts, tokens and the KV cache stay in this tab.</div>
           <div class="suggest-grid" id="suggest-grid">
+            <!-- Answerable because chat-flow.ts's system prompt carries the
+                 zero-tvm facts — none of these models saw zerotvm.com in
+                 training. -->
+            <button class="suggest" data-prompt="What is zero-tvm, and what makes it different from other ways of running an LLM in a browser?">
+              <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 2l10 10-10 10L2 12z"/><path d="M8 12h3l1.5-2.5L14 14l1.5-2H17"/></svg></span>
+              <span class="suggest-body">
+                <span class="suggest-title">What is zero-tvm?</span>
+                <span class="suggest-hint">The engine you are talking through</span>
+              </span>
+            </button>
             <button class="suggest" data-prompt="Explain WebGPU compute shaders in three sentences.">
               <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M19.07 4.93L4.93 19.07"/></svg></span>
               <span class="suggest-body">

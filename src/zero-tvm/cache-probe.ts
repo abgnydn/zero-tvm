@@ -20,8 +20,33 @@
  */
 
 import type { ModelSpec } from '../compiler/model-spec.js'
-import { opfsDirFor, opfsKey } from './weight-loader.js'
+import { opfsDirFor, opfsKey, localMirrorBase } from './weight-loader.js'
 import { planModel, planKey } from './weight-loader-mlx.js'
+
+/**
+ * DEV ONLY: is the vite mirror primed for this model? When the mirror serves
+ * the weights, the loader deliberately writes NO OPFS copy (it would be a
+ * second local copy of up to 19.5 GB) — so in dev, OPFS silence is not
+ * absence, and every mirror-primed MLX model showed "not on this device"
+ * forever. A primed mirror IS on this device: boot reads it at disk speed,
+ * which is exactly what the badge promises.
+ *
+ * MLX only, probed by the safetensors index name: the middleware falls
+ * unknown repos through to the default Phi-3 snapshot, an MLC dir that can
+ * never answer 200 for an MLX-only filename — so no false positives. MLC
+ * models keep pure-OPFS semantics. localMirrorBase is null in prod builds,
+ * so this whole path compiles away to a no-op there.
+ */
+async function mirrorHasModel(spec: ModelSpec): Promise<boolean> {
+  if (spec.weightFormat !== 'mlx-safetensors') return false
+  const mirror = localMirrorBase(spec)
+  if (!mirror) return false
+  try {
+    return (await fetch(mirror + 'model.safetensors.index.json', { method: 'HEAD' })).ok
+  } catch {
+    return false
+  }
+}
 
 export async function isModelCached(spec: ModelSpec): Promise<boolean> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
@@ -60,6 +85,6 @@ export async function isModelCached(spec: ModelSpec): Promise<boolean> {
     }
     return true
   } catch {
-    return false
+    return await mirrorHasModel(spec)
   }
 }

@@ -1248,3 +1248,14 @@ footer li a:hover { color: var(--accent); }
   #models .cs-chat, #models .cs-root.cs-chatting .cs-engage.cs-go { animation: none; }
   #models .cs-summoning .mb-pedestal::before { animation: none; }
 }
+
+/* ══ DOWNLOADED = READY ══ The READY tag gains a fill so it reads at roster
+   distance, and a variant chip that is already on this device carries a dot —
+   both from the same OPFS probe as everything else. */
+#models .mb-dot[data-cached]::after {
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+}
+#models .mb-variant[data-cached]::after {
+  content: '●'; margin-left: 7px; font-size: 0.5rem; vertical-align: 2px;
+  color: var(--ok);
+}
