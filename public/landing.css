@@ -1027,3 +1027,224 @@ footer li a:hover { color: var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   .cs-comet, #models .cs-root.cs-idle .mb-art { animation: none; }
 }
+
+
+/* ══ CHAT MODE ══ ENTER pressed: the roster and the sheet step aside, the
+   conversation takes the right column, and the character stays on stage —
+   summoning heartbeat while the weights land, faster heartbeat while it
+   thinks, one bounce per real token while it speaks. Requires chat-ui.css
+   (linked by index.html) for the message bubbles and the composer; below is
+   only the panel chrome and the stagecraft. */
+
+#models .cs-root.cs-chatting {
+  /* The nav is sticky IN FLOW (60px + border), so a flat 100dvh hangs the
+     composer 61px below the fold. In chat mode the composer is the primary
+     control — the chamber must end above it. The tightened padding-top gives
+     the reclaimed room to the conversation. */
+  height: calc(100dvh - 61px);
+  min-height: 0;
+  padding-top: 22px;
+  grid-template-columns: 1fr minmax(420px, 600px);
+  grid-template-rows: auto 1fr auto;
+  grid-template-areas:
+    'plate chat'
+    'stage chat'
+    'note  chat';
+}
+/* #models-prefixed: the base rules carry the #models id, and a bare class
+   pair loses that specificity fight — the roster stayed visible and its
+   orphaned grid-area spawned implicit tracks that crushed the real columns
+   (caught by the first browser pass). */
+#models .cs-chatting .mb-info, #models .cs-chatting .mb-roster,
+#models .cs-chatting .cs-roster-head, #models .cs-chatting .cs-enter,
+#models .cs-chatting .mb-arrow, #models .cs-chatting .cs-corner-r { display: none; }
+
+/* The engage flash no longer hands off to another page — it lifts to reveal
+   the chamber. Starts opaque (the .cs-go fade ran under it), holds long
+   enough to cover the swap, then clears. */
+#models .cs-root.cs-chatting .cs-engage.cs-go { animation: csEngageReveal 0.9s ease forwards; }
+@keyframes csEngageReveal {
+  0%, 30% { opacity: 1; }
+  100% { opacity: 0; visibility: hidden; }
+}
+
+/* The panel: the sheet's glass and rune corners, grown into an instrument. */
+#models .cs-chat {
+  /* min-width 0: grid items default to min-content width, and the nowrap
+     composer-hint line was wider than a phone — the panel overflowed the
+     viewport instead of shrinking into its column. */
+  grid-area: chat; z-index: 2; min-height: 0; min-width: 0; position: relative;
+  /* It is a <section>, and the page's generic section rule pads 72px into
+     the panel — zero it; the head/composer carry their own spacing. */
+  padding: 0;
+  display: flex; flex-direction: column;
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 22%, var(--border));
+  border-radius: 4px;
+  background: linear-gradient(180deg, #0c1220ee, #090e18e6);
+  box-shadow: inset 0 1px 0 #ffffff0a, 0 18px 50px #0009;
+  backdrop-filter: blur(4px);
+  animation: csChatIn 0.5s cubic-bezier(0.2, 1, 0.3, 1) 0.1s both;
+}
+@keyframes csChatIn {
+  from { opacity: 0; transform: translateX(26px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+#models .cs-chat::before, #models .cs-chat::after {
+  content: ''; position: absolute; width: 40px; height: 40px; z-index: 3; pointer-events: none;
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff);
+  -webkit-mask: url('/entrance/corner.svg') 0 0 / contain no-repeat;
+  mask: url('/entrance/corner.svg') 0 0 / contain no-repeat;
+}
+#models .cs-chat::before { top: -5px; left: -5px; }
+#models .cs-chat::after { bottom: -5px; right: -5px; transform: rotate(180deg); }
+
+/* Panel header: sigil, name, build, live badge, tools. */
+.cs-chat-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px; border-bottom: 1px solid #ffffff0f;
+}
+.cs-chat-sigil { flex: none; width: 22px; height: 22px;
+  color: var(--cs-accent, var(--accent)); }
+.cs-chat-sigil svg { width: 100%; height: 100%; }
+.cs-chat-id { display: flex; flex-direction: column; gap: 1px; min-width: 0; margin-right: auto; }
+.cs-chat-id b { font-family: var(--display); font-weight: 600; font-size: 1.02rem;
+  line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cs-chat-id i { font-style: normal; font-family: var(--mono); font-size: 0.58rem;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 70%, var(--text));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cs-chat-tool {
+  flex: none; font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--dim); text-decoration: none;
+  padding: 5px 9px; border: 1px solid #ffffff1c; border-radius: 3px; background: #ffffff07;
+  cursor: pointer; transition: color 0.15s, border-color 0.15s;
+}
+.cs-chat-tool:hover { color: var(--text); border-color: var(--muted); }
+.cs-chat-tool:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Live badge — written by loading-ui.ts (Summoning → % → Ready). */
+.cs-chat .badge {
+  flex: none; display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 4px 9px; border: 1px solid #ffffff1c; border-radius: 999px; color: var(--dim);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.cs-chat .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.cs-chat .badge.loading { color: #fbbf24; border-color: #fbbf2440; }
+.cs-chat .badge.loading .dot { background: #fbbf24; animation: csBadgePulse 1.4s infinite; }
+.cs-chat .badge.ready { color: var(--cs-accent, var(--accent));
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent); }
+.cs-chat .badge.ready .dot { background: var(--cs-accent, var(--accent)); }
+.cs-chat .badge.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.cs-chat .badge.error .dot { background: var(--err); }
+@keyframes csBadgePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+/* The rite card: download + compile progress, then it folds away. */
+.cs-boot { padding: 16px 16px 14px; border-bottom: 1px solid #ffffff0f; }
+.cs-boot.cs-done { display: none; }
+.cs-boot-title { font-family: var(--display); font-size: 1.05rem; margin-bottom: 2px; }
+.cs-boot-status { font-size: 0.78rem; color: var(--text-dim, #a9b3c6); min-height: 1.2em; margin-bottom: 10px; }
+.cs-boot-track { height: 4px; border-radius: 2px; background: #ffffff12; overflow: hidden; }
+.cs-boot-track i {
+  display: block; height: 100%; width: 0; border-radius: 2px;
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 55%, transparent),
+    var(--cs-accent, var(--accent)));
+  transition: width 0.25s ease;
+}
+.cs-boot-detail { margin-top: 7px; font-family: var(--mono); font-size: 0.64rem;
+  color: var(--dim); font-variant-numeric: tabular-nums; }
+.cs-boot-note { margin-top: 7px; font-size: 0.72rem; color: var(--warn, #d9a441); }
+.cs-boot-log { margin-top: 9px; }
+.cs-boot-log summary {
+  font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--dim); cursor: pointer; user-select: none;
+}
+.cs-boot-log summary:hover { color: var(--text-dim, #a9b3c6); }
+.cs-boot-log pre {
+  margin-top: 6px; max-height: 130px; overflow-y: auto;
+  padding: 8px 10px; border: 1px solid #ffffff0f; border-radius: 3px; background: #070b13;
+  font-family: var(--mono); font-size: 0.62rem; line-height: 1.5; color: var(--text-dim, #a9b3c6);
+  white-space: pre-wrap;
+}
+.cs-boot-error { display: none; margin-top: 10px; padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--err) 40%, transparent); border-radius: 3px;
+  background: color-mix(in srgb, var(--err) 9%, transparent);
+  font-size: 0.76rem; line-height: 1.5; color: color-mix(in srgb, var(--err) 60%, #fff); }
+.cs-boot-error.visible { display: block; }
+
+/* Conversation column: bubbles ride the panel glass, not their own ground. */
+.cs-chat .chat-main { flex: 1; min-height: 0; }
+.cs-chat .welcome.cs-wait, .cs-chat .welcome.hidden { display: none; }
+.cs-chat .welcome { padding: 1.4rem 0.2rem 1rem; }
+.cs-welcome-title { font-family: var(--display); font-size: 1.3rem; margin-bottom: 6px; }
+.cs-welcome-lore { font-size: 0.8rem; font-style: italic; line-height: 1.55;
+  color: color-mix(in srgb, var(--text) 62%, transparent); margin-bottom: 14px; }
+.cs-sug-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.cs-chat .suggest {
+  text-align: left; font-size: 0.76rem; line-height: 1.4; color: var(--text-dim, #a9b3c6);
+  padding: 10px 12px; border: 1px solid #ffffff14; border-radius: 3px; background: #ffffff06;
+  cursor: pointer; transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.cs-chat .suggest:hover {
+  color: var(--text); background: color-mix(in srgb, var(--cs-accent, var(--accent)) 8%, transparent);
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 45%, transparent);
+}
+
+/* Composer, re-cut to the entrance's edge language (chat-ui.css carries the
+   mechanics; only the chrome changes here). */
+.cs-chat .composer-wrap { background: transparent; border-top: 1px solid #ffffff0f; padding: 11px 13px 10px; }
+.cs-chat .composer { background: #0a101ccc; border-radius: 3px;
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 26%, var(--border)); }
+.cs-chat .composer:focus-within { background: #0c1322; border-color: var(--cs-accent, var(--accent)); }
+.cs-chat .composer-btn { border-radius: 3px; }
+.cs-chat .composer-hint {
+  display: flex; justify-content: space-between; gap: 4px 10px; flex-wrap: wrap; text-align: left;
+  font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.06em; color: var(--dim);
+  max-width: none;
+}
+.cs-chat-stats { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* ── Stagecraft: what the realm does while the model works ──────────────── */
+
+/* Summoning: the circle beats slowly and the ring runs the armed sweep — the
+   character is being drawn through. */
+#models .cs-summoning .mb-pedestal::after { animation: ringPulse 1.5s ease-in-out infinite; }
+#models .cs-summoning .mb-pedestal::before {
+  content: ''; position: absolute; inset: 0;
+  background: conic-gradient(from 0deg,
+    transparent 0deg, transparent 290deg,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 90%, #fff) 330deg,
+    transparent 360deg);
+  -webkit-mask: url('/entrance/ring.svg') center bottom / 100% auto no-repeat;
+  mask: url('/entrance/ring.svg') center bottom / 100% auto no-repeat;
+  animation: armedSpin 2.6s linear infinite;
+}
+/* Thinking: prefill — the ring tightens to a fast shallow breath. */
+#models .cs-thinking .mb-pedestal::after { animation: ringPulse 0.9s ease-in-out infinite; }
+#models .cs-thinking .mb-pedestal { filter: brightness(1.18); }
+/* Generating: the floor burns steady and bright; the bounce on stage is the
+   token stream itself (mascot.pulse per emitted token). */
+#models .cs-generating .mb-pedestal { filter: brightness(1.3); }
+#models .cs-generating .mb-pedestal::after { animation: none; opacity: 1; }
+#models .mb-pedestal { transition: filter 0.4s ease; }
+
+/* Phones: the character folds to a small familiar above the conversation. */
+@media (max-width: 900px) {
+  #models .cs-root.cs-chatting {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto 1fr;
+    grid-template-areas: 'plate' 'stage' 'chat';
+  }
+  #models .cs-chatting .mb-mascot { height: 110px; -webkit-box-reflect: none; }
+  #models .cs-chatting .mb-pedestal { height: 60px; }
+  #models .cs-chatting .cs-lore { display: none; }
+  #models .cs-chatting .mb-plate { padding-bottom: 4px; }
+  #models .cs-chatting .mb-name { font-size: 1.3rem; }
+  .cs-sug-grid { grid-template-columns: 1fr; }
+  .cs-chat-tool#new-chat-btn { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #models .cs-chat, #models .cs-root.cs-chatting .cs-engage.cs-go { animation: none; }
+  #models .cs-summoning .mb-pedestal::before { animation: none; }
+}

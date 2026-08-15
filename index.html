@@ -28,6 +28,10 @@
   <link rel="preload" href="/fonts/f4-plinean.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/fonts.css">
   <link rel="stylesheet" href="/tokens.css">
+  <!-- chat-ui.css: the shared message surface — ENTER opens the chat IN the
+       entrance (landing-chat.ts), so this page renders bubbles and the
+       composer too. Before landing.css, which carries the panel chrome. -->
+  <link rel="stylesheet" href="/chat-ui.css">
   <link rel="stylesheet" href="/landing.css">
 
   <script type="application/ld+json">
@@ -78,7 +82,10 @@
            destination on the site. -->
       <a href="docs.html#vs-webllm">Proof</a>
       <a href="docs.html">Docs</a>
-      <a href="zero-tvm.html" class="nav-cta">Open chat →</a>
+      <!-- "Open chat →" left with the in-place chat: the page below IS the
+           chat entrance, and the CTA duplicated ENTER while routing through
+           the old standalone gate. zero-tvm.html remains the deep-link
+           surface (footer, docs, ?model= links). -->
     </div>
   </div>
 </nav>

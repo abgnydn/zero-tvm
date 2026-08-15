@@ -20,6 +20,7 @@
 import { SHIPPED_MODELS, modelBranding } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
+import { LANE_SIGIL, laneOf, loreOf } from './landing-lore.js'
 
 interface Variant { param: string; spec: ModelSpec; label: string }
 interface Group { name: string; params: string; variants: Variant[] }
@@ -60,32 +61,8 @@ const STAT_ICON: Record<string, string> = {
   Speed: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9 1L3 9h4l-1 6 6-8H8z"/></svg>',
 }
 
-const LANE_SIGIL: Record<string, string> = {
-  moe: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3 3-3 3-3-3zM5 9l2.4 2.4L5 13.8 2.6 11.4zM19 9l2.4 2.4L19 13.8l-2.4-2.4zM12 16l3 3-3 3-3-3z" opacity="0.9"/><circle cx="12" cy="11.4" r="1.6"/></svg>',
-  hybrid: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 9c3 0 3-4 6-4s3 4 6 4 3-4 6-4"/><path d="M2 16h6l3-5 3 8 2-3h6" opacity="0.85"/></svg>',
-  dense: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1" opacity="0.55"/><rect x="4" y="13" width="7" height="7" rx="1" opacity="0.55"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>',
-  mla: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 9-8 9-8-9z"/><path d="M12 8l4 4-4 4-4-4z" fill="currentColor" stroke="none" opacity="0.7"/></svg>',
-  embed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12c2.5-4 6-6 9-6s6.5 2 9 6c-2.5 4-6 6-9 6s-6.5-2-9-6z"/><path d="M8 12h8" opacity="0.8"/></svg>',
-}
-/** One line of lore per character — every clause computed from the spec, so
- *  the flavour text is as registry-true as the stat rows. */
-function loreOf(spec: ModelSpec): string {
-  if (spec.embeddingOnly) return 'Returns a vector. It does not speak.'
-  if (spec.mla) return 'Attends through a compressed latent — the cache is 7× smaller than it looks.'
-  if (spec.moe) {
-    const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
-    return `Routes every token through ${spec.moe.topK} of ${spec.moe.experts} experts`
-      + (gdn > 0 ? `, ${gdn} of ${spec.layers} layers recurrent.` : '.')
-  }
-  const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
-  if (gdn > 0) return `${gdn} recurrent layers, ${spec.layers - gdn} attention — memory that does not grow.`
-  return `${spec.layers} layers straight through, ${spec.heads} heads each.`
-}
-
-function laneOf(spec: ModelSpec): string {
-  return spec.embeddingOnly ? 'embed' : spec.mla ? 'mla' : spec.moe ? 'moe'
-    : spec.layerKinds.some((k) => k === 'gdn') ? 'hybrid' : 'dense'
-}
+// LANE_SIGIL / laneOf / loreOf live in landing-lore.ts — shared with the
+// in-place chat panel (landing-chat.ts), which wears the same sigil.
 
 /** Spec ids whose weights are already in OPFS. Filled asynchronously; the
  *  picker renders without waiting, and a model that turns out to be cached
@@ -365,6 +342,9 @@ function render(): void {
   })
   host.tabIndex = 0
   host.addEventListener('keydown', (e) => {
+    // In chat mode the keyboard belongs to the composer — arrows must not
+    // switch characters under a conversation.
+    if (root.classList.contains('cs-chatting')) return
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); go(gi + 1) }
     else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); go(gi - 1) }
     else if (e.key === 'Enter' && (e.target as HTMLElement).tagName !== 'BUTTON' && (e.target as HTMLElement).tagName !== 'A') {
@@ -420,15 +400,34 @@ function render(): void {
     } catch { /* the static line stands */ }
   })()
 
+  // ENTER stays home. The ceremony flashes, the roster steps aside, and the
+  // chat mounts IN the entrance — the character never leaves the stage
+  // (landing-chat.ts, imported only now because its chain touches WebGPU
+  // globals). The href still points at zero-tvm.html?model=&pool= — that is
+  // what modified clicks, middle-click, and browsers without WebGPU get.
   root.querySelector<HTMLAnchorElement>('.mb-cta')?.addEventListener('click', (e) => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
-    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return
-    const a = e.currentTarget as HTMLAnchorElement
-    const engage = root.querySelector<HTMLElement>('.cs-engage')
-    if (!engage) return
+    if (root.classList.contains('cs-chatting')) { e.preventDefault(); return }
+    if (!('gpu' in navigator)) return  // navigate — the chat page explains what is missing
+    const href = (e.currentTarget as HTMLAnchorElement).href
     e.preventDefault()
-    engage.classList.add('cs-go')
-    setTimeout(() => { location.href = a.href }, 330)
+    if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      root.querySelector<HTMLElement>('.cs-engage')?.classList.add('cs-go')
+    }
+    const v = GROUPS[gi].variants[vi]
+    const modes = modelBranding(v.spec).poolModes ?? []
+    const mode = modes[mi] ?? modes[0]
+    import('./landing-chat.js').then(({ enterChat }) => enterChat({
+      root,
+      spec: v.spec,
+      poolSlots: mode?.slots ?? 0,
+      poolLabel: mode && mode.slots ? mode.label : '',
+      mascot,
+    })).catch((err) => {
+      // The panel could not even mount — fall back to the standalone page.
+      console.error('[landing] in-place chat failed, navigating:', err)
+      location.href = href
+    })
   })
 
   // Idle: 18 s without input and the realm starts breathing on its own —
