@@ -81,90 +81,17 @@
   </div>
 </nav>
 
-<header class="hero">
-  <div class="wrap">
-    <span class="eyebrow"><i class="pulse"></i> WebGPU · WGSL · int4 weights</span>
-
-    <h1>LLM inference in the browser,<br><em>on hand-written WGSL.</em></h1>
-
-    <p>
-      zero-tvm is an LLM inference engine written by hand in WGSL and
-      TypeScript. It runs entirely in the browser: weights download once,
-      cache locally, and inference runs on your own GPU.
-    </p>
-
-    <div class="hero-actions">
-      <a href="zero-tvm.html" class="btn btn-primary">Open chat</a>
-      <a href="https://github.com/abgnydn/zero-tvm" class="btn">Read the source</a>
-    </div>
-
-    <!-- KERNEL WINDOW. The hero's evidence is the code, because every number
-         this repo produces changes weekly and the shaders do not. -->
-    <div class="kw">
-      <div class="kw-bar">
-        <div class="kw-dots"><i></i><i></i><i></i></div>
-        <div class="kw-tabs" role="tablist" aria-label="Kernel source">
-          <button class="kw-tab" role="tab" aria-selected="true"  aria-controls="k1" id="t1">moe_router_topk.wgsl</button>
-          <button class="kw-tab" role="tab" aria-selected="false" aria-controls="k2" id="t2">attention_sg.wgsl</button>
-          <button class="kw-tab" role="tab" aria-selected="false" aria-controls="k3" id="t3">int4_matmul.gen.ts</button>
-        </div>
-      </div>
-      <div class="kw-body">
-<pre id="k1" role="tabpanel" aria-labelledby="t1"><span class="t-com">// Softmax over every expert, then the top-K survivors. One subgroup,</span>
-<span class="t-com">// eight experts per lane: subgroupMax/subgroupAdd reduce with no barrier.</span>
-<span class="t-key">var</span> m : <span class="t-type">f32</span> = <span class="t-num">-3.0e38</span>;
-<span class="t-key">for</span> (<span class="t-key">var</span> i : <span class="t-type">u32</span> = <span class="t-num">0u</span>; i &lt; PER; i = i + <span class="t-num">1u</span>) {
-  <span class="t-key">let</span> e : <span class="t-type">u32</span> = t * PER + i;
-  <span class="t-com">// Lanes past E must lose every max: -inf, not 0 (logits can be negative).</span>
-  <span class="t-key">let</span> v : <span class="t-type">f32</span> = <span class="t-fn">select</span>(<span class="t-num">-3.0e38</span>, logits[lBase + e], e &lt; E);
-  pv[i] = v;
-  m = <span class="t-fn">max</span>(m, v);
-}
-<span class="t-key">let</span> peak : <span class="t-type">f32</span> = <span class="t-fn">subgroupMax</span>(m);</pre>
-<pre id="k2" role="tabpanel" aria-labelledby="t2" hidden><span class="t-com">// Flash-style attention, one workgroup per (batch, head), scores reduced</span>
-<span class="t-com">// across the subgroup instead of through workgroup memory.</span>
-<span class="t-attr">@compute</span> <span class="t-attr">@workgroup_size</span>(<span class="t-num">32</span>, <span class="t-num">1</span>, <span class="t-num">1</span>)
-<span class="t-key">fn</span> <span class="t-fn">attention_sg</span>(
-  <span class="t-attr">@builtin</span>(workgroup_id) blockIdx : <span class="t-type">vec3</span>&lt;<span class="t-type">u32</span>&gt;,
-  <span class="t-attr">@builtin</span>(local_invocation_id) threadIdx : <span class="t-type">vec3</span>&lt;<span class="t-type">u32</span>&gt;,
-) {
-  <span class="t-key">let</span> batch : <span class="t-type">i32</span> = <span class="t-type">i32</span>(blockIdx.x);
-  <span class="t-key">let</span> head  : <span class="t-type">i32</span> = <span class="t-type">i32</span>(blockIdx.y);
-  <span class="t-key">if</span> (batch &gt;= podArgs.B) { <span class="t-key">return</span>; }
-  <span class="t-key">let</span> kv_head : <span class="t-type">i32</span> = head / GQA_GROUP;</pre>
-<pre id="k3" role="tabpanel" aria-labelledby="t3" hidden><span class="t-com">// The int4 matmul is generated, not hand-copied: one function emits every</span>
-<span class="t-com">// variant, so a fix lands in all of them at once.</span>
-<span class="t-key">export const</span> INT4_MATMUL_VARIANTS: <span class="t-type">Int4MatmulOpts</span>[] = [
-  { subgroups: <span class="t-key">true</span>, rowsPerWG: <span class="t-num">4</span> },              <span class="t-com">// tiled</span>
-  { subgroups: <span class="t-key">true</span>, rowsPerWG: <span class="t-num">4</span>, mDyn: <span class="t-key">true</span> }, <span class="t-com">// chunked prefill</span>
-  { subgroups: <span class="t-key">true</span>, vec4Half: <span class="t-key">true</span>, affine: <span class="t-key">true</span> },
-  { affine: <span class="t-key">true</span>, moe: <span class="t-key">true</span>, subgroups: <span class="t-key">true</span>, rowsPerWG: <span class="t-num">4</span> },
-  <span class="t-com">// ...one entry per shipped shape</span>
-]</pre>
-      </div>
-      <div class="kw-foot">
-        <span>every kernel this engine dispatches is in the repository; the int4 matmul family is emitted by one generator beside them</span>
-        <a href="https://github.com/abgnydn/zero-tvm/tree/main/src/compiler/shaders">src/compiler/shaders →</a>
-      </div>
-    </div>
-  </div>
-</header>
-
 <section id="models">
-  <div class="wrap">
-    <div class="sec-head">
-      <span class="eyebrow">Models</span>
-      <h2>Choose your model</h2>
-      <p>
-        Every figure and every number renders from the engine's own model
-        table — the same rows the loader reads. Arrow keys or the roster move
-        between models; quantisation and memory builds are picked per
-        character, and the chat boots exactly what you chose.
-      </p>
-    </div>
-    <div id="model-browser"></div>
-  </div>
+  <!-- The game entrance. Full-viewport character select — landing.ts renders
+       the whole screen (splash, stage, roster, sheet) into this root. Every
+       figure and number still comes from the registry; the scroll below keeps
+       the essay and the kernel window for the reader who wants the why. -->
+  <div id="model-browser" class="cs-root"></div>
 </section>
+
+<!-- The page IS the character select now — nav above, footer below,
+     nothing between. The essay, the kernel window and the deep copy left
+     with the 2026-08-15 entrance redesign; docs.html carries the why. -->
 
 <footer>
   <div class="wrap">
@@ -204,19 +131,5 @@
 
 <script type="module" src="/src/landing.ts"></script>
 
-<script>
-  // Kernel window tabs. Plain DOM: the hero must render and switch without
-  // the module bundle, which is gated behind WebGPU feature detection.
-  document.querySelectorAll('.kw-tab').forEach((tab) => {
-    tab.addEventListener('click', () => {
-      const win = tab.closest('.kw')
-      win.querySelectorAll('.kw-tab').forEach((t) => {
-        const on = t === tab
-        t.setAttribute('aria-selected', String(on))
-        win.querySelector('#' + t.getAttribute('aria-controls')).hidden = !on
-      })
-    })
-  })
-</script>
 </body>
 </html>

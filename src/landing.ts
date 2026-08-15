@@ -80,37 +80,49 @@ function render(): void {
   if (host === null) return
   const root: HTMLElement = host
 
+  // THE SELECT SCREEN, WoW layout: nameplate top-centre, the character
+  // centre-stage on its light, the roster a vertical rail on the right, the
+  // sheet on the left, ENTER CHAT bottom-centre. The splash is the logo
+  // opening — once per session, skipped for reduced-motion.
   host.innerHTML = `
+    <div class="cs-splash" aria-hidden="true"><span>zero<b>-tvm</b></span></div>
+    <div class="mb-plate">
+      <div class="mb-name"></div>
+      <div class="mb-params"></div>
+    </div>
     <div class="mb-stage">
       <button class="mb-arrow" data-dir="-1" aria-label="Previous model">&lsaquo;</button>
-      <div class="mb-slide">
-        <div class="mb-art">
-          <div class="mb-pedestal" aria-hidden="true"></div>
-          <canvas class="mb-mascot" aria-hidden="true"></canvas>
-          <div class="mb-plate">
-            <div class="mb-name"></div>
-            <div class="mb-params"></div>
-          </div>
-        </div>
-        <div class="mb-info">
-          <div class="mb-panel">
-            <div class="mb-row-label">Quantisation</div>
-            <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
-            <dl class="mb-stats"></dl>
-            <div class="mb-row-label mb-modes-label" hidden>Memory build</div>
-            <div class="mb-modes" role="tablist" aria-label="Memory build"></div>
-            <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
-            <p class="mb-ram"></p>
-          </div>
-          <a class="mb-cta btn btn-primary">Enter chat ▸</a>
-        </div>
+      <div class="mb-art">
+        <div class="mb-pedestal" aria-hidden="true"></div>
+        <canvas class="mb-mascot" aria-hidden="true"></canvas>
       </div>
       <button class="mb-arrow" data-dir="1" aria-label="Next model">&rsaquo;</button>
     </div>
+    <aside class="mb-info">
+      <div class="mb-panel">
+        <div class="mb-row-label">Quantisation</div>
+        <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
+        <dl class="mb-stats"></dl>
+        <div class="mb-row-label mb-modes-label" hidden>Memory build</div>
+        <div class="mb-modes" role="tablist" aria-label="Memory build"></div>
+        <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
+        <p class="mb-ram"></p>
+      </div>
+    </aside>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
+    <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
     ${'gpu' in navigator ? '' :
-      '<p class="note">This browser has no WebGPU — the chat needs Chrome, Edge, or another WebGPU-enabled browser.</p>'}
+      '<p class="note cs-note">This browser has no WebGPU — the chat needs Chrome, Edge, or another WebGPU-enabled browser.</p>'}
   `
+  {
+    const splash = host.querySelector<HTMLElement>('.cs-splash')!
+    const still2 = matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (still2 || sessionStorage.getItem('zt-intro')) splash.remove()
+    else {
+      sessionStorage.setItem('zt-intro', '1')
+      splash.addEventListener('animationend', () => splash.remove())
+    }
+  }
 
   const el = <T extends Element>(s: string): T => host.querySelector<T>(s)!
   const canvas = el<HTMLCanvasElement>('.mb-mascot')
@@ -125,7 +137,10 @@ function render(): void {
     slots && spec.moe ? slots / (spec.moe.experts + 1) : 0
 
   dots.innerHTML = GROUPS.map((g, i) =>
-    `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}"><span class="mb-dot-name">${g.name.replace(/-Instruct.*$/, '')}</span></button>`).join('')
+    `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}">
+       <span class="mb-dot-face" aria-hidden="true"></span>
+       <span class="mb-dot-text"><b>${g.name.replace(/-Instruct.*$/, '')}</b><i>${g.params}</i></span>
+     </button>`).join('')
 
   /** Roster portraits: one hidden mascot cycles the roster and snapshots each
    *  face — eight PNGs, not eight live render loops. Re-run when the cache
@@ -141,7 +156,7 @@ function render(): void {
       m.setSpec(spec, CACHED.has(spec.id))
       await new Promise((r) => setTimeout(r, 40))
       const url = await m.snapshot()
-      const dot = root.querySelector<HTMLElement>(`.mb-dot[data-i="${i}"]`)
+      const dot = root.querySelector<HTMLElement>(`.mb-dot[data-i="${i}"] .mb-dot-face`)
       if (dot) dot.style.setProperty('--thumb', `url("${url}")`)
     }
     m.destroy()

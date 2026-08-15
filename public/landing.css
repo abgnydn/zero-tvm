@@ -332,3 +332,112 @@ footer li a:hover { color: var(--accent); }
   display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
   font-family: var(--mono); font-size: var(--step--1); color: var(--dim);
 }
+
+
+/* ── THE GAME ENTRANCE ─────────────────────────────────────────────────────
+   #models is the first screen of the site: a full-viewport character select.
+   Grid regions, WoW's own arrangement — nameplate top-centre, stage centre,
+   roster rail right, sheet left, enter bottom-centre. Every value shown is
+   still the registry row; this block is presentation only. */
+#models { padding: 0; }
+#models .cs-root {
+  position: relative;
+  min-height: 100dvh;
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) 1fr minmax(240px, 300px);
+  grid-template-rows: auto 1fr auto auto;
+  grid-template-areas:
+    'plate plate  roster'
+    'sheet stage  roster'
+    'enter enter  roster'
+    'note  note   note';
+  gap: 12px 20px;
+  padding: calc(var(--nav-h, 64px) + 18px) 28px 26px;
+  background:
+    radial-gradient(ellipse at 50% 88%,
+      color-mix(in srgb, var(--cs-accent, var(--accent)) 9%, transparent) 0%,
+      transparent 55%),
+    radial-gradient(ellipse at 50% -10%, #101623 0%, transparent 60%),
+    var(--bg);
+  overflow: hidden;
+}
+#models .mb-plate {
+  grid-area: plate; position: static; transform: none; justify-self: center;
+  text-align: center; margin-top: 6px;
+}
+#models .mb-name { font-size: var(--step-3, 2.2rem); }
+#models .mb-stage {
+  grid-area: stage; display: flex; align-items: stretch; gap: 8px; min-height: 0;
+}
+#models .mb-art { flex: 1; padding-bottom: 0; display: flex; align-items: center; justify-content: center; }
+#models .mb-mascot { height: min(52dvh, 480px); max-width: 100%; }
+#models .mb-pedestal { bottom: 6%; width: 64%; height: 90px; }
+#models .mb-arrow { align-self: center; }
+#models .mb-info { grid-area: sheet; align-self: center; }
+#models .cs-enter { grid-area: enter; display: flex; justify-content: center; padding-bottom: 6px; }
+#models .cs-enter .mb-cta {
+  min-width: 300px; letter-spacing: 0.04em; text-transform: uppercase;
+  font-weight: 700; box-shadow: 0 8px 28px color-mix(in srgb, var(--cs-accent, var(--accent)) 35%, transparent);
+}
+#models .cs-note { grid-area: note; text-align: center; }
+
+/* Roster rail: WoW's right-hand character list. */
+#models .mb-roster {
+  grid-area: roster; flex-direction: column; justify-content: flex-start;
+  margin: 0; gap: 8px; overflow-y: auto; padding-right: 2px;
+  border-left: 1px solid var(--border); padding-left: 14px;
+}
+#models .mb-dot {
+  width: 100%; height: auto; min-height: 62px; padding: 6px 10px;
+  display: flex; flex-direction: row; align-items: center; gap: 10px;
+  text-align: left; border-radius: 10px;
+}
+.mb-dot-face {
+  flex: 0 0 48px; height: 48px; border-radius: 8px;
+  background: var(--thumb, radial-gradient(circle at 50% 40%, var(--border-hi) 0%, transparent 60%))
+    center / cover no-repeat, var(--surface-2);
+}
+.mb-dot-text { display: flex; flex-direction: column; min-width: 0; }
+.mb-dot-text b { font-size: 0.82rem; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mb-dot-text i { font-style: normal; font-family: var(--mono); font-size: 0.62rem;
+  color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* The logo opening. Plays once per session; reduced-motion never sees it. */
+.cs-splash {
+  position: absolute; inset: 0; z-index: 30;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg);
+  animation: csSplashOut 2.1s ease forwards;
+}
+.cs-splash span {
+  font-family: var(--display); font-size: clamp(3rem, 9vw, 7rem); color: var(--text);
+  animation: csLogoIn 1.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.cs-splash b { color: var(--accent); }
+@keyframes csLogoIn {
+  0% { opacity: 0; transform: scale(1.24); letter-spacing: 0.14em; filter: blur(10px); }
+  55% { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: scale(1.0); letter-spacing: 0.01em; }
+}
+@keyframes csSplashOut {
+  0%, 72% { opacity: 1; }
+  100% { opacity: 0; visibility: hidden; }
+}
+
+/* Phones: stage on top, sheet under it, roster a horizontal strip. */
+@media (max-width: 900px) {
+  #models .cs-root {
+    grid-template-columns: 1fr;
+    grid-template-areas: 'plate' 'stage' 'roster' 'sheet' 'enter' 'note';
+    padding: calc(var(--nav-h, 64px) + 10px) 14px 20px;
+  }
+  #models .mb-mascot { height: min(38dvh, 300px); }
+  #models .mb-roster {
+    flex-direction: row; overflow-x: auto; overflow-y: hidden;
+    border-left: 0; border-top: 1px solid var(--border);
+    padding: 10px 2px 2px; gap: 8px;
+  }
+  #models .mb-dot { width: auto; min-width: 150px; }
+  #models .cs-enter .mb-cta { min-width: 0; width: 100%; }
+}
