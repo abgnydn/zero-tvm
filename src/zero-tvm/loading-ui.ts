@@ -147,6 +147,11 @@ export interface BootEngineOptions {
   /** Load only ONE PIPELINE STAGE's weights (see loadWeights). The caller's
    *  buildEngine must pass the same range to buildDecodeEngine. */
   layerRange?: { start: number; end: number }
+  /** Expert slots per MoE layer (the memory-mode picker / ?pool=). Passed to
+   *  the LOADER — the stacked expert tensors are then never allocated, which
+   *  is where the saving lives — and the page's buildEngine must hand the
+   *  SAME number to buildDecodeEngine. */
+  expertPool?: number
   /** Warm the lazily-JIT'd pipelines. Default: one forwardLogits pass. */
   warmup?: (engine: DecodeEngine, tokenizer: Tokenizer, log?: (msg: string) => void) => Promise<void>
 }
@@ -264,7 +269,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
           (s.etaSec > 0 ? ` · ~${formatEta(s.etaSec)} left` : ''),
       )
       setBadge(`${pct}%`, 'loading')
-    }, spec, opts.layerRange)
+    }, spec, opts.layerRange, opts.expertPool)
   } catch (e) {
     setBadge('Download failed', 'error')
     setProgress(10, `Weight load error: ${e}`)

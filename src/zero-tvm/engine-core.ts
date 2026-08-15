@@ -379,6 +379,12 @@ export interface DecodeEngineOptions {
    * projections + one gdn_recur dispatch per layer per chunk.
    */
   chunkedPrefill?: boolean
+  /** Pooled engines only: chunk the prefill through the per-layer union cut.
+   *  DEFAULT OFF — token-identical to per-token (162-chunk gate, 2026-08-15)
+   *  but its speed is UNMEASURED on mains power; the one timing pair taken so
+   *  far ran on battery and is void. Opt in with ?chunk=1 until the AC pair
+   *  exists. Unpooled chunking is unaffected (measured, default on). */
+  pooledChunkedPrefill?: boolean
   /** Chunk capacity in tokens (default 64). See the CHUNK_CAP note in
    *  buildChunkPrefill; sweep results in BENCH.md. */
   chunkCap?: number
@@ -3081,7 +3087,11 @@ export function buildDecodeEngine(
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
   interface ChunkPrefill {
-    record(promptIds: number[], start: number, seqLen: number): void
+    record(promptIds: number[], start: number, seqLen: number): void | Promise<void>
+    /** Tokens per chunk this instance was built for — pooled chunks are capped
+     *  at 16 (see the pooled-cut note in record), so the caller must slice by
+     *  THIS, not by CHUNK_CAP. */
+    cap: number
     /** These buffers are CHUNK_CAP times the width of the decode ones, so on a
      *  hybrid spec they are the largest thing the engine allocates for itself —
      *  worth freeing, and only reachable from inside this closure. */
@@ -3090,7 +3100,13 @@ export function buildDecodeEngine(
 
   let chunkGemmUsed = 'matvec'
   function buildChunkPrefill(): ChunkPrefill {
-    const C = CHUNK_CAP
+    // Pooled chunks are capped at 16 tokens: the chunk's expert UNION must be
+    // resident simultaneously, and the 1827-step routing trace puts the p100
+    // union at C=16 at 84 of 128 experts — under a 96-slot pool with zero
+    // overflows in 87k windows (scratch feasibility analysis, 2026-08-15).
+    // Bigger C at these pool sizes overflows; the construction gate below
+    // refuses pools under 96 slots outright.
+    const C = pooling ? Math.min(CHUNK_CAP, 16) : CHUNK_CAP
     // MLC symmetric and MLX affine are different kernels with different
     // bindings — affine takes a 6th buffer (biases at @binding(5)) and reads
     // its scales in groups of 64 rather than 32.
@@ -3197,6 +3213,14 @@ export function buildDecodeEngine(
           moeGateUp: makeBuf(device, C * S.moeSlots * 2 * S.ffn * 2, 'c.moeGateUp'),
           moeH:      makeBuf(device, C * S.moeSlots * S.ffn * 2, 'c.moeH'),
           moeDown:   makeBuf(device, C * S.moeSlots * S.d * 2, 'c.moeDown'),
+          /** Pooled chunks only: the whole chunk's expert ids, read back once
+           *  per MoE layer so the CPU can resolve the union and write slot
+           *  ids before the expert matmuls run. */
+          idsRead: pooling ? device.createBuffer({
+            size: C * S.moeSlots * 4,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            label: 'c.idsRead',
+          }) : null,
         }
       : null
 
@@ -3379,7 +3403,7 @@ export function buildDecodeEngine(
       }
     }
 
-    function record(promptIds: number[], start: number, seqLen: number): void {
+    async function record(promptIds: number[], start: number, seqLen: number): Promise<void> {
       const n = seqLen
       // Per-chunk state + uniform writes — queue-ordered before the submit.
       const ids = new Int32Array(n)
@@ -3427,10 +3451,43 @@ export function buildDecodeEngine(
           : gemmTiledGrid
             ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 32), 1, label)
             : dispatch(enc2, gemm, bgx, Math.ceil(rows / 4), 1, 1, label)
-      const enc = device.createCommandEncoder()
+      let enc = device.createCommandEncoder()
       if (start === 0) clearGdnState(enc)
       dispatch(enc, AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
       dispatch(enc, P.rmsNorm, cbgInitNorm, n, 1, 1, 'cRmsNormInit')
+      /** THE POOLED CUT. The chunk's routers have run for layer L; the expert
+       *  matmuls need every routed expert of every token resident at once.
+       *  One readback per MoE layer per CHUNK — 1/16th of the per-token
+       *  pooled prefill's readback count — then the union is resolved on the
+       *  CPU, misses upload, and CM.moeIds is rewritten from expert ids to
+       *  slot ids, exactly the contract the serial decode path established. */
+      const pooledCut = async (L: number): Promise<void> => {
+        enc.copyBufferToBuffer(CM!.moeIds, 0, CM!.idsRead!, 0, n * S.moeSlots * 4)
+        device.queue.submit([enc.finish()])
+        await CM!.idsRead!.mapAsync(GPUMapMode.READ)
+        const raw = new Uint32Array(CM!.idsRead!.getMappedRange().slice(0, n * S.moeSlots * 4))
+        CM!.idsRead!.unmap()
+        const lp = layerPools[L - L0]!
+        const seen = new Set<number>()
+        const union: number[] = []
+        for (const e of raw) if (!seen.has(e)) { seen.add(e), union.push(e) }
+        if (union.length > POOL_SLOTS) {
+          // v1 limitation, stated rather than mishandled: sub-ranging the
+          // expert dispatch by token needs TOK_BASE plumbed through three
+          // kernels. At C=16 / P>=96 the trace shows zero overflows; if a
+          // prompt finds one anyway, the run fails loudly instead of
+          // computing with an evicted expert.
+          throw new Error(
+            `pooled chunk overflow: layer ${L} routes ${union.length} distinct experts, `
+            + `pool holds ${POOL_SLOTS} — shorten the chunk or raise expertPool`)
+        }
+        const { misses } = lp.pool.resolve(union)
+        if (misses.length > 0) await fillSlots(lp, misses)
+        const slotIds = new Uint32Array(new ArrayBuffer(raw.length * 4))
+        for (let i2 = 0; i2 < raw.length; i2++) slotIds[i2] = lp.pool.slotFor(raw[i2])
+        device.queue.writeBuffer(CM!.moeIds, 0, slotIds)
+        enc = device.createCommandEncoder()
+      }
       for (let L = 0; L < S.layers; L++) {
         const blk = cLayers[L]
         if (blk.gdnProj) {
@@ -3459,6 +3516,7 @@ export function buildDecodeEngine(
           // per-token prefill spent seven PER TOKEN.
           dispatch(enc, moeRouterPipe, blk.moe.routerLogits, MOE_ROUTER_ROWS, n, 1, 'cMoeRouterLogits')
           dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, n, 1, 1, 'cMoeRouterTopk')
+          if (pooling) await pooledCut(L)
           const rows = S.ffn / MOE_RPW
           dispatch(enc, moeMMGate!, blk.moe.gate, rows, n, S.moeSlots, 'cMoeGate')
           dispatch(enc, moeMMGate!, blk.moe.up, rows, n, S.moeSlots, 'cMoeUp')
@@ -3479,8 +3537,9 @@ export function buildDecodeEngine(
 
     return {
       record,
+      cap: C,
       destroy() {
-        for (const b of [...Object.values(CB), ...Object.values(cU), ...Object.values(CM ?? {})]) b.destroy()
+        for (const buf of [...Object.values(CB), ...Object.values(cU), ...Object.values(CM ?? {})]) buf?.destroy()
       },
     }
   }
@@ -3532,14 +3591,20 @@ export function buildDecodeEngine(
   // ids[] would name experts in a buffer that holds slots. It could not be
   // rescued by resolving per chunk either — one 256-token chunk routes to most
   // of the experts in the layer, which is more than the pool holds by design.
+  // Pooled chunking needs a pool big enough for a 16-token union: 96 slots is
+  // where the routing trace measures zero overflows. Smaller pools (the
+  // quarter-pool configurations) keep per-token prefill.
+  const pooledChunkOK = !pooling || (POOL_SLOTS >= 96 && !optimistic && opts.pooledChunkedPrefill === true)
   const chunkPrefill: ChunkPrefill | null =
-    !partial && !S.mla && !pooling && (opts.chunkedPrefill ?? true) && dynReady
+    !partial && !S.mla && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
   {
-    const why = chunkPrefill ? `on (cap ${CHUNK_CAP}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''})`
+    const why = chunkPrefill ? `on (cap ${chunkPrefill.cap}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''}${pooling ? ', pooled' : ''})`
       : S.mla ? 'off (per-token — MLA has no chunked attention path)'
-      : pooling ? 'off (per-token — expertPool holds slots, and a chunk routes past them)'
+      : pooling ? (POOL_SLOTS >= 96
+          ? 'off (per-token — pooled chunking is opt-in until its AC timing pair exists: ?chunk=1)'
+          : `off (per-token — pool of ${POOL_SLOTS} is under the 96-slot union floor for pooled chunks)`)
       : !dynReady ? 'off (per-token — no subgroups, so no batched GEMM)'
       : 'off (per-token)'
     console.log(`[engine] chunked prefill: ${why}`)
@@ -3700,8 +3765,10 @@ export function buildDecodeEngine(
     // chunk. Short tails fall through to the per-token path below.
     if (chunkPrefill) {
       while (last - prefillPos >= CHUNK_MIN) {
-        const s = Math.min(CHUNK_CAP, last - prefillPos)
-        chunkPrefill.record(promptIds, prefillPos, s)
+        const s = Math.min(chunkPrefill.cap, last - prefillPos)
+        // Pooled chunks await a readback per MoE layer; unpooled ones resolve
+        // immediately. One await covers both.
+        await chunkPrefill.record(promptIds, prefillPos, s)
         prefillPos += s
         chunks++
       }
@@ -3716,7 +3783,7 @@ export function buildDecodeEngine(
     if (startPos > 0 || chunks > 0) {
       console.log(
         `[engine] prefill: ${promptIds.length} tokens, reused prefix ${startPos}` +
-        (chunks ? `, ${chunks} chunk${chunks > 1 ? 's' : ''} of ≤${CHUNK_CAP}` : ''),
+        (chunks ? `, ${chunks} chunk${chunks > 1 ? 's' : ''} of ≤${chunkPrefill!.cap}` : ''),
       )
     }
     // Last prefill step: readback to get the first generated token.

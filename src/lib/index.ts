@@ -96,6 +96,9 @@ export interface CreateEngineOptions {
   /** Chunk capacity in tokens (DecodeEngineOptions.chunkCap; default 256 with
    *  the matrix unit, 64 without). Exposed for the CHUNK_CAP sweep. */
   chunkCap?: number
+  /** Pooled chunked prefill (engine pooledChunkedPrefill) — opt-in, awaiting
+   *  its AC timing pair; token-identity already gated. */
+  pooledChunkedPrefill?: boolean
   /** Shader-variant flags as a query string, e.g. '?vec4=0'. Same parser the
    *  chat page uses, so a kernel A/B run here selects what users get. */
   variantQuery?: string
@@ -322,6 +325,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
     ...(opts.poolOptimistic ? { poolOptimistic: true } : {}),
     ...(opts.chunkedPrefill === false ? { chunkedPrefill: false } : {}),
     ...(opts.chunkCap ? { chunkCap: opts.chunkCap } : {}),
+    ...(opts.pooledChunkedPrefill ? { pooledChunkedPrefill: true } : {}),
   })
 
   // Dawn JITs each pipeline on its FIRST dispatch (measured ~5 s cold vs

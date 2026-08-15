@@ -42,6 +42,86 @@ import {
 
 const SPEC = specFromSearch(location.search)
 const BRAND = modelBranding(SPEC)
+// Memory mode (?pool=): expert slots held resident per MoE layer, the rest
+// streamed from OPFS on demand. Saves RAM, not download — the full checkpoint
+// still lands in the cache. 'half'/'quarter' are fractions of the expert
+// count; a bare number is slots. Non-MoE specs ignore it.
+function poolFromSearch(): number {
+  if (!SPEC.moe) return 0
+  const v = new URLSearchParams(location.search).get('pool')
+  if (!v) return 0
+  const E = SPEC.moe.experts
+  const slots = v === 'half' ? Math.round(E / 2) : v === 'quarter' ? Math.round(E / 4) : Number(v)
+  return Number.isFinite(slots) && slots > 0 ? slots : 0
+}
+let POOL_SLOTS_UI = poolFromSearch()
+
+/**
+ * Memory-mode labels, measured where a measurement exists (BENCH.md
+ * 2026-08-15 AC price curve; est = derived from the expert fraction, not
+ * measured). Chat throughput only — the saving is RAM while running; the
+ * DOWNLOAD is the full checkpoint either way, streamed from OPFS on demand.
+ */
+const POOL_PRESETS: Record<string, { slots: number; label: string; note?: string }[]> = {
+  'qwen36-35b-a3b-q3': [
+    { slots: 0, label: 'Full — 15.7 GB · ~66 tok/s' },
+    { slots: 128, label: 'Half the experts — ~8.4 GB · ~15 tok/s' },
+    { slots: 64, label: 'Quarter — ~4.8 GB · ~12 tok/s', note: 'long prompts run token-by-token in this mode' },
+  ],
+  'qwen36-35b-a3b': [
+    { slots: 0, label: 'Full — 19.7 GB · unmeasured' },
+    { slots: 128, label: 'Half the experts — ~11 GB est · ~15 tok/s' },
+    { slots: 64, label: 'Quarter — ~6 GB est', note: 'long prompts run token-by-token in this mode' },
+  ],
+  'qwen3-30b-a3b-4bit': [
+    { slots: 0, label: 'Full — ~17 GB · ~75 tok/s' },
+    { slots: 96, label: '96 of 128 experts — ~13 GB est · ~15 tok/s' },
+    { slots: 64, label: 'Half — ~9.5 GB est · ~15 tok/s', note: 'long prompts run token-by-token in this mode' },
+  ],
+}
+
+/** The memory-mode radios in the download gate. MoE chat models only; the
+ *  selection feeds bootEngine directly (the gate runs before boot, so no
+ *  reload is needed) and is mirrored into ?pool= so the link is shareable.
+ *  Output is token-identical in every mode — the measured cost is speed. */
+function mountMemoryPicker(): void {
+  const presets = POOL_PRESETS[SPEC.id]
+  if (!presets) return
+  const host = document.querySelector('#start-dialog .dialog-notes')
+  if (!host) return
+  const wrap = document.createElement('div')
+  wrap.id = 'memory-picker'
+  wrap.style.cssText = 'padding:0.4rem 0 0.2rem;border-top:1px solid var(--border);margin-top:0.6rem'
+  const title = document.createElement('div')
+  title.textContent = 'Memory'
+  title.style.cssText = 'font-size:0.66rem;text-transform:uppercase;letter-spacing:0.07em;color:var(--muted);margin-bottom:0.4rem'
+  wrap.appendChild(title)
+  const noteEl = document.createElement('div')
+  noteEl.style.cssText = 'font-size:0.7rem;color:var(--warn,#d9a441);margin-top:0.25rem;min-height:1em'
+  for (const p of presets) {
+    const row = document.createElement('label')
+    row.style.cssText = 'display:flex;gap:0.5rem;align-items:center;font-size:0.78rem;cursor:pointer;padding:2px 0'
+    const radio = document.createElement('input')
+    radio.type = 'radio'
+    radio.name = 'memory-mode'
+    radio.value = String(p.slots)
+    radio.checked = p.slots === POOL_SLOTS_UI
+    radio.addEventListener('change', () => {
+      POOL_SLOTS_UI = p.slots
+      const url = new URL(location.href)
+      if (p.slots) url.searchParams.set('pool', String(p.slots))
+      else url.searchParams.delete('pool')
+      history.replaceState(null, '', url)
+      noteEl.textContent = p.note ?? (p.slots ? 'Same output, token for token — the cost is speed. Download size is unchanged.' : '')
+    })
+    const span = document.createElement('span')
+    span.textContent = p.label
+    row.append(radio, span)
+    wrap.appendChild(row)
+  }
+  wrap.appendChild(noteEl)
+  host.appendChild(wrap)
+}
 // Quant label for the message header + gate copy — derived in chat-ui.ts so
 // the remote guest page shows the same truth.
 const QUANT_TAG = quantTagFor(SPEC)
@@ -179,6 +259,9 @@ async function main(): Promise<void> {
 
   const boot = await bootEngine({
     spec: SPEC,
+    // Memory mode: the loader allocates slot-sized expert stacks instead of
+    // full ones — that allocation difference IS the saving.
+    ...(POOL_SLOTS_UI ? { expertPool: POOL_SLOTS_UI } : {}),
     // Subgroups (when the adapter has them) for the _sg shader variants;
     // timestamp-query for profileStep / `await bench(0, 0, true)`.
     // subgroup-matrix: requested when the adapter offers it (experimental
@@ -240,8 +323,10 @@ async function main(): Promise<void> {
         fused,
         int8KV,
         spec,
+        ...(POOL_SLOTS_UI ? { expertPool: POOL_SLOTS_UI } : {}),
         prefixReuse: q.get('reuse') !== '0',
         chunkedPrefill: q.get('chunk') !== '0',
+        pooledChunkedPrefill: q.get('chunk') === '1',
         sampling: temperature > 0
           ? {
               temperature,
@@ -631,6 +716,7 @@ function applyModelBranding(): void {
       notes.prepend(li)
     }
   }
+  mountMemoryPicker()
   if (SPEC.id === 'phi3-mini') return
   document.title = `Zero-TVM Chat — ${BRAND.name}`
   set('#start-dialog .dialog-title', `${BRAND.name} on raw WebGPU`)
