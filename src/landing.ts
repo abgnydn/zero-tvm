@@ -54,6 +54,12 @@ const GROUPS = buildGroups()
 
 /** Class sigils — one per architecture lane, same circuit-rune language as
  *  the /entrance assets. currentColor, so they sit in the accent for free. */
+const STAT_ICON: Record<string, string> = {
+  Weights: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1l3 3-3 3-3-3z"/><path d="M4 8l3 3-3 3-3-3z" opacity="0.6"/><path d="M12 8l3 3-3 3-3-3z" opacity="0.6"/></svg>',
+  Context: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 2h8l2 2v10H3z"/><path d="M5 6h6M5 9h6M5 12h4" opacity="0.7"/></svg>',
+  Speed: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9 1L3 9h4l-1 6 6-8H8z"/></svg>',
+}
+
 const LANE_SIGIL: Record<string, string> = {
   moe: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3 3-3 3-3-3zM5 9l2.4 2.4L5 13.8 2.6 11.4zM19 9l2.4 2.4L19 13.8l-2.4-2.4zM12 16l3 3-3 3-3-3z" opacity="0.9"/><circle cx="12" cy="11.4" r="1.6"/></svg>',
   hybrid: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 9c3 0 3-4 6-4s3 4 6 4 3-4 6-4"/><path d="M2 16h6l3-5 3 8 2-3h6" opacity="0.85"/></svg>',
@@ -128,6 +134,7 @@ function render(): void {
     <div class="cs-spires" aria-hidden="true"></div>
     <div class="cs-col cs-col-l" aria-hidden="true"></div>
     <div class="cs-col cs-col-r" aria-hidden="true"></div>
+    <div class="cs-comet" aria-hidden="true"></div>
     <div class="cs-fog" aria-hidden="true"><i></i><i></i></div>
     <div class="cs-dust" aria-hidden="true"></div>
     <div class="mb-plate">
@@ -159,6 +166,8 @@ function render(): void {
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
     <div class="cs-live" aria-live="polite"></div>
+    <div class="cs-wipe" aria-hidden="true"></div>
+    <div class="cs-engage" aria-hidden="true"></div>
     <div class="cs-borderline-t" aria-hidden="true"></div>
     <div class="cs-borderline-b" aria-hidden="true"></div>
     <div class="cs-corner cs-corner-l" aria-hidden="true">registry-rendered · numbers are measured</div>
@@ -173,6 +182,9 @@ function render(): void {
     else {
       sessionStorage.setItem('zt-intro', '1')
       splash.addEventListener('animationend', () => splash.remove())
+      const skip = (): void => splash.remove()
+      splash.addEventListener('pointerdown', skip)
+      window.addEventListener('keydown', skip, { once: true })
     }
   }
 
@@ -188,11 +200,15 @@ function render(): void {
   const poolFracOf = (spec: ModelSpec, slots: number): number =>
     slots && spec.moe ? slots / (spec.moe.experts + 1) : 0
 
-  dots.innerHTML = GROUPS.map((g, i) =>
-    `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}">
+  dots.innerHTML = GROUPS.map((g, i) => {
+    const spec0 = g.variants[0].spec
+    const pal0 = mascotPalette(spec0)
+    return `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}">
        <span class="mb-dot-face" aria-hidden="true"></span>
        <span class="mb-dot-text"><b>${g.name.replace(/-Instruct.*$/, '')}</b><i>${g.params}</i></span>
-     </button>`).join('')
+       <span class="mb-dot-sigil" style="color:${pal0.accent}" aria-hidden="true">${LANE_SIGIL[laneOf(spec0)] ?? ''}</span>
+     </button>`
+  }).join('')
 
   /** Roster portraits: one hidden mascot cycles the roster and snapshots each
    *  face — eight PNGs, not eight live render loops. Re-run when the cache
@@ -248,7 +264,8 @@ function render(): void {
       chatUrl(v.param) + (mode && mode.slots ? `${v.param ? '&' : '?'}pool=${mode.slots}` : '')
 
     el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
-      `<button class="mb-variant mb-mode" data-m="${i}" role="tab" aria-selected="${i === mi}">${x.label}</button>`).join('')
+      `<button class="mb-variant mb-mode" data-m="${i}" role="tab" aria-selected="${i === mi}">`
+      + `<span class="mb-gauge" aria-hidden="true">${'◆'.repeat(modes.length - i)}${'◇'.repeat(i)}</span>${x.label}</button>`).join('')
     ;(el('.mb-modes-label') as HTMLElement).hidden = modes.length < 2
 
     el('.mb-variants').innerHTML = g.variants.length < 2 ? '' : g.variants.map((x, i) =>
@@ -261,8 +278,20 @@ function render(): void {
       ['Context', `${ctxLabel(v.spec.maxContext)} tokens`],
     ]
     if (b.rateLabel) rows.push(['Speed', `${b.rateLabel} <span class="mb-hw">M2 Max</span>`])
-    el('.mb-stats').innerHTML = rows.map(([k, val]) =>
-      `<div><dt>${k}</dt><dd>${val}</dd></div>`).join('')
+    // Context bar: shipped ceiling over the checkpoint's own maxSeq — a
+    // within-character fraction (the 35B shows 32k of a 262k ceiling).
+    // Memory bar: the chosen build's slots over the full expert count.
+    const ctxFrac = Math.min(1, v.spec.maxContext / v.spec.maxSeq)
+    const memFrac = mode && mode.slots && v.spec.moe ? mode.slots / (v.spec.moe.experts + 1) : 1
+    const bar = (frac: number, title: string): string =>
+      `<span class="mb-bar" title="${title}"><i style="width:${Math.round(frac * 100)}%"></i></span>`
+    el('.mb-stats').innerHTML = rows.map(([k, val]) => {
+      const icon = STAT_ICON[k] ? `<span class="mb-stat-ico" aria-hidden="true">${STAT_ICON[k]}</span>` : ''
+      const sub = k === 'Context' ? bar(ctxFrac, `${Math.round(ctxFrac * 100)}% of the checkpoint's ${ctxLabel(v.spec.maxSeq)} ceiling`)
+        : k === 'Weights' && memFrac < 1 ? bar(memFrac, `${Math.round(memFrac * 100)}% of experts resident in this build`)
+        : ''
+      return `<div><dt>${icon}${k}</dt><dd>${val}${sub}</dd></div>`
+    }).join('')
     // Count-up: numbers roll to their real value in ~300 ms. The final frame
     // is always the exact registry string; the roll is presentation only.
     if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -304,6 +333,8 @@ function render(): void {
   /** Selection transition: retrigger the stage flash + plate/sheet entrance
    *  animations by yanking the class off for a frame. */
   function selectFx(): void {
+    const wipe = root.querySelector<HTMLElement>('.cs-wipe')
+    if (wipe) { wipe.classList.remove('cs-go'); void wipe.offsetWidth; wipe.classList.add('cs-go') }
     for (const sel of ['.mb-art', '.mb-plate', '.mb-panel']) {
       const n = root.querySelector<HTMLElement>(sel)
       if (!n) continue
@@ -343,6 +374,17 @@ function render(): void {
   const art = el<HTMLElement>('.mb-art')
   art.addEventListener('mouseenter', () => mascot?.setHover(true))
   art.addEventListener('mouseleave', () => mascot?.setHover(false))
+  // The character notices the roster: hovering the rail turns the stage a
+  // few degrees toward it and wakes the mascot's hover state — attention,
+  // not animation for its own sake.
+  dots.addEventListener('mouseenter', () => {
+    art.style.rotate = 'y -6deg'
+    mascot?.setHover(true)
+  }, true)
+  dots.addEventListener('mouseleave', () => {
+    art.style.rotate = 'none'
+    mascot?.setHover(false)
+  }, true)
 
   // Depth: the fog and dust track the pointer at different rates — the cheap
   // half of a camera. Skipped entirely under reduced motion.
@@ -377,6 +419,30 @@ function render(): void {
       }
     } catch { /* the static line stands */ }
   })()
+
+  root.querySelector<HTMLAnchorElement>('.mb-cta')?.addEventListener('click', (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    const a = e.currentTarget as HTMLAnchorElement
+    const engage = root.querySelector<HTMLElement>('.cs-engage')
+    if (!engage) return
+    e.preventDefault()
+    engage.classList.add('cs-go')
+    setTimeout(() => { location.href = a.href }, 330)
+  })
+
+  // Idle: 18 s without input and the realm starts breathing on its own —
+  // any movement hands the camera back. Reduced motion never idles.
+  if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    let idleTimer = 0
+    const wake = (): void => {
+      root.classList.remove('cs-idle')
+      clearTimeout(idleTimer)
+      idleTimer = window.setTimeout(() => root.classList.add('cs-idle'), 18000)
+    }
+    for (const ev of ['pointermove', 'pointerdown', 'keydown']) root.addEventListener(ev, wake)
+    wake()
+  }
 
   paint()
   selectFx()

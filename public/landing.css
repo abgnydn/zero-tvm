@@ -885,3 +885,145 @@ footer li a:hover { color: var(--accent); }
   .cs-banner { height: 56px; opacity: 0.4; }
   .cs-borderline-t, .cs-borderline-b { display: none; }
 }
+
+
+/* ══ ROUND 8: THE ALIGNMENT PASS ═══════════════════════════════════════════
+   One rhythm: an 8px gutter system, a hard max-width so ultrawide screens
+   frame the scene instead of stretching it, the sheet and roster hung from
+   the same top line, and the enter slab locked to the stage's centre line. */
+#models .cs-root {
+  --cs-gutter: 24px;
+  max-width: 1720px; margin: 0 auto;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr) minmax(260px, 310px);
+  gap: 8px var(--cs-gutter);
+  padding: calc(var(--nav-h, 64px) + 12px) max(28px, 4vw) 22px;
+}
+/* Sheet and roster share a top line: both start where the stage starts. */
+#models .mb-info { align-self: start; padding-top: 34px; }
+#models .cs-roster-head { padding-top: 8px; height: 26px; }
+#models .mb-roster { margin-top: 34px; }
+/* The plate is the one centred element; give it a fixed rhythm below. */
+#models .mb-plate { margin: 2px 0 0; padding-bottom: 6px; }
+/* Enter hangs centred under the stage column only, not the whole row —
+   optically aligned with the character above it. */
+#models .cs-enter { grid-column: 2; justify-self: center; }
+#models .cs-corner-l { left: max(28px, 4vw); }
+#models .cs-corner-r { right: max(28px, 4vw); }
+/* Border strips share the content inset. */
+.cs-borderline-t, .cs-borderline-b { left: max(28px, 4vw); right: max(28px, 4vw); }
+/* Stat rows: value column right-aligned on a shared edge, tabular digits. */
+#models .mb-stats dd { font-variant-numeric: tabular-nums; text-align: right; }
+#models .mb-stats dt { padding-right: 12px; }
+/* Chips wrap on the same 8px rhythm. */
+#models .mb-variants, #models .mb-modes { gap: 8px; }
+@media (max-width: 900px) {
+  #models .cs-enter { grid-column: 1; justify-self: stretch; }
+  #models .mb-info { padding-top: 0; }
+  #models .mb-roster { margin-top: 0; }
+}
+
+/* ══ ROUND 15: THE PARTY READS AS CLASSES ══ */
+#models .mb-dot { padding-right: 26px; }
+.mb-dot-sigil {
+  position: absolute; right: 7px; bottom: 6px; width: 13px; height: 13px; opacity: 0.75;
+}
+.mb-dot-sigil svg { width: 100%; height: 100%; }
+
+/* ══ ROUND 17: THE SPLASH YIELDS ══ */
+.cs-splash { cursor: pointer; }
+
+
+/* ══ ROUND 9: ATTENTION ══ */
+#models .mb-art { transition: rotate 0.4s ease, transform 0.3s ease-out; perspective: 900px; }
+
+/* ══ ROUND 11: THE SELECTION WIPE ══ A sheet of the class light crossing the
+   stage on every selection — the cut between characters reads as a cut. */
+.cs-wipe {
+  position: absolute; inset: 0; z-index: 3; pointer-events: none; opacity: 0;
+  background: linear-gradient(100deg, transparent 30%,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 26%, transparent) 50%,
+    transparent 70%);
+  transform: translateX(-100%);
+}
+.cs-wipe.cs-go { animation: csWipe 0.55s ease-out; }
+@keyframes csWipe {
+  0% { opacity: 1; transform: translateX(-100%); }
+  100% { opacity: 1; transform: translateX(100%); }
+}
+
+/* ══ ROUND 16: THE ENGAGE ══ Clicking ENTER flashes the realm in the class
+   light and falls to black before the chat page takes over — an exit that
+   answers the entrance. Reduced motion (and modified clicks) skip it. */
+.cs-engage {
+  position: absolute; inset: 0; z-index: 40; pointer-events: none; opacity: 0;
+  background:
+    radial-gradient(ellipse at 50% 60%,
+      color-mix(in srgb, var(--cs-accent, var(--accent)) 45%, transparent) 0%, transparent 60%),
+    #05070d;
+}
+.cs-engage.cs-go { animation: csEngage 0.34s ease-in forwards; }
+@keyframes csEngage {
+  0% { opacity: 0; }
+  45% { opacity: 0.65; }
+  100% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) { .cs-wipe.cs-go, .cs-engage.cs-go { animation: none; } }
+
+
+/* ══ ROUND 10: STAT ICONOGRAPHY + HONEST BARS ══ Icons name the stat; the
+   bars are within-character fractions only (context: shipped ceiling over
+   the checkpoint's own max; memory: the build's residency) — never a
+   cross-model ranking. */
+.mb-stat-ico { display: inline-flex; width: 12px; height: 12px; margin-right: 7px;
+  vertical-align: -1px; color: color-mix(in srgb, var(--cs-accent, var(--accent)) 60%, var(--dim)); }
+.mb-stat-ico svg { width: 100%; height: 100%; }
+.mb-bar { display: block; height: 3px; margin-top: 5px; border-radius: 2px;
+  background: #ffffff12; overflow: hidden; }
+.mb-bar i { display: block; height: 100%; border-radius: 2px;
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 55%, transparent),
+    var(--cs-accent, var(--accent)));
+  transition: width 0.45s cubic-bezier(0.22, 1, 0.36, 1); }
+#models .mb-stats dd { min-width: 128px; }
+
+/* ══ ROUND 13: THE LOADOUT GAUGE ══ Filled diamonds for what the build
+   keeps, hollow for what it streams — ordinal, not a measurement. */
+.mb-gauge { font-size: 0.6rem; letter-spacing: 0.08em; margin-right: 7px;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 70%, var(--dim)); }
+
+
+/* ══ ROUND 12: IDLE LIFE ══ Left alone, the realm breathes: the stage sways
+   a few pixels on a long period and the aura thickens slightly. Any input
+   snaps the camera back to the hand. */
+#models .cs-root.cs-idle .mb-art { animation: idleSway 14s ease-in-out infinite; }
+@keyframes idleSway {
+  0%, 100% { transform: translate(0, 0); }
+  25% { transform: translate(6px, -3px); }
+  75% { transform: translate(-6px, 2px); }
+}
+#models .cs-root.cs-idle .cs-aura i { animation-duration: calc(3.8s / var(--cs-tempo, 1)); }
+
+/* ══ ROUND 14: REALM WEATHER ══ A falling trace crosses the high sky every
+   ~16 s — thin, fast, gone. And the fog drinks a hint of the class light, so
+   the weather itself changes when the character does. */
+.cs-comet {
+  position: absolute; top: 12%; left: -8%; width: 130px; height: 2px;
+  background: linear-gradient(90deg, transparent, #cfe0ffbb 60%, #fff);
+  border-radius: 2px; opacity: 0; pointer-events: none; z-index: 0;
+  transform: rotate(9deg);
+  animation: comet 16s linear infinite;
+  animation-delay: 5s;
+}
+@keyframes comet {
+  0%, 93% { opacity: 0; left: -8%; top: 12%; }
+  94% { opacity: 0.9; }
+  100% { opacity: 0; left: 108%; top: 26%; }
+}
+.cs-fog i {
+  background: radial-gradient(ellipse at center,
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 12%, #18223a) 0%, transparent 65%);
+  opacity: 0.36;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cs-comet, #models .cs-root.cs-idle .mb-art { animation: none; }
+}
