@@ -108,6 +108,7 @@ function mountMemoryPicker(): void {
     radio.checked = p.slots === POOL_SLOTS_UI
     radio.addEventListener('change', () => {
       POOL_SLOTS_UI = p.slots
+      if (SPEC.moe) gateMascot?.setSpec(SPEC, false, p.slots ? p.slots / (SPEC.moe.experts + 1) : 0)
       const url = new URL(location.href)
       if (p.slots) url.searchParams.set('pool', String(p.slots))
       else url.searchParams.delete('pool')
@@ -510,6 +511,7 @@ async function main(): Promise<void> {
       // Cooperative cancellation: the engine polls the flag between pipeline
       // submissions and drains its in-flight readbacks before returning.
       await engine.generatePipelined(promptIds, budget, (id) => {
+        headerMascot?.pulse()
         if (firstToken) {
           // Swap thinking indicator for the real body on first token. When
           // resuming, the body already holds the text so far — the next
@@ -736,6 +738,11 @@ function applyModelBranding(): void {
  * gets (and it cannot run the engine either, so it never reaches this page
  * with a model loaded).
  */
+/** The header mascot's handle, kept so generation can drive its heartbeat —
+ *  one pulse() per real token, so the bounce IS the measured cadence. */
+let headerMascot: import('../mascot.js').MascotHandle | null = null
+let gateMascot: import('../mascot.js').MascotHandle | null = null
+
 function mountChatMascots(): void {
   const host = document.querySelector('.model-info')
   if (host && !document.getElementById('header-mascot')) {
@@ -744,7 +751,14 @@ function mountChatMascots(): void {
     c.className = 'header-mascot'
     c.setAttribute('aria-hidden', 'true')
     host.parentElement?.insertBefore(c, host)
-    void mountMascot(c, SPEC).then((m) => { if (!m) c.remove() }).catch(() => c.remove())
+    void mountMascot(c, SPEC).then((m) => {
+      if (!m) { c.remove(); return }
+      headerMascot = m
+      // Memory mode leans the figure and pulls the streamed experts' sprites
+      // into a far ghost orbit — the pool, drawn from the same number the
+      // picker chose.
+      if (POOL_SLOTS_UI && SPEC.moe) m.setSpec(SPEC, false, POOL_SLOTS_UI / (SPEC.moe.experts + 1))
+    }).catch(() => c.remove())
   }
 
   const logo = document.getElementById('welcome-logo')
@@ -814,7 +828,14 @@ async function boot(): Promise<void> {
   {
     const canvas = document.getElementById('gate-mascot') as HTMLCanvasElement | null
     if (canvas) {
-      void mountMascot(canvas, SPEC).then((m) => { if (!m) canvas.remove() }).catch(() => canvas.remove())
+      void mountMascot(canvas, SPEC).then((m) => {
+        if (!m) { canvas.remove(); return }
+        gateMascot = m
+        // The picker's radios re-pose this figure live: choose less memory,
+        // watch the character lean and the streamed experts drift out. The
+        // choice and its meaning in the same glance.
+        if (POOL_SLOTS_UI && SPEC.moe) m.setSpec(SPEC, false, POOL_SLOTS_UI / (SPEC.moe.experts + 1))
+      }).catch(() => canvas.remove())
     }
   }
   initSamplingControls(() => liveEngine)

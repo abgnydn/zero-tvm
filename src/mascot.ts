@@ -27,6 +27,7 @@
  */
 
 import type { ModelSpec } from './compiler/model-spec.js'
+import { modelBranding } from './zero-tvm/model-registry.js'
 
 const WGSL = /* wgsl */ `
 struct U {
@@ -36,6 +37,15 @@ struct U {
   ink: f32, eyesOpen: f32, bandShift: f32, _p0: f32,
   hair: vec3<f32>, _p1: f32,
   iris: vec3<f32>, cached: f32,
+  // tempo: idle-clock multiplier from the model's MEASURED rate — a 256 tok/s
+  // model fidgets, a 35B breathes. beat: decaying pulse bumped once per real
+  // generated token. earCtx: ear length from log2(maxContext) — the 6k→32k
+  // raise is visible. poolFrac: experts resident / experts — the memory
+  // picker's fraction; sprites split into a close resident orbit and a far
+  // ghosted drift, and the body leans out. All four are read from the spec,
+  // the registry's measured labels, or live engine events — same rule as
+  // every other trait: the picture cannot disagree with the table.
+  tempo: f32, beat: f32, earCtx: f32, poolFrac: f32,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -57,8 +67,9 @@ fn sdCap(p: vec3<f32>, h: f32, r: f32) -> f32 {
 //   0 skin   1 hair   2 eye white   3 iris   4 sprite
 fn map2(pIn: vec3<f32>) -> vec2<f32> {
   var p = pIn;
-  p.y = p.y - sin(u.time * 1.2) * 0.018;            // idle bob
-  let m = rot(sin(u.time * 0.4) * 0.42);            // sway, never a full spin
+  let T = u.time * u.tempo;
+  p.y = p.y - sin(T * 1.2) * 0.018 - u.beat * 0.020; // idle bob + token pulse
+  let m = rot(sin(T * 0.4) * 0.42);                  // sway, never a full spin
   let xz = m * vec2<f32>(p.x, p.z);
   p = vec3<f32>(xz.x, p.y, xz.y);
 
@@ -71,7 +82,10 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
   var mat = 0.0;
 
   // Body + arms, deliberately small.
-  let body = sdCap(p - vec3<f32>(0.0, -R * 0.72, 0.0), R * 0.30, R * 0.40);
+  // Memory mode: fewer experts resident, leaner figure. 12% at the quarter
+  // pool — visible beside the full-mode sibling, not a different character.
+  let lean = select(0.0, (1.0 - u.poolFrac) * 0.12, u.poolFrac > 0.0);
+  let body = sdCap(p - vec3<f32>(0.0, -R * 0.72, 0.0), R * 0.30 * (1.0 - lean), R * 0.40);
   d = smin(d, body, R * 0.18);
   let arm = sdCap(q - vec3<f32>(R * 0.46, -R * 0.72, 0.0), R * 0.16, R * 0.14);
   d = smin(d, arm, R * 0.06);
@@ -100,7 +114,7 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
   // Ear tufts, from the KV head count.
   {
     let t = sdEllip(q - vec3<f32>(R * 0.88, hy + R * 0.30, 0.0),
-                    vec3<f32>(R * 0.16, R * 0.30 * clamp(u.kvh / 16.0, 0.4, 1.4), R * 0.16));
+                    vec3<f32>(R * 0.16, R * 0.30 * clamp(u.kvh / 16.0, 0.4, 1.4) * (0.8 + 0.5 * u.earCtx), R * 0.16));
     hair = smin(hair, t, R * 0.05);
   }
   if (hair < d) { d = hair; mat = 1.0; }
@@ -146,11 +160,16 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
   if (u.experts > 0.5) {
     let n = min(u.experts, 24.0);
     let sect = 6.28318 / n;
-    let a = atan2(p.z, p.x) + u.time * 0.5;
+    let a = atan2(p.z, p.x) + u.time * u.tempo * 0.5;
     let i = round(a / sect);
-    let ang = i * sect - u.time * 0.5;
-    let c = p - vec3<f32>(cos(ang) * R * 1.55, hy + sin(i * 2.0) * R * 0.35, sin(ang) * R * 1.55);
-    let s = length(c) - R * 0.075;
+    let ang = i * sect - u.time * u.tempo * 0.5;
+    // Memory mode: the resident fraction keeps the close orbit; the streamed
+    // remainder drifts out and shrinks — the pool, drawn honestly.
+    let resident = select(1.0, f32((i / n) < u.poolFrac), u.poolFrac > 0.0);
+    let orbitR = mix(R * 2.15, R * 1.55, resident);
+    let sprR = mix(R * 0.045, R * 0.075, resident);
+    let c = p - vec3<f32>(cos(ang) * orbitR, hy + sin(i * 2.0) * R * 0.35, sin(ang) * orbitR);
+    let s = length(c) - sprR;
     if (s < d) { d = s; mat = 4.0 + i; }
   }
   return vec2<f32>(d, mat);
@@ -260,8 +279,12 @@ fn fs(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 `
 
 export interface MascotHandle {
-  setSpec: (spec: ModelSpec, cached?: boolean) => void
+  setSpec: (spec: ModelSpec, cached?: boolean, poolFrac?: number) => void
   setHover: (on: boolean) => void
+  /** One generated token — bumps the heartbeat, which decays over ~a third of
+   *  a second. Driven by the chat page's onToken, so the bounce IS the real
+   *  cadence rather than an animation pretending to be one. */
+  pulse: () => void
   /** One frame as a PNG data URL, for surfaces that want the character
    *  without a GPU pass of their own — a message avatar appears once per
    *  reply and would otherwise be a live canvas each. Awaits the queue: read
@@ -320,7 +343,7 @@ export function mascotPalette(spec: ModelSpec): { accent: string; accentHi: stri
 }
 
 /** Spec → the numbers the shader draws. Nothing is authored per model. */
-export function mascotParams(spec: ModelSpec, cached = false): Float32Array<ArrayBuffer> {
+export function mascotParams(spec: ModelSpec, cached = false, poolFrac = 0): Float32Array<ArrayBuffer> {
   const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
   const coil = gdn / Math.max(spec.layers, 1)
   const isMoe = spec.moe != null
@@ -338,7 +361,14 @@ export function mascotParams(spec: ModelSpec, cached = false): Float32Array<Arra
   const bits = spec.moe?.bits ?? 4
   const group = spec.weightFormat === 'mlx-safetensors' ? 64 : 32
 
-  const a: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(112))
+  // Idle tempo from the MEASURED rate label — registry data, '' → 1.0. The
+  // map is deliberately gentle: llama32's ~256 t/s reads as fidgety (~1.9),
+  // the 35B's ~66 as calm (~1.1), and an unmeasured model does not pretend.
+  const rate = parseFloat(modelBranding(spec).rateLabel.replace(/[^0-9.]/g, ''))
+  const tempo = Number.isFinite(rate) ? Math.min(1.9, 0.75 + rate / 160) : 1.0
+  // Ear length from the context ceiling: log2(4k)=12 → 0, log2(262k)=18 → 1.
+  const earCtx = Math.max(0, Math.min(1.4, (Math.log2(spec.maxContext) - 12) / 6))
+  const a: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(128))
   a.set([
     0, 0, 0, 0,
     0.30 + Math.log2(spec.d) * 0.016,
@@ -355,6 +385,7 @@ export function mascotParams(spec: ModelSpec, cached = false): Float32Array<Arra
     0,
     hair[0], hair[1], hair[2], 0,
     iris[0], iris[1], iris[2], cached ? 1 : 0,
+    tempo, 0 /* beat, written per frame */, earCtx, poolFrac,
   ])
   return a
 }
@@ -398,6 +429,7 @@ export async function mountMascot(
 
   const still = matchMedia('(prefers-reduced-motion: reduce)').matches
   let hover = 0, t = 0, raf = 0, dead = false
+  let beat = 0
 
   const frame = (): void => {
     if (dead) return
@@ -409,6 +441,8 @@ export async function mountMascot(
     params[1] = canvas.height
     params[2] = t
     params[3] = hover
+    params[25] = beat
+    beat *= 0.90
     device.queue.writeBuffer(ubo, 0, params)
     const enc = device.createCommandEncoder()
     const pass = enc.beginRenderPass({
@@ -425,8 +459,9 @@ export async function mountMascot(
   frame()
 
   return {
-    setSpec(next, cached = false) {
-      const p = mascotParams(next, cached)
+    pulse() { beat = 1 },
+    setSpec(next, cached = false, poolFrac = 0) {
+      const p = mascotParams(next, cached, poolFrac)
       p[2] = t
       params = p
       if (still) frame()
