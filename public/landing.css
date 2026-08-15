@@ -777,3 +777,111 @@ footer li a:hover { color: var(--accent); }
   #models .mb-variant[aria-selected="true"] { animation: none; }
   .cs-aura i { opacity: 0.35; transform: translateY(-8vh); }
 }
+
+
+/* ══ ROUND 7: THE ENVIRONMENT ══════════════════════════════════════════════
+   The realm gains architecture. Silhouette layers between backdrop and
+   stage, each on its own parallax rate: obelisk skyline far, rune columns
+   near, the character floating between them under an aerial ring. */
+.cs-spires {
+  position: absolute; left: -3%; right: -3%; bottom: 0; height: 42vh;
+  background: url('/entrance/spires.svg') bottom center / cover no-repeat;
+  opacity: 0.85; pointer-events: none; z-index: 0;
+}
+.cs-col {
+  position: absolute; bottom: -2vh; width: min(240px, 16vw); height: 92vh;
+  background: url('/entrance/column.svg') bottom / contain no-repeat;
+  pointer-events: none; z-index: 1; opacity: 0.9;
+}
+.cs-col-l { left: max(6px, 2vw); }
+.cs-col-r { right: max(6px, 2vw); transform: scaleX(-1); }
+
+/* The aerial ring: a great slow wheel behind the character, in the class
+   light at whisper opacity. The armed floor ring is ceremony; this is
+   architecture. */
+.cs-backring {
+  position: absolute; left: 50%; top: 46%; width: min(64dvh, 620px); aspect-ratio: 1;
+  translate: -50% -50%;
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 70%, #fff);
+  -webkit-mask: url('/entrance/backring.svg') center / contain no-repeat;
+  mask: url('/entrance/backring.svg') center / contain no-repeat;
+  opacity: 0.14; z-index: 0;
+  animation: backringSpin 80s linear infinite;
+}
+@keyframes backringSpin { to { rotate: 360deg; } }
+
+/* Nameplate banner wings behind the name. */
+#models .mb-plate { padding-top: 10px; }
+.cs-banner {
+  position: absolute; left: 50%; top: 16px; transform: translateX(-50%);
+  width: min(640px, 92vw); height: 80px; pointer-events: none;
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 65%, #fff);
+  -webkit-mask: url('/entrance/banner.svg') center / contain no-repeat;
+  mask: url('/entrance/banner.svg') center / contain no-repeat;
+  opacity: 0.5; z-index: -1;
+}
+
+/* Portrait frames on the roster faces. */
+.mb-dot-face { position: relative; }
+.mb-dot-face::after {
+  content: ''; position: absolute; inset: -3px;
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 55%, #9fb4d8);
+  -webkit-mask: url('/entrance/pframe.svg') center / contain no-repeat;
+  mask: url('/entrance/pframe.svg') center / contain no-repeat;
+  opacity: 0.35; transition: opacity 0.15s;
+}
+#models .mb-dot[aria-selected="true"] .mb-dot-face::after,
+#models .mb-dot:hover .mb-dot-face::after { opacity: 0.9; }
+
+/* The cinematic edges upgraded: the dark breath now carries the rune border
+   strip along its inner line. */
+#models .cs-root::before {
+  background:
+    linear-gradient(180deg, #05070dcc, transparent),
+    linear-gradient(180deg, transparent 76px, transparent 76px);
+}
+#models .cs-root > .cs-edge-t, #models .cs-root > .cs-edge-b { display: none; }
+#models .cs-root::after {
+  background: linear-gradient(0deg, #05070d99, transparent);
+}
+.cs-borderline-t, .cs-borderline-b {
+  position: absolute; left: 8%; right: 8%; height: 12px; z-index: 2; pointer-events: none;
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, #6c7f9f);
+  -webkit-mask: url('/entrance/border.svg') center / auto 100% repeat-x;
+  mask: url('/entrance/border.svg') center / auto 100% repeat-x;
+  opacity: 0.4;
+}
+.cs-borderline-t { top: calc(var(--nav-h, 64px) + 2px); }
+.cs-borderline-b { bottom: 8px; }
+
+/* The splash's ring burst: the aerial ring blooming open behind the emblem. */
+.cs-splash { position: absolute; }
+.cs-splash-ring {
+  position: absolute; width: 420px; aspect-ratio: 1;
+  background: var(--accent);
+  -webkit-mask: url('/entrance/backring.svg') center / contain no-repeat;
+  mask: url('/entrance/backring.svg') center / contain no-repeat;
+  animation: splashRing 2.2s cubic-bezier(0.16, 1, 0.3, 1) both;
+  opacity: 0.22;
+}
+@keyframes splashRing {
+  0% { transform: scale(0.4) rotate(-40deg); opacity: 0; }
+  40% { opacity: 0.3; }
+  100% { transform: scale(1.05) rotate(8deg); opacity: 0.18; }
+}
+
+/* The realm's cursor: a small trace-diamond. Entrance only. */
+#models .cs-root, #models .cs-root a, #models .cs-root button {
+  cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22"><path d="M11 1 L21 11 L11 21 L1 11 Z" fill="none" stroke="white" stroke-width="2"/><path d="M11 7 L15 11 L11 15 L7 11 Z" fill="white"/></svg>') 11 11, auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cs-backring, .cs-splash-ring { animation: none; }
+}
+@media (max-width: 900px) {
+  .cs-col { display: none; }
+  .cs-spires { height: 26vh; opacity: 0.6; }
+  .cs-backring { width: min(78vw, 380px); top: 40%; }
+  .cs-banner { height: 56px; opacity: 0.4; }
+  .cs-borderline-t, .cs-borderline-b { display: none; }
+}

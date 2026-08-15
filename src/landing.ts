@@ -115,6 +115,7 @@ function render(): void {
   // opening — once per session, skipped for reduced-motion.
   host.innerHTML = `
     <div class="cs-splash" aria-hidden="true">
+      <div class="cs-splash-ring" aria-hidden="true"></div>
       <svg class="cs-emblem" viewBox="0 0 96 96" fill="none">
         <path d="M48 6 L90 48 L48 90 L6 48 Z" stroke="currentColor" stroke-width="3"/>
         <path d="M48 20 L76 48 L48 76 L20 48 Z" stroke="currentColor" stroke-width="1.4" opacity="0.55"/>
@@ -124,9 +125,13 @@ function render(): void {
       <span class="cs-logo">zero<b>-tvm</b></span>
       <span class="cs-sub">LLM inference in the browser · hand-written WGSL</span>
     </div>
+    <div class="cs-spires" aria-hidden="true"></div>
+    <div class="cs-col cs-col-l" aria-hidden="true"></div>
+    <div class="cs-col cs-col-r" aria-hidden="true"></div>
     <div class="cs-fog" aria-hidden="true"><i></i><i></i></div>
     <div class="cs-dust" aria-hidden="true"></div>
     <div class="mb-plate">
+      <div class="cs-banner" aria-hidden="true"></div>
       <div class="mb-name"></div>
       <div class="mb-params"><span class="mb-sigil" aria-hidden="true"></span><span class="mb-params-text"></span></div>
       <div class="cs-lore"></div>
@@ -154,6 +159,8 @@ function render(): void {
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
     <div class="cs-live" aria-live="polite"></div>
+    <div class="cs-borderline-t" aria-hidden="true"></div>
+    <div class="cs-borderline-b" aria-hidden="true"></div>
     <div class="cs-corner cs-corner-l" aria-hidden="true">registry-rendered · numbers are measured</div>
     <div class="cs-corner cs-corner-r" aria-hidden="true">WebGPU · hand-written WGSL</div>
     ${'gpu' in navigator ? '' :
@@ -340,16 +347,21 @@ function render(): void {
   // Depth: the fog and dust track the pointer at different rates — the cheap
   // half of a camera. Skipped entirely under reduced motion.
   if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    const fog = root.querySelector<HTMLElement>('.cs-fog')
-    const dust = root.querySelector<HTMLElement>('.cs-dust')
-    const art = root.querySelector<HTMLElement>('.mb-art')
+    const layers: [HTMLElement | null, number, number][] = [
+      [root.querySelector('.cs-spires'), 6, 2],
+      [root.querySelector('.cs-col-l'), 34, 8],
+      [root.querySelector('.cs-col-r'), 34, 8],
+      [root.querySelector('.cs-fog'), 26, 10],
+      [root.querySelector('.cs-dust'), 12, 5],
+      [root.querySelector('.mb-art'), -7, -3],
+    ]
     root.addEventListener('pointermove', (e) => {
       const r = root.getBoundingClientRect()
       const x = (e.clientX - r.left) / r.width - 0.5
       const y = (e.clientY - r.top) / r.height - 0.5
-      if (fog) fog.style.transform = `translate(${x * 26}px, ${y * 10}px)`
-      if (dust) dust.style.transform = `translate(${x * 12}px, ${y * 5}px)`
-      if (art) art.style.transform = `translate(${x * -7}px, ${y * -3}px)`
+      for (const [n, fx, fy] of layers) {
+        if (n) n.style.transform = `translate(${x * fx}px, ${y * fy}px)`
+      }
     })
   }
 

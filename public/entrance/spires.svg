@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="420" viewBox="0 0 1920 420" preserveAspectRatio="xMidYMax slice">
+  <!-- The realm's skyline: datacenter-temple obelisks. Silhouettes only —
+       parallax layer behind the stage; the lit traces are the windows. -->
+  <defs>
+    <linearGradient id="sp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1526"/><stop offset="100%" stop-color="#080d19"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#sp)">
+    <path d="M60 420 V210 l30 -40 30 40 V420 Z"/>
+    <path d="M270 420 V150 l24 -34 24 34 V420 Z"/>
+    <path d="M470 420 V260 l40 -50 40 50 V420 Z"/>
+    <path d="M1350 420 V190 l28 -38 28 38 V420 Z"/>
+    <path d="M1600 420 V240 l36 -46 36 46 V420 Z"/>
+    <path d="M1790 420 V170 l22 -30 22 30 V420 Z"/>
+  </g>
+  <g stroke="#3d5a8f" stroke-width="2" opacity="0.5">
+    <path d="M90 200 V320 M78 240 V370 M102 250 V340" fill="none"/>
+    <path d="M294 140 V300 M282 180 V360" fill="none"/>
+    <path d="M510 240 V360 M494 280 V400 M526 290 V380" fill="none"/>
+    <path d="M1378 180 V330 M1364 220 V390" fill="none"/>
+    <path d="M1636 230 V370 M1620 260 V400" fill="none"/>
+    <path d="M1812 160 V300 M1800 200 V360" fill="none"/>
+  </g>
+  <g fill="#7ea6e0" opacity="0.8">
+    <rect x="88" y="212" width="4" height="4"/><rect x="88" y="252" width="4" height="4"/>
+    <rect x="292" y="152" width="4" height="4"/><rect x="292" y="212" width="4" height="4"/>
+    <rect x="508" y="252" width="4" height="4"/><rect x="1376" y="192" width="4" height="4"/>
+    <rect x="1634" y="242" width="4" height="4"/><rect x="1810" y="172" width="4" height="4"/>
+  </g>
+</svg>
