@@ -72,14 +72,20 @@ zero-tvm's engine can hold a subset of the 256 experts in an LRU slot pool and
 stream the rest from the on-disk weight cache on demand
 (`DecodeEngineOptions.expertPool`, with weights loaded via the matching
 `loadWeights` option). This is the library API only — the website does not
-wire it. Measured 2026-08-14 on this checkpoint, blocking `generate()` path,
-AC power:
+wire it. Measured 2026-08-15 on this checkpoint, blocking `generate()` path,
+AC power, 2 rounds × 512 tokens, every row token-identical to unpooled:
 
-| experts resident | resident memory | speed (blocking path, AC) | warm LRU hit rate (512-token gen) |
+| experts resident | resident memory | speed | warm LRU hit rate |
 |---|---:|---:|---:|
-| 256/256 (as shipped) | 15.7 GB | see Speed above | — |
-| 128/256 | ~8.4 GB | 15.6 tok/s | 93.5% |
-| 64/256, speculative prefetch on | ~4.8 GB | not measured | 97.9% |
+| 256/256 (as shipped) | 15.7 GB | 58.6 tok/s (this harness; see Speed above for the browser protocol figure) | — |
+| 128/256 | ~8.4 GB | 15.3 tok/s | 93.5% |
+| 96/256 | ~6.6 GB | 15.0 tok/s | 90.4% |
+| 64/256 | ~4.8 GB | 11.7 tok/s | 83.8% |
+
+The flat 96→128 step says the cost is the per-layer readback, not the misses
+— which is also why the quarter pool is nearly as fast as the half. With the
+engine's speculative prefetch on, warm hit rates rise to 97.9–98.9%, at
+similar speed.
 
 Every pooled configuration is **token-exact** on both generate paths: pooled
 generation is token-identical to unpooled over 512-token generations
