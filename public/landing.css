@@ -1259,3 +1259,74 @@ footer li a:hover { color: var(--accent); }
   content: '●'; margin-left: 7px; font-size: 0.5rem; vertical-align: 2px;
   color: var(--ok);
 }
+
+/* ══ GAME ROUND: abilities, saves, listening, the token stream ═════════════ */
+
+/* Abilities: the spec's mechanics as passives — rune bullet, name, clause. */
+#models .mb-abilities { list-style: none; margin: 12px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px; }
+#models .mb-abilities li { display: flex; align-items: baseline; gap: 8px;
+  font-size: 0.74rem; line-height: 1.4; }
+#models .mb-abilities li::before { content: '◆'; flex: none; font-size: 0.5rem;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 80%, #fff); }
+#models .mb-abilities b { flex: none; font-weight: 600; letter-spacing: 0.02em;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 55%, var(--text)); }
+#models .mb-abilities span { color: var(--dim); }
+
+/* Save slot: a stored conversation marks its character — roster glyph +
+   sheet line. Presence only, never a count. */
+#models .mb-dot[data-save] .mb-dot-text b::after {
+  content: ' ◈'; font-size: 0.7em; vertical-align: 1px;
+  color: #cfe0ffaa;
+}
+#models .mb-save { font-size: var(--step--1); margin: 10px 0 0;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 60%, var(--text)); }
+
+/* LISTENING: keys are landing — the character turns toward the panel. The
+   ears perk through the mascot's hover state; this is the body language. */
+#models .cs-chatting.cs-listening .mb-art { rotate: y 9deg; }
+#models .mb-art { transition: transform 0.3s ease-out, rotate 0.45s ease; }
+
+/* THE TOKEN STREAM: while the model speaks, glyphs fly from the character's
+   mouth into the conversation. Visible ONLY under cs-generating — the stream
+   exists exactly when tokens do. */
+.cs-stream { display: none; }
+#models .cs-chatting.cs-generating .cs-stream { display: block;
+  position: absolute; left: 26%; right: 0; top: 0; bottom: 0;
+  pointer-events: none; z-index: 2; }
+.cs-stream i {
+  position: absolute; left: 0; top: 44%;
+  font-style: normal; font-size: 11px;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff);
+  text-shadow: 0 0 6px color-mix(in srgb, var(--cs-accent, var(--accent)) 60%, transparent);
+  opacity: 0;
+  animation: tokFly 1.15s linear infinite;
+}
+.cs-stream i:nth-child(2) { animation-delay: 0.19s; font-size: 8px; top: 45.5%; }
+.cs-stream i:nth-child(3) { animation-delay: 0.38s; top: 43%; }
+.cs-stream i:nth-child(4) { animation-delay: 0.57s; font-size: 8px; top: 46%; }
+.cs-stream i:nth-child(5) { animation-delay: 0.76s; top: 44.5%; }
+.cs-stream i:nth-child(6) { animation-delay: 0.95s; font-size: 9px; top: 43.5%; }
+@keyframes tokFly {
+  0% { transform: translateX(0) translateY(0); opacity: 0; }
+  12% { opacity: 0.9; }
+  55% { transform: translateX(22vw) translateY(-1.2vh); opacity: 0.85; }
+  92% { opacity: 0.5; }
+  100% { transform: translateX(38vw) translateY(-0.6vh); opacity: 0; }
+}
+
+/* SUMMON FAILURE: the circle goes cold. The rite card carries the flavour
+   line; the diagnostic stays in the error panel. */
+#models .cs-boot-failed .mb-pedestal { filter: grayscale(0.7) brightness(0.55); }
+#models .cs-boot-failed .mb-pedestal::after { animation: none; opacity: 0.3; }
+#models .cs-boot-failed .mb-pedestal::before { display: none; }
+
+@media (max-width: 900px) {
+  /* The stream's geometry assumes stage-left/panel-right; stacked phones
+     have neither, and the abilities pad the sheet. */
+  .cs-stream { display: none !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cs-stream { display: none !important; }
+  #models .cs-chatting.cs-listening .mb-art { rotate: none; }
+}

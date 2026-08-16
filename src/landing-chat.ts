@@ -171,6 +171,11 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     // Retry re-runs the whole entry; completed shards come straight from OPFS.
     stage('idle')
     root.classList.add('cs-boot-failed')
+    // Failure theater: the ring dims (CSS on cs-boot-failed) and the rite
+    // card says what happened in the realm's own words. The error line below
+    // it keeps the real reason — flavour never replaces the diagnostic.
+    const title = panel.querySelector('#loading-title')
+    if (title) title.textContent = 'The summoning failed'
     showBootError(boot.reason, () => {
       panel.remove()
       root.classList.remove('cs-chatting', 'cs-boot-failed')
@@ -192,4 +197,26 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     onToken: () => mascot?.pulse(),
     onPhase: (p) => stage(p),
   })
+
+  // LISTENING: typing is real attention — the character turns toward the
+  // panel (CSS on cs-listening) and perks its ears (the hover state) while
+  // keys are landing, and lets go a beat after they stop. The composer is
+  // disabled while busy, so this can never fight the thinking/talking moods.
+  {
+    const inp = panel.querySelector<HTMLTextAreaElement>('#inp')
+    let listenT = 0
+    const unlisten = (): void => {
+      root.classList.remove('cs-listening')
+      if (!root.classList.contains('cs-thinking')) mascot?.setHover(false)
+    }
+    const listen = (): void => {
+      root.classList.add('cs-listening')
+      mascot?.setHover(true)
+      clearTimeout(listenT)
+      listenT = window.setTimeout(unlisten, 1600)
+    }
+    inp?.addEventListener('input', listen)
+    inp?.addEventListener('focus', listen)
+    inp?.addEventListener('blur', () => { clearTimeout(listenT); unlisten() })
+  }
 }

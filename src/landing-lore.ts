@@ -17,6 +17,26 @@ export const LANE_SIGIL: Record<string, string> = {
   embed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12c2.5-4 6-6 9-6s6.5 2 9 6c-2.5 4-6 6-9 6s-6.5-2-9-6z"/><path d="M8 12h8" opacity="0.8"/></svg>',
 }
 
+/** The character's ABILITIES: the spec's real mechanics written as passives.
+ *  Every clause is a registry fact (experts, layer kinds, trained window) —
+ *  game flavour on top of true statements, same contract as loreOf. */
+export function abilitiesOf(spec: ModelSpec): Array<{ name: string; desc: string }> {
+  const out: Array<{ name: string; desc: string }> = []
+  const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
+  if (spec.moe) {
+    out.push({ name: 'Sparse Routing', desc: `${spec.moe.topK} of ${spec.moe.experts} experts wake per token` })
+    if (spec.sharedExpertIndex >= 0) out.push({ name: 'Constant Companion', desc: 'one shared expert always answers' })
+  }
+  if (gdn > 0) out.push({ name: 'Delta Rule', desc: `${gdn} recurrent layers — memory that does not grow` })
+  if (spec.mla) out.push({ name: 'Latent Gaze', desc: 'attends through a compressed latent cache' })
+  if (!spec.moe && gdn === 0 && !spec.mla && !spec.embeddingOnly) {
+    out.push({ name: 'Full Attention', desc: `every token sees every token, ${spec.layers} layers deep` })
+  }
+  if (spec.qkNorm) out.push({ name: 'Steady Gaze', desc: 'QK-norm holds attention in range' })
+  if (spec.maxSeq >= 131072) out.push({ name: 'Long Sight', desc: `trained to a ${Math.round(spec.maxSeq / 1024)}k window` })
+  return out.slice(0, 3)
+}
+
 export function laneOf(spec: ModelSpec): string {
   return spec.embeddingOnly ? 'embed' : spec.mla ? 'mla' : spec.moe ? 'moe'
     : spec.layerKinds.some((k) => k === 'gdn') ? 'hybrid' : 'dense'

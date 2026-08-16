@@ -20,7 +20,7 @@
 import { SHIPPED_MODELS, modelBranding, specWithCtx } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
-import { LANE_SIGIL, laneOf, loreOf } from './landing-lore.js'
+import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
 
 interface Variant { param: string; spec: ModelSpec; label: string }
 interface Group { name: string; params: string; variants: Variant[] }
@@ -84,6 +84,20 @@ const STAT_ICON: Record<string, string> = {
   Weights: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1l3 3-3 3-3-3z"/><path d="M4 8l3 3-3 3-3-3z" opacity="0.6"/><path d="M12 8l3 3-3 3-3-3z" opacity="0.6"/></svg>',
   Context: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 2h8l2 2v10H3z"/><path d="M5 6h6M5 9h6M5 12h4" opacity="0.7"/></svg>',
   Speed: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M9 1L3 9h4l-1 6 6-8H8z"/></svg>',
+  Footprint: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M2 11h12v3H2z"/><path d="M4 7h8v4H4z" opacity="0.75"/><path d="M6 3h4v4H6z" opacity="0.5"/></svg>',
+}
+
+/** Weights GB parsed from a registry label ('~16.4 GB', 'Half · ~8.4 GB · …').
+ *  The labels are the single source for resident size; NaN hides the row. */
+const weightsGb = (label: string): number => {
+  const m = /([\d.]+)\s*GB/.exec(label)
+  return m ? parseFloat(m[1]) : NaN
+}
+
+/** A saved conversation exists for this spec (chat-flow.ts's localStorage
+ *  key). Presence only — the save-slot glyph, not a tally. */
+const hasSave = (specId: string): boolean => {
+  try { return (localStorage.getItem(`zt-chat-${specId}`)?.length ?? 0) > 2 } catch { return false }
 }
 
 // LANE_SIGIL / laneOf / loreOf live in landing-lore.ts — shared with the
@@ -137,6 +151,7 @@ function render(): void {
     <div class="cs-col cs-col-l" aria-hidden="true"></div>
     <div class="cs-col cs-col-r" aria-hidden="true"></div>
     <div class="cs-comet" aria-hidden="true"></div>
+    <div class="cs-stream" aria-hidden="true"><i>◆</i><i>◇</i><i>◆</i><i>◇</i><i>◆</i><i>◇</i></div>
     <div class="cs-fog" aria-hidden="true"><i></i><i></i></div>
     <div class="cs-dust" aria-hidden="true"></div>
     <div class="mb-plate">
@@ -158,11 +173,13 @@ function render(): void {
         <div class="mb-row-label">Quantisation</div>
         <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
         <dl class="mb-stats"></dl>
+        <ul class="mb-abilities"></ul>
         <div class="mb-row-label mb-modes-label" hidden>Memory build</div>
         <div class="mb-modes" role="tablist" aria-label="Memory build"></div>
         <div class="mb-row-label mb-ctxs-label" hidden>Context</div>
         <div class="mb-modes mb-ctxs" role="tablist" aria-label="Context"></div>
         <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
+        <p class="mb-save" hidden>◈ Saved conversation — it continues where you left it</p>
         <p class="mb-ram"></p>
       </div>
     </aside>
@@ -302,6 +319,16 @@ function render(): void {
       ['Context', `${ctxLabel(cx.tokens)} tokens`],
     ]
     if (b.rateLabel) rows.push(['Speed', `${b.rateLabel} <span class="mb-hw">M2 Max</span>`])
+    // Boot footprint: resident weights (the chosen build's label) + the
+    // chosen window's KV — the number that answers "will it fit?", assembled
+    // from the same sources every other figure reads.
+    {
+      const w = weightsGb(mode && mode.slots ? mode.label : b.sizeLabel)
+      if (Number.isFinite(w)) {
+        const total = w + (cx.tokens * v.spec.kvBytesPerToken) / 2 ** 30
+        rows.push(['Footprint', `~${total.toFixed(1)} GB <span class="mb-hw">weights + KV</span>`])
+      }
+    }
     // Context bar: the CHOSEN build over the checkpoint's own maxSeq — a
     // within-character fraction that fills as the picker climbs to Full.
     // Memory bar: the chosen build's slots over the full expert count.
@@ -337,6 +364,10 @@ function render(): void {
       }
     }
 
+    // Abilities: the spec's mechanics as passives — rune bullets, true clauses.
+    el('.mb-abilities').innerHTML = abilitiesOf(v.spec).map((a) =>
+      `<li><b>${a.name}</b><span>${a.desc}</span></li>`).join('')
+
     const ram = el<HTMLElement>('.mb-ram')
     // A pooled build's note replaces the full model's RAM warning — picking
     // less memory IS the answer to that warning. A long-context build adds
@@ -355,9 +386,12 @@ function render(): void {
       // to variants[0] alone hid exactly the downloads worth showing.
       const grp = GROUPS[Number(d.dataset.i)]
       d.toggleAttribute('data-cached', grp.variants.some((x) => CACHED.has(x.spec.id)))
+      // Save slot: a conversation stored on this device continues on enter.
+      d.toggleAttribute('data-save', grp.variants.some((x) => hasSave(x.spec.id)))
     }
     const cached = el<HTMLElement>('.mb-cached')
     cached.hidden = !CACHED.has(v.spec.id)
+    el<HTMLElement>('.mb-save').hidden = !hasSave(v.spec.id)
 
     // The character wears the chosen builds: pool leans the figure, and the
     // context build sets the EARS (earCtx is derived from maxContext) — pick
