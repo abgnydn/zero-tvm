@@ -251,7 +251,9 @@ function render(): void {
       const spec = GROUPS[i].variants[0].spec
       m.setSpec(spec, GROUPS[i].variants.some((x) => CACHED.has(x.spec.id)))
       await new Promise((r) => setTimeout(r, 40))
-      const url = await m.snapshot()
+      // Posed: every portrait the same front-facing frame — a rail of
+      // random sway/blink instants read as misaligned cards.
+      const url = await m.snapshot(true)
       const dot = root.querySelector<HTMLElement>(`.mb-dot[data-i="${i}"] .mb-dot-face`)
       if (dot) dot.style.setProperty('--thumb', `url("${url}")`)
     }

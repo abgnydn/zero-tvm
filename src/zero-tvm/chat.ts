@@ -318,7 +318,7 @@ function mountChatMascots(): void {
     logo.classList.add('has-mascot')
     void mountMascot(c, SPEC).then(async (m) => {
       if (!m) { c.remove(); logo.classList.remove('has-mascot'); return }
-      const url = await m.snapshot()
+      const url = await m.snapshot(true)
       document.documentElement.style.setProperty('--mascot-avatar', `url("${url}")`)
       document.documentElement.classList.add('has-mascot-avatar')
     }).catch(() => { c.remove(); logo.classList.remove('has-mascot') })

@@ -54,7 +54,9 @@ struct U {
   tempo: f32, beat: f32, earCtx: f32, poolFrac: f32,
   // gaze: pointer position in [-1,1], written per frame — the irises follow
   // the hand. Suppressed while thinking (the upward drift owns the eyes).
-  gaze: vec2<f32>, _p2: vec2<f32>,
+  // pose.x: portrait flag — one frame with no sway, no bob, no blink, so
+  // every roster snapshot is the same front-facing framing.
+  gaze: vec2<f32>, pose: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -84,9 +86,10 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
   // Idle bob always — slower and deeper while asleep (breathing); the token
   // pulse bobs the BODY only when not talking — while talking the same beat
   // drives the mouth instead (below).
-  p.y = p.y - sin(T * mix(1.2, 0.55, sleepy)) * mix(0.018, 0.028, sleepy)
-      - u.beat * 0.020 * (1.0 - talking);
-  let m = rot(sin(T * 0.4) * 0.42);                  // sway, never a full spin
+  let live = 1.0 - u.pose.x;                         // 0 while posing a portrait
+  p.y = p.y - (sin(T * mix(1.2, 0.55, sleepy)) * mix(0.018, 0.028, sleepy)
+      + u.beat * 0.020 * (1.0 - talking)) * live;
+  let m = rot(sin(T * 0.4) * 0.42 * live);           // sway, never a full spin
   let xz = m * vec2<f32>(p.x, p.z);
   p = vec3<f32>(xz.x, p.y, xz.y);
 
@@ -162,7 +165,7 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
     // three-quarters shut on top; the greet is a happy squint.
     let b1 = abs(fract(T * 0.20) - 0.04);
     let b2 = abs(fract(T * 0.077 + 0.5) - 0.04);
-    let blink = 1.0 - smoothstep(0.025, 0.05, min(b1, b2));
+    let blink = (1.0 - smoothstep(0.025, 0.05, min(b1, b2))) * live;
     let eyeY = (1.0 - 0.85 * max(blink, sleepy * 0.75)) * (1.0 - 0.2 * greet);
     let ec = vec3<f32>(R * 0.38, hy - R * 0.22, R * 0.74);
     let white = sdEllip(q - ec, vec3<f32>(R * 0.30, R * 0.38 * eyeY, R * 0.20));
@@ -352,8 +355,10 @@ export interface MascotHandle {
    *  without a GPU pass of their own — a message avatar appears once per
    *  reply and would otherwise be a live canvas each. Awaits the queue: read
    *  before the frame lands and the canvas is still empty, which shows up as
-   *  a blank avatar rather than an error. */
-  snapshot: () => Promise<string>
+   *  a blank avatar rather than an error. `posed` renders one PORTRAIT frame
+   *  first — no sway, no bob, no blink — so a rail of snapshots all share
+   *  the same front-facing framing. */
+  snapshot: (posed?: boolean) => Promise<string>
   destroy: () => void
 }
 
@@ -431,9 +436,12 @@ export function mascotParams(spec: ModelSpec, cached = false, poolFrac = 0): Flo
   const tempo = Number.isFinite(rate) ? Math.min(1.9, 0.75 + rate / 160) : 1.0
   // Ear length from the context ceiling: log2(4k)=12 → 0, log2(262k)=18 → 1.
   const earCtx = Math.max(0, Math.min(1.4, (Math.log2(spec.maxContext) - 12) / 6))
-  // 144 B: 32 spec floats + gaze vec2 + pad. gaze/mood/beat are written per
-  // frame by the handle, never here — setSpec must not reset a live face.
-  const a: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(144))
+  // 128 B = the U struct exactly: 28 spec floats + gaze vec2 (28,29) + pose
+  // vec2 (30,31). gaze/pose/mood/beat are written per frame by the handle,
+  // never here — setSpec must not reset a live face. The indices MUST match
+  // the struct: writes past its size land in ignored bytes and the trait
+  // silently never renders (gaze was dead for a day exactly this way).
+  const a: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(128))
   a.set([
     0, 0, 0, 0,
     0.30 + Math.log2(spec.d) * 0.016,
@@ -499,8 +507,8 @@ export async function mountMascot(
   let mood = 0
   let gx = 0, gy = 0
 
-  const frame = (): void => {
-    if (dead) return
+  let posing = false
+  const renderPass = (): void => {
     const dpr = Math.min(devicePixelRatio || 1, 2)
     const w = Math.max(1, Math.round(canvas.clientWidth * dpr))
     const h = Math.max(1, Math.round(canvas.clientHeight * dpr))
@@ -512,8 +520,8 @@ export async function mountMascot(
     // Written per frame (not in mascotParams) so setSpec cannot reset them.
     params[15] = mood
     params[25] = beat
-    params[32] = gx
-    params[33] = gy
+    params[28] = gx
+    params[29] = gy
     beat *= 0.90
     device.queue.writeBuffer(ubo, 0, params)
     const enc = device.createCommandEncoder()
@@ -526,6 +534,12 @@ export async function mountMascot(
     })
     pass.setPipeline(pipeline); pass.setBindGroup(0, bind); pass.draw(3); pass.end()
     device.queue.submit([enc.finish()])
+  }
+  const frame = (): void => {
+    if (dead) return
+    // A posed portrait is being captured — the live loop must not present
+    // over it between the pose render and the readback.
+    if (!posing) renderPass()
     if (!still) { t += 1 / 60; raf = requestAnimationFrame(frame) }
   }
   frame()
@@ -549,9 +563,16 @@ export async function mountMascot(
       gy = Math.max(-1, Math.min(1, y))
       if (still) frame()
     },
-    async snapshot() {
+    async snapshot(posed = false) {
+      if (posed) {
+        posing = true
+        params[30] = 1     // pose.x — one frame, front-facing, eyes open
+        renderPass()
+      }
       await device.queue.onSubmittedWorkDone()
-      return canvas.toDataURL('image/png')
+      const url = canvas.toDataURL('image/png')
+      if (posed) { params[30] = 0; posing = false }
+      return url
     },
     destroy() { dead = true; cancelAnimationFrame(raf) },
   }
