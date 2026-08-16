@@ -57,6 +57,17 @@ const ICON_PLAY = '<svg class="icon" viewBox="0 0 24 24"><polygon points="6 4 20
  *  on a plain ground, js runs with console piped to the page. */
 const CANVAS_LANGS = new Set(['html', 'svg', 'js', 'javascript'])
 
+/** The most recent runnable block this page rendered — what `/canvas`
+ *  reopens. Streaming re-renders overwrite it; the final render wins. */
+let lastRunnable: { code: string; lang: string } | null = null
+
+/** Open the last runnable code block, if any (the `/canvas` command). */
+export function openLastCanvas(): boolean {
+  if (!lastRunnable) return false
+  openCanvas(lastRunnable.code, lastRunnable.lang)
+  return true
+}
+
 /**
  * THE CANVAS — model-written code, actually run. A sandboxed iframe overlay:
  * `sandbox="allow-scripts"` ONLY, so the code executes in an opaque origin —
@@ -64,6 +75,9 @@ const CANVAS_LANGS = new Set(['html', 'svg', 'js', 'javascript'])
  * It can compute and draw; it cannot reach.
  */
 function openCanvas(code: string, lang: string): void {
+  // A deed: model-written code, actually run (fire-and-forget import — feats
+  // is DOM/GPU-free and failure-silent).
+  void import('../feats.js').then((f) => f.recordFeat('canvas')).catch(() => {})
   document.getElementById('code-canvas')?.remove()
   const host = document.createElement('div')
   host.id = 'code-canvas'
@@ -110,6 +124,7 @@ function makeCodeBlock(code: string, lang: string): HTMLElement {
   head.appendChild(langEl)
   const norm = (lang || '').toLowerCase()
   if (CANVAS_LANGS.has(norm)) {
+    lastRunnable = { code, lang: norm }
     const run = document.createElement('button')
     run.type = 'button'
     run.className = 'code-run'

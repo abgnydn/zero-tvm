@@ -1330,3 +1330,47 @@ footer li a:hover { color: var(--accent); }
   .cs-stream { display: none !important; }
   #models .cs-chatting.cs-listening .mb-art { rotate: none; }
 }
+
+/* ══ EXTENDED ROUND: sleep, the constellation, the deeds rail ══════════════ */
+
+/* ASLEEP (50 s idle): the ring cools and slows with the character — the
+   sleepy face itself is the mascot's mood, this is the room's light. */
+#models .cs-asleep .mb-pedestal { filter: brightness(0.7) saturate(0.8); }
+#models .cs-asleep .mb-pedestal::after { animation-duration: 10s; }
+#models .cs-asleep .cs-fog i { opacity: 0.2; }
+
+/* THE CONSTELLATION: the lane's sigil, huge and faint, behind the stage.
+   Masked accent — it recolours with the character and drifts on parallax. */
+.cs-sigilbg {
+  position: absolute; z-index: 0; pointer-events: none;
+  left: 50%; top: 50%;
+  width: min(74vh, 58vw); height: min(74vh, 58vw);
+  margin: calc(min(74vh, 58vw) / -2) 0 0 calc(min(74vh, 58vw) / -2);
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 80%, #fff);
+  opacity: 0.05;
+  -webkit-mask-size: contain; mask-size: contain;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center; mask-position: center;
+}
+#models .cs-chatting .cs-sigilbg { left: 27%; }
+
+/* THE DEEDS RAIL: things that happened on this device. Unearned = a dim rune
+   with the trigger in its tooltip (a quest list, not decoration); earned =
+   lit, named. No counts anywhere. */
+#models .cs-deeds {
+  grid-area: note; z-index: 1; justify-self: center;
+  display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+  padding: 2px 0;
+}
+.cs-deed {
+  font-family: var(--mono); font-size: 0.56rem; letter-spacing: 0.12em;
+  text-transform: uppercase; color: color-mix(in srgb, var(--dim) 55%, transparent);
+  cursor: default;
+}
+.cs-deed i { font-style: normal; display: none; margin-left: 5px; }
+.cs-deed[data-on] {
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 75%, #fff);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--cs-accent, var(--accent)) 45%, transparent);
+}
+.cs-deed[data-on] i { display: inline; }
+@media (max-width: 900px) { #models .cs-deeds { display: none; } }

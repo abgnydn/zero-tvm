@@ -35,6 +35,7 @@ import {
   setChatIdentity, quantTagFor, autoGrow,
   wireScrollFab, addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
+import { openLastCanvas } from './markdown.js'
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T | null
@@ -203,6 +204,9 @@ export interface ChatSurfaceOptions {
   onToken?: () => void
   onPhase?: (phase: ChatPhase) => void
   log?: (msg: string) => void
+  /** Surface-specific slash commands (name without the slash → action),
+   *  merged over the built-ins (/new, /canvas). */
+  commands?: Record<string, () => void>
 }
 
 /** Wire the full conversational surface onto the page's chat markup. */
@@ -301,7 +305,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     // True ceiling is the KV page table (spec.maxPages × spec.pageSize), which
     // is what the engine enforces — not the model's nominal maxSeq.
     if (!nTokens) {
-      ctxHint.textContent = 'Zero TVM · 10 WGSL kernel roles'
+      ctxHint.textContent = 'Zero TVM · 10 WGSL kernel roles · “/” for commands'
     } else if (nTokens >= engine.maxContext) {
       ctxHint.textContent = `Context full — ${engine.maxContext} / ${engine.maxContext} tokens · start a new chat`
     } else {
@@ -522,10 +526,37 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     inp?.focus()
   }
 
+  // ── Slash commands ── handled locally, never sent to the model. The
+  // built-ins are shared; a surface adds its own (the entrance adds /roster).
+  const COMMANDS: Record<string, () => void> = {
+    new: () => resetChat(),
+    canvas: () => {
+      if (!openLastCanvas()) sysNote('No runnable code block yet — ask for html, svg, or js.')
+    },
+    ...opts.commands,
+  }
+  /** A quiet system line in the message column — command feedback, not a
+   *  conversation turn (never enters history). */
+  function sysNote(text: string): void {
+    const el = document.createElement('div')
+    el.className = 'sys-note'
+    el.textContent = text
+    $('messages')?.appendChild(el)
+  }
   async function send(): Promise<void> {
     if (generating || !inp) return
     const text = inp.value.trim()
     if (!text) return
+    // Only EXACT command names are intercepted — "/etc/hosts?" is a question
+    // for the model, not a typo'd command.
+    const cmdName = text.startsWith('/') ? text.slice(1).split(/\s/)[0].toLowerCase() : ''
+    if (cmdName && COMMANDS[cmdName]) {
+      inp.value = ''
+      autoGrow(inp)
+      updateSendEnabled()
+      COMMANDS[cmdName]()
+      return
+    }
     inp.value = ''
     autoGrow(inp)
     addUserMsg(text)

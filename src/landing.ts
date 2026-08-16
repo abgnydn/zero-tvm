@@ -21,6 +21,7 @@ import { SHIPPED_MODELS, modelBranding, specWithCtx } from './zero-tvm/model-reg
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
+import { FEATS, feats } from './feats.js'
 
 interface Variant { param: string; spec: ModelSpec; label: string }
 interface Group { name: string; params: string; variants: Variant[] }
@@ -151,6 +152,7 @@ function render(): void {
     <div class="cs-col cs-col-l" aria-hidden="true"></div>
     <div class="cs-col cs-col-r" aria-hidden="true"></div>
     <div class="cs-comet" aria-hidden="true"></div>
+    <div class="cs-sigilbg" aria-hidden="true"></div>
     <div class="cs-stream" aria-hidden="true"><i>◆</i><i>◇</i><i>◆</i><i>◇</i><i>◆</i><i>◇</i></div>
     <div class="cs-fog" aria-hidden="true"><i></i><i></i></div>
     <div class="cs-dust" aria-hidden="true"></div>
@@ -183,6 +185,7 @@ function render(): void {
         <p class="mb-ram"></p>
       </div>
     </aside>
+    ${'gpu' in navigator ? '<div class="cs-deeds" role="list" aria-label="Deeds"></div>' : ''}
     <div class="cs-roster-head" aria-hidden="true">Roster · ${GROUPS.length}</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
@@ -266,6 +269,18 @@ function render(): void {
     el('.mb-params-text').textContent = g.params
     el('.mb-sigil').innerHTML = LANE_SIGIL[laneOf(v.spec)] ?? ''
     el('.cs-lore').textContent = loreOf(v.spec)
+    // The constellation: the lane's sigil, huge and faint, behind the stage —
+    // as a mask, so the accent wash colours it. The geometry carries the
+    // alpha; the SVG's currentColor resolves opaque, which is all a mask needs.
+    {
+      const bg = root.querySelector<HTMLElement>('.cs-sigilbg')
+      const svg = LANE_SIGIL[laneOf(v.spec)]
+      if (bg && svg) {
+        const uri = `url("data:image/svg+xml,${encodeURIComponent(svg)}")`
+        bg.style.webkitMaskImage = uri
+        bg.style.maskImage = uri
+      }
+    }
     // Aura tempo from the measured rate — the same number the mascot's idle
     // clock uses. Unmeasured models get 1.0 rather than a guess.
     const rate2 = parseFloat(b.rateLabel.replace(/[^0-9.]/g, ''))
@@ -400,6 +415,20 @@ function render(): void {
       mode ? poolFracOf(v.spec, mode.slots) : 0)
   }
 
+  /** DEEDS: things that happened on this device — lit runes, earned names.
+   *  Unearned deeds keep their glyph and tooltip (the trigger is stated, so
+   *  the rail is a quest list, not decoration); earned ones show the name. */
+  function paintDeeds(): void {
+    const rail = root.querySelector<HTMLElement>('.cs-deeds')
+    if (!rail) return
+    const have = feats()
+    rail.innerHTML = FEATS.map((f) =>
+      `<span class="cs-deed" role="listitem"${have.has(f.id) ? ' data-on' : ''} `
+      + `title="${f.name} — ${f.desc}">◆<i>${f.name}</i></span>`).join('')
+  }
+  document.addEventListener('zt-feat', paintDeeds)
+  paintDeeds()
+
   /** Selection transition: retrigger the stage flash + plate/sheet entrance
    *  animations by yanking the class off for a frame. */
   function selectFx(): void {
@@ -471,6 +500,7 @@ function render(): void {
       [root.querySelector('.cs-col-r'), 34, 8],
       [root.querySelector('.cs-fog'), 26, 10],
       [root.querySelector('.cs-dust'), 12, 5],
+      [root.querySelector('.cs-sigilbg'), 9, 4],
       [root.querySelector('.mb-art'), -7, -3],
     ]
     root.addEventListener('pointermove', (e) => {
@@ -480,6 +510,9 @@ function render(): void {
       for (const [n, fx, fy] of layers) {
         if (n) n.style.transform = `translate(${x * fx}px, ${y * fy}px)`
       }
+      // The character watches the hand — same normalized pointer the
+      // parallax reads, straight into the irises.
+      mascot?.setGaze(x * 2, y * 2)
     })
   }
 
@@ -528,14 +561,30 @@ function render(): void {
     })
   })
 
-  // Idle: 18 s without input and the realm starts breathing on its own —
-  // any movement hands the camera back. Reduced motion never idles.
+  // Idle: 18 s without input and the realm starts breathing on its own; 50 s
+  // and the character falls ASLEEP — heavy lids, slow breath, dim ring — but
+  // never mid-work (summoning/thinking/talking defer the nap). Any movement
+  // hands the camera back and wakes it. Reduced motion never idles.
   if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
     let idleTimer = 0
+    let sleepTimer = 0
+    const busyNow = (): boolean => ['cs-summoning', 'cs-thinking', 'cs-generating']
+      .some((c) => root.classList.contains(c))
+    const sleep = (): void => {
+      if (busyNow()) { sleepTimer = window.setTimeout(sleep, 50000); return }
+      root.classList.add('cs-asleep')
+      mascot?.setMood('sleepy')
+    }
     const wake = (): void => {
+      if (root.classList.contains('cs-asleep')) {
+        root.classList.remove('cs-asleep')
+        if (!busyNow()) mascot?.setMood('idle')
+      }
       root.classList.remove('cs-idle')
       clearTimeout(idleTimer)
+      clearTimeout(sleepTimer)
       idleTimer = window.setTimeout(() => root.classList.add('cs-idle'), 18000)
+      sleepTimer = window.setTimeout(sleep, 50000)
     }
     for (const ev of ['pointermove', 'pointerdown', 'keydown']) root.addEventListener(ev, wake)
     wake()

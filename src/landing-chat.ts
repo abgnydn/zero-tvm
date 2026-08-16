@@ -20,6 +20,7 @@ import { mascotPalette } from './mascot.js'
 import { modelBranding, specWithCtx } from './zero-tvm/model-registry.js'
 import { bootChatEngine, wireChatSurface, showBootError, type ChatPhase } from './zero-tvm/chat-flow.js'
 import { LANE_SIGIL, laneOf, loreOf } from './landing-lore.js'
+import { recordFeat } from './feats.js'
 
 export interface EnterChatOptions {
   /** The .cs-root the select screen rendered into. */
@@ -184,11 +185,34 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     return
   }
 
-  // Summoned: the rite card folds away, the welcome steps forward.
+  // Summoned: the rite card folds away, the welcome steps forward — and the
+  // character GREETS: a held smile with a little bounce, released back to
+  // idle unless a fast first message already claimed the face.
   stage('idle')
   root.classList.add('cs-ready')
   panel.querySelector('.cs-boot')?.classList.add('cs-done')
   panel.querySelector('#welcome')?.classList.remove('cs-wait')
+  mascot?.setMood('greet')
+  mascot?.pulse()
+  setTimeout(() => {
+    if (!root.classList.contains('cs-thinking') && !root.classList.contains('cs-generating')) {
+      mascot?.setMood('idle')
+    }
+  }, 1600)
+
+  // DEEDS — this summon actually happened; record what kind it was. The
+  // lane deeds mirror the roster's own lanes; heavy = the same footprint
+  // number the sheet shows (weights + KV), earned at ≥10 GB.
+  recordFeat('first-summon')
+  const lane = laneOf(spec)
+  if (lane === 'dense' || lane === 'hybrid' || lane === 'moe') recordFeat(`lane-${lane}`)
+  if (opts.poolSlots) recordFeat('pooled')
+  if (opts.ctxTokens) recordFeat('long-ctx')
+  {
+    const w = /([\d.]+)\s*GB/.exec(opts.poolLabel || brand.sizeLabel)
+    const gb = (w ? parseFloat(w[1]) : 0) + (spec.maxContext * spec.kvBytesPerToken) / 2 ** 30
+    if (gb >= 10) recordFeat('heavy')
+  }
 
   wireChatSurface({
     spec,
@@ -196,6 +220,8 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     engine: boot.engine,
     onToken: () => mascot?.pulse(),
     onPhase: (p) => stage(p),
+    // /roster leaves the chat the same way the header link does.
+    commands: { roster: () => location.reload() },
   })
 
   // LISTENING: typing is real attention — the character turns toward the

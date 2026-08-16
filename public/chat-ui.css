@@ -491,3 +491,23 @@
     /* The iframe ground is white on purpose: model-written pages assume a
        default (light) document, and an unstyled preview should look like one. */
     .canvas-view { flex: 1; width: 100%; border: 0; background: #fff; }
+
+    /* ─────────── Command feedback + reply settle ─────────── */
+    /* A quiet system line in the message column (slash-command feedback) —
+       styled as stage direction, not as a conversation turn. */
+    .sys-note {
+      margin: 0.6rem auto 1rem;
+      max-width: 80%;
+      text-align: center;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    /* A finished reply settles with a brief accent wash. */
+    .msg.ai.msg-done { animation: msgDone 0.8s ease; border-radius: 10px; }
+    @keyframes msgDone {
+      0% { background: var(--accent-tint); }
+      100% { background: transparent; }
+    }
+    @media (prefers-reduced-motion: reduce) { .msg.ai.msg-done { animation: none; } }

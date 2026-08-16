@@ -201,6 +201,8 @@ async function main(): Promise<void> {
     onToken: () => headerMascot?.pulse(),
     onPhase: (p) => headerMascot?.setMood(
       p === 'generating' ? 'talking' : p === 'thinking' ? 'thinking' : 'idle'),
+    // /roster returns to the entrance, where the character select lives.
+    commands: { roster: () => { location.href = '/' } },
     log,
   })
 }

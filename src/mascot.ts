@@ -35,9 +35,11 @@ struct U {
   headR: f32, spikes: f32, coil: f32, kvh: f32,
   experts: f32, topk: f32, sharedFused: f32, bands: f32,
   // mood: what the model is DOING right now — 0 idle, 1 thinking (prefill),
-  // 2 talking (streaming). Thinking is a face (irises up, mouth pursed, ears
-  // perked); talking routes the per-token beat into the MOUTH instead of a
-  // body bob, so the flap rate is the real token cadence.
+  // 2 talking (streaming), 3 sleepy (long idle), 4 greet (summon complete).
+  // Thinking is a face (irises up, mouth pursed, ears perked); talking routes
+  // the per-token beat into the MOUTH instead of a body bob, so the flap rate
+  // is the real token cadence; sleepy is heavy lids and slow breathing; greet
+  // is a wide smile and a happy squint, held for a beat by the page.
   ink: f32, eyesOpen: f32, bandShift: f32, mood: f32,
   hair: vec3<f32>, _p1: f32,
   iris: vec3<f32>, cached: f32,
@@ -50,6 +52,9 @@ struct U {
   // the registry's measured labels, or live engine events — same rule as
   // every other trait: the picture cannot disagree with the table.
   tempo: f32, beat: f32, earCtx: f32, poolFrac: f32,
+  // gaze: pointer position in [-1,1], written per frame — the irises follow
+  // the hand. Suppressed while thinking (the upward drift owns the eyes).
+  gaze: vec2<f32>, _p2: vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> u: U;
 
@@ -72,11 +77,15 @@ fn sdCap(p: vec3<f32>, h: f32, r: f32) -> f32 {
 fn map2(pIn: vec3<f32>) -> vec2<f32> {
   var p = pIn;
   let T = u.time * u.tempo;
-  let talking = step(1.5, u.mood);
-  let thinking = step(0.5, u.mood) * (1.0 - talking);
-  // Idle bob always; the token pulse bobs the BODY only when not talking —
-  // while talking the same beat drives the mouth instead (below).
-  p.y = p.y - sin(T * 1.2) * 0.018 - u.beat * 0.020 * (1.0 - talking);
+  let talking = step(1.5, u.mood) * (1.0 - step(2.5, u.mood));
+  let thinking = step(0.5, u.mood) * (1.0 - step(1.5, u.mood));
+  let sleepy = step(2.5, u.mood) * (1.0 - step(3.5, u.mood));
+  let greet = step(3.5, u.mood);
+  // Idle bob always — slower and deeper while asleep (breathing); the token
+  // pulse bobs the BODY only when not talking — while talking the same beat
+  // drives the mouth instead (below).
+  p.y = p.y - sin(T * mix(1.2, 0.55, sleepy)) * mix(0.018, 0.028, sleepy)
+      - u.beat * 0.020 * (1.0 - talking);
   let m = rot(sin(T * 0.4) * 0.42);                  // sway, never a full spin
   let xz = m * vec2<f32>(p.x, p.z);
   p = vec3<f32>(xz.x, p.y, xz.y);
@@ -148,13 +157,25 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
   // A concave dimple cannot hold a catchlight, and the catchlight is the whole
   // reason an anime eye reads as alive.
   if (u.eyesOpen > 0.5) {
+    // BLINK: two incommensurate phases so the rhythm never reads as a loop.
+    // Each spike closes the lids for ~a tenth of its cycle. Sleep holds them
+    // three-quarters shut on top; the greet is a happy squint.
+    let b1 = abs(fract(T * 0.20) - 0.04);
+    let b2 = abs(fract(T * 0.077 + 0.5) - 0.04);
+    let blink = 1.0 - smoothstep(0.025, 0.05, min(b1, b2));
+    let eyeY = (1.0 - 0.85 * max(blink, sleepy * 0.75)) * (1.0 - 0.2 * greet);
     let ec = vec3<f32>(R * 0.38, hy - R * 0.22, R * 0.74);
-    let white = sdEllip(q - ec, vec3<f32>(R * 0.30, R * 0.38, R * 0.20));
+    let white = sdEllip(q - ec, vec3<f32>(R * 0.30, R * 0.38 * eyeY, R * 0.20));
     if (white < d) { d = white; mat = 2.0; }
     // Thinking face: the irises drift up — the classic looking-for-the-word.
+    // Otherwise they FOLLOW the pointer: q is mirrored (|x|), so a world-x
+    // gaze needs the sign of the eye's own side to keep both looking the
+    // same way instead of crossing.
     let lookUp = thinking * R * 0.10;
-    let iris = sdEllip(q - (ec + vec3<f32>(0.0, -R * 0.04 + lookUp, R * 0.11)),
-                       vec3<f32>(R * 0.23, R * 0.30, R * 0.17));
+    let sx = select(-1.0, 1.0, p.x >= 0.0);
+    let gz = vec3<f32>(u.gaze.x * sx, -u.gaze.y, 0.0) * R * 0.07 * (1.0 - thinking) * (1.0 - sleepy);
+    let iris = sdEllip(q - (ec + vec3<f32>(0.0, -R * 0.04 + lookUp, R * 0.11) + gz),
+                       vec3<f32>(R * 0.23, R * 0.30 * eyeY, R * 0.17));
     if (iris < d) { d = iris; mat = 3.0; }
   } else {
     // Closed: a lash line, so the face still has a feature.
@@ -174,8 +195,13 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
     // SPEAKING rather than surprise. At high token rates beat alone pins the
     // mouth open — the chatter is the flap.
     let open = clamp(u.beat * 1.5, 0.0, 1.0) * talking * (0.30 + 0.70 * abs(sin(u.time * 12.0)));
-    let mw = R * mix(mix(0.11, 0.055, thinking), 0.085, open);
-    let mh = R * (mix(0.055, 0.025, thinking) + 0.11 * open);
+    var mwB = mix(0.11, 0.055, thinking);
+    mwB = mix(mwB, 0.20, greet);                       // the smile is WIDE
+    var mhB = mix(0.055, 0.025, thinking);
+    mhB = mix(mhB, 0.020, sleepy);                     // asleep: barely there
+    mhB = mix(mhB, 0.028, greet);                      // ...and shallow
+    let mw = R * mix(mwB, 0.085, open);
+    let mh = R * (mhB + 0.11 * open);
     let mo = sdEllip(p - vec3<f32>(0.0, hy - R * 0.62 - open * R * 0.04, R * 0.80),
                      vec3<f32>(mw, mh, R * 0.08));
     if (mo < d) { d = mo; mat = -1.0; }
@@ -313,8 +339,11 @@ export interface MascotHandle {
   setHover: (on: boolean) => void
   /** What the model is doing, as a face: 'thinking' purses the mouth, drifts
    *  the irises up and perks the ears; 'talking' routes pulse() into the
-   *  mouth instead of a body bob. Persists across setSpec. */
-  setMood: (mood: 'idle' | 'thinking' | 'talking') => void
+   *  mouth instead of a body bob; 'sleepy' is heavy lids and slow breathing;
+   *  'greet' is a held smile. Persists across setSpec. */
+  setMood: (mood: 'idle' | 'thinking' | 'talking' | 'sleepy' | 'greet') => void
+  /** Where the pointer is, in [-1,1] — the irises follow. */
+  setGaze: (x: number, y: number) => void
   /** One generated token — bumps the heartbeat, which decays over ~a third of
    *  a second. Driven by the chat page's onToken, so the bounce IS the real
    *  cadence rather than an animation pretending to be one. */
@@ -402,7 +431,9 @@ export function mascotParams(spec: ModelSpec, cached = false, poolFrac = 0): Flo
   const tempo = Number.isFinite(rate) ? Math.min(1.9, 0.75 + rate / 160) : 1.0
   // Ear length from the context ceiling: log2(4k)=12 → 0, log2(262k)=18 → 1.
   const earCtx = Math.max(0, Math.min(1.4, (Math.log2(spec.maxContext) - 12) / 6))
-  const a: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(128))
+  // 144 B: 32 spec floats + gaze vec2 + pad. gaze/mood/beat are written per
+  // frame by the handle, never here — setSpec must not reset a live face.
+  const a: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(144))
   a.set([
     0, 0, 0, 0,
     0.30 + Math.log2(spec.d) * 0.016,
@@ -420,6 +451,7 @@ export function mascotParams(spec: ModelSpec, cached = false, poolFrac = 0): Flo
     hair[0], hair[1], hair[2], 0,
     iris[0], iris[1], iris[2], cached ? 1 : 0,
     tempo, 0 /* beat, written per frame */, earCtx, poolFrac,
+    0, 0 /* gaze, written per frame */, 0, 0,
   ])
   return a
 }
@@ -465,6 +497,7 @@ export async function mountMascot(
   let hover = 0, t = 0, raf = 0, dead = false
   let beat = 0
   let mood = 0
+  let gx = 0, gy = 0
 
   const frame = (): void => {
     if (dead) return
@@ -479,6 +512,8 @@ export async function mountMascot(
     // Written per frame (not in mascotParams) so setSpec cannot reset them.
     params[15] = mood
     params[25] = beat
+    params[32] = gx
+    params[33] = gy
     beat *= 0.90
     device.queue.writeBuffer(ubo, 0, params)
     const enc = device.createCommandEncoder()
@@ -505,7 +540,13 @@ export async function mountMascot(
     },
     setHover(on) { hover = on ? 1 : 0 },
     setMood(m) {
-      mood = m === 'talking' ? 2 : m === 'thinking' ? 1 : 0
+      mood = m === 'talking' ? 2 : m === 'thinking' ? 1
+        : m === 'sleepy' ? 3 : m === 'greet' ? 4 : 0
+      if (still) frame()
+    },
+    setGaze(x, y) {
+      gx = Math.max(-1, Math.min(1, x))
+      gy = Math.max(-1, Math.min(1, y))
       if (still) frame()
     },
     async snapshot() {

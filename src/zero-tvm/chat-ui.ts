@@ -153,6 +153,9 @@ export function addAiMsg(): AiMsgHandle {
       // Ensure final markdown render without cursor.
       const frag = renderMarkdown(fullText)
       body.replaceChildren(frag)
+      // A finished reply settles with a brief accent wash (CSS keyframe;
+      // restored messages get it too — the class is the "done" state).
+      wrap.classList.add('msg-done')
       // A resumed reply re-runs finish() on the same message — drop the
       // banner that made it resumable before rebuilding.
       wrap.querySelector('.truncation')?.remove()
