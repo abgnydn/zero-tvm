@@ -72,10 +72,18 @@ type BindEntry = GPUBuffer | { buffer: GPUBuffer; offset: number; size: number }
 function bg(device: GPUDevice, pipeline: GPUComputePipeline, bufs: BindEntry[]): GPUBindGroup {
   return device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
-    entries: bufs.map((b, i) => ({
-      binding: i,
-      resource: 'buffer' in b ? (b as GPUBufferBinding) : { buffer: b as GPUBuffer },
-    })),
+    entries: bufs.map((b, i) => {
+      if (!b) {
+        // A null here is ALWAYS a wiring bug (an optional buffer bound on a
+        // path that never allocates it) — name the slot instead of letting
+        // `'buffer' in null` throw a TypeError that points at nothing.
+        throw new Error(`bg: null buffer at binding ${i} of pipeline '${pipeline.label || '?'}'`)
+      }
+      return {
+        binding: i,
+        resource: 'buffer' in b ? (b as GPUBufferBinding) : { buffer: b as GPUBuffer },
+      }
+    }),
   })
 }
 
@@ -1170,7 +1178,15 @@ export function buildDecodeEngine(
   // RoPE inverse-frequency table (f32, HALF_ROTARY entries) — rope.wgsl
   // binding 6. Computed on the CPU (model-spec.ts ropeInvFreqTable) so
   // llama3-style rope_scaling is a table swap, not a kernel variant.
-  const ropeFreqs = fused ? null : (() => {
+  //
+  // ALWAYS created, even for fused specs whose DECODE does RoPE inline: the
+  // chunk-prefill path runs the unfused composition (rope_kernel) for every
+  // spec, so `fused ? null` left Phi-3 — the only fused family — binding a
+  // null here at BUILD time. That broke the default model's boot for ten
+  // days (cd4bf95 → 2026-08-16) while every test ran non-fused models. The
+  // table is HALF_ROTARY f32s (~192 B); a dead table is cheaper than a
+  // conditional that has to mirror the chunk builder's reach.
+  const ropeFreqs = (() => {
     const b = makeBuf(device, S.halfRotary * 4, 'ropeFreqs')
     device.queue.writeBuffer(b, 0, ropeInvFreqTable(S))
     return b

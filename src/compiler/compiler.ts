@@ -266,6 +266,9 @@ function createPipelineFor(device: GPUDevice, src: string, entry: string, spec: 
   const module = device.createShaderModule({ code: withPrelude(src, spec) })
   return device.createComputePipeline({
     layout: 'auto',
+    // The entry point IS the kernel's name — carrying it as the label is what
+    // lets a bind-group error say WHICH pipeline instead of '?'.
+    label: entry,
     compute: { module, entryPoint: entry },
   })
 }

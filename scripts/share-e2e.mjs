@@ -62,7 +62,14 @@ try {
   // ── HOST ──
   const host = await browser.newPage()
   host.on('pageerror', (e) => console.error(`[host pageerror] ${e.message}`))
-  await host.goto(`http://localhost:${VITE_PORT}/share.html?model=qwen3`, { waitUntil: 'domcontentloaded' })
+  // MODEL env picks the hosted model (default qwen3) — same knob as
+  // peer-weights-e2e.mjs, for machines whose primed mirrors differ.
+  await host.goto(`http://localhost:${VITE_PORT}/share.html?model=${process.env.MODEL ?? 'qwen3'}`, { waitUntil: 'domcontentloaded' })
+  // The hosting consent gate ALWAYS shows since f29b451 (the download
+  // question disappears when the weights are cached; the hosting question
+  // never does) — the harness, like a human, must click through it.
+  await host.waitForSelector('#share-gate-go', { visible: true, timeout: 30_000 })
+  await host.click('#share-gate-go')
   console.log('host: booting engine (first run downloads from the local mirror) …')
   await host.waitForFunction(() => window.__shareReady === true, { timeout: 8 * 60_000, polling: 1000 })
   const link = await host.evaluate(() => window.__shareLink)
