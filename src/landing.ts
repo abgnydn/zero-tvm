@@ -17,7 +17,7 @@
  * The mascot and the cached badge are additive; both fail to silence.
  */
 
-import { SHIPPED_MODELS, modelBranding } from './zero-tvm/model-registry.js'
+import { SHIPPED_MODELS, modelBranding, specWithCtx } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf } from './landing-lore.js'
@@ -25,11 +25,32 @@ import { LANE_SIGIL, laneOf, loreOf } from './landing-lore.js'
 interface Variant { param: string; spec: ModelSpec; label: string }
 interface Group { name: string; params: string; variants: Variant[] }
 
-const chatUrl = (param: string): string => (param ? `zero-tvm.html?model=${param}` : 'zero-tvm.html')
+// (the CTA URL is composed in paint() — model + pool + ctx, one query string)
 
 /** Context ceiling, derived from the spec (maxPages x pageSize) — a fact about
  *  the build rather than a figure typed into the page. */
 const ctxLabel = (t: number): string => (t >= 1024 ? `${Math.round(t / 1024)}k` : String(t))
+
+/** What a context window costs: KV bytes, from the spec's own per-token rate.
+ *  Computed, never typed — the same rule as every other figure here. */
+const kvPrice = (spec: ModelSpec, tokens: number): string => {
+  const b = tokens * spec.kvBytesPerToken
+  return b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(1)} GB KV` : `${Math.round(b / 2 ** 20)} MB KV`
+}
+
+interface CtxMode { name: string; tokens: number }
+
+/** Context builds, derived from the spec: the compiled default (a ~1 GiB KV
+ *  budget choice, not a limit), a middle step, and the checkpoint's own
+ *  trained window. One entry when the default already IS the trained window
+ *  (Phi-3) — then the row does not render. */
+function ctxModesOf(spec: ModelSpec): CtxMode[] {
+  const out: CtxMode[] = [{ name: 'Standard', tokens: spec.maxContext }]
+  const long = Math.min(spec.maxContext * 4, spec.maxSeq)
+  if (long > spec.maxContext) out.push({ name: 'Long', tokens: long })
+  if (spec.maxSeq > long) out.push({ name: 'Full', tokens: spec.maxSeq })
+  return out
+}
 
 /** Branding writes "4B dense · q4f16_1": the family is the first part and the
  *  quantisation is the rest. With no separator there is one variant and the
@@ -139,6 +160,8 @@ function render(): void {
         <dl class="mb-stats"></dl>
         <div class="mb-row-label mb-modes-label" hidden>Memory build</div>
         <div class="mb-modes" role="tablist" aria-label="Memory build"></div>
+        <div class="mb-row-label mb-ctxs-label" hidden>Context</div>
+        <div class="mb-modes mb-ctxs" role="tablist" aria-label="Context"></div>
         <p class="mb-cached" hidden>Already on this device — opens in seconds</p>
         <p class="mb-ram"></p>
       </div>
@@ -177,6 +200,10 @@ function render(): void {
   /** Selected memory build (index into the spec's poolModes; 0 = full). Reset
    *  on every model/variant change — a build belongs to a character. */
   let mi = 0
+  /** Selected context build (index into ctxModesOf; 0 = the compiled default).
+   *  Context is a KV-memory dial, not a model property — the number the sheet
+   *  shows is whichever build is chosen here, priced in KV bytes. */
+  let xi = 0
   let mascot: MascotHandle | null = null
   const poolFracOf = (spec: ModelSpec, slots: number): number =>
     slots && spec.moe ? slots / (spec.moe.experts + 1) : 0
@@ -236,18 +263,33 @@ function render(): void {
     const pal = mascotPalette(v.spec)
     root.style.setProperty('--cs-accent', pal.accent)
     root.style.setProperty('--cs-accent-hi', pal.accentHi)
-    // The CHARACTER SCREEN contract: the chat link carries the chosen build,
-    // so what you picked here is what boots there — ?pool= is the same number
-    // the registry row and the engine read.
+    // The CHARACTER SCREEN contract: the chat link carries the chosen builds,
+    // so what you picked here is what boots there — ?pool= and ?ctx= are the
+    // same numbers the registry row and the engine read.
     const modes = b.poolModes ?? []
     const mode = modes[mi] ?? modes[0]
-    el<HTMLAnchorElement>('.mb-cta').href =
-      chatUrl(v.param) + (mode && mode.slots ? `${v.param ? '&' : '?'}pool=${mode.slots}` : '')
+    const ctxs = ctxModesOf(v.spec)
+    const cx = ctxs[xi] ?? ctxs[0]
+    {
+      const qs: string[] = []
+      if (v.param) qs.push(`model=${v.param}`)
+      if (mode && mode.slots) qs.push(`pool=${mode.slots}`)
+      if (cx.tokens !== v.spec.maxContext) qs.push(`ctx=${cx.tokens}`)
+      el<HTMLAnchorElement>('.mb-cta').href = `zero-tvm.html${qs.length ? '?' + qs.join('&') : ''}`
+    }
 
     el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
       `<button class="mb-variant mb-mode" data-m="${i}" role="tab" aria-selected="${i === mi}">`
       + `<span class="mb-gauge" aria-hidden="true">${'◆'.repeat(modes.length - i)}${'◇'.repeat(i)}</span>${x.label}</button>`).join('')
     ;(el('.mb-modes-label') as HTMLElement).hidden = modes.length < 2
+
+    // Context is a KV-memory dial, not a model constant — the engine's page
+    // table is a budget choice, and specWithCtx rebuilds it at boot. Each chip
+    // carries its true KV price, computed from the spec's own per-token rate.
+    el('.mb-ctxs').innerHTML = ctxs.length < 2 ? '' : ctxs.map((c, i) =>
+      `<button class="mb-variant mb-ctx" data-x="${i}" role="tab" aria-selected="${i === xi}">`
+      + `${c.name} · ${ctxLabel(c.tokens)} · ~${kvPrice(v.spec, c.tokens)}</button>`).join('')
+    ;(el('.mb-ctxs-label') as HTMLElement).hidden = ctxs.length < 2
 
     el('.mb-variants').innerHTML = g.variants.length < 2 ? '' : g.variants.map((x, i) =>
       `<button class="mb-variant" data-v="${i}" role="tab" aria-selected="${i === vi}"`
@@ -257,19 +299,19 @@ function render(): void {
     // with no measurement renders no speed row rather than a guess.
     const rows: Array<[string, string]> = [
       ['Weights', b.sizeLabel],
-      ['Context', `${ctxLabel(v.spec.maxContext)} tokens`],
+      ['Context', `${ctxLabel(cx.tokens)} tokens`],
     ]
     if (b.rateLabel) rows.push(['Speed', `${b.rateLabel} <span class="mb-hw">M2 Max</span>`])
-    // Context bar: shipped ceiling over the checkpoint's own maxSeq — a
-    // within-character fraction (the 35B shows 32k of a 262k ceiling).
+    // Context bar: the CHOSEN build over the checkpoint's own maxSeq — a
+    // within-character fraction that fills as the picker climbs to Full.
     // Memory bar: the chosen build's slots over the full expert count.
-    const ctxFrac = Math.min(1, v.spec.maxContext / v.spec.maxSeq)
+    const ctxFrac = Math.min(1, cx.tokens / v.spec.maxSeq)
     const memFrac = mode && mode.slots && v.spec.moe ? mode.slots / (v.spec.moe.experts + 1) : 1
     const bar = (frac: number, title: string): string =>
       `<span class="mb-bar" title="${title}"><i style="width:${Math.round(frac * 100)}%"></i></span>`
     el('.mb-stats').innerHTML = rows.map(([k, val]) => {
       const icon = STAT_ICON[k] ? `<span class="mb-stat-ico" aria-hidden="true">${STAT_ICON[k]}</span>` : ''
-      const sub = k === 'Context' ? bar(ctxFrac, `${Math.round(ctxFrac * 100)}% of the checkpoint's ${ctxLabel(v.spec.maxSeq)} ceiling`)
+      const sub = k === 'Context' ? bar(ctxFrac, `${Math.round(ctxFrac * 100)}% of the checkpoint's trained ${ctxLabel(v.spec.maxSeq)} window`)
         : k === 'Weights' && memFrac < 1 ? bar(memFrac, `${Math.round(memFrac * 100)}% of experts resident in this build`)
         : ''
       return `<div><dt>${icon}${k}</dt><dd>${val}${sub}</dd></div>`
@@ -297,9 +339,14 @@ function render(): void {
 
     const ram = el<HTMLElement>('.mb-ram')
     // A pooled build's note replaces the full model's RAM warning — picking
-    // less memory IS the answer to that warning.
-    ram.textContent = mode && mode.slots ? (mode.note ?? '') : (b.ramNote ?? '')
-    ram.hidden = !(mode && mode.slots ? mode.note : b.ramNote)
+    // less memory IS the answer to that warning. A long-context build adds
+    // its own: the KV is allocated EAGERLY at boot, so the price is upfront.
+    const baseNote = mode && mode.slots ? (mode.note ?? '') : (b.ramNote ?? '')
+    const ctxNote = cx.tokens > v.spec.maxContext
+      ? `long context allocates ~${kvPrice(v.spec, cx.tokens)} at boot, on top of the weights`
+      : ''
+    ram.textContent = [baseNote, ctxNote].filter(Boolean).join(' — ')
+    ram.hidden = !(baseNote || ctxNote)
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
@@ -312,7 +359,11 @@ function render(): void {
     const cached = el<HTMLElement>('.mb-cached')
     cached.hidden = !CACHED.has(v.spec.id)
 
-    mascot?.setSpec(v.spec, CACHED.has(v.spec.id), mode ? poolFracOf(v.spec, mode.slots) : 0)
+    // The character wears the chosen builds: pool leans the figure, and the
+    // context build sets the EARS (earCtx is derived from maxContext) — pick
+    // Full and they grow.
+    mascot?.setSpec(specWithCtx(v.spec, cx.tokens), CACHED.has(v.spec.id),
+      mode ? poolFracOf(v.spec, mode.slots) : 0)
   }
 
   /** Selection transition: retrigger the stage flash + plate/sheet entrance
@@ -333,6 +384,7 @@ function render(): void {
     gi = (nextG + GROUPS.length) % GROUPS.length
     vi = 0
     mi = 0
+    xi = 0
     paint()
     selectFx()
   }
@@ -345,8 +397,10 @@ function render(): void {
     if (dot) { go(Number(dot.dataset.i)); return }
     const modeBtn = t.closest<HTMLElement>('.mb-mode')
     if (modeBtn) { mi = Number(modeBtn.dataset.m); paint(); return }
+    const ctxBtn = t.closest<HTMLElement>('.mb-ctx')
+    if (ctxBtn) { xi = Number(ctxBtn.dataset.x); paint(); return }
     const variant = t.closest<HTMLElement>('.mb-variant')
-    if (variant) { vi = Number(variant.dataset.v); mi = 0; paint() }
+    if (variant) { vi = Number(variant.dataset.v); mi = 0; xi = 0; paint() }
   })
   host.tabIndex = 0
   host.addEventListener('keydown', (e) => {
@@ -425,11 +479,13 @@ function render(): void {
     const v = GROUPS[gi].variants[vi]
     const modes = modelBranding(v.spec).poolModes ?? []
     const mode = modes[mi] ?? modes[0]
+    const cx = ctxModesOf(v.spec)[xi] ?? ctxModesOf(v.spec)[0]
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
       root,
       spec: v.spec,
       poolSlots: mode?.slots ?? 0,
       poolLabel: mode && mode.slots ? mode.label : '',
+      ctxTokens: cx.tokens !== v.spec.maxContext ? cx.tokens : 0,
       mascot,
     })).catch((err) => {
       // The panel could not even mount — fall back to the standalone page.

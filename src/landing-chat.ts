@@ -17,7 +17,7 @@
 import type { ModelSpec } from './compiler/model-spec.js'
 import type { MascotHandle } from './mascot.js'
 import { mascotPalette } from './mascot.js'
-import { modelBranding } from './zero-tvm/model-registry.js'
+import { modelBranding, specWithCtx } from './zero-tvm/model-registry.js'
 import { bootChatEngine, wireChatSurface, showBootError, type ChatPhase } from './zero-tvm/chat-flow.js'
 import { LANE_SIGIL, laneOf, loreOf } from './landing-lore.js'
 
@@ -29,6 +29,9 @@ export interface EnterChatOptions {
   poolSlots: number
   /** The chosen build's registry label ('' for the full model). */
   poolLabel: string
+  /** Context build in tokens (0 = the compiled default). Applied through
+   *  specWithCtx — the same knob as ?ctx= on the standalone page. */
+  ctxTokens?: number
   /** The stage mascot — already showing this character. */
   mascot: MascotHandle | null
 }
@@ -37,21 +40,21 @@ const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
 const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>'
 
-function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, poolLabel: string): string {
+function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, buildLabel: string): string {
   const sigil = LANE_SIGIL[laneOf(spec)] ?? ''
   const size = brand.params.split(/[\s·]/)[0]
   // The one note a visitor cannot undo by waiting: RAM for the full build,
-  // the build's own caveat for a pooled one (picking less memory IS the
+  // the build's own caveat for a chosen one (picking less memory IS the
   // answer to the RAM warning).
-  const note = poolLabel
-    ? `Memory build: ${poolLabel}`
+  const note = buildLabel !== brand.params
+    ? `Build: ${buildLabel}`
     : (brand.ramNote ?? '')
   return `
     <div class="cs-chat-head">
       <span class="cs-chat-sigil" aria-hidden="true">${sigil}</span>
       <div class="cs-chat-id">
         <b>${brand.name}</b>
-        <i>${poolLabel || brand.params}</i>
+        <i>${buildLabel}</i>
       </div>
       <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">Summoning</span></span>
       <button class="cs-chat-tool" id="new-chat-btn" type="button" title="New chat" disabled>New chat</button>
@@ -97,8 +100,19 @@ function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, p
 }
 
 export async function enterChat(opts: EnterChatOptions): Promise<void> {
-  const { root, spec, mascot } = opts
+  const { root, mascot } = opts
+  // The context build rebuilds the spec (page table + every derived field)
+  // BEFORE anything reads it — the panel, the boot, and the turn loop all see
+  // the same window. Chat history is keyed by spec.id, which specWithCtx
+  // preserves, so a conversation carries across context builds of one model.
+  const spec = opts.ctxTokens ? specWithCtx(opts.spec, opts.ctxTokens) : opts.spec
   const brand = modelBranding(spec)
+  const buildLabel = [
+    opts.poolLabel || brand.params,
+    spec.maxContext !== opts.spec.maxContext
+      ? `${Math.round(spec.maxContext / 1024)}k ctx`
+      : '',
+  ].filter(Boolean).join(' · ')
 
   // The page becomes this character's page: the lane accent the mascot wears
   // is the accent every chat-ui control reads (same move as zero-tvm.html).
@@ -117,7 +131,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   panel.className = 'cs-chat'
   panel.setAttribute('role', 'region')
   panel.setAttribute('aria-label', `Chat with ${brand.name}`)
-  panel.innerHTML = panelMarkup(spec, brand, opts.poolLabel)
+  panel.innerHTML = panelMarkup(spec, brand, buildLabel)
   root.appendChild(panel)
   root.classList.add('cs-chatting')
 
