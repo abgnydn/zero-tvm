@@ -80,6 +80,9 @@ function normalize(messages) {
 }
 
 let busy = false
+/** Cost of the most recent request — prefill/decode rates, TTFT, context
+ *  used. Printed per request and served on /health so any device can watch. */
+let lastStats = null
 let poolTried = false
 let saveTimer = null
 
@@ -104,13 +107,42 @@ async function runJob(body, onDelta) {
   let out = ''
   const stopStrs = typeof body.stop === 'string' ? [body.stop] : (body.stop ?? [])
   const hit = { stop: null }
+  // PER-REQUEST TIMING. The first token's arrival splits the request in two:
+  // everything before it is prefill (prompt processing), everything after is
+  // decode. Both rates are wall clock over real token counts — the same
+  // definitions bench/run.mjs uses, so a number seen here is comparable to
+  // BENCH.md rather than being a second, private notion of speed.
+  const tStart = Date.now()
+  let tFirst = 0
   const ids = await engine.generatePipelined(promptIds, budget, (id) => {
+    if (!tFirst) tFirst = Date.now()
     const piece = tokenizer.decode([id])
     out += piece
     onDelta?.(piece)
     for (const st of stopStrs) if (st && out.endsWith(st)) { hit.stop = st; break }
   }, () => hit.stop !== null)
   if (hit.stop) out = out.slice(0, out.length - hit.stop.length)
+  {
+    const ttft = (tFirst || Date.now()) - tStart
+    const decodeMs = Date.now() - (tFirst || Date.now())
+    lastStats = {
+      promptTokens: promptIds.length,
+      genTokens: ids.length,
+      ttftMs: ttft,
+      prefillTokPerSec: ttft > 0 ? +(promptIds.length / (ttft / 1000)).toFixed(1) : 0,
+      decodeTokPerSec: decodeMs > 0 && ids.length > 1 ? +((ids.length - 1) / (decodeMs / 1000)).toFixed(1) : 0,
+      contextUsed: promptIds.length + ids.length,
+      at: new Date().toISOString(),
+    }
+    // Prefill rate counts the prompt against time-to-first-token; with prefix
+    // reuse a follow-up turn re-reads almost nothing, so a huge rate there is
+    // the cache working, not the GPU getting faster.
+    const pf = ttft > 0 ? (promptIds.length / (ttft / 1000)) : 0
+    const dec = decodeMs > 0 && ids.length > 1 ? ((ids.length - 1) / (decodeMs / 1000)) : 0
+    console.log(`[native] prompt ${promptIds.length.toLocaleString()} tok · ttft ${(ttft / 1000).toFixed(2)}s`
+      + ` (${pf.toFixed(0)} tok/s prefill) · gen ${ids.length} tok`
+      + ` (${dec.toFixed(1)} tok/s) · ctx ${(promptIds.length + ids.length).toLocaleString()}/${spec.maxContext.toLocaleString()}`)
+  }
 
   const parsed = body.tools?.length ? S.parseToolCalls(dialect, out) : { text: out, calls: [] }
   const toolCalls = parsed.calls.map((c, i) => ({
@@ -164,7 +196,9 @@ createServer(async (req, res) => {
     return
   }
   if (url.pathname === '/' || url.pathname === '/health') {
-    json(res, 200, { ok: true, hosting: spec.id, native: true, busy })
+    // `last` is the previous request's measured cost — the numbers LM Studio
+    // prints in its log, readable from any device on the tailnet.
+    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, last: lastStats })
     return
   }
   if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {
