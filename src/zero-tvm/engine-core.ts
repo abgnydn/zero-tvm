@@ -3776,7 +3776,12 @@ export function buildDecodeEngine(
     promptIds: number[],
     maxTokens: number,
     onToken: (id: number) => void,
-    shouldStop?: () => boolean
+    shouldStop?: () => boolean,
+    /** Prefill progress, in tokens. Called after each chunk and periodically
+     *  through the per-token tail — prompt processing on a long conversation
+     *  is MINUTES of wall clock during which a caller otherwise has nothing
+     *  to show. Purely observational: it never gates or syncs. */
+    onPrefill?: (done: number, total: number) => void,
   ): Promise<number[]> {
     const tokens: number[] = []
     if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
@@ -3808,6 +3813,7 @@ export function buildDecodeEngine(
         await chunkPrefill.record(promptIds, prefillPos, s)
         prefillPos += s
         chunks++
+        onPrefill?.(prefillPos, promptIds.length)
       }
     }
     // Per-token tail: fire without readback. The argmax of intermediate
@@ -3815,7 +3821,9 @@ export function buildDecodeEngine(
     // skipping readback removes the CPU syncs.
     for (; prefillPos < last; prefillPos++) {
       submitStep(promptIds[prefillPos], prefillPos, false)
+      if ((prefillPos & 63) === 0) onPrefill?.(prefillPos, promptIds.length)
     }
+    onPrefill?.(promptIds.length, promptIds.length)
     const lcp = absorbedLcp(promptIds)
     lastPrefill = {
       promptLen: promptIds.length, reused: startPos, chunks,

@@ -110,6 +110,11 @@ function normalize(messages) {
 }
 
 let busy = false
+/** What the CURRENT request is doing, for anything watching: prompt
+ *  processing on a long conversation is minutes of wall clock, and a client
+ *  that shows nothing during it looks hung. Written from the engine's own
+ *  callbacks, read by /health. */
+let live = null
 /** Cost of the most recent request — prefill/decode rates, TTFT, context
  *  used. Printed per request and served on /health so any device can watch. */
 let lastStats = null
@@ -144,13 +149,19 @@ async function runJob(body, onDelta) {
   // BENCH.md rather than being a second, private notion of speed.
   const tStart = Date.now()
   let tFirst = 0
+  live = { phase: 'prefill', done: 0, total: promptIds.length, generated: 0, startedAt: tStart }
   const ids = await engine.generatePipelined(promptIds, budget, (id) => {
     if (!tFirst) tFirst = Date.now()
     const piece = tokenizer.decode([id])
     out += piece
     onDelta?.(piece)
+    live = {
+      phase: 'decode', done: promptIds.length, total: promptIds.length,
+      generated: (live?.generated ?? 0) + 1, budget, startedAt: tStart, firstAt: tFirst,
+    }
     for (const st of stopStrs) if (st && out.endsWith(st)) { hit.stop = st; break }
-  }, () => hit.stop !== null)
+  }, () => hit.stop !== null,
+  (done, total) => { live = { phase: 'prefill', done, total, generated: 0, startedAt: tStart } })
   if (hit.stop) out = out.slice(0, out.length - hit.stop.length)
   {
     const ttft = (tFirst || Date.now()) - tStart
@@ -172,6 +183,7 @@ async function runJob(body, onDelta) {
     // the cache working, not the GPU getting faster.
     const pfRate = ttft > 0 ? (promptIds.length / (ttft / 1000)) : 0
     const dec = decodeMs > 0 && ids.length > 1 ? ((ids.length - 1) / (decodeMs / 1000)) : 0
+    live = null
     const reused = lastStats.reusedTokens
     console.log(`[native] prompt ${promptIds.length.toLocaleString()} tok`
       + (reused ? ` (${reused.toLocaleString()} reused, ${(promptIds.length - reused).toLocaleString()} new)` : ' (no reuse)')
@@ -246,7 +258,7 @@ createServer(async (req, res) => {
   if (url.pathname === '/' || url.pathname === '/health') {
     // `last` is the previous request's measured cost — the numbers LM Studio
     // prints in its log, readable from any device on the tailnet.
-    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, last: lastStats })
+    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, last: lastStats, live })
     return
   }
   if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {

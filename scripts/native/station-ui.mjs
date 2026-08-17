@@ -90,8 +90,17 @@ export function stationUi() {
   <span class="pill"><span class="dot" id="dot"></span><span id="state">—</span></span>
 </header>
 
+<div id="inflight" style="display:none">
+  <h2>In flight</h2>
+  <div class="cell" style="border:1px solid var(--line);border-radius:6px">
+    <div class="v" id="ipv">—</div><div class="k" id="ipk">working</div>
+    <div class="bar"><i id="ipbar" style="width:0%"></i></div>
+    <div class="note" id="ipnote" style="margin-top:8px"></div>
+  </div>
+</div>
+
 <div id="live" style="display:none">
-  <h2>Running</h2>
+  <h2>Last request</h2>
   <div class="grid">
     <div class="cell"><div class="v" id="pf">—</div><div class="k">prefill tok/s</div></div>
     <div class="cell"><div class="v" id="dec">—</div><div class="k">decode tok/s</div></div>
@@ -235,6 +244,31 @@ async function tick(){
   $('live').style.display=s.phase==='ready'?'':'none'
   const key=JSON.stringify([MODELS.length,s.loaded&&s.loaded.param,s.phase])
   if(key!==renderedFor){renderedFor=key;renderModels(s.loaded)}
+  // IN FLIGHT — prompt processing is minutes on a long conversation; showing
+  // nothing through it is what makes a working server look hung.
+  const lv=s.engine&&s.engine.live
+  $('inflight').style.display=lv?'':'none'
+  if(lv){
+    const secs=(Date.now()-lv.startedAt)/1000
+    if(lv.phase==='prefill'){
+      const pct=lv.total?(lv.done/lv.total)*100:0
+      const rate=secs>0?lv.done/secs:0
+      const left=rate>0?(lv.total-lv.done)/rate:0
+      $('ipv').innerHTML=pct.toFixed(1)+'%<small>'+fmt(lv.done)+' / '+fmt(lv.total)+' tokens</small>'
+      $('ipk').textContent='reading the prompt'
+      $('ipbar').style.width=Math.min(100,pct)+'%'
+      $('ipnote').textContent=rate>0?fmt(rate)+' tok/s · about '+fmt(left)+'s left · '+fmt(secs)+'s elapsed':''
+    } else {
+      const gsecs=lv.firstAt?(Date.now()-lv.firstAt)/1000:0
+      const rate=gsecs>0?lv.generated/gsecs:0
+      const pct=lv.budget?(lv.generated/lv.budget)*100:0
+      $('ipv').innerHTML=fmt(lv.generated)+'<small>tokens written</small>'
+      $('ipk').textContent='writing the answer'
+      $('ipbar').style.width=Math.min(100,pct)+'%'
+      $('ipnote').textContent=rate>0?rate.toFixed(1)+' tok/s · '+fmt(gsecs)+'s generating':''
+    }
+  }
+
   // Machine memory — measured (macOS vm_stat), absent elsewhere rather than faked.
   const m=s.memory
   $('memBox').style.display=m?'':'none'
