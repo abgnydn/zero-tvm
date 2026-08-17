@@ -93,6 +93,21 @@ if (preset?.native || args.includes('--native')) {
       console.log('stopping the browser-mode agent-server on :8017')
       spawn('pkill', ['-f', 'scripts/agent-server.mjs']).on('error', () => {})
       await new Promise((r) => setTimeout(r, 800))
+    } else {
+      // A native host is ALREADY on the port. Leaving it there made a restart
+      // a silent no-op: the new process died on EADDRINUSE, the readiness poll
+      // then saw the OLD one answer native:true, and the launcher reported
+      // READY for code that was never loaded (this is how a rebuilt host went
+      // unnoticed). Replace it — and refuse to do that mid-generation, since
+      // killing a busy host drops a client's in-flight request.
+      if (h.busy) {
+        console.log('the native host on :8017 is GENERATING right now — not killing it.')
+        console.log('wait for it to finish (watch http://127.0.0.1:8017/) and run this again.')
+        process.exit(1)
+      }
+      console.log(`replacing the native host on :8017 (was ${h.hosting})`)
+      spawn('pkill', ['-f', 'scripts/agent-native.mjs']).on('error', () => {})
+      await new Promise((r) => setTimeout(r, 1200))
     }
   } catch { /* nothing on 8017 — good */ }
   try { await import('webgpu') } catch {
