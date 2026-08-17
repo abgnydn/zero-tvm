@@ -1426,3 +1426,17 @@ footer li a:hover { color: var(--accent); }
   color: color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff);
   border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent);
 }
+
+/* ══ LENS ROUND 2026-08-17 FIXES ═══════════════════════════════════════════ */
+
+/* The cinematic bottom fade must not wash the chat panel's composer — the
+   panel IS the bottom of the screen in chat mode. */
+#models .cs-root.cs-chatting::after { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  /* The mood states re-armed the ring pulse that the base reduce block had
+     disabled; and guests should simply appear. */
+  #models .cs-summoning .mb-pedestal::after,
+  #models .cs-thinking .mb-pedestal::after { animation: none; }
+  .cs-guest-mascot { animation: none; }
+}

@@ -17,7 +17,13 @@ Head-to-head vs WebLLM numbers live in `BENCH.md`.
 
 Vite-built multi-page static site. Each HTML file is a standalone demo:
 
-- `index.html` — landing: hero, kernel window, model carousel
+- `index.html` — the ENTRANCE: a full-screen character-select screen
+  (`src/landing.ts` renders splash, stage, roster, sheet, deeds into
+  `#model-browser`), nav above and footer below, nothing else. ENTER mounts
+  the chat IN PLACE (`landing-chat.ts`) rather than navigating; the ⟁ Room
+  tool hosts from there (`landing-room.ts` over `room-host.ts`). The hero,
+  kernel window and carousel left with the 2026-08-15 redesign; docs.html
+  carries the why.
 - `zero-tvm.html` — the hand-written chat surface
 - `docs.html`, `validate.html` — docs and the validation harness
 - `share.html` — host a model for other devices; `agent-host.html` — the

@@ -162,7 +162,10 @@ const BRANDINGS: Record<string, ModelBrand> = {
     sizeLabel: '~19.5 GB',
     poolModes: [
       { slots: 0, label: 'Full · 19.7 GB' },
-      { slots: 128, label: 'Half · ~11 GB est · ~15 t/s' },
+      // No rate: the 4-bit build has never been measured pooled (BENCH.md
+      // records it as unmeasured) — the ~15 that used to sit here was the q3
+      // build's number wearing the wrong card. Lens round 2026-08-17.
+      { slots: 128, label: 'Half · ~11 GB est' },
       { slots: 64, label: 'Quarter · ~6 GB est', note: 'long prompts run token-by-token' },
     ], rateLabel: '',
     ramNote: 'needs ~24 GB free RAM (64 GB Mac recommended)',

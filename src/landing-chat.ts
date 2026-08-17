@@ -21,6 +21,7 @@ import { modelBranding, specWithCtx } from './zero-tvm/model-registry.js'
 import { bootChatEngine, wireChatSurface, showBootError, type ChatPhase } from './zero-tvm/chat-flow.js'
 import { LANE_SIGIL, laneOf, loreOf } from './landing-lore.js'
 import { recordFeat } from './feats.js'
+import { makeEngineLock } from './zero-tvm/engine-lock.js'
 
 export interface EnterChatOptions {
   /** The .cs-root the select screen rendered into. */
@@ -69,7 +70,7 @@ function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, b
     </div>
     <div class="cs-boot" id="progress-wrap">
       <div class="cs-boot-title" id="loading-title">Summoning ${brand.name}</div>
-      <div class="cs-boot-status" id="progress-status">Preparing…</div>
+      <div class="cs-boot-status" id="progress-status" aria-live="polite">Preparing…</div>
       <div class="cs-boot-track"><i id="progress-bar"></i></div>
       <div class="cs-boot-detail" id="progress-detail">${brand.sizeLabel} · cached after first load — next visit starts in seconds</div>
       ${note ? `<div class="cs-boot-note">${note}</div>` : ''}
@@ -141,6 +142,11 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   panel.innerHTML = panelMarkup(spec, brand, buildLabel)
   root.appendChild(panel)
   root.classList.add('cs-chatting')
+  // ENTER just display:none'd itself — without a new focus target the whole
+  // boot runs with focus on <body> and nothing announced. The panel takes it
+  // (its aria-live status then narrates the summoning).
+  panel.tabIndex = -1
+  panel.focus()
 
   // Leaving is a fresh page — the engine and its weights do not tear down
   // mid-session, and OPFS makes the way back in fast.
@@ -220,10 +226,16 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     if (gb >= 10) recordFeat('heavy')
   }
 
+  // ONE engine, one owner: the local turn loop and the room host share this
+  // latch — without it their two independent busy flags interleave
+  // generations into the same KV cache (lens round 2026-08-17).
+  const lock = makeEngineLock()
+
   wireChatSurface({
     spec,
     tokenizer: boot.tokenizer,
     engine: boot.engine,
+    lock,
     onToken: () => mascot?.pulse(),
     onPhase: (p) => stage(p),
     // /roster leaves the chat the same way the header link does.
@@ -235,6 +247,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   void import('./landing-room.js').then(({ mountRoomTool }) => mountRoomTool({
     root, panel, spec, param: opts.param,
     engine: boot.engine, tokenizer: boot.tokenizer, mascot,
+    lock, poolSlots: opts.poolSlots,
     openStrip: opts.openRoom === true,
   })).catch((e) => console.warn('[landing] room tool failed to mount:', e))
 

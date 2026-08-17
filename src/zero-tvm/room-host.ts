@@ -94,6 +94,9 @@ export interface HostRoomOptions {
   stageRange?: { start: number; end: number } | null
   /** Where a guest link points; share.ts passes its own pathname. */
   guestPath?: string
+  /** Shared single-owner latch — REQUIRED when another driver (a local chat
+   *  surface) runs the same engine. pump() holds it for each generation. */
+  lock?: import('./engine-lock.js').EngineLock
   ui: RoomUI
 }
 
@@ -191,6 +194,10 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
     const { guest, req } = next
     const preview = req.messages.at(-1)?.content.slice(0, 80) ?? ''
     const st = ui.row(guest, preview)
+    // One engine, one owner: if the host's own chat is mid-reply, this guest
+    // waits — visibly — instead of interleaving into the same KV cache.
+    if (opts.lock?.held()) st('waiting — the host is chatting…')
+    await opts.lock?.acquire()
     try {
       const promptIds = encode(req.messages)
       // The per-reply cap is the KV room the prompt leaves behind, not a
@@ -221,6 +228,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
       send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
       st('error')
     } finally {
+      opts.lock?.release()
       generating = false
       ui.onBusy?.(false)
       void pump()

@@ -511,3 +511,13 @@
       100% { background: transparent; }
     }
     @media (prefers-reduced-motion: reduce) { .msg.ai.msg-done { animation: none; } }
+
+    /* Reduced motion: the message surface holds still too — instant scroll,
+       no entrance fade, steady cursor and thinking dots (they stay VISIBLE;
+       only the movement goes). */
+    @media (prefers-reduced-motion: reduce) {
+      .chat-main { scroll-behavior: auto; }
+      .msg { animation: none; }
+      .msg.ai .cursor { animation: none; }
+      .thinking span { animation: none; opacity: 0.6; }
+    }

@@ -542,6 +542,10 @@ export async function mountMascot(
     if (!posing) renderPass()
     if (!still) { t += 1 / 60; raf = requestAnimationFrame(frame) }
   }
+  // Under prefers-reduced-motion there is no RAF loop, so a resize or
+  // rotation would leave the last bitmap stretched — re-render on resize.
+  const onResize = (): void => { if (still && !dead) frame() }
+  window.addEventListener('resize', onResize)
   frame()
 
   return {
@@ -574,6 +578,13 @@ export async function mountMascot(
       if (posed) { params[30] = 0; posing = false }
       return url
     },
-    destroy() { dead = true; cancelAnimationFrame(raf) },
+    destroy() {
+      dead = true
+      cancelAnimationFrame(raf)
+      window.removeEventListener('resize', onResize)
+      // The uniform buffer outlives nothing — a room's guest mascots mount
+      // and unmount per join, and each leaked ~128 B of GPU memory before.
+      ubo.destroy()
+    },
   }
 }

@@ -27,19 +27,35 @@ async function wipeOpfs(page: import("puppeteer").Page): Promise<void> {
     if (!navigator.storage?.getDirectory) return;
     const root = await navigator.storage.getDirectory();
     try { await root.removeEntry("zero-tvm-weights", { recursive: true }); } catch { /* dir didn't exist — fine */ }
+    // Chat history persists per model since 2026-08-15 and the suite shares
+    // one Chrome profile — a restored conversation would change what later
+    // assertions see.
+    try { localStorage.clear(); } catch { /* private mode */ }
   });
 }
 
+/**
+ * A sentinel the CURRENT cache-probe accepts as "fully cached".
+ *
+ * The old one wrote `{"records":[]}`, which cache-probe.ts now rejects on
+ * purpose: an empty record list means the manifest exists but no shard does,
+ * which is exactly the interrupted-download state the gate must still appear
+ * for. So the sentinel names one shard and writes that shard's file too —
+ * the probe's real contract (manifest + every shard it names).
+ */
 async function seedOpfsSentinel(page: import("puppeteer").Page): Promise<void> {
   await page.evaluate(async () => {
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle("zero-tvm-weights", { create: true });
-    const fh = await dir.getFileHandle("ndarray-cache.json", { create: true });
     type Writable = { write(data: BlobPart): Promise<void>; close(): Promise<void> };
-    const fhWithCreate = fh as unknown as { createWritable: () => Promise<Writable> };
-    const w = await fhWithCreate.createWritable();
-    await w.write(new TextEncoder().encode('{"records":[]}'));
-    await w.close();
+    const put = async (name: string, body: string) => {
+      const fh = await dir.getFileHandle(name, { create: true });
+      const w = await (fh as unknown as { createWritable: () => Promise<Writable> }).createWritable();
+      await w.write(new TextEncoder().encode(body));
+      await w.close();
+    };
+    await put("ndarray-cache.json", '{"records":[{"dataPath":"params_shard_0.bin"}]}');
+    await put("params_shard_0.bin", "x");   // opfsKey('params_shard_0.bin') is itself
   });
 }
 

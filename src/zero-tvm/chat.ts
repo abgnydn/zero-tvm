@@ -306,7 +306,7 @@ function mountChatMascots(): void {
       // Memory mode leans the figure and pulls the streamed experts' sprites
       // into a far ghost orbit — the pool, drawn from the same number the
       // picker chose.
-      if (POOL_SLOTS_UI && SPEC.moe) m.setSpec(SPEC, false, POOL_SLOTS_UI / (SPEC.moe.experts + 1))
+      if (POOL_SLOTS_UI && SPEC.moe) m.setSpec(SPEC, false, POOL_SLOTS_UI / (SPEC.moe.experts + (SPEC.sharedExpertIndex >= 0 ? 1 : 0)))
     }).catch(() => c.remove())
   }
 
@@ -381,7 +381,7 @@ async function boot(): Promise<void> {
         if (!m) { canvas.remove(); return }
         // Posed to the build the landing chose (?pool=) — the same lean the
         // character screen showed is the one the gate confirms.
-        if (POOL_SLOTS_UI && SPEC.moe) m.setSpec(SPEC, false, POOL_SLOTS_UI / (SPEC.moe.experts + 1))
+        if (POOL_SLOTS_UI && SPEC.moe) m.setSpec(SPEC, false, POOL_SLOTS_UI / (SPEC.moe.experts + (SPEC.sharedExpertIndex >= 0 ? 1 : 0)))
       }).catch(() => canvas.remove())
     }
   }

@@ -12,7 +12,7 @@
  */
 
 import { describe, test, expect } from 'vitest'
-import { SHIPPED_MODELS } from '../../src/zero-tvm/model-registry.js'
+import { SHIPPED_MODELS, modelBranding } from '../../src/zero-tvm/model-registry.js'
 
 describe('lib entry point', () => {
   test('imports without throwing when there is no WebGPU', async () => {
@@ -30,10 +30,19 @@ describe('lib entry point', () => {
     const { listModels } = await import('../../src/lib/index.js')
     const models = listModels()
 
-    // One row per registry entry, in registry order — adding a model with
-    // scripts/add-model.mjs must reach this surface with no extra step.
-    expect(models.map((m) => m.param)).toEqual(SHIPPED_MODELS.map((m) => m.param))
-    expect(models.map((m) => m.id)).toEqual(SHIPPED_MODELS.map((m) => m.spec.id))
+    // One row per VALIDATED registry entry, in registry order — adding a
+    // model with scripts/add-model.mjs must reach this surface with no extra
+    // step, but only once its numerics are checked: `pending` marks a spec
+    // that is generated and compile-gated and nothing more, and this list is
+    // the library's claim of what runs (ModelInfo carries no flag a consumer
+    // could filter on, so the filter has to live here).
+    const shipped = SHIPPED_MODELS.filter((m) => !modelBranding(m.spec).pending)
+    expect(models.map((m) => m.param)).toEqual(shipped.map((m) => m.param))
+    expect(models.map((m) => m.id)).toEqual(shipped.map((m) => m.spec.id))
+    // ...and a pending model is genuinely absent, not merely reordered.
+    for (const m of SHIPPED_MODELS.filter((x) => modelBranding(x.spec).pending)) {
+      expect(models.some((r) => r.param === m.param)).toBe(false)
+    }
 
     // Branding is present, not blank — these strings are the whole point of
     // the call. (rateLabel is deliberately '' when no measured number exists.)

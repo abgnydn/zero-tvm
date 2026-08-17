@@ -110,12 +110,16 @@ export function addAiMsg(): AiMsgHandle {
     <div class="role">
       <span class="role-dot">Z</span>
       <span class="role-name"></span>
-      <span class="model-tag">${IDENT.tag}</span>
+      <span class="model-tag"></span>
     </div>
     <div class="body"></div>
     <div class="actions"></div>
   `
+  // Both identity strings go in through textContent: on the ROOMS GUEST they
+  // arrive over the wire from the host, and a hostile host's tag was a stored
+  // XSS when interpolated into the markup above (lens 2026-08-17).
   ;(wrap.querySelector('.role-name') as HTMLElement).textContent = IDENT.name
+  ;(wrap.querySelector('.model-tag') as HTMLElement).textContent = IDENT.tag
   const body = wrap.querySelector('.body') as HTMLElement
   const cursor = document.createElement('span')
   cursor.className = 'cursor'

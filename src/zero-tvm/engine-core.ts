@@ -3612,12 +3612,16 @@ export function buildDecodeEngine(
   // quarter-pool configurations) keep per-token prefill.
   const pooledChunkOK = !pooling || (POOL_SLOTS >= 96 && !optimistic && opts.pooledChunkedPrefill === true)
   const chunkPrefill: ChunkPrefill | null =
-    !partial && !S.mla && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
+    // int8 KV excluded: the chunk path binds the f16 kv_append/attention_prefill
+    // kernels, which would write full-width values into half-size int8 pages —
+    // silent corruption, not an error (lens round 2026-08-17).
+    !partial && !S.mla && !int8Mode && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
   {
     const why = chunkPrefill ? `on (cap ${chunkPrefill.cap}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''}${pooling ? ', pooled' : ''})`
       : S.mla ? 'off (per-token — MLA has no chunked attention path)'
+      : int8Mode ? 'off (per-token — int8 KV has no chunked append/attention path)'
       : pooling ? (POOL_SLOTS >= 96
           ? 'off (per-token — pooled chunking is opt-in until its AC timing pair exists: ?chunk=1)'
           : `off (per-token — pool of ${POOL_SLOTS} is under the 96-slot union floor for pooled chunks)`)

@@ -132,10 +132,15 @@ function infoFor(param: string, spec: ModelSpec): ModelInfo {
   }
 }
 
-/** Every model this build ships, in registry order. Safe anywhere — no GPU,
- *  no network, no DOM. */
+/** Every model this build ships AND stands behind, in registry order. Safe
+ *  anywhere — no GPU, no network, no DOM. Pending entries (spec generated
+ *  but not yet numerics-validated) are excluded: this list is the library's
+ *  public claim of what runs, and ModelInfo carries no flag a consumer could
+ *  filter on. */
 export function listModels(): ModelInfo[] {
-  return SHIPPED_MODELS.map((m) => infoFor(m.param, m.spec))
+  return SHIPPED_MODELS
+    .filter((m) => !modelBranding(m.spec).pending)
+    .map((m) => infoFor(m.param, m.spec))
 }
 
 /**

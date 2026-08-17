@@ -207,6 +207,12 @@ export interface ChatSurfaceOptions {
   /** Surface-specific slash commands (name without the slash → action),
    *  merged over the built-ins (/new, /canvas). */
   commands?: Record<string, () => void>
+  /** Shared single-owner latch for the engine — REQUIRED when anything else
+   *  can drive the same engine (the entrance's room host). The turn loop
+   *  acquires it around every generation and disables the composer while
+   *  another driver holds it; without it, two generatePipelined calls
+   *  interleave into one KV cache. */
+  lock?: import('./engine-lock.js').EngineLock
 }
 
 /** Wire the full conversational surface onto the page's chat markup. */
@@ -250,7 +256,9 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
   // ── History persistence ── the conversation survives a reload the way the
   // weights do. localStorage, keyed by model — on-device only, the same
   // privacy story as the OPFS weight cache. Assistant ids ride along so
-  // Continue and regenerate still work on a restored conversation.
+  // REGENERATE works on a restored conversation; a cut-short reply's
+  // Continue button does NOT survive a reload (the cut flag is not stored),
+  // only its text does.
   const STORE_KEY = `zt-chat-${SPEC.id}`
   function persist(): void {
     try {
@@ -325,7 +333,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     setStats('')
     setBadge('Ready', 'ready')   // clears a lingering "Context full" state
     updateCtxHint()
-    inp?.focus()
+    if (!matchMedia('(pointer: coarse)').matches) inp?.focus()
   }
 
   // Initial enabled state
@@ -337,7 +345,19 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
   updateCtxHint()
   wireScrollFab()
   restoreHistory()
-  inp.focus()
+  // No focus steal on touch devices — popping the keyboard unprompted buries
+  // half the panel behind it.
+  const finePointer = !matchMedia('(pointer: coarse)').matches
+  if (finePointer) inp.focus()
+
+  // Another driver on the same engine (the room host serving a guest): hold
+  // the composer while it generates, honestly labeled.
+  opts.lock?.onChange((held) => {
+    if (generating) return   // our own hold — setBusy owns the UI
+    inp.disabled = held
+    sendBtn.disabled = held || inp.value.trim().length === 0
+    inp.placeholder = held ? 'Serving a room guest…' : `Ask ${BRAND.name} anything…`
+  })
 
   inp.addEventListener('input', () => { autoGrow(inp); updateSendEnabled() })
   inp.addEventListener('keydown', (e) => {
@@ -460,6 +480,9 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
    * tokenization, run, commit response to history, re-enable UI. */
   async function runTurn(): Promise<void> {
     setBusy(true); stopRequested = false
+    // One engine, one owner: wait out a room guest's generation if the host
+    // is serving one. Released in the shared epilogue below.
+    await opts.lock?.acquire()
     // Resuming an earlier reply stops being meaningful once a new turn is
     // under way — retire the button but keep the "this was cut short" text.
     $('messages')?.querySelectorAll('.truncation-btn').forEach((b) => b.remove())
@@ -474,6 +497,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
       setBadge('Context full', 'error')
       updateCtxHint(promptIds.length)
       log(msg)
+      opts.lock?.release()
       setBusy(false); stopRequested = false
       updateSendEnabled()
       return
@@ -486,9 +510,10 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     entry.content = r.text
     entry.ids = r.ids
     persist()
+    opts.lock?.release()
     setBusy(false); stopRequested = false
     updateSendEnabled()
-    inp?.focus()
+    if (finePointer) inp?.focus()
   }
 
   /**
@@ -515,15 +540,17 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     // stale button is no longer about the last thing the model said.
     if (history[history.length - 1] !== entry) return
     setBusy(true); stopRequested = false
+    await opts.lock?.acquire()
     const promptIds = buildChatPromptFor(SPEC, history.slice(0, -1), tokenizer)
       .concat(entry.ids)
     const r = await runGeneration(ai, promptIds, entry.ids, () => { void continueTurn(entry, ai) })
     entry.content = r.text
     entry.ids = r.ids
     persist()
+    opts.lock?.release()
     setBusy(false); stopRequested = false
     updateSendEnabled()
-    inp?.focus()
+    if (finePointer) inp?.focus()
   }
 
   // ── Slash commands ── handled locally, never sent to the model. The
@@ -570,7 +597,11 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     if (history.length === 0 || history[history.length - 1].role !== 'assistant') return
     history.pop()
     persist()
-    $('messages')?.querySelector('.msg.ai:last-child')?.remove()
+    // The LAST ai message, not '.msg.ai:last-child' — a sys-note (slash
+    // command feedback) after the reply makes that selector match nothing,
+    // and the popped history would drift from the DOM (lens 2026-08-17).
+    const ais = $('messages')?.querySelectorAll('.msg.ai')
+    if (ais && ais.length > 0) ais[ais.length - 1].remove()
     await runTurn()
   }
 

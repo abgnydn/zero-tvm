@@ -24,7 +24,10 @@ import { modelBranding, SHIPPED_MODELS } from './model-registry.js'
 // Pending models (generated, not yet numerics-validated) stay out of the
 // switcher for the same reason they stay off the entrance roster — listing
 // one is a claim it runs. ?model= still boots them for the validation itself.
-const MODELS = SHIPPED_MODELS.filter((m) => !modelBranding(m.spec).pending)
+// The embedding model is filtered for a different reason: it returns a
+// vector and cannot chat, and this switcher only ever leads to a chat.
+const MODELS = SHIPPED_MODELS.filter((m) =>
+  !modelBranding(m.spec).pending && m.spec.embeddingOnly !== true)
 
 /**
  * Reload onto `param`, keeping every other query flag. Bench runs drive this

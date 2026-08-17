@@ -37,6 +37,11 @@ export interface RoomToolOptions {
   /** Open the strip immediately (the "Enter & open a room" path) — on the
    *  CONSENT step; hosting still takes the explicit click. */
   openStrip?: boolean
+  /** The engine's single-owner latch, shared with the local chat surface. */
+  lock: import('./zero-tvm/engine-lock.js').EngineLock
+  /** Expert-pool slots the engine booted with (0 = full) — a pooled host
+   *  must not advertise the full model's measured rate to guests. */
+  poolSlots: number
 }
 
 export function mountRoomTool(o: RoomToolOptions): void {
@@ -59,7 +64,8 @@ export function mountRoomTool(o: RoomToolOptions): void {
     <div class="cs-room-consent">
       <p>Open a room and whoever has the link chats with <b>${brand.name}</b> running on
       THIS machine. Their prompts run on your GPU; every request is listed here as it
-      arrives. Keep this tab in the foreground while serving.</p>
+      arrives. Guests can also copy the model's cached weights from this machine to
+      run it locally. Keep this tab in the foreground while serving.</p>
       <button type="button" class="cs-chat-tool" id="room-open">Open room →</button>
     </div>
     <div class="cs-room-live" hidden>
@@ -68,8 +74,8 @@ export function mountRoomTool(o: RoomToolOptions): void {
         <button type="button" class="cs-chat-tool" id="room-copy">Copy</button>
         <button type="button" class="cs-chat-tool" id="room-close">Close room</button>
       </div>
-      <div class="cs-room-members" id="room-members">waiting for guests…</div>
-      <ul class="cs-room-log" id="room-log"></ul>
+      <div class="cs-room-members" id="room-members" aria-live="polite">waiting for guests…</div>
+      <ul class="cs-room-log" id="room-log" role="log" aria-live="polite" aria-label="Guest requests"></ul>
     </div>`
   head.insertAdjacentElement('afterend', strip)
 
@@ -92,6 +98,9 @@ export function mountRoomTool(o: RoomToolOptions): void {
       guestMascots.push(entry)
       void mountMascot(c, o.spec).then((m) => {
         if (!m) { c.remove(); return }
+        // The guest may have LEFT while the mascot was mounting — a canvas
+        // no longer in the DOM must not keep a live render loop.
+        if (!c.isConnected) { m.destroy(); return }
         entry.handle = m
       })
     }
@@ -102,16 +111,23 @@ export function mountRoomTool(o: RoomToolOptions): void {
     }
   }
 
-  btn.addEventListener('click', () => { strip.hidden = !strip.hidden })
+  btn.setAttribute('aria-expanded', String(!strip.hidden))
+  btn.addEventListener('click', () => {
+    strip.hidden = !strip.hidden
+    btn.setAttribute('aria-expanded', String(!strip.hidden))
+  })
 
   $('#room-open').addEventListener('click', () => {
     if (room) return
     room = hostRoom({
       spec: o.spec,
-      brand,
+      // A pooled host must not tell guests the full model's measured rate —
+      // the pooled builds are slower and the guest sees the label as truth.
+      brand: o.poolSlots ? { ...brand, rateLabel: '' } : brand,
       param: o.param,
       engine: o.engine,
       tokenizer: o.tokenizer,
+      lock: o.lock,
       encode: (messages) => buildChatPromptFor(o.spec, messages, o.tokenizer),
       ui: {
         row: (who, text) => {

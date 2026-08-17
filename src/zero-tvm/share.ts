@@ -214,6 +214,17 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   // Consent BEFORE the first byte, not after.
   await confirmDownload(spec, brand)
 
+  // ?pool= — the same memory-build knob as the chat page, so the entrance's
+  // "Enter & open a room" fallback link carries the chosen build honestly.
+  const poolSlots = ((): number => {
+    if (!spec.moe) return 0
+    const v = new URLSearchParams(location.search).get('pool')
+    if (!v) return 0
+    const E = spec.moe.experts
+    const n = v === 'half' ? Math.round(E / 2) : v === 'quarter' ? Math.round(E / 4) : Number(v)
+    return Number.isFinite(n) && n > 0 ? n : 0
+  })()
+
   // Same engine composition as chat.ts — this is the throughput path, not the
   // scalar validation path.
   const boot = await loadingUi.bootEngine({
@@ -221,6 +232,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     optionalFeatures: ['subgroups' as GPUFeatureName],
     probeSubgroups: true,
     layerRange: stageRange ?? undefined,
+    ...(poolSlots ? { expertPool: poolSlots } : {}),
     buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
       const flags = variantsMod.parseVariantFlags(location.search, {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
@@ -234,6 +246,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       const kv = engineMod.allocKVPages(device, s)
       return engineMod.buildDecodeEngine(device, weights, kv, {
         variants: flags, fused, spec: s, layerRange: stageRange ?? undefined,
+        ...(poolSlots ? { expertPool: poolSlots } : {}),
       })
     },
     // A stage cannot run the default warmup (forwardLogits needs the whole
@@ -257,7 +270,10 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   const logRow = (guest: string, text: string): HTMLElement => {
     $('req-empty')?.remove()
     const li = document.createElement('li')
-    li.innerHTML = `<span class="who">${guest}</span> · <span class="body"></span> <span class="st"></span>`
+    // The guest id comes from the RELAY — like everything remote it goes in
+    // through textContent, never markup (lens 2026-08-17).
+    li.innerHTML = '<span class="who"></span> · <span class="body"></span> <span class="st"></span>'
+    ;(li.querySelector('.who') as HTMLElement).textContent = guest
     ;(li.querySelector('.body') as HTMLElement).textContent = text
     $('req-log').prepend(li)
     return li.querySelector('.st') as HTMLElement
@@ -272,7 +288,9 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   }
 
   const room = hostRoom({
-    spec, brand,
+    spec,
+    // A pooled host must not tell guests the full model's measured rate.
+    brand: poolSlots ? { ...brand, rateLabel: '' } : brand,
     param: new URLSearchParams(location.search).get('model') ?? '',
     engine, tokenizer,
     encode: (messages) => buildChatPromptFor(spec, messages, tokenizer),
@@ -336,6 +354,11 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
   $('page-title').textContent = `Serving ${brand.name} layers ${range.start}-${range.end}`
   const stats = $('room-stats')
   stats.textContent = `loading layers ${range.start}-${range.end} of ${spec.layers}…`
+
+  // Consent BEFORE the first byte — same gate as the host. A helper link in
+  // a chat message used to boot the download and enrol the GPU in a
+  // stranger's room with no click at all (lens 2026-08-17).
+  await confirmDownload(spec, brand)
 
   const boot = await loadingUi.bootEngine({
     spec,

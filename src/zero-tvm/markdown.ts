@@ -41,10 +41,16 @@ function renderInline(text: string, into: Node): void {
     } else if (m[4]) {
       const em = document.createElement('em'); em.textContent = m[4].slice(1, -1); into.appendChild(em)
     } else if (m[5] && m[6]) {
-      const a = document.createElement('a')
-      a.href = m[6]; a.textContent = m[5]
-      a.target = '_blank'; a.rel = 'noopener noreferrer'
-      into.appendChild(a)
+      // Model (or, on the rooms guest, host) output — only web schemes become
+      // links; a javascript:/data: URL renders as plain text instead.
+      if (/^https?:\/\//i.test(m[6])) {
+        const a = document.createElement('a')
+        a.href = m[6]; a.textContent = m[5]
+        a.target = '_blank'; a.rel = 'noopener noreferrer'
+        into.appendChild(a)
+      } else {
+        into.appendChild(document.createTextNode(m[0]))
+      }
     }
     last = m.index + m[0].length
   }
@@ -82,14 +88,20 @@ function openCanvas(code: string, lang: string): void {
   const host = document.createElement('div')
   host.id = 'code-canvas'
   host.innerHTML = `
-    <div class="canvas-frame" role="dialog" aria-label="Code preview">
+    <div class="canvas-frame" role="dialog" aria-modal="true" aria-label="Code preview">
       <div class="canvas-head">
         <span class="canvas-title">canvas · ${lang}</span>
         <button type="button" class="canvas-close" aria-label="Close preview">✕ close</button>
       </div>
       <iframe class="canvas-view" sandbox="allow-scripts" title="Code preview"></iframe>
     </div>`
-  const close = (): void => { host.remove(); window.removeEventListener('keydown', onKey) }
+  // A dialog owns focus: take it on open, hand it back on close.
+  const opener = document.activeElement as HTMLElement | null
+  const close = (): void => {
+    host.remove()
+    window.removeEventListener('keydown', onKey)
+    opener?.focus?.()
+  }
   const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') close() }
   host.addEventListener('click', (e) => {
     const t = e.target as HTMLElement
@@ -111,6 +123,7 @@ window.addEventListener('error',function(e){log('Error:',e.message)});
 <\/script><script>${safe}<\/script>`
   ;(host.querySelector('.canvas-view') as HTMLIFrameElement).srcdoc = doc
   document.body.appendChild(host)
+  ;(host.querySelector('.canvas-close') as HTMLButtonElement).focus()
 }
 
 function makeCodeBlock(code: string, lang: string): HTMLElement {

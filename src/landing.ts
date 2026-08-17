@@ -175,7 +175,7 @@ function render(): void {
     </div>
     <aside class="mb-info">
       <div class="mb-panel">
-        <div class="mb-row-label">Quantisation</div>
+        <div class="mb-row-label mb-variants-label">Quantisation</div>
         <div class="mb-variants" role="tablist" aria-label="Quantisation"></div>
         <dl class="mb-stats"></dl>
         <ul class="mb-abilities"></ul>
@@ -200,7 +200,7 @@ function render(): void {
     <div class="cs-engage" aria-hidden="true"></div>
     <div class="cs-borderline-t" aria-hidden="true"></div>
     <div class="cs-borderline-b" aria-hidden="true"></div>
-    <div class="cs-corner cs-corner-l" aria-hidden="true">registry-rendered · numbers are measured</div>
+    <div class="cs-corner cs-corner-l" aria-hidden="true">registry-rendered · measured, or marked est</div>
     <div class="cs-corner cs-corner-r" aria-hidden="true">WebGPU · hand-written WGSL</div>
     ${'gpu' in navigator ? '' :
       '<p class="note cs-note">This browser has no WebGPU — the chat needs Chrome, Edge, or another WebGPU-enabled browser.</p>'}
@@ -211,7 +211,9 @@ function render(): void {
     if (still2 || sessionStorage.getItem('zt-intro')) splash.remove()
     else {
       sessionStorage.setItem('zt-intro', '1')
-      splash.addEventListener('animationend', () => splash.remove())
+      // Child animations (emblem, logo) bubble their animationend — only the
+      // splash's OWN fade-out may remove it, or it vanishes at full opacity.
+      splash.addEventListener('animationend', (e) => { if (e.target === splash) splash.remove() })
       const skip = (): void => splash.remove()
       splash.addEventListener('pointerdown', skip)
       window.addEventListener('keydown', skip, { once: true })
@@ -231,8 +233,12 @@ function render(): void {
    *  shows is whichever build is chosen here, priced in KV bytes. */
   let xi = 0
   let mascot: MascotHandle | null = null
+  // Denominator counts the shared expert only where one EXISTS — qwen30b has
+  // none, and a blanket +1 understated its residency fraction.
   const poolFracOf = (spec: ModelSpec, slots: number): number =>
-    slots && spec.moe ? slots / (spec.moe.experts + 1) : 0
+    slots && spec.moe
+      ? slots / (spec.moe.experts + (spec.sharedExpertIndex >= 0 ? 1 : 0))
+      : 0
 
   dots.innerHTML = GROUPS.map((g, i) => {
     const spec0 = g.variants[0].spec
@@ -316,9 +322,10 @@ function render(): void {
       if (mode && mode.slots) qs.push(`pool=${mode.slots}`)
       if (cx.tokens !== v.spec.maxContext) qs.push(`ctx=${cx.tokens}`)
       el<HTMLAnchorElement>('.mb-cta').href = `zero-tvm.html${qs.length ? '?' + qs.join('&') : ''}`
-      // The room path shares the build choices; its no-JS fallback is the
-      // standalone host page for the same model.
-      el<HTMLAnchorElement>('.mb-cta-room').href = `share.html${v.param ? `?model=${v.param}` : ''}`
+      // The room path carries the SAME build choices — share.html reads
+      // ?pool= and ?ctx= too, so a modified click hosts the build that was
+      // chosen, not silently the full model.
+      el<HTMLAnchorElement>('.mb-cta-room').href = `share.html${qs.length ? '?' + qs.join('&') : ''}`
     }
 
     el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
@@ -337,6 +344,9 @@ function render(): void {
     el('.mb-variants').innerHTML = g.variants.length < 2 ? '' : g.variants.map((x, i) =>
       `<button class="mb-variant" data-v="${i}" role="tab" aria-selected="${i === vi}"`
       + `${CACHED.has(x.spec.id) ? ' data-cached' : ''}>${x.label}</button>`).join('')
+    // A section label over an empty picker reads as a rendering fault — 5 of
+    // 7 groups ship one quantisation.
+    ;(el('.mb-variants-label') as HTMLElement).hidden = g.variants.length < 2
 
     // Every figure is read from the spec or from a measured rate label. A model
     // with no measurement renders no speed row rather than a guess.
@@ -344,7 +354,9 @@ function render(): void {
       ['Weights', b.sizeLabel],
       ['Context', `${ctxLabel(cx.tokens)} tokens`],
     ]
-    if (b.rateLabel) rows.push(['Speed', `${b.rateLabel} <span class="mb-hw">M2 Max</span>`])
+    // Suppressed when a pooled build is chosen: the measured rate belongs to
+    // the FULL model, and the sheet must not contradict the chip beside it.
+    if (b.rateLabel && !(mode && mode.slots)) rows.push(['Speed', `${b.rateLabel} <span class="mb-hw">M2 Max</span>`])
     // Boot footprint: resident weights (the chosen build's label) + the
     // chosen window's KV — the number that answers "will it fit?", assembled
     // from the same sources every other figure reads.
@@ -359,7 +371,7 @@ function render(): void {
     // within-character fraction that fills as the picker climbs to Full.
     // Memory bar: the chosen build's slots over the full expert count.
     const ctxFrac = Math.min(1, cx.tokens / v.spec.maxSeq)
-    const memFrac = mode && mode.slots && v.spec.moe ? mode.slots / (v.spec.moe.experts + 1) : 1
+    const memFrac = mode && mode.slots ? (poolFracOf(v.spec, mode.slots) || 1) : 1
     const bar = (frac: number, title: string): string =>
       `<span class="mb-bar" title="${title}"><i style="width:${Math.round(frac * 100)}%"></i></span>`
     el('.mb-stats').innerHTML = rows.map(([k, val]) => {
@@ -433,9 +445,13 @@ function render(): void {
     const rail = root.querySelector<HTMLElement>('.cs-deeds')
     if (!rail) return
     const have = feats()
-    rail.innerHTML = FEATS.map((f) =>
-      `<span class="cs-deed" role="listitem"${have.has(f.id) ? ' data-on' : ''} `
-      + `title="${f.name} — ${f.desc}">◆<i>${f.name}</i></span>`).join('')
+    // aria-label as well as title: an unearned deed's only visible content is
+    // a glyph, so screen readers had nothing to read at all.
+    rail.innerHTML = FEATS.map((f) => {
+      const label = `${have.has(f.id) ? 'Earned' : 'Not yet earned'}: ${f.name} — ${f.desc}`
+      return `<span class="cs-deed" role="listitem"${have.has(f.id) ? ' data-on' : ''} `
+        + `title="${f.name} — ${f.desc}" aria-label="${label}">◆<i>${f.name}</i></span>`
+    }).join('')
   }
   document.addEventListener('zt-feat', paintDeeds)
   paintDeeds()
@@ -469,14 +485,20 @@ function render(): void {
     if (arrow) { go(gi + Number(arrow.dataset.dir)); return }
     const dot = t.closest<HTMLElement>('.mb-dot')
     if (dot) { go(Number(dot.dataset.i)); return }
+    // paint() re-creates the chips, destroying the button that was just
+    // activated — restore focus to its successor or a keyboard user lands on
+    // <body> after every choice.
+    const refocus = (sel: string): void => { root.querySelector<HTMLElement>(sel)?.focus() }
     const modeBtn = t.closest<HTMLElement>('.mb-mode')
-    if (modeBtn) { mi = Number(modeBtn.dataset.m); paint(); return }
+    if (modeBtn) { mi = Number(modeBtn.dataset.m); paint(); refocus(`.mb-mode[data-m="${mi}"]`); return }
     const ctxBtn = t.closest<HTMLElement>('.mb-ctx')
-    if (ctxBtn) { xi = Number(ctxBtn.dataset.x); paint(); return }
+    if (ctxBtn) { xi = Number(ctxBtn.dataset.x); paint(); refocus(`.mb-ctx[data-x="${xi}"]`); return }
     const variant = t.closest<HTMLElement>('.mb-variant')
-    if (variant) { vi = Number(variant.dataset.v); mi = 0; xi = 0; paint() }
+    if (variant) { vi = Number(variant.dataset.v); mi = 0; xi = 0; paint(); refocus(`.mb-variant[data-v="${vi}"]`) }
   })
   host.tabIndex = 0
+  host.setAttribute('role', 'application')
+  host.setAttribute('aria-label', 'Character select — Up and Down arrows change model, Enter opens the chat')
   host.addEventListener('keydown', (e) => {
     // In chat mode the keyboard belongs to the composer — arrows must not
     // switch characters under a conversation.
