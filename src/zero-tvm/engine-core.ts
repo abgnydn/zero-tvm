@@ -737,6 +737,75 @@ export function buildDecodeEngine(
     }
   }
 
+  // ---- GDN rewind points -------------------------------------------------
+  // Without these, hybrid prefix reuse is all-or-nothing: the recurrent state
+  // cannot be rewound, so `reuseStart` demands the new prompt extend EVERY
+  // absorbed token and re-reads the whole conversation otherwise. Measured on
+  // a real agent client: 16 changed tokens near the end of a 43,709-token
+  // prompt (the client regenerates a trailing metadata block every turn)
+  // discarded all 43,693 that still matched — 339 s of GPU, every turn.
+  //
+  // A ring of snapshots taken at chunk boundaries turns that into "replay from
+  // the nearest boundary at or before the divergence". On that same case the
+  // newest usable point is 43,008, so the replay is 753 tokens instead of
+  // 43,761. Four slots is ~4k tokens of lookback, which covers a client
+  // rewriting its own trailing turn; a divergence older than the ring simply
+  // falls back to the full re-prefill it does today.
+  // NB: read the option directly — `prefixReuse` is declared further down, so
+  // referencing it here is a temporal dead zone, not a value.
+  const GDN_CKPT_SLOTS = hybrid && (opts.prefixReuse ?? true) ? 4 : 0
+  const gdnCkptConv: (GPUBuffer | null)[][] = []
+  const gdnCkptRecur: (GPUBuffer | null)[][] = []
+  /** Absorbed-token position each slot's state sits at; -1 = empty. */
+  const gdnCkptPos: number[] = new Array(GDN_CKPT_SLOTS).fill(-1)
+  let gdnCkptNext = 0
+  for (let slot = 0; slot < GDN_CKPT_SLOTS; slot++) {
+    const conv: (GPUBuffer | null)[] = []
+    const recur: (GPUBuffer | null)[] = []
+    for (let L = 0; L < S.layers; L++) {
+      if (gdnConvState[L]) {
+        conv.push(makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `gdnCkptConv_${slot}_${L}`))
+        recur.push(makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `gdnCkptRecur_${slot}_${L}`))
+      } else { conv.push(null); recur.push(null) }
+    }
+    gdnCkptConv.push(conv)
+    gdnCkptRecur.push(recur)
+  }
+
+  /** Snapshot the live GDN state as the rewind point for `pos`. */
+  function saveGdnCkpt(pos: number): void {
+    if (GDN_CKPT_SLOTS === 0) return
+    const slot = gdnCkptNext
+    const enc = device.createCommandEncoder()
+    for (let L = 0; L < S.layers; L++) {
+      const c = gdnConvState[L], r = gdnRecurState[L]
+      if (!c || !r) continue
+      enc.copyBufferToBuffer(c, 0, gdnCkptConv[slot][L]!, 0, c.size)
+      enc.copyBufferToBuffer(r, 0, gdnCkptRecur[slot][L]!, 0, r.size)
+    }
+    device.queue.submit([enc.finish()])
+    gdnCkptPos[slot] = pos
+    gdnCkptNext = (gdnCkptNext + 1) % GDN_CKPT_SLOTS
+  }
+
+  function restoreGdnCkpt(slot: number): void {
+    const enc = device.createCommandEncoder()
+    for (let L = 0; L < S.layers; L++) {
+      const c = gdnConvState[L], r = gdnRecurState[L]
+      if (!c || !r) continue
+      enc.copyBufferToBuffer(gdnCkptConv[slot][L]!, 0, c, 0, c.size)
+      enc.copyBufferToBuffer(gdnCkptRecur[slot][L]!, 0, r, 0, r.size)
+    }
+    device.queue.submit([enc.finish()])
+  }
+
+  /** Anything that moves the state without replaying tokens voids every slot.
+   *  A stale rewind point is not a slow path, it is a wrong answer. */
+  function invalidateGdnCkpts(): void {
+    gdnCkptPos.fill(-1)
+    gdnCkptNext = 0
+  }
+
   // A MoE block is STATELESS — unlike the GDN recurrence above, nothing carries
   // between tokens — so every buffer here is shared across all 40 layers.
   // moeH and moeDown are allocated fresh rather than reusing B.ffnOut (ffn*2 =
@@ -2575,6 +2644,8 @@ export function buildDecodeEngine(
    */
   function clearGdnState(enc: GPUCommandEncoder): void {
     for (const b of gdnStateBufs) enc.clearBuffer(b)
+    // Every rewind point described the state this just erased.
+    invalidateGdnCkpts()
   }
 
   // ============================================================
@@ -3050,6 +3121,9 @@ export function buildDecodeEngine(
       }
       gdnStatePos = snap.tokens
     }
+    // A restored snapshot jumps the state to snap.tokens without replaying
+    // anything, so no earlier rewind point describes it any more.
+    invalidateGdnCkpts()
     absorbed = [...snap.ids]
     absorbedValid = true
     return true
@@ -3798,16 +3872,41 @@ export function buildDecodeEngine(
     // --- Prefill ---
     // Cross-turn prefix reuse: skip prompt tokens the engine has provably
     // already absorbed (KV slots + GDN state) — see computeReuseStart.
-    const startPos = computeReuseStart(promptIds)
-    // Snapshot the reuse inputs BEFORE prefill runs. Prefill calls
-    // noteAbsorbed for every token it processes, so reading `absorbed` after
-    // it has finished measures THIS turn's record, not the one the decision
-    // was made against — which made the first version of this diagnostic
-    // report a tautology ("lcp equals absorbed.length") on every miss.
+    // Snapshot the reuse inputs FIRST — before computeReuseStart and before
+    // the rewind below, which TRUNCATES `absorbed` and moves gdnStatePos.
+    // Reading them afterwards would describe the state the rewind created
+    // rather than the one the decision was made against: the same tautology
+    // this diagnostic was already rewritten once to avoid.
     const preLcp = absorbedLcp(promptIds)
     const preAbsorbed = absorbed.length
     const preGdnPos = gdnStatePos
     const preValid = absorbedValid
+    let startPos = computeReuseStart(promptIds)
+    // Second chance: reuseStart said no, but a rewind point may sit at or
+    // before the position where the prompts still agree. Replaying from there
+    // costs about one chunk instead of the whole conversation, and leaves the
+    // recurrent state exactly where an ordinary prefill would have.
+    let rewoundTo = -1
+    if (startPos === 0 && GDN_CKPT_SLOTS > 0 && absorbedValid && prefixReuse && absorbed.length > 0) {
+      // Usable only if the prompt AGREES with the absorbed record all the way
+      // down to the point (so the KV beneath it still belongs to THIS prompt)
+      // and it leaves at least one token to run — prefill must produce logits.
+      const limit = Math.min(absorbedLcp(promptIds), promptIds.length - 1)
+      let bestSlot = -1
+      for (let s = 0; s < GDN_CKPT_SLOTS; s++) {
+        if (gdnCkptPos[s] > 0 && gdnCkptPos[s] <= limit
+          && (bestSlot < 0 || gdnCkptPos[s] > gdnCkptPos[bestSlot])) bestSlot = s
+      }
+      if (bestSlot >= 0) {
+        rewoundTo = gdnCkptPos[bestSlot]
+        restoreGdnCkpt(bestSlot)
+        gdnStatePos = rewoundTo
+        // Truncate the record to match: everything above the rewind point is
+        // about to be rewritten by the replay — noteAbsorbed's own rewind case.
+        absorbed.length = rewoundTo
+        startPos = rewoundTo
+      }
+    }
     const last = promptIds.length - 1
     let prefillPos = startPos
     let chunks = 0
@@ -3839,6 +3938,9 @@ export function buildDecodeEngine(
         // so the bubble this costs is a rounding error next to honest
         // progress and a cancel that can land within one chunk.
         await device.queue.onSubmittedWorkDone()
+        // Rewind point for the NEXT turn. The state sits exactly at
+        // prefillPos here, which is the only moment it can be captured cheaply.
+        saveGdnCkpt(prefillPos)
         onPrefill?.(prefillPos, promptIds.length)
       }
     }
@@ -3866,6 +3968,16 @@ export function buildDecodeEngine(
       console.log(
         `[engine] prefill: ${promptIds.length} tokens, reused prefix ${startPos}` +
         (chunks ? `, ${chunks} chunk${chunks > 1 ? 's' : ''} of ≤${chunkPrefill!.cap}` : ''),
+      )
+    }
+    // A rewind is a SAVE, not a miss, and it would otherwise be invisible: the
+    // line above just shows a smaller reuse than the caller expected. Say what
+    // it cost against what the all-or-nothing rule would have charged.
+    if (rewoundTo > 0) {
+      console.log(
+        `[engine] prefix REWOUND to ${rewoundTo} — the prompt diverged at ${preLcp} of ` +
+        `${preAbsorbed} absorbed; replayed ${promptIds.length - rewoundTo} tokens ` +
+        `instead of re-reading all ${promptIds.length}`,
       )
     }
     // Re-prefilling a conversation that the cache already holds is the most
