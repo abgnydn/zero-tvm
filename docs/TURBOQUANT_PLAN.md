@@ -392,6 +392,40 @@ because cache error accumulates with context and that is the regime that
 matters. If 4-bit holds there, the target is 4 bits (3.9x) rather than 8
 (2.0x) and the kernel work is the same shape either way.
 
+## SETTLED (2026-08-17) — 8 bits is free, 4 bits is real and grows. Build 8.
+
+The full paired grid on qwen36q3, both arms scoring identical windows:
+
+| bits | window | paired dNLL | z | windows worse | ppl cost |
+|---|---|---|---|---|---|
+| 8 | 1024 | -0.000851 +/- 0.001648 | -0.5 | 5/12 | **-0.09%** |
+| 8 | 4096 | +0.001023 +/- 0.000865 | 1.2 | 3/6 | **+0.10%** |
+| 4 | 1024 | +0.005456 +/- 0.002731 | 2.0 | 8/12 | +0.55% |
+| 4 | 4096 | +0.007668 +/- 0.002001 | **3.8** | **6/6** | **+0.77%** |
+
+**8 bits is free and stable.** Two window sizes, both within noise, sign
+flipping between them — the signature of no effect.
+
+**4 bits is a real cost that GROWS WITH CONTEXT.** 0.55% at 1k becomes 0.77% at
+4k, z climbs 2.0 → 3.8, and every window is worse rather than 8 of 12. That is
+the accumulation the earlier caveat predicted: each cached token is another
+rounded value the softmax sums over, so the longer the context the more of the
+answer rests on rounded numbers. It does not bite at 8 bits; it plainly does at
+4. Note the regime that matters most — 32k-64k, the reason to compress a cache
+at all — is still unmeasured and the trend points the wrong way.
+
+**DECISION: build 8-bit, everywhere.** It is proven free on the model that
+would use it, at the context length actually served. It is the existing
+kernel generalized rather than a new packing. And the layout is already
+parameterized by bit-width, so if 4 bits is ever wanted, it is a small step
+from a working 8-bit path rather than a fresh one — with the 32k measurement
+as its gate.
+
+For scale, the trade being declined: +0.77% buys 3.9x instead of 2.0x. Not
+absurd — this repo shipped the 3-bit expert build at +8.4% — but there is no
+reason to spend quality on a first implementation when the free option
+delivers the same kernels.
+
 ## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;
