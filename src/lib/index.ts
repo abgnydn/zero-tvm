@@ -74,6 +74,11 @@ export interface CreateEngineOptions {
    *  engine throws. Off by default. Passed to the LOADER as well as the
    *  engine: the stacked expert tensors are then never allocated, which is
    *  where the memory saving comes from. */
+  /** int8 KV cache — half the cache memory for a measured ~1.2% attention
+   *  output error (docs/TURBOQUANT_PLAN.md, phase 1 gate). Requires the FUSED
+   *  QKV path, which today means symmetric non-qk-norm specs: Phi-3 alone.
+   *  Exposed so that limit can be MEASURED end to end rather than argued. */
+  int8KV?: boolean
   expertPool?: number
   /** Run the next MoE layer's router a layer early and prefetch what it names
    *  (DecodeEngineOptions.expertSpeculate). Needs expertPool. */
@@ -242,7 +247,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
 
   // The lazy import the header is about. Everything reachable from here reads
   // GPUBufferUsage (or imports something that does) at module scope.
-  const [{ loadWeights }, { loadTokenizerFor, buildChatPromptFor }, { allocKVPages, buildDecodeEngine }, { parseVariantFlags }] =
+  const [{ loadWeights }, { loadTokenizerFor, buildChatPromptFor }, { allocKVPages, allocKVPagesInt8, buildDecodeEngine }, { parseVariantFlags }] =
     await Promise.all([
       import('../zero-tvm/weight-loader.js'),
       import('../zero-tvm/model-select.js'),
@@ -321,8 +326,18 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   // hook, and dequantises symmetric group-32 inline. Same rule chat.ts
   // applies; the failure mode is not a crash, it is wrong logits.
   const fused = !spec.qkNorm && spec.weightFormat !== 'mlx-safetensors'
-  const engine = buildDecodeEngine(device, weights, allocKVPages(device, spec), {
-    spec, variants, fused, ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
+  // int8KV rides the fused path only — the quantize kernel reads the fused
+  // QKV scratch. Refuse rather than silently serving an f16 cache, which
+  // would make a memory measurement report the wrong number.
+  if (opts.int8KV && !fused) {
+    throw new Error(
+      `int8KV needs the fused QKV path; ${spec.id} takes the unfused one `
+      + `(${spec.qkNorm ? 'qk-norm' : 'MLX-affine weights'}). Only symmetric non-qk-norm specs qualify today.`,
+    )
+  }
+  const kv = opts.int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
+  const engine = buildDecodeEngine(device, weights, kv, {
+    spec, variants, fused, ...(opts.int8KV ? { int8KV: true } : {}), ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
     ...(opts.traceMoe ? { traceMoe: true } : {}),
     ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),
     ...(opts.expertSpeculate ? { expertSpeculate: true } : {}),

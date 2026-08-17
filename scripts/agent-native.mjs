@@ -35,6 +35,10 @@ const PORT = Number(flag('port')) || 8017
 //   of prefill for gigabytes of RAM — never turn it on to serve long prompts.
 const POOL = flag('pool') !== '0'
 const EXPERTS = Number(flag('experts')) || 0
+// --kv8 halves the KV cache. Here so the quality cost can be MEASURED end to
+// end (identical prompts, greedy, first divergent token) rather than argued
+// from an offline error metric. Fused path only, so Phi-3 today.
+const KV8 = args.includes('--kv8')
 
 await installShims({ unsafe: !args.includes('--safe') })
 // dist-lib is real resolved JS — the src tree's `.js`-suffixed TS imports
@@ -45,11 +49,13 @@ const S = await hostSurface()
 
 console.log(`[native] booting ${param}${CTX ? ` ctx=${CTX}` : ''} on dawn.node…`)
 const t0 = Date.now()
+if (KV8) console.log('[native] int8 KV cache — half the cache memory, fused path only')
 if (EXPERTS) console.log(`[native] expert pool ${EXPERTS} slots/layer — saves RAM, but prefill runs PER TOKEN (no chunking)`)
 const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   model: param,
   ...(CTX ? { ctx: CTX } : {}),
   ...(EXPERTS ? { expertPool: EXPERTS } : {}),
+  ...(KV8 ? { int8KV: true } : {}),
   onProgress: (p) => { if (p.stage === 'weights' || p.stage === 'ready') process.stdout.write(`\r[native] ${p.message}          `) },
 })
 console.log(`\n[native] ${info.name} ready in ${((Date.now() - t0) / 1000).toFixed(1)}s — ctx ${spec.maxContext.toLocaleString()}`)
@@ -368,7 +374,7 @@ createServer(async (req, res) => {
     // there is no way to tell a host that will save its prefill from one that
     // will not — the two behave identically until the NEXT boot, and the flag
     // spent weeks silently off because the station passed the wrong one.
-    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, last: lastStats, live })
+    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, kv8: KV8, last: lastStats, live })
     return
   }
   if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {
