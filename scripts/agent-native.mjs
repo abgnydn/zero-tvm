@@ -280,7 +280,11 @@ createServer(async (req, res) => {
   if (url.pathname === '/' || url.pathname === '/health') {
     // `last` is the previous request's measured cost — the numbers LM Studio
     // prints in its log, readable from any device on the tailnet.
-    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, last: lastStats, live })
+    // `pool` reports whether the KV prefix cache on disk is armed. Without it
+    // there is no way to tell a host that will save its prefill from one that
+    // will not — the two behave identically until the NEXT boot, and the flag
+    // spent weeks silently off because the station passed the wrong one.
+    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, last: lastStats, live })
     return
   }
   if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {

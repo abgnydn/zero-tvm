@@ -321,6 +321,17 @@ async function tick(){
     const ctx=s.engine.ctx||1,pct=(l.contextUsed/ctx)*100
     $('ctxv').innerHTML=fmt(l.contextUsed)+'<small>/ '+fmt(ctx)+' · '+pct.toFixed(1)+'%</small>'
     $('ctxbar').style.width=Math.min(100,pct)+'%'
+  } else {
+    // A fresh engine has no last request, and this block used to be absent —
+    // so the panel kept the PREVIOUS engine's numbers painted after a reload.
+    // Reading "43,702 prompt tokens · 43,764 context used" on an engine whose
+    // KV cache is empty says the cache survived the restart. It did not: the
+    // cache lives in GPU memory and dies with the process. Stale stats that
+    // look live are worse than no stats.
+    for(const id of ['pf','dec','ttft','pt','reused','gt','reusev','ctxv']) $(id).innerHTML='&mdash;'
+    $('reusebar').style.width='0%'
+    $('ctxbar').style.width='0%'
+    $('reusenote').textContent='no requests since this model loaded — the KV cache is empty'
   }
 }
 tick();setInterval(tick,1000)
