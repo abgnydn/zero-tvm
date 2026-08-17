@@ -20,6 +20,7 @@
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { installShims } from './native/shims.mjs'
+import { panelHtml } from './native/panel.mjs'
 
 const args = process.argv.slice(2)
 const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
@@ -195,6 +196,14 @@ createServer(async (req, res) => {
     json(res, 200, { object: 'list', data: [{ id: spec.id, object: 'model', created: 0, owned_by: 'zero-tvm-native' }] })
     return
   }
+  // A BROWSER at the root gets the panel; everything else (the launcher's
+  // readiness poll, curl, any client) keeps the JSON it has always had —
+  // matched on Accept so no existing caller changes behavior.
+  if (url.pathname === '/' && (req.headers.accept ?? '').includes('text/html')) {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+    res.end(panelHtml())
+    return
+  }
   if (url.pathname === '/' || url.pathname === '/health') {
     // `last` is the previous request's measured cost — the numbers LM Studio
     // prints in its log, readable from any device on the tailnet.
@@ -255,4 +264,5 @@ createServer(async (req, res) => {
   }
 }).listen(PORT, '127.0.0.1', () => {
   console.log(`[native] OpenAI surface: http://127.0.0.1:${PORT}/v1  (model id "${spec.id}" or "ztvm")`)
+  console.log(`[native] panel:          http://127.0.0.1:${PORT}/`)
 })
