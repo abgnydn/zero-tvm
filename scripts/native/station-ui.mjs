@@ -97,6 +97,7 @@ export function stationUi() {
     <div class="cell"><div class="v" id="dec">—</div><div class="k">decode tok/s</div></div>
     <div class="cell"><div class="v" id="ttft">—</div><div class="k">first token</div></div>
     <div class="cell"><div class="v" id="pt">—</div><div class="k">prompt tokens</div></div>
+    <div class="cell"><div class="v" id="reused">—</div><div class="k">prefix reused</div></div>
     <div class="cell"><div class="v" id="gt">—</div><div class="k">generated</div></div>
   </div>
   <div class="cell" style="border:1px solid var(--line);border-top:0;border-radius:0 0 6px 6px">
@@ -120,7 +121,7 @@ export function stationUi() {
 <div id="histBox" style="display:none">
   <h2>Requests <button style="margin-left:8px;padding:2px 8px" onclick="clearHistory()">clear</button></h2>
   <table><thead><tr>
-    <th>time</th><th>prompt</th><th>prefill</th><th>first tok</th><th>gen</th><th>decode</th><th>ctx after</th>
+    <th>time</th><th>prompt</th><th>reused</th><th>prefill</th><th>first tok</th><th>gen</th><th>decode</th><th>ctx after</th>
   </tr></thead><tbody id="hrows"></tbody></table>
 </div>
 
@@ -246,7 +247,8 @@ async function tick(){
   const H=s.history||[]
   $('histBox').style.display=H.length?'':'none'
   $('hrows').innerHTML=H.map((r)=>'<tr><td>'+new Date(r.at).toLocaleTimeString()+
-    '</td><td>'+fmt(r.promptTokens)+'</td><td>'+fmt(r.prefillTokPerSec)+
+    '</td><td>'+fmt(r.promptTokens)+'</td><td>'+(r.reusedTokens==null?'—':r.reusedTokens===0?'none':fmt(r.reusedTokens))+
+    '</td><td>'+fmt(r.prefillTokPerSec)+
     '</td><td>'+(r.ttftMs/1000).toFixed(2)+'s</td><td>'+fmt(r.genTokens)+
     '</td><td>'+fmt(r.decodeTokPerSec,1)+'</td><td>'+fmt(r.contextUsed)+'</td></tr>').join('')
   const l=s.engine&&s.engine.last
@@ -255,6 +257,11 @@ async function tick(){
     $('dec').textContent=fmt(l.decodeTokPerSec,1)
     $('ttft').innerHTML=(l.ttftMs/1000).toFixed(2)+'<small>s</small>'
     $('pt').textContent=fmt(l.promptTokens)
+    // Reused vs re-read: a turn that reuses nothing pays for the whole
+    // conversation again, which is the difference between seconds and minutes.
+    $('reused').innerHTML=l.reusedTokens==null?'—'
+      :l.reusedTokens===0?'<span style="color:var(--err)">none</span>'
+      :fmt(l.reusedTokens)+'<small>of '+fmt(l.promptTokens)+'</small>'
     $('gt').textContent=fmt(l.genTokens)
     const ctx=s.engine.ctx||1,pct=(l.contextUsed/ctx)*100
     $('ctxv').innerHTML=fmt(l.contextUsed)+'<small>/ '+fmt(ctx)+' · '+pct.toFixed(1)+'%</small>'

@@ -1398,7 +1398,15 @@ export function buildDecodeEngine(
   let absorbed: number[] = []
   let absorbedValid = true
   const prefixReuse = opts.prefixReuse ?? true
-  let lastPrefill: { promptLen: number; reused: number; chunks: number } | null = null
+  let lastPrefill: {
+    promptLen: number; reused: number; chunks: number
+    /** Why reuse did not cover more: how far the new prompt agreed with the
+     *  absorbed record (`lcp`), how much was absorbed, and — for hybrids —
+     *  where the recurrent state actually sits. A turn that re-prefills
+     *  everything is the single most expensive thing this engine can do, so
+     *  it says why rather than leaving it to be inferred from a stopwatch. */
+    lcp: number; absorbed: number; gdnStatePos: number; hybrid: boolean; valid: boolean
+  } | null = null
 
   // The rules themselves live in prefix-reuse.ts, pinned by
   // tests/unit/prefix-reuse.test.ts against a table hand-derived from the
@@ -1420,6 +1428,15 @@ export function buildDecodeEngine(
 
   function computeReuseStart(promptIds: number[]): number {
     return reuseStart(reuseState(), promptIds)
+  }
+
+  /** How far the new prompt agrees with what the cache holds. Reported, never
+   *  used to decide — reuseStart owns the decision. */
+  function absorbedLcp(promptIds: number[]): number {
+    const max = Math.min(absorbed.length, promptIds.length)
+    let lcp = 0
+    while (lcp < max && absorbed[lcp] === promptIds[lcp]) lcp++
+    return lcp
   }
 
   // Logit readback buffer — used by forwardLogits() for the validation harness only.
@@ -2951,7 +2968,7 @@ export function buildDecodeEngine(
     return { ids: out, steps: Math.min(moeTraceIdx, TRACE_CAP), stride: traceStride / 4 }
   }
 
-  function getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null {
+  function getLastPrefill(): typeof lastPrefill {
     return lastPrefill
   }
 
@@ -3799,12 +3816,31 @@ export function buildDecodeEngine(
     for (; prefillPos < last; prefillPos++) {
       submitStep(promptIds[prefillPos], prefillPos, false)
     }
-    lastPrefill = { promptLen: promptIds.length, reused: startPos, chunks }
+    const lcp = absorbedLcp(promptIds)
+    lastPrefill = {
+      promptLen: promptIds.length, reused: startPos, chunks,
+      lcp, absorbed: absorbed.length, gdnStatePos, hybrid, valid: absorbedValid,
+    }
     if (startPos > 0 || chunks > 0) {
       console.log(
         `[engine] prefill: ${promptIds.length} tokens, reused prefix ${startPos}` +
         (chunks ? `, ${chunks} chunk${chunks > 1 ? 's' : ''} of ≤${chunkPrefill!.cap}` : ''),
       )
+    }
+    // Re-prefilling a conversation that the cache already holds is the most
+    // expensive failure mode here, and it is invisible without this line: say
+    // WHERE the agreement ended, so a caller can tell "the client changed an
+    // earlier turn" from "the recurrent state is not where reuse needs it".
+    if (startPos === 0 && absorbed.length > 0) {
+      const why = !absorbedValid ? 'the absorbed record was invalidated (a gap in submitted positions)'
+        : lcp === 0 ? 'the new prompt diverges at token 0 — a different conversation, or the system prompt changed'
+        : lcp < absorbed.length
+          ? `the new prompt matches only ${lcp} of ${absorbed.length} absorbed tokens — it CHANGED an earlier turn `
+            + '(a re-rendered assistant message or re-tokenized text will do this)'
+        : hybrid && gdnStatePos !== absorbed.length
+          ? `recurrent state sits at ${gdnStatePos}, not ${absorbed.length} — hybrid reuse is all-or-nothing`
+          : 'the prompt is not longer than what is absorbed'
+      console.log(`[engine] prefix reuse DECLINED — ${why}; re-prefilling all ${promptIds.length} tokens`)
     }
     // Last prefill step: readback to get the first generated token.
     const firstTokenPromise = submitStep(promptIds[last], last, true)!

@@ -62,6 +62,34 @@ const poolCfg = () => ({
 const flattenContent = (c) => typeof c === 'string' ? c
   : Array.isArray(c) ? c.map((p) => typeof p === 'string' ? p : p?.type === 'text' ? (p.text ?? '') : '').join('') : ''
 
+/**
+ * VERBATIM ASSISTANT TURNS — what the model wrote, not a reconstruction.
+ *
+ * A client hands assistant turns back as STRUCTURE (content + tool_calls),
+ * because that is what the OpenAI shape carries. Re-rendering that structure
+ * produces text that is *equivalent* but rarely byte-identical to what the
+ * model emitted — different whitespace inside a <tool_call> block is enough.
+ * Different text means different tokens, which means the new prompt stops
+ * matching the KV cache at the FIRST assistant turn, and the engine has to
+ * re-prefill the entire conversation. Measured on a real Cline session: a
+ * 16,454-token prompt re-prefilled in full, 98s to first token, when only
+ * 4,733 tokens were new.
+ *
+ * So the raw output is kept, keyed by the structure the client will send
+ * back, and substituted on the next turn. Bounded, and a miss simply falls
+ * back to re-rendering — the old behaviour, never an error.
+ */
+const RAW_CACHE = new Map()
+const RAW_CACHE_MAX = 64
+const rawKey = (content, calls) => JSON.stringify([content ?? '',
+  (calls ?? []).map((c) => [c.name, JSON.stringify(c.arguments ?? {})])])
+function rememberRaw(text, calls, raw) {
+  const k = rawKey(text, calls)
+  RAW_CACHE.delete(k)
+  RAW_CACHE.set(k, raw)
+  while (RAW_CACHE.size > RAW_CACHE_MAX) RAW_CACHE.delete(RAW_CACHE.keys().next().value)
+}
+
 function normalize(messages) {
   const out = []
   for (const m of messages ?? []) {
@@ -73,7 +101,8 @@ function normalize(messages) {
         let a = {}; try { a = JSON.parse(c.function?.arguments || '{}') } catch { /* keep {} */ }
         return { name: c.function?.name ?? '', arguments: a }
       })
-      content = S.renderAssistantCalls(dialect, content ?? '', calls)
+      const raw = RAW_CACHE.get(rawKey(content, calls))
+      content = raw ?? S.renderAssistantCalls(dialect, content ?? '', calls)
     }
     out.push({ role, content })
   }
@@ -126,11 +155,14 @@ async function runJob(body, onDelta) {
   {
     const ttft = (tFirst || Date.now()) - tStart
     const decodeMs = Date.now() - (tFirst || Date.now())
+    const pf = engine.getLastPrefill?.() ?? null
     lastStats = {
+      reusedTokens: pf ? pf.reused : null,
       promptTokens: promptIds.length,
       genTokens: ids.length,
       ttftMs: ttft,
       prefillTokPerSec: ttft > 0 ? +(promptIds.length / (ttft / 1000)).toFixed(1) : 0,
+      newTokens: pf ? promptIds.length - pf.reused : null,
       decodeTokPerSec: decodeMs > 0 && ids.length > 1 ? +((ids.length - 1) / (decodeMs / 1000)).toFixed(1) : 0,
       contextUsed: promptIds.length + ids.length,
       at: new Date().toISOString(),
@@ -138,10 +170,12 @@ async function runJob(body, onDelta) {
     // Prefill rate counts the prompt against time-to-first-token; with prefix
     // reuse a follow-up turn re-reads almost nothing, so a huge rate there is
     // the cache working, not the GPU getting faster.
-    const pf = ttft > 0 ? (promptIds.length / (ttft / 1000)) : 0
+    const pfRate = ttft > 0 ? (promptIds.length / (ttft / 1000)) : 0
     const dec = decodeMs > 0 && ids.length > 1 ? ((ids.length - 1) / (decodeMs / 1000)) : 0
-    console.log(`[native] prompt ${promptIds.length.toLocaleString()} tok · ttft ${(ttft / 1000).toFixed(2)}s`
-      + ` (${pf.toFixed(0)} tok/s prefill) · gen ${ids.length} tok`
+    const reused = lastStats.reusedTokens
+    console.log(`[native] prompt ${promptIds.length.toLocaleString()} tok`
+      + (reused ? ` (${reused.toLocaleString()} reused, ${(promptIds.length - reused).toLocaleString()} new)` : ' (no reuse)')
+      + ` · ttft ${(ttft / 1000).toFixed(2)}s (${pfRate.toFixed(0)} tok/s prefill) · gen ${ids.length} tok`
       + ` (${dec.toFixed(1)} tok/s) · ctx ${(promptIds.length + ids.length).toLocaleString()}/${spec.maxContext.toLocaleString()}`)
   }
 
@@ -150,6 +184,11 @@ async function runJob(body, onDelta) {
     id: `call_${randomUUID().slice(0, 8)}_${i}`, type: 'function',
     function: { name: c.name, arguments: JSON.stringify(c.arguments ?? {}) },
   }))
+  // Keep the RAW output against the structure the client will hand back, so
+  // the next turn re-sends what the model actually wrote and the KV cache
+  // still matches. Only for turns that carry calls — plain text round-trips
+  // unchanged already.
+  if (parsed.calls.length) rememberRaw(parsed.text, parsed.calls, out)
   return {
     text: parsed.text, toolCalls,
     finishReason: toolCalls.length ? 'tool_calls' : ids.length >= budget ? 'length' : 'stop',
