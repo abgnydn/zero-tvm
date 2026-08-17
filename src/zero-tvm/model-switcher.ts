@@ -21,7 +21,10 @@ import { modelBranding, SHIPPED_MODELS } from './model-registry.js'
 // statically, so a static import here would drag that chain into the chat
 // page's entry and break it on any browser without WebGPU.
 
-const MODELS = SHIPPED_MODELS
+// Pending models (generated, not yet numerics-validated) stay out of the
+// switcher for the same reason they stay off the entrance roster — listing
+// one is a claim it runs. ?model= still boots them for the validation itself.
+const MODELS = SHIPPED_MODELS.filter((m) => !modelBranding(m.spec).pending)
 
 /**
  * Reload onto `param`, keeping every other query flag. Bench runs drive this

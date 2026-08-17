@@ -69,6 +69,9 @@ function buildGroups(): Group[] {
     // work) but earns no place on a character-select screen for conversation.
     if (spec.embeddingOnly) continue
     const b = modelBranding(spec)
+    // Pending = generated but not yet numerics-validated. A roster card is a
+    // claim the model runs; the claim waits for validate-model.
+    if (b.pending) continue
     const { family, variant } = splitParams(b.params)
     let g = out.get(b.name)
     if (!g) { g = { name: b.name, params: family, variants: [] }; out.set(b.name, g) }

@@ -118,6 +118,12 @@ export interface ModelBrand {
   rateLabel: string
   /** Present when the model needs more memory than a typical machine has. */
   ramNote?: string
+  /** Spec generated and compile-gated but NOT yet numerics-validated against
+   *  its reference (mlx_lm logits + greedy). The entrance hides pending
+   *  characters — a live roster card is a claim the model runs, and this
+   *  registry does not claim what it has not checked. ?model= still boots it
+   *  for exactly that validation. Remove the flag when validate-model passes. */
+  pending?: true
   /** Memory builds for the landing character screen — expert-pool presets,
    *  measured where a measurement exists (BENCH.md 2026-08-15 AC price
    *  curve; est = derived from the expert fraction, not measured). slots=0
@@ -190,7 +196,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },
   [QWEN3_5_9B_MLX_4BIT.id]: { name: 'Qwen3.5-9B', params: '9B hybrid (DeltaNet)', sizeLabel: '~4.7 GB', rateLabel: '~43 t/s' },
-  [QWEN3_8_27B_4BIT.id]: { name: 'Qwen3.8-27B', params: '27B hybrid (DeltaNet)', sizeLabel: '~14.1 GB', rateLabel: '', ramNote: 'needs ~18 GB free RAM' },
+  [QWEN3_8_27B_4BIT.id]: { name: 'Qwen3.8-27B', params: '27B hybrid (DeltaNet)', sizeLabel: '~14.1 GB', rateLabel: '', ramNote: 'needs ~18 GB free RAM', pending: true },
   // ADD-MODEL:BRANDINGS
 }
 
