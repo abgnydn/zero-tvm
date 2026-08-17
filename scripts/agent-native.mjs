@@ -182,6 +182,34 @@ async function runJob(body, onDelta, isAborted) {
     const ttft = (tFirst || Date.now()) - tStart
     const decodeMs = Date.now() - (tFirst || Date.now())
     const pf = engine.getLastPrefill?.() ?? null
+    // A full re-prefill on a conversation the cache already holds is the most
+    // expensive thing here, and "matches only 105 of 14316" does not say WHOSE
+    // fault it is. Which MESSAGE the agreement dies in does:
+    //   message 0 (system)  → the client rewrites its own system prompt each
+    //                         turn; nothing downstream can reuse anything.
+    //   an assistant turn   → our re-render differs from what the model wrote,
+    //                         i.e. a RAW_CACHE miss — ours to fix.
+    //   a user/tool turn    → the client edited earlier content.
+    // Cheap exactly when it matters: the loop stops as soon as the running
+    // count passes lcp, so a divergence at token 105 costs one short encode.
+    // Counts include each prefix's generation prompt, so treat the boundary as
+    // approximate — it identifies the message, not the token.
+    if (pf && pf.reused === 0 && pf.absorbed > 0 && pf.lcp < pf.absorbed) {
+      try {
+        let where = null
+        for (let k = 1; k <= messages.length; k++) {
+          const n = S.buildChatPromptFor(spec, messages.slice(0, k), tokenizer).length
+          if (n > pf.lcp) { where = { i: k - 1, role: messages[k - 1].role, upto: n }; break }
+        }
+        if (where) {
+          console.log(`[native] the divergence falls in message ${where.i} of ${messages.length}`
+            + ` (role '${where.role}', ends near token ${where.upto}) — `
+            + (where.i === 0 ? 'the SYSTEM prompt changed between turns, so nothing can be reused'
+              : where.role === 'assistant' ? 'OUR re-render of that assistant turn differs from what the model wrote (raw-cache miss)'
+              : 'the client edited an earlier message'))
+        }
+      } catch { /* diagnostics never break a request */ }
+    }
     lastStats = {
       reusedTokens: pf ? pf.reused : null,
       promptTokens: promptIds.length,
