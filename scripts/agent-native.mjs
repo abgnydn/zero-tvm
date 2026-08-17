@@ -44,8 +44,12 @@ const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
 })
 console.log(`\n[native] ${info.name} ready in ${((Date.now() - t0) / 1000).toFixed(1)}s — ctx ${spec.maxContext.toLocaleString()}`)
 
+// Same table as agent-host.ts — read off each checkpoint's own template, not
+// guessed from the family name: Qwen ships BOTH call formats under ChatML,
+// and the wrong one reads as "the model is bad at tools". Qwen3.8's template
+// demands the XML form (<tool_call><function=…><parameter=…>).
 const dialect = spec.chatTemplateId === 'llama3' ? 'llama3'
-  : spec.id.startsWith('qwen36') ? 'chatml-xml' : 'chatml-json'
+  : ['qwen36', 'qwen3-8-27b'].some((p) => spec.id.startsWith(p)) ? 'chatml-xml' : 'chatml-json'
 const poolCfg = () => ({
   spec, weightRevision: spec.hfRepo, variants, fused: false, int8KV: false,
   prefillPath: !spec.moe && variants.subgroups ? 'chunked' : 'per-token',

@@ -64,12 +64,28 @@ const spec = specFromSearch(location.search)
 const brand = modelBranding(spec)
 el('model').textContent = `${brand.name} — ${brand.params}`
 
-/** Which tool convention this spec's template speaks. Read off chatTemplateId
- *  rather than the model name: the same family ships both JSON and XML call
- *  formats across versions, and tool-calls.ts pins each against vendor jinja. */
+/** Which tool convention this spec's template speaks.
+ *
+ *  ChatML does NOT determine this — the Qwen line ships both call formats
+ *  under it, so every entry here is read off that checkpoint's own
+ *  chat_template.jinja and pinned in tool-calls.ts against the vendor text:
+ *
+ *    chatml-xml   Qwen3.6-35B-A3B, Qwen3.8-27B — the template spells out
+ *                 `<tool_call><function=NAME><parameter=K>V</parameter>…`
+ *    chatml-json  Qwen3-4B, Qwen3-30B-A3B, Qwen3.5 — a JSON object inside
+ *                 <tool_call> tags
+ *
+ *  A model whose template was never read must NOT be guessed at: the wrong
+ *  dialect renders tool blocks the model cannot follow and parses calls it
+ *  never made, which reads as "the model is bad at tools" rather than as a
+ *  wiring bug. Qwen3.8 landed exactly in that trap — an id-prefix test for
+ *  'qwen36' sent it to chatml-json while its template demands XML.
+ */
+const XML_DIALECT_SPECS = new Set(['qwen36', 'qwen3-8-27b'])
 function dialectFor(id: string): ToolDialect {
   if (id === 'llama3') return 'llama3'
-  return spec.id.startsWith('qwen36') ? 'chatml-xml' : 'chatml-json'
+  return [...XML_DIALECT_SPECS].some((p) => spec.id.startsWith(p))
+    ? 'chatml-xml' : 'chatml-json'
 }
 
 // No top-level await: the build targets es2020 (vite.config.ts), where it is a
