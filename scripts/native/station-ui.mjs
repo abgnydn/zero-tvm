@@ -103,7 +103,25 @@ export function stationUi() {
     <div class="v" id="ctxv">—</div><div class="k">context used</div>
     <div class="bar"><i id="ctxbar" style="width:0%"></i></div>
   </div>
-  <div style="margin-top:10px"><button onclick="unload()">Unload</button></div>
+  <div style="margin-top:10px">
+    <button onclick="clearModel()" title="unload the model and free its memory">Clear</button>
+  </div>
+</div>
+
+<div id="memBox" style="display:none">
+  <h2>Machine</h2>
+  <div class="cell" style="border:1px solid var(--line);border-radius:6px">
+    <div class="v" id="memv">—</div><div class="k">memory in use</div>
+    <div class="bar"><i id="membar" style="width:0%"></i></div>
+    <div class="note" id="memnote" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div id="histBox" style="display:none">
+  <h2>Requests <button style="margin-left:8px;padding:2px 8px" onclick="clearHistory()">clear</button></h2>
+  <table><thead><tr>
+    <th>time</th><th>prompt</th><th>prefill</th><th>first tok</th><th>gen</th><th>decode</th><th>ctx after</th>
+  </tr></thead><tbody id="hrows"></tbody></table>
 </div>
 
 <div id="loadingBox" style="display:none">
@@ -146,7 +164,8 @@ async function load(param){
   if(!r.ok){const e=await r.json();alert(e.error||'load refused')}
   tick()
 }
-async function unload(){await fetch('/api/unload',{method:'POST'});tick()}
+async function clearModel(){await fetch('/api/unload',{method:'POST'});tick()}
+async function clearHistory(){await fetch('/api/history/clear',{method:'POST'});tick()}
 
 function residentGb(m){
   // What actually occupies memory. A pool build holds fewer experts, so the
@@ -210,6 +229,26 @@ async function tick(){
   $('live').style.display=s.phase==='ready'?'':'none'
   const key=JSON.stringify([MODELS.length,s.loaded&&s.loaded.param,s.phase])
   if(key!==renderedFor){renderedFor=key;renderModels(s.loaded)}
+  // Machine memory — measured (macOS vm_stat), absent elsewhere rather than faked.
+  const m=s.memory
+  $('memBox').style.display=m?'':'none'
+  if(m){
+    const pct=m.usedGb!=null?(m.usedGb/m.totalGb)*100:0
+    $('memv').innerHTML=fmt(m.usedGb,1)+'<small>/ '+fmt(m.totalGb,0)+' GB'+
+      (m.compressedGb?' · '+fmt(m.compressedGb,1)+' compressed':'')+'</small>'
+    $('membar').style.width=Math.min(100,pct)+'%'
+    $('membar').style.background=m.swappingNow?'linear-gradient(90deg,#e2685f88,#e2685f)'
+      :pct>85?'linear-gradient(90deg,#d9a44188,#d9a441)':'linear-gradient(90deg,#f0a86088,var(--accent))'
+    $('memnote').textContent=m.note||(pct>85?'close to full — a second model will swap':'')
+    $('memnote').className='note'+(m.swappingNow?' err':'')
+  }
+  // Request trend — the point is decode drifting down as the window fills.
+  const H=s.history||[]
+  $('histBox').style.display=H.length?'':'none'
+  $('hrows').innerHTML=H.map((r)=>'<tr><td>'+new Date(r.at).toLocaleTimeString()+
+    '</td><td>'+fmt(r.promptTokens)+'</td><td>'+fmt(r.prefillTokPerSec)+
+    '</td><td>'+(r.ttftMs/1000).toFixed(2)+'s</td><td>'+fmt(r.genTokens)+
+    '</td><td>'+fmt(r.decodeTokPerSec,1)+'</td><td>'+fmt(r.contextUsed)+'</td></tr>').join('')
   const l=s.engine&&s.engine.last
   if(l){
     $('pf').textContent=fmt(l.prefillTokPerSec)

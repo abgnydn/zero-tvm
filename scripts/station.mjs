@@ -22,8 +22,10 @@
 
 import { createServer, request as httpRequest } from 'node:http'
 import { spawn } from 'node:child_process'
+import { readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { sampleMemory } from './native/sysmem.mjs'
 import { SHIPPED_MODELS, modelBranding, specWithCtx } from '../src/zero-tvm/model-registry.ts'
 import { stationUi } from './native/station-ui.mjs'
 
@@ -68,6 +70,14 @@ let phase = 'idle'
 let loaded = null          // { param, ctx, pool }
 let logLines = []          // the child's recent output, for the UI
 let failure = ''
+/** Completed requests, newest first — the trend is the point: decode drifting
+ *  down or TTFT climbing as a conversation fills the window. */
+let history = []
+let lastSeenAt = null
+/** Latest system-memory sample (macOS). null elsewhere; the UI omits the row. */
+let memory = null
+/** What to reload after a restart, so a reboot does not leave clients on 503. */
+const REMEMBER = join(ROOT, '.station.json')
 
 const pushLog = (s) => {
   for (const line of String(s).split('\n')) {
@@ -109,6 +119,8 @@ async function loadModel({ param, ctx, pool }) {
   await new Promise((r) => setTimeout(r, 400))   // let the port free
   logLines = []
   failure = ''
+  history = []          // a new engine's numbers are not the old one's
+  lastSeenAt = null
   phase = 'loading'
   loaded = { param, ctx: ctx || 0, pool: pool || 0 }
   const argv = [join(ROOT, 'scripts/agent-native.mjs'), param, '--port', String(ENGINE_PORT)]
@@ -132,8 +144,35 @@ async function loadModel({ param, ctx, pool }) {
     return false
   }
   phase = 'ready'
+  remember({ param, ctx: ctx || 0, pool: pool || 0 })
   return true
 }
+
+function remember(choice) {
+  try { writeFileSync(REMEMBER, JSON.stringify(choice)) } catch { /* not fatal */ }
+}
+function forget() {
+  try { rmSync(REMEMBER, { force: true }) } catch { /* not fatal */ }
+}
+
+// Poll the engine for its per-request record and accumulate the ones we have
+// not seen. The engine keeps only the LAST; the trend lives here.
+setInterval(async () => {
+  if (phase !== 'ready') return
+  try {
+    const h = await (await fetch(`http://127.0.0.1:${ENGINE_PORT}/health`,
+      { signal: AbortSignal.timeout(1200) })).json()
+    const l = h.last
+    if (l && l.at !== lastSeenAt) {
+      lastSeenAt = l.at
+      history.unshift({ ...l, model: loaded?.param ?? '' })
+      if (history.length > 20) history.length = 20
+    }
+  } catch { /* mid-restart */ }
+}, 1000)
+
+setInterval(async () => { memory = await sampleMemory() }, 3000)
+void sampleMemory().then((m) => { memory = m })
 
 // ── proxy: everything the engine owns ───────────────────────────────────────
 function proxy(req, res) {
@@ -180,7 +219,8 @@ createServer(async (req, res) => {
           { signal: AbortSignal.timeout(1500) })).json()
       } catch { /* mid-restart */ }
     }
-    json(res, 200, { phase, loaded, failure, log: logLines.slice(-24), engine, models: CATALOGUE, port: PORT })
+    json(res, 200, { phase, loaded, failure, log: logLines.slice(-24), engine,
+      history, memory, models: CATALOGUE, port: PORT })
     return
   }
 
@@ -207,6 +247,15 @@ createServer(async (req, res) => {
 
   if (url.pathname === '/api/unload' && req.method === 'POST') {
     stopEngine()
+    forget()            // an explicit clear also cancels auto-load
+    history = []
+    lastSeenAt = null
+    json(res, 200, { ok: true })
+    return
+  }
+
+  if (url.pathname === '/api/history/clear' && req.method === 'POST') {
+    history = []
     json(res, 200, { ok: true })
     return
   }
@@ -232,6 +281,18 @@ createServer(async (req, res) => {
   console.log(`[station] UI:       http://127.0.0.1:${PORT}/`)
   console.log(`[station] OpenAI:   http://127.0.0.1:${PORT}/v1   (stable across model swaps)`)
   console.log(`[station] ${CATALOGUE.length} models available — load one from the UI`)
+  // Reload whatever was loaded last, so a restart does not leave every client
+  // on 503 until someone opens a browser. `--no-autoload` opts out; an
+  // explicit Clear in the UI forgets the choice.
+  if (!process.argv.includes('--no-autoload')) {
+    try {
+      const saved = JSON.parse(readFileSync(REMEMBER, 'utf8'))
+      if (CATALOGUE.some((m) => m.param === saved.param)) {
+        console.log(`[station] auto-loading ${saved.param} (ctx ${saved.ctx || 'default'})`)
+        void loadModel(saved)
+      }
+    } catch { /* nothing remembered — idle is correct */ }
+  }
 })
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
