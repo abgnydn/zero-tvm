@@ -26,6 +26,9 @@ export interface EnterChatOptions {
   /** The .cs-root the select screen rendered into. */
   root: HTMLElement
   spec: ModelSpec
+  /** ?model= registry param — the room's info frame carries it so a guest
+   *  who copies the weights can serve the same room. */
+  param: string
   /** Expert slots of the chosen memory build (0 = full model). */
   poolSlots: number
   /** The chosen build's registry label ('' for the full model). */
@@ -223,6 +226,13 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     // /roster leaves the chat the same way the header link does.
     commands: { roster: () => location.reload() },
   })
+
+  // The Room tool: serve this booted engine to other machines, from inside
+  // the game. Additive — a failure to load it must not touch the chat.
+  void import('./landing-room.js').then(({ mountRoomTool }) => mountRoomTool({
+    root, panel, spec, param: opts.param,
+    engine: boot.engine, tokenizer: boot.tokenizer, mascot,
+  })).catch((e) => console.warn('[landing] room tool failed to mount:', e))
 
   // LISTENING: typing is real attention — the character turns toward the
   // panel (CSS on cs-listening) and perks its ears (the hover state) while

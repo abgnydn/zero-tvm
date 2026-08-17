@@ -1,0 +1,404 @@
+/**
+ * ROOM HOST CORE — serve the engine in THIS tab to guests over WebRTC.
+ *
+ * Extracted from share.ts's runHost so two surfaces can host without drift:
+ * share.html (the standalone page, e2e-covered) and the landing entrance's
+ * in-place chat (landing-room.ts, where the room is part of the game). Same
+ * rule as chat-flow.ts: one host loop, page-specific chrome behind callbacks.
+ *
+ * DOM-free by contract: everything the host's eyes need arrives through
+ * RoomUI. No GPU globals at module scope — the engine comes in as a value,
+ * and every import here is proven safe on WebGPU-less machines (share.ts has
+ * always imported them statically on the guest path).
+ *
+ * Protocol, privacy model and the serialized-FIFO rule are unchanged — see
+ * share.ts's header. The signaling endpoint constants live HERE now, single-
+ * sourced for host, guest and helper.
+ */
+
+import type { ModelSpec } from '../compiler/model-spec.js'
+import type { DecodeEngine } from './engine-core.js'
+import { quantTagFor } from './chat-ui.js'
+import { serveWeights } from './peer-weights.js'
+import { makeStageClient, type StageReply } from './pipeline-peer.js'
+
+// ── signaling endpoint (single source for host/guest/helper) ──
+const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
+const PROD_SIGNAL = 'wss://zero-tvm-share-signal.abgunaydin94.workers.dev'  // deployed 2026-08-06
+/** `?sig=<port|ws-url>` overrides the relay — DEV ONLY, so a shared link can
+ *  never point a guest's signaling at a third party in production. */
+export function signalEnv(): { base: string; override: string | null } {
+  const override = DEV ? new URLSearchParams(location.search).get('sig') : null
+  const base = override
+    ? (/^wss?:\/\//.test(override) ? override : `ws://localhost:${override}`)
+    : DEV ? 'ws://localhost:8787' : PROD_SIGNAL
+  return { base, override }
+}
+
+export const ICE: RTCConfiguration = {
+  // STUN only, deliberately: same-network and home-NAT paths connect
+  // directly. Hostile (corporate) NATs need a TURN relay — a later problem,
+  // and a separate consent: TURN routes ciphertext through a third party.
+  iceServers: [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }],
+}
+
+// ── wire protocol ─────────────────────────────────────────────
+export interface ChatMsg { role: 'system' | 'user' | 'assistant'; content: string }
+export interface ChatReq { type: 'chat'; id: number; messages: ChatMsg[] }
+export interface StopReq { type: 'stop'; id: number }
+/** A peer that holds the REST of a split model, offering to run it. */
+export interface StageOffer { type: 'stage-offer'; start: number; end: number; specId: string }
+type GuestMsg = ChatReq | StopReq | StageOffer
+export type HostMsg =
+  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string; specId: string }
+  | { type: 'text'; id: number; full: string }
+  | { type: 'done'; id: number; tokens: number; tps: number }
+  | { type: 'busy'; id: number; pos: number }
+  | { type: 'error'; id: number; message: string }
+  | { type: 'stage-accept'; start: number; end: number }
+  | { type: 'stage-reject'; message: string }
+  | { type: 'stage-wait'; message: string }
+
+// ── the host's eyes ───────────────────────────────────────────
+export interface RoomUI {
+  /** One request/event row — your machine should not run someone's prompt
+   *  without you seeing it. Returns a setter for the row's status cell. */
+  row: (who: string, text: string) => (status: string) => void
+  /** Membership: signaller counts + how many guests THIS host has channels
+   *  to (the number a stage full of mascots draws). */
+  onMembers?: (m: { hosts: number; guests: number; connected: number }) => void
+  /** Split-model chain state, human-readable ('' when not split). */
+  onChain?: (text: string) => void
+  /** The chain now tiles the whole model (or stopped doing so). */
+  onPaired?: (complete: boolean) => void
+  /** One real token generated for a guest — the entrance mascot's mouth. */
+  onToken?: () => void
+  /** The engine started/stopped serving a guest request. */
+  onBusy?: (busy: boolean) => void
+}
+
+export interface HostRoomOptions {
+  spec: ModelSpec
+  brand: { name: string; params: string; rateLabel: string }
+  /** ?model= param, sent in the info frame so a guest who copies the weights
+   *  can host the same room. */
+  param: string
+  engine: DecodeEngine
+  tokenizer: { decode: (ids: number[]) => string }
+  /** Chat template + tokenize — injected so this module never imports the
+   *  loader chain. */
+  encode: (messages: ChatMsg[]) => number[]
+  /** Join an EXISTING room (adds this device as another host). */
+  existingRoom?: string | null
+  /** This engine holds only layers [start,end) of a split model. */
+  stageRange?: { start: number; end: number } | null
+  /** Where a guest link points; share.ts passes its own pathname. */
+  guestPath?: string
+  ui: RoomUI
+}
+
+export interface RoomHandle {
+  roomId: string
+  link: string
+  close: () => void
+}
+
+export function hostRoom(opts: HostRoomOptions): RoomHandle {
+  const { spec, brand, param, engine, tokenizer, encode, stageRange, ui } = opts
+  const { base: signalBase, override: sigOverride } = signalEnv()
+
+  // Joining an existing room keeps its id (that is what makes this device an
+  // ADDITIONAL host rather than a second room nobody has the link to).
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  const roomId = opts.existingRoom
+    ?? btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  // Carry a dev signaling override into the guest link, or the guest dials the
+  // default relay and the room never forms.
+  const link = `${location.origin}${opts.guestPath ?? '/share.html'}`
+    + `${sigOverride ? `?sig=${encodeURIComponent(sigOverride)}` : ''}#${roomId}`
+
+  const ws = new WebSocket(`${signalBase}/room/${roomId}?role=host`)
+  const peers = new Map<string, { pc: RTCPeerConnection; dc: RTCDataChannel | null }>()
+  const pipelines = new Map<string, RTCDataChannel>()
+
+  // Serialized generation: the engine is single-stream. FIFO of pending
+  // requests across all guests; queue positions are reported honestly.
+  const queue: { guest: string; req: ChatReq }[] = []
+  let generating = false
+  const stopFlags = new Map<string, number>()   // guest -> request id to stop
+
+  const send = (guest: string, msg: HostMsg): void => {
+    const dc = peers.get(guest)?.dc
+    if (dc?.readyState === 'open') dc.send(JSON.stringify(msg))
+  }
+
+  // ── the rest of a split model ────────────────────────────────────────────
+  // Helper peers each announce a layer range and are assembled into an
+  // ordered CHAIN. Until the chain reaches the last layer the host has a
+  // model it cannot finish, and says so rather than generating from part of
+  // a network. Hub-and-spoke on purpose — see share.ts history.
+  interface DownStage {
+    guest: string
+    start: number
+    end: number
+    step: (pos: number, residual: ArrayBuffer) => Promise<StageReply>
+    meanHopMs: () => number
+  }
+  const chain: DownStage[] = []
+  // Offers that are valid but not yet adjacent to the assembled chain.
+  const pendingStages = new Map<string, StageOffer>()
+  /** The first layer still missing — where the next stage must start. */
+  const chainEnd = (): number => (chain.length ? chain[chain.length - 1].end : stageRange!.end)
+  const chainComplete = (): boolean => !!stageRange && chainEnd() === spec.layers
+
+  /**
+   * The token loop for a SPLIT model — the whole-model generatePipelined
+   * cannot run here, because this engine holds only the first layers.
+   */
+  async function generateSplit(
+    promptIds: number[], budget: number,
+    onToken: (id: number) => void, shouldStop: () => boolean,
+  ): Promise<number[]> {
+    if (!chainComplete()) throw new Error(`layers ${chainEnd()}-${spec.layers} of this model are not connected`)
+    const stages = [...chain]
+    const stepAll = async (tokenId: number, pos: number): Promise<number> => {
+      let out: StageReply = await engine.pipelineStep({ tokenId }, pos)
+      for (const s of stages) {
+        if ('tokenId' in out) throw new Error('a stage ended the model before the last one')
+        out = await s.step(pos, out.residual)
+      }
+      if (!('tokenId' in out)) throw new Error('the last stage returned a residual, not a token')
+      return out.tokenId
+    }
+    let tok = 0
+    for (let i = 0; i < promptIds.length; i++) tok = await stepAll(promptIds[i], i)
+    const out: number[] = []
+    for (let n = 0; n < budget; n++) {
+      // Stop ids are consumed, never shown — same contract as generate().
+      if (spec.stops.includes(tok) || shouldStop()) break
+      out.push(tok)
+      onToken(tok)
+      tok = await stepAll(tok, promptIds.length + n)
+    }
+    return out
+  }
+
+  async function pump(): Promise<void> {
+    if (generating) return
+    const next = queue.shift()
+    if (!next) return
+    generating = true
+    const { guest, req } = next
+    const preview = req.messages.at(-1)?.content.slice(0, 80) ?? ''
+    const st = ui.row(guest, preview)
+    try {
+      const promptIds = encode(req.messages)
+      // The per-reply cap is the KV room the prompt leaves behind, not a
+      // magic constant — same rule as chat.ts.
+      const budget = spec.maxContext - promptIds.length
+      if (budget < 16) throw new Error(`prompt is ${promptIds.length} tokens — over this model's ${spec.maxContext}-token context`)
+      const allIds: number[] = []
+      const t0 = performance.now()
+      st('generating…')
+      ui.onBusy?.(true)
+      const onTok = (id: number) => {
+        allIds.push(id)
+        ui.onToken?.()
+        send(guest, { type: 'text', id: req.id, full: tokenizer.decode(allIds) })
+      }
+      const stop = () => stopFlags.get(guest) === req.id || !peers.has(guest)
+      if (stageRange) await generateSplit(promptIds, budget, onTok, stop)
+      else await engine.generatePipelined(promptIds, budget, onTok, stop)
+      const secs = (performance.now() - t0) / 1000
+      const tps = allIds.length / Math.max(secs, 0.001)
+      send(guest, { type: 'done', id: req.id, tokens: allIds.length, tps })
+      // The hop SUM is what a token actually waited on — the number that
+      // decides whether a long chain is usable at all.
+      const hopTotal = chain.reduce((a, s) => a + s.meanHopMs(), 0)
+      st(`${allIds.length} tok · ${tps.toFixed(1)} tok/s`
+        + (chain.length ? ` · ${hopTotal.toFixed(1)} ms/hop across ${chain.length} stage${chain.length === 1 ? '' : 's'}` : ''))
+    } catch (e) {
+      send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
+      st('error')
+    } finally {
+      generating = false
+      ui.onBusy?.(false)
+      void pump()
+    }
+  }
+
+  function onGuestMessage(guest: string, raw: string): void {
+    let msg: GuestMsg
+    try { msg = JSON.parse(raw) as GuestMsg } catch { return }
+    if (msg.type === 'stop') { stopFlags.set(guest, msg.id); return }
+    if (msg.type === 'stage-offer') { offerStage(guest, msg); return }
+    if (msg.type !== 'chat' || !Array.isArray(msg.messages)) return
+    stopFlags.delete(guest)
+    queue.push({ guest, req: msg })
+    const pos = queue.length - (generating ? 0 : 1)
+    if (pos > 0) send(guest, { type: 'busy', id: msg.id, pos })
+    void pump()
+  }
+
+  // Membership has two sources — the signaller's periodic counts and this
+  // host's own peer table — and they must not overwrite each other.
+  let roomCounts = { hosts: 1, guests: 0 }
+  function announce(): void {
+    ui.onMembers?.({ ...roomCounts, connected: peers.size })
+    ui.onChain?.(stageRange ? describeChain() : '')
+  }
+
+  /** What the room looks like right now, for the host's own eyes. */
+  function describeChain(): string {
+    const held = `${stageRange!.start}-${stageRange!.end} here`
+    const rest = chain.map((s) => `${s.start}-${s.end}`).join(' → ')
+    const missing = chainComplete() ? '' : ` · waiting for layers ${chainEnd()}-${spec.layers}`
+    return `split model — layers ${held}${rest ? ` → ${rest}` : ''}${missing}`
+  }
+
+  /**
+   * A peer says which layers it holds. Refuse what can never fit; hold what
+   * fits but is not adjacent YET — the accepted stages must tile
+   * [k, layers) contiguously, built from peers arriving in any order.
+   */
+  function offerStage(guest: string, offer: StageOffer): void {
+    const pipe = pipelines.get(guest)
+    const bad = !stageRange ? 'this host runs the whole model'
+      : offer.specId !== spec.id ? `different model (${offer.specId} vs ${spec.id})`
+      : !pipe ? 'the pipeline channel is not open'
+      : !(offer.start < offer.end) ? `layers ${offer.start}-${offer.end} is not a range`
+      : offer.end > spec.layers ? `layers ${offer.start}-${offer.end} runs past this model's ${spec.layers}`
+      : offer.start < stageRange.end ? `layers ${offer.start}-${offer.end} overlaps the ${stageRange.start}-${stageRange.end} this host holds`
+      : chain.some((c) => offer.start < c.end && c.start < offer.end)
+        ? `layers ${offer.start}-${offer.end} overlap a stage already in the chain`
+        : null
+    if (bad) {
+      send(guest, { type: 'stage-reject', message: bad })
+      ui.row(guest, `stage offer refused — ${bad}`)
+      return
+    }
+    pendingStages.set(guest, offer)
+    extendChain()
+    if (pendingStages.has(guest)) {
+      const why = `layers ${offer.start}-${offer.end} held — the chain needs ${chainEnd()} next`
+      send(guest, { type: 'stage-wait', message: why })
+      ui.row(guest, why)
+    }
+  }
+
+  /** Attach every pending offer that now continues the chain, repeatedly: one
+   *  arrival can unblock several that came in out of order. */
+  function extendChain(): void {
+    for (;;) {
+      const want = chainEnd()
+      const hit = [...pendingStages].find(([, o]) => o.start === want)
+      if (!hit) break
+      const [guest, offer] = hit
+      const pipe = pipelines.get(guest)
+      if (!pipe) { pendingStages.delete(guest); continue }
+      pendingStages.delete(guest)
+      const client = makeStageClient(pipe)
+      chain.push({ guest, start: offer.start, end: offer.end, step: client.step, meanHopMs: client.meanHopMs })
+      send(guest, { type: 'stage-accept', start: offer.start, end: offer.end })
+      ui.row(guest, `serving layers ${offer.start}-${offer.end}`)
+    }
+    announce()
+    if (chainComplete()) {
+      ui.row('room', `the model is complete across ${chain.length + 1} stages`)
+      ui.onPaired?.(true)
+    }
+  }
+
+  /** A stage left. Everything downstream of it is orphaned: those peers stay
+   *  connected, go back to pending, and re-attach if a replacement arrives. */
+  function dropStage(guest: string): void {
+    const i = chain.findIndex((c) => c.guest === guest)
+    if (i < 0) { pendingStages.delete(guest); return }
+    const orphaned = chain.splice(i)
+    for (const o of orphaned.slice(1)) {
+      if (peers.has(o.guest)) pendingStages.set(o.guest, { type: 'stage-offer', start: o.start, end: o.end, specId: spec.id })
+    }
+    extendChain()
+    ui.onPaired?.(chainComplete())
+  }
+
+  function makePeer(guest: string): void {
+    // A reassigned guest (its previous host closed) arrives as a fresh
+    // peer-joined here; drop any half-built connection under the same id.
+    peers.get(guest)?.pc.close()
+    const pc = new RTCPeerConnection(ICE)
+    const entry = { pc, dc: null as RTCDataChannel | null }
+    peers.set(guest, entry)
+    const dc = pc.createDataChannel('chat', { ordered: true })
+    entry.dc = dc
+    // A SECOND channel carries weight replication. Separate because a 2 GB
+    // transfer and a token stream must not share a queue: DataChannels are
+    // head-of-line blocked, so pieces in flight would stall every reply.
+    const weights = pc.createDataChannel('weights', { ordered: true })
+    serveWeights(weights, spec, (m) => ui.row(guest, `weights — ${m}`))
+    // Third channel: residuals to a peer holding the rest of a split model.
+    // Its own queue again — a hand-off must never wait behind a token stream.
+    const pipeline = pc.createDataChannel('pipeline', { ordered: true })
+    pipeline.binaryType = 'arraybuffer'
+    pipelines.set(guest, pipeline)
+    dc.onopen = () => {
+      send(guest, {
+        type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel,
+        tag: quantTagFor(spec), param, specId: spec.id,
+      })
+      announce()
+    }
+    dc.onmessage = (e) => onGuestMessage(guest, String(e.data))
+    pc.onicecandidate = (e) => {
+      if (e.candidate) ws.send(JSON.stringify({ to: guest, type: 'ice', candidate: e.candidate }))
+    }
+    void pc.createOffer()
+      .then(async (offer) => {
+        await pc.setLocalDescription(offer)
+        ws.send(JSON.stringify({ to: guest, type: 'offer', sdp: offer }))
+      })
+    announce()
+  }
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(String(e.data)) as {
+      type: string; from?: string; hosts?: number; guests?: number
+      sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit
+    }
+    if (msg.type === 'room') {
+      roomCounts = { hosts: msg.hosts ?? 1, guests: msg.guests ?? 0 }
+      announce()
+      return
+    }
+    const guest = msg.from
+    if (!guest) return
+    if (msg.type === 'peer-joined') makePeer(guest)
+    else if (msg.type === 'peer-left') {
+      peers.get(guest)?.pc.close()
+      peers.delete(guest)
+      pipelines.delete(guest)
+      if (stageRange && (chain.some((c) => c.guest === guest) || pendingStages.has(guest))) {
+        ui.row(guest, 'a stage of the model left')
+        dropStage(guest)
+      }
+      announce()
+    }
+    else if (msg.type === 'answer' && msg.sdp) void peers.get(guest)?.pc.setRemoteDescription(msg.sdp)
+    else if (msg.type === 'ice' && msg.candidate) void peers.get(guest)?.pc.addIceCandidate(msg.candidate)
+  }
+  const onUnload = (): void => ws.close()
+  window.addEventListener('beforeunload', onUnload)
+  announce()
+
+  return {
+    roomId,
+    link,
+    close() {
+      window.removeEventListener('beforeunload', onUnload)
+      ws.close()
+      for (const [, p] of peers) p.pc.close()
+      peers.clear()
+      pipelines.clear()
+    },
+  }
+}

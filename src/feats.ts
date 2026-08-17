@@ -17,6 +17,7 @@ export type FeatId =
   | 'pooled'         // booted a lean expert-pool build
   | 'long-ctx'       // booted a long-context build
   | 'canvas'         // ran model-written code in the canvas
+  | 'room'           // hosted a room from the entrance
 
 export interface FeatDef { id: FeatId; name: string; desc: string }
 
@@ -31,6 +32,7 @@ export const FEATS: FeatDef[] = [
   { id: 'pooled', name: 'Lean Build', desc: 'Boot an expert-pool memory build' },
   { id: 'long-ctx', name: 'Long Sight', desc: 'Boot a long-context build' },
   { id: 'canvas', name: 'Made It Real', desc: 'Run model-written code in the canvas' },
+  { id: 'room', name: 'Opened the Gates', desc: 'Host a room for other machines' },
 ]
 
 const KEY = 'zt-feats'

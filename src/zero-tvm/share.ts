@@ -33,49 +33,22 @@
  */
 
 import {
-  setChatIdentity, quantTagFor, autoGrow, wireScrollFab,
+  setChatIdentity, autoGrow, wireScrollFab,
   addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
 import { specForParam } from './model-registry.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
-import { serveWeights, fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
-import { serveStage, makeStageClient, type StageReply } from './pipeline-peer.js'
+import { fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
+import { serveStage } from './pipeline-peer.js'
+// The host loop, the wire protocol, and the signaling constants live in
+// room-host.ts — shared with the landing entrance's in-place room
+// (landing-room.ts), so the two hosting surfaces cannot drift.
+import {
+  hostRoom, signalEnv, ICE,
+  type HostMsg, type ChatReq, type StopReq, type StageOffer,
+} from './room-host.js'
 
-// Signaling endpoint. Dev: `npx wrangler dev --port 8787` in
-// workers/share-signal (what scripts/share-e2e.mjs spawns). (Same import.meta
-// cast as weight-loader.ts — the repo has no vite/client types.)
-const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
-const PROD_SIGNAL = 'wss://zero-tvm-share-signal.abgunaydin94.workers.dev'  // deployed 2026-08-06
-/** `?sig=<port|ws-url>` overrides the relay — DEV ONLY, so a shared link can
- *  never point a guest's signaling at a third party in production. Two test
- *  drivers run their own wrangler on different ports concurrently. */
-const SIG_OVERRIDE = DEV ? new URLSearchParams(location.search).get('sig') : null
-const SIGNAL_BASE = SIG_OVERRIDE
-  ? (/^wss?:\/\//.test(SIG_OVERRIDE) ? SIG_OVERRIDE : `ws://localhost:${SIG_OVERRIDE}`)
-  : DEV ? 'ws://localhost:8787' : PROD_SIGNAL
-
-const ICE: RTCConfiguration = {
-  // STUN only, deliberately: same-network and home-NAT paths connect
-  // directly. Hostile (corporate) NATs need a TURN relay — a later problem,
-  // and a separate consent: TURN routes ciphertext through a third party.
-  iceServers: [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }],
-}
-
-// ── wire protocol ─────────────────────────────────────────────
-interface ChatReq { type: 'chat'; id: number; messages: { role: 'system' | 'user' | 'assistant'; content: string }[] }
-interface StopReq { type: 'stop'; id: number }
-/** A peer that holds the REST of a split model, offering to run it. */
-interface StageOffer { type: 'stage-offer'; start: number; end: number; specId: string }
-type GuestMsg = ChatReq | StopReq | StageOffer
-type HostMsg =
-  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string; specId: string }
-  | { type: 'text'; id: number; full: string }
-  | { type: 'done'; id: number; tokens: number; tps: number }
-  | { type: 'busy'; id: number; pos: number }
-  | { type: 'error'; id: number; message: string }
-  | { type: 'stage-accept'; start: number; end: number }
-  | { type: 'stage-reject'; message: string }
-  | { type: 'stage-wait'; message: string }
+const { base: SIGNAL_BASE, override: SIG_OVERRIDE } = signalEnv()
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement
 
@@ -280,35 +253,6 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     return
   }
   const { engine, tokenizer } = boot
-  const enc = (messages: ChatReq['messages']) => buildChatPromptFor(spec, messages, tokenizer)
-
-  // ── room ──
-  // Joining an existing room keeps its id (that is what makes this device an
-  // ADDITIONAL host rather than a second room nobody has the link to).
-  const bytes = crypto.getRandomValues(new Uint8Array(16))
-  const roomId = existingRoom
-    ?? btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-  // Carry a dev signaling override into the guest link, or the guest dials the
-  // default relay and the room never forms.
-  const link = `${location.origin}${location.pathname}${SIG_OVERRIDE ? `?sig=${encodeURIComponent(SIG_OVERRIDE)}` : ''}#${roomId}`
-  if (existingRoom) $('page-title').textContent = `Serving ${brand.name} in a shared room`
-  const linkInput = $('share-link') as HTMLInputElement
-  linkInput.value = link
-  $('copy-link').addEventListener('click', () => {
-    void navigator.clipboard.writeText(link)
-    $('copy-link').textContent = 'Copied'
-    setTimeout(() => { $('copy-link').textContent = 'Copy' }, 1200)
-  })
-
-  const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=host`)
-  const peers = new Map<string, { pc: RTCPeerConnection; dc: RTCDataChannel | null }>()
-  const pipelines = new Map<string, RTCDataChannel>()
-
-  // Serialized generation: the engine is single-stream. FIFO of pending
-  // requests across all guests; queue positions are reported honestly.
-  const queue: { guest: string; req: ChatReq }[] = []
-  let generating = false
-  const stopFlags = new Map<string, number>()   // guest -> request id to stop
 
   const logRow = (guest: string, text: string): HTMLElement => {
     $('req-empty')?.remove()
@@ -319,290 +263,45 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     return li.querySelector('.st') as HTMLElement
   }
 
-  const send = (guest: string, msg: HostMsg): void => {
-    const dc = peers.get(guest)?.dc
-    if (dc?.readyState === 'open') dc.send(JSON.stringify(msg))
+  // Membership + chain text must not overwrite each other — one renderer,
+  // one source for each half (the lesson from the two-writer #room-stats bug).
+  let roomMembers = '1 machine serving \u00b7 0 guests connected'
+  let chainText = ''
+  function renderStats(): void {
+    $('room-stats').textContent = chainText ? `${chainText} \u00b7 ${roomMembers}` : roomMembers
   }
 
-  // ── the rest of a split model ─────────────────────────────────────────────
-  // A split host holds layers [0, k) and needs the remaining layers to exist
-  // somewhere. They arrive as helper peers, each announcing its own range, and
-  // are assembled here into an ordered CHAIN. Until that chain reaches the last
-  // layer the host has a model it cannot finish, and says so rather than
-  // generating from part of a network.
-  //
-  // Stages connect to the host, not to each other, so a token walks out and
-  // back once per stage: N-1 round trips rather than the N-1 one-way legs a
-  // direct stage-to-stage chain would cost. That is a real ~2x on the dominant
-  // term, and it is deliberate for now — hub-and-spoke reuses the pairing and
-  // NAT traversal that already work, and no helper needs a route to any other
-  // helper. Worth revisiting once N-way is proven on real machines.
-  interface DownStage {
-    guest: string
-    start: number
-    end: number
-    step: (pos: number, residual: ArrayBuffer) => Promise<StageReply>
-    meanHopMs: () => number
-  }
-  const chain: DownStage[] = []
-  // Offers that are valid but not yet adjacent to the assembled chain. Six
-  // tabs opened at once connect in whatever order they finish loading, so a
-  // stage that arrives early waits instead of being refused.
-  const pendingStages = new Map<string, StageOffer>()
-  /** The first layer still missing — where the next stage must start. */
-  const chainEnd = (): number => (chain.length ? chain[chain.length - 1].end : stageRange!.end)
-  const chainComplete = (): boolean => !!stageRange && chainEnd() === spec.layers
-
-  /**
-   * The token loop for a SPLIT model — the whole-model generatePipelined
-   * cannot run here, because this engine holds only the first layers.
-   *
-   * Per token: this stage's layers, then a round trip to the peer holding the
-   * rest, which returns the argmax. Prefill runs the same way, one position at
-   * a time (chunked prefill is a whole-model optimisation).
-   */
-  async function generateSplit(
-    promptIds: number[], budget: number,
-    onToken: (id: number) => void, shouldStop: () => boolean,
-  ): Promise<number[]> {
-    if (!chainComplete()) throw new Error(`layers ${chainEnd()}-${spec.layers} of this model are not connected`)
-    const stages = [...chain]
-    const stepAll = async (tokenId: number, pos: number): Promise<number> => {
-      let out: StageReply = await engine.pipelineStep({ tokenId }, pos)
-      for (const s of stages) {
-        if ('tokenId' in out) throw new Error('a stage ended the model before the last one')
-        out = await s.step(pos, out.residual)
-      }
-      if (!('tokenId' in out)) throw new Error('the last stage returned a residual, not a token')
-      return out.tokenId
-    }
-    const stepBoth = stepAll
-    let tok = 0
-    for (let i = 0; i < promptIds.length; i++) tok = await stepBoth(promptIds[i], i)
-    const out: number[] = []
-    for (let n = 0; n < budget; n++) {
-      // Stop ids are consumed, never shown — same contract as generate().
-      if (spec.stops.includes(tok) || shouldStop()) break
-      out.push(tok)
-      onToken(tok)
-      tok = await stepBoth(tok, promptIds.length + n)
-    }
-    return out
-  }
-
-  async function pump(): Promise<void> {
-    if (generating) return
-    const next = queue.shift()
-    if (!next) return
-    generating = true
-    const { guest, req } = next
-    const preview = req.messages.at(-1)?.content.slice(0, 80) ?? ''
-    const st = logRow(guest, preview)
-    try {
-      const promptIds = enc(req.messages)
-      // The per-reply cap is the KV room the prompt leaves behind, not a magic
-      // constant — same rule as chat.ts. (v1 shipped a min(1024, …) here and a
-      // guest's long refactor request was cut mid-function at exactly 1024.)
-      const budget = spec.maxContext - promptIds.length
-      if (budget < 16) throw new Error(`prompt is ${promptIds.length} tokens — over this model's ${spec.maxContext}-token context`)
-      const allIds: number[] = []
-      const t0 = performance.now()
-      st.textContent = 'generating…'
-      const onTok = (id: number) => {
-        allIds.push(id)
-        send(guest, { type: 'text', id: req.id, full: tokenizer.decode(allIds) })
-      }
-      const stop = () => stopFlags.get(guest) === req.id || !peers.has(guest)
-      if (stageRange) await generateSplit(promptIds, budget, onTok, stop)
-      else await engine.generatePipelined(promptIds, budget, onTok, stop)
-      const secs = (performance.now() - t0) / 1000
-      const tps = allIds.length / Math.max(secs, 0.001)
-      send(guest, { type: 'done', id: req.id, tokens: allIds.length, tps })
-      // One mean per stage would be noise; the sum is what a token actually
-      // waited on, which is the number that decides whether a long chain is
-      // usable at all.
-      const hopTotal = chain.reduce((a, s) => a + s.meanHopMs(), 0)
-      st.textContent = `${allIds.length} tok · ${tps.toFixed(1)} tok/s`
-        + (chain.length ? ` · ${hopTotal.toFixed(1)} ms/hop across ${chain.length} stage${chain.length === 1 ? '' : 's'}` : '')
-    } catch (e) {
-      send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
-      st.textContent = 'error'
-    } finally {
-      generating = false
-      void pump()
-    }
-  }
-
-  function onGuestMessage(guest: string, raw: string): void {
-    let msg: GuestMsg
-    try { msg = JSON.parse(raw) as GuestMsg } catch { return }
-    if (msg.type === 'stop') { stopFlags.set(guest, msg.id); return }
-    if (msg.type === 'stage-offer') { offerStage(guest, msg); return }
-    if (msg.type !== 'chat' || !Array.isArray(msg.messages)) return
-    stopFlags.delete(guest)
-    queue.push({ guest, req: msg })
-    const pos = queue.length - (generating ? 0 : 1)
-    if (pos > 0) send(guest, { type: 'busy', id: msg.id, pos })
-    void pump()
-  }
-
-  const param = new URLSearchParams(location.search).get('model') ?? ''
-
-  // #room-stats has two things to say — who is in the room, and how much of the
-  // model is present — and they arrive from different places (the signaller's
-  // periodic `room` message, and stages attaching or leaving). They used to
-  // overwrite each other, so a split host lost its chain view the moment anyone
-  // joined. One renderer, one source of truth for each half.
-  let roomCounts = { hosts: 1, guests: 0 }
-  function renderRoomStats(): void {
-    const { hosts: h, guests: g } = roomCounts
-    const members = `${h} ${h === 1 ? 'machine' : 'machines'} serving · ${g} ${g === 1 ? 'guest' : 'guests'} connected`
-    $('room-stats').textContent = stageRange ? `${describeChain()} · ${members}` : members
-  }
-
-  /** What the room looks like right now, for the host's own eyes. */
-  function describeChain(): string {
-    const held = `${stageRange!.start}-${stageRange!.end} here`
-    const rest = chain.map((s) => `${s.start}-${s.end}`).join(' → ')
-    const missing = chainComplete() ? '' : ` · waiting for layers ${chainEnd()}-${spec.layers}`
-    return `split model — layers ${held}${rest ? ` → ${rest}` : ''}${missing}`
-  }
-
-  /**
-   * A peer says which layers it holds. Refuse what can never fit; hold what
-   * fits but is not adjacent YET.
-   *
-   * The old rule was that a helper had to be the EXACT complement of this
-   * stage, which is what limited a room to two halves. The rule now is only
-   * that the accepted stages must tile [k, layers) contiguously — a mismatched
-   * range still produces fluent nonsense, so nothing is accepted on faith, but
-   * the tiling can be built from any number of peers arriving in any order.
-   */
-  function offerStage(guest: string, offer: StageOffer): void {
-    const pipe = pipelines.get(guest)
-    const bad = !stageRange ? 'this host runs the whole model'
-      : offer.specId !== spec.id ? `different model (${offer.specId} vs ${spec.id})`
-      : !pipe ? 'the pipeline channel is not open'
-      : !(offer.start < offer.end) ? `layers ${offer.start}-${offer.end} is not a range`
-      : offer.end > spec.layers ? `layers ${offer.start}-${offer.end} runs past this model's ${spec.layers}`
-      : offer.start < stageRange.end ? `layers ${offer.start}-${offer.end} overlaps the ${stageRange.start}-${stageRange.end} this host holds`
-      : chain.some((c) => offer.start < c.end && c.start < offer.end)
-        ? `layers ${offer.start}-${offer.end} overlap a stage already in the chain`
-        : null
-    if (bad) {
-      send(guest, { type: 'stage-reject', message: bad })
-      logRow(guest, `stage offer refused — ${bad}`)
-      return
-    }
-    pendingStages.set(guest, offer)
-    extendChain()
-    if (pendingStages.has(guest)) {
-      const why = `layers ${offer.start}-${offer.end} held — the chain needs ${chainEnd()} next`
-      send(guest, { type: 'stage-wait', message: why })
-      logRow(guest, why)
-    }
-  }
-
-  /** Attach every pending offer that now continues the chain, repeatedly: one
-   *  arrival can unblock several that came in out of order. */
-  function extendChain(): void {
-    for (;;) {
-      const want = chainEnd()
-      const hit = [...pendingStages].find(([, o]) => o.start === want)
-      if (!hit) break
-      const [guest, offer] = hit
-      const pipe = pipelines.get(guest)
-      if (!pipe) { pendingStages.delete(guest); continue }
-      pendingStages.delete(guest)
-      const client = makeStageClient(pipe)
-      chain.push({ guest, start: offer.start, end: offer.end, step: client.step, meanHopMs: client.meanHopMs })
-      send(guest, { type: 'stage-accept', start: offer.start, end: offer.end })
-      logRow(guest, `serving layers ${offer.start}-${offer.end}`)
-    }
-    renderRoomStats()
-    if (chainComplete()) {
-      logRow('room', `the model is complete across ${chain.length + 1} stages`)
-      ;(window as unknown as Record<string, unknown>).__stagePaired = true
-    }
-  }
-
-  /** A stage left. Everything downstream of it is orphaned: those peers are
-   *  still connected but their inputs are gone, so they go back to pending
-   *  rather than being dropped, and re-attach if a replacement arrives. */
-  function dropStage(guest: string): void {
-    const i = chain.findIndex((c) => c.guest === guest)
-    if (i < 0) { pendingStages.delete(guest); return }
-    const orphaned = chain.splice(i)
-    for (const o of orphaned.slice(1)) {
-      if (peers.has(o.guest)) pendingStages.set(o.guest, { type: 'stage-offer', start: o.start, end: o.end, specId: spec.id })
-    }
-    extendChain()
-    ;(window as unknown as Record<string, unknown>).__stagePaired = chainComplete()
-  }
-
-  function makePeer(guest: string): void {
-    // A reassigned guest (its previous host closed) arrives as a fresh
-    // peer-joined here; drop any half-built connection under the same id.
-    peers.get(guest)?.pc.close()
-    const pc = new RTCPeerConnection(ICE)
-    const entry = { pc, dc: null as RTCDataChannel | null }
-    peers.set(guest, entry)
-    const dc = pc.createDataChannel('chat', { ordered: true })
-    entry.dc = dc
-    // A SECOND channel carries weight replication. Separate because a 2 GB
-    // transfer and a token stream must not share a queue: DataChannels are
-    // head-of-line blocked, so pieces in flight would stall every reply.
-    const weights = pc.createDataChannel('weights', { ordered: true })
-    serveWeights(weights, spec, (m) => logRow(guest, `weights — ${m}`))
-    // Third channel: residuals to a peer holding the rest of a split model.
-    // Its own queue again — a hand-off must never wait behind a token stream.
-    const pipeline = pc.createDataChannel('pipeline', { ordered: true })
-    pipeline.binaryType = 'arraybuffer'
-    pipelines.set(guest, pipeline)
-    dc.onopen = () => send(guest, {
-      type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel,
-      tag: quantTagFor(spec), param, specId: spec.id,
-    })
-    dc.onmessage = (e) => onGuestMessage(guest, String(e.data))
-    pc.onicecandidate = (e) => {
-      if (e.candidate) ws.send(JSON.stringify({ to: guest, type: 'ice', candidate: e.candidate }))
-    }
-    void pc.createOffer()
-      .then(async (offer) => {
-        await pc.setLocalDescription(offer)
-        ws.send(JSON.stringify({ to: guest, type: 'offer', sdp: offer }))
-      })
-  }
-
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(String(e.data)) as {
-      type: string; from?: string; hosts?: number; guests?: number
-      sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit
-    }
-    if (msg.type === 'room') {
-      roomCounts = { hosts: msg.hosts ?? 1, guests: msg.guests ?? 0 }
-      renderRoomStats()
-      return
-    }
-    const guest = msg.from
-    if (!guest) return
-    if (msg.type === 'peer-joined') makePeer(guest)
-    else if (msg.type === 'peer-left') {
-      peers.get(guest)?.pc.close()
-      peers.delete(guest)
-      pipelines.delete(guest)
-      if (stageRange && (chain.some((c) => c.guest === guest) || pendingStages.has(guest))) {
-        logRow(guest, 'a stage of the model left')
-        dropStage(guest)
-      }
-    }
-    else if (msg.type === 'answer' && msg.sdp) void peers.get(guest)?.pc.setRemoteDescription(msg.sdp)
-    else if (msg.type === 'ice' && msg.candidate) void peers.get(guest)?.pc.addIceCandidate(msg.candidate)
-  }
-  window.addEventListener('beforeunload', () => ws.close())
+  const room = hostRoom({
+    spec, brand,
+    param: new URLSearchParams(location.search).get('model') ?? '',
+    engine, tokenizer,
+    encode: (messages) => buildChatPromptFor(spec, messages, tokenizer),
+    existingRoom, stageRange,
+    guestPath: location.pathname,
+    ui: {
+      row: (who, text) => {
+        const st = logRow(who, text)
+        return (s) => { st.textContent = s }
+      },
+      onMembers: ({ hosts, guests }) => {
+        roomMembers = `${hosts} ${hosts === 1 ? 'machine' : 'machines'} serving \u00b7 `
+          + `${guests} ${guests === 1 ? 'guest' : 'guests'} connected`
+        renderStats()
+      },
+      onChain: (text) => { chainText = text; renderStats() },
+      onPaired: (ok) => { (window as unknown as Record<string, unknown>).__stagePaired = ok },
+    },
+  })
+  if (existingRoom) $('page-title').textContent = `Serving ${brand.name} in a shared room`
+  ;($('share-link') as HTMLInputElement).value = room.link
+  $('copy-link').addEventListener('click', () => {
+    void navigator.clipboard.writeText(room.link)
+    $('copy-link').textContent = 'Copied'
+    setTimeout(() => { $('copy-link').textContent = 'Copy' }, 1200)
+  })
 
   // e2e hooks
-  ;(window as unknown as Record<string, unknown>).__shareLink = link
+  ;(window as unknown as Record<string, unknown>).__shareLink = room.link
   ;(window as unknown as Record<string, unknown>).__shareReady = true
 }
 

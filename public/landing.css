@@ -1374,3 +1374,41 @@ footer li a:hover { color: var(--accent); }
 }
 .cs-deed[data-on] i { display: inline; }
 @media (max-width: 900px) { #models .cs-deeds { display: none; } }
+
+/* ══ THE ROOM ══ Hosting from inside the game: the strip in the panel, and
+   one small mascot per connected guest flanking the character. */
+.cs-room { padding: 12px 14px; border-bottom: 1px solid #ffffff0f; }
+.cs-room-consent p { font-size: 0.76rem; line-height: 1.55; color: var(--text-dim, #a9b3c6);
+  margin: 0 0 10px; }
+.cs-room-linkrow { display: flex; gap: 6px; align-items: center; }
+.cs-room-linkrow input {
+  flex: 1; min-width: 0; padding: 6px 9px; font-family: var(--mono); font-size: 0.66rem;
+  color: var(--text); background: #0a101ccc; border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 30%, var(--border));
+}
+.cs-room-members { margin-top: 8px; font-family: var(--mono); font-size: 0.62rem;
+  letter-spacing: 0.08em; color: var(--dim); }
+.cs-room-log { list-style: none; margin: 8px 0 0; padding: 0; display: flex;
+  flex-direction: column; gap: 4px; }
+.cs-room-log li { display: flex; gap: 8px; align-items: baseline; font-size: 0.7rem;
+  color: var(--text-dim, #a9b3c6); overflow: hidden; white-space: nowrap; }
+.cs-room-log b { font-family: var(--mono); font-size: 0.6rem; font-weight: 400;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 70%, var(--text)); flex: none; }
+.cs-room-log span { overflow: hidden; text-overflow: ellipsis; }
+.cs-room-log i { font-style: normal; font-family: var(--mono); font-size: 0.6rem;
+  color: var(--dim); margin-left: auto; flex: none; }
+.cs-tool-live { border-color: var(--cs-accent, var(--accent)) !important;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 80%, #fff) !important; }
+
+/* Guests on stage: small familiars on the ring's edge. */
+.cs-guest-mascot { position: absolute; width: 90px; height: 90px; z-index: 1;
+  pointer-events: none; animation: guestIn 0.5s ease both; }
+.cs-guest-0 { left: 8%;  bottom: 10%; }
+.cs-guest-1 { right: 8%; bottom: 10%; }
+.cs-guest-2 { left: 2%;  bottom: 34%; }
+.cs-guest-3 { right: 2%; bottom: 34%; }
+.cs-guest-4 { left: 16%; bottom: 0; }
+.cs-guest-5 { right: 16%; bottom: 0; }
+@keyframes guestIn { from { opacity: 0; transform: translateY(10px) scale(0.8); }
+  to { opacity: 1; transform: none; } }
+@media (max-width: 900px) { .cs-guest-mascot { display: none; } }

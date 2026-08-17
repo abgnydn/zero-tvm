@@ -552,6 +552,7 @@ function render(): void {
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
       root,
       spec: v.spec,
+      param: v.param,
       poolSlots: mode?.slots ?? 0,
       poolLabel: mode && mode.slots ? mode.label : '',
       ctxTokens: cx.tokens !== v.spec.maxContext ? cx.tokens : 0,
