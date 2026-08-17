@@ -256,6 +256,66 @@ shows a max÷median ratio in double digits, the reference in
 noting the gate used keys as a stand-in for queries — real Q vectors are a
 different projection, and a sharper test would dump those too.
 
+## Phase 1 GATE (2026-08-17) — int4-per-row does NOT get 4x, and the error is large
+
+Phase 0b concluded "int4-per-row KV gets the same 4x with better error and none
+of the machinery". Measuring it properly refutes the first half of that
+sentence and puts the second in question. `scripts/kv-bits-gate.py` runs the
+same real cached vectors through a full attention block — `softmax(QK/sqrt d) @ V`
+— because that is what leaves the layer, and it is the only number that decides
+whether to ship. Inner-product error ranks quantizers; attention output tells
+you if it matters. Softmax forgives a uniform score shift, and the weighted sum
+can concentrate error, so neither direction is predictable from phase 0b.
+
+**Per-row int-b, the scheme the shipped int8 path implements:**
+
+| bits | bytes/token/layer | vs f16 | attn output rel err |
+|---|---|---|---|
+| 4 | 520 | 3.9x | **0.207** |
+| 5 | 648 | 3.2x | 0.101 |
+| 8 | 1032 | 2.0x | **0.012** |
+
+Two corrections to the plan fall straight out. The "4x" was never 4x — one f16
+scale per (token, head, side) is real memory, so 4 bits buys 3.9x and 8 bits
+buys 2.0x, not 2x/4x of the raw payload. And 20% error on a block's output is
+not a small quality risk next to int8's 1.2%.
+
+**Finer groups and a zero point help, but not enough, and not the way expected:**
+
+| config | bytes/token/layer | attn output rel err |
+|---|---|---|
+| 4-bit, group 256 (per-row), symmetric | 520 | 0.207 |
+| 4-bit, group 64, asymmetric | 576 | 0.108 |
+| 4-bit, group 32, asymmetric | 640 | 0.088 |
+| **5-bit, group 256, asymmetric** | **656** | **0.077** |
+| 8-bit, group 256, symmetric | 1032 | 0.012 |
+
+**The counterintuitive part, and the one worth remembering: at equal memory,
+MORE BITS WITH COARSE GROUPS beats fewer bits with fine groups.** 4-bit at
+group 32 asymmetric costs 640 bytes for 0.088; 5-bit per-row asymmetric costs
+656 for 0.077 — 2.5% more memory, 12% less error. Shrinking the group to
+rescue a lower bit-width spends the saving on scales and loses. So the
+grouping knob, which is where this kind of work usually goes next, is a dead
+end here; asymmetry is the cheap win (a zero point costs one extra f16 per
+group and cuts error ~20% at every width).
+
+**What this means for what to build.** The genuinely safe win is not 4 bits at
+all — it is that the EXISTING int8 path (1.2% error, 2.0x) runs on no model
+where context matters: it demands `fused` mode, so Phi-3 alone, and it is
+excluded from chunked prefill. Making int8 work on the hybrid / MLX-affine /
+chunked models IS the memory win, at a quality cost already known to be small,
+with no new quantizer to justify. That is a pure engineering task with a
+measurable gate, and it should come before anything below 8 bits.
+
+Anything under 8 bits needs a perplexity gate first — `quality-ab.py` is
+paired and has already shown it can see damage. Until that runs, treat 4-bit
+KV as unproven, not as a plan.
+
+**Caveats, same as phase 0b:** 335 tokens of one prompt on one model, and the
+queries are cached keys standing in for real Q vectors, which are a different
+projection. The attention-output metric is much closer to what matters than
+inner-product error, but it is still not perplexity.
+
 ## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;
