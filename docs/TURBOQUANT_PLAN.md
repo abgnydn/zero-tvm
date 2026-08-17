@@ -346,6 +346,52 @@ the work is three new WGSL kernels (int8 attention_prefill, int8 versions of
 the two subgroup decode variants, a quantizing writer for the unfused path)
 that this sandbox cannot GPU-test.
 
+## Phase 1 QUALITY GATE, part 2 (2026-08-17) — and my attention-output metric was WRONG
+
+Two more runs, and the second one refutes a measurement earlier in this file.
+
+**8 bits holds at realistic context** (6 windows x 4096, the length actually
+served rather than the 1k first tried):
+
+    f16 cache     ppl 13.1855
+    8-bit cache   ppl 13.1990
+    paired dNLL +0.001023 +/- 0.000865   z = 1.2   worse on 3/6   +0.10%
+
+**4 bits costs far less than predicted** (12 windows x 1024, same windows as
+the 8-bit run at that size, so directly comparable):
+
+    f16 cache     ppl 21.8273
+    4-bit cache   ppl 21.9467
+    paired dNLL +0.005456 +/- 0.002731   z = 2.0   worse on 8/12   +0.55%
+
+**THE CORRECTION: the attention-output gate above overstates the damage by
+more than an order of magnitude.** It put 4-bit at 0.207 relative error
+against 8-bit's 0.012 — 17x — and concluded 4-bit was "not a trade you make
+quietly". End to end the same comparison is +0.55% perplexity against ~0%.
+A 20% error in what leaves an attention block turns into half a percent of
+perplexity, because the residual stream and the layers above absorb it. The
+proxy ranked the options correctly and was worthless for deciding whether
+either was acceptable — the exact mistake phase 0b made one level down, where
+inner-product error was used to judge what only attention output could answer.
+**Stop using offline error metrics for go/no-go. They rank; they do not
+decide.**
+
+For scale: this repo shipped the 3-bit expert build at +8.4% perplexity. A
+KV quantizer at +0.55% is an order of magnitude inside that.
+
+The verdict banding in `kv-quality-ab.py` was fixed as a result: 4-bit landed
+at z = 2.0, worse on 8 of 12 windows, and the old binary cut printed "WITHIN
+NOISE" because it fell a hair under the threshold. That is a borderline result
+being reported as a null one, so the script now bands it and never prints a
+verdict without the effect size.
+
+**Where this leaves the plan.** 8 bits is free and confirmed at 4k context.
+4 bits looks cheap but is measured only at 1k and only at borderline
+significance; the missing run is `--kv-bits 4 --window 4096 --windows 6`,
+because cache error accumulates with context and that is the regime that
+matters. If 4-bit holds there, the target is 4 bits (3.9x) rather than 8
+(2.0x) and the kernel work is the same shape either way.
+
 ## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;

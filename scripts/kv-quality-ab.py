@@ -143,7 +143,22 @@ print(f"\n  f16 cache      ppl {a['perplexity']:.4f}   nll {a['mean_nll']:.5f}")
 print(f"  {args.kv_bits}-bit cache    ppl {b['perplexity']:.4f}   nll {b['mean_nll']:.5f}")
 print(f"  paired dNLL {md:+.6f} +/- {sd:.6f}   z = {z:.1f}   worse on {worse}/{n} windows")
 print(f"  perplexity cost: {(b['perplexity'] / a['perplexity'] - 1) * 100:+.2f}%")
-print("\n  " + ("WITHIN NOISE — the cache quantizer is not measurably hurting this model"
-                if abs(z) < 2 else
-                "REAL DIFFERENCE — quantizing the cache costs quality on this model"))
-print("  (paired z, so |z| < 2 means the per-window differences do not separate from zero)")
+# A binary verdict at |z| = 2 is the wrong shape for this measurement and got
+# it wrong once already: 4-bit came back z = 2.0, worse on 8 of 12 windows and
+# five times 8-bit's effect, and printed "WITHIN NOISE" because the number
+# landed a hair under the cut. Report the band, and never without the effect
+# size — "not separable from zero at this window count" is a statement about
+# how much was measured, not evidence that the effect is zero.
+az = abs(z)
+if az < 1.5:
+    verdict = "WITHIN NOISE — no effect this measurement can see"
+elif az < 3:
+    verdict = (f"BORDERLINE — the direction is consistent ({worse}/{n} windows worse) but does not"
+               " separate cleanly. Raise --windows before concluding either way")
+else:
+    verdict = "REAL — quantizing the cache costs quality on this model"
+print(f"\n  {verdict}")
+print(f"  paired z = {z:.1f} over {n} windows of {args.window} tokens."
+      " Cache-quantization error accumulates with context, so a result at one")
+print("  window size does not transfer to a longer one — re-run at the length you serve.")
+print("  For scale: this repo measured expert-only 3-bit weight quantization at +8.4% perplexity.")
