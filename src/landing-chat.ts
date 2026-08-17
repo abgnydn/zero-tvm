@@ -36,6 +36,9 @@ export interface EnterChatOptions {
   /** Context build in tokens (0 = the compiled default). Applied through
    *  specWithCtx — the same knob as ?ctx= on the standalone page. */
   ctxTokens?: number
+  /** Arrived via "Enter & open a room" — the room strip opens on its consent
+   *  step once the engine is live. Never auto-hosts. */
+  openRoom?: boolean
   /** The stage mascot — already showing this character. */
   mascot: MascotHandle | null
 }
@@ -232,6 +235,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   void import('./landing-room.js').then(({ mountRoomTool }) => mountRoomTool({
     root, panel, spec, param: opts.param,
     engine: boot.engine, tokenizer: boot.tokenizer, mascot,
+    openStrip: opts.openRoom === true,
   })).catch((e) => console.warn('[landing] room tool failed to mount:', e))
 
   // LISTENING: typing is real attention — the character turns toward the

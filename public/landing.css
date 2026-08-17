@@ -1412,3 +1412,17 @@ footer li a:hover { color: var(--accent); }
 @keyframes guestIn { from { opacity: 0; transform: translateY(10px) scale(0.8); }
   to { opacity: 1; transform: none; } }
 @media (max-width: 900px) { .cs-guest-mascot { display: none; } }
+
+/* The room path under ENTER: quiet sibling, same class light. */
+#models .cs-enter { flex-direction: column; align-items: center; gap: 8px; }
+#models .mb-cta-room {
+  font-family: var(--mono); font-size: 0.64rem; letter-spacing: 0.1em;
+  text-transform: uppercase; text-decoration: none; cursor: pointer;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 65%, var(--dim));
+  padding: 4px 10px; border: 1px solid transparent; border-radius: 3px;
+  transition: color 0.15s, border-color 0.15s;
+}
+#models .mb-cta-room:hover {
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff);
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent);
+}

@@ -34,6 +34,9 @@ export interface RoomToolOptions {
   engine: DecodeEngine
   tokenizer: Tokenizer
   mascot: MascotHandle | null
+  /** Open the strip immediately (the "Enter & open a room" path) — on the
+   *  CONSENT step; hosting still takes the explicit click. */
+  openStrip?: boolean
 }
 
 export function mountRoomTool(o: RoomToolOptions): void {
@@ -51,7 +54,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
 
   const strip = document.createElement('div')
   strip.className = 'cs-room'
-  strip.hidden = true
+  strip.hidden = !o.openStrip
   strip.innerHTML = `
     <div class="cs-room-consent">
       <p>Open a room and whoever has the link chats with <b>${brand.name}</b> running on

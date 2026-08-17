@@ -188,7 +188,10 @@ function render(): void {
     ${'gpu' in navigator ? '<div class="cs-deeds" role="list" aria-label="Deeds"></div>' : ''}
     <div class="cs-roster-head" aria-hidden="true">Roster · ${GROUPS.length}</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
-    <div class="cs-enter"><a class="mb-cta btn btn-primary">Enter chat ▸</a></div>
+    <div class="cs-enter">
+      <a class="mb-cta btn btn-primary">Enter chat ▸</a>
+      <a class="mb-cta-room">⟁ Enter &amp; open a room — serve this model to other machines</a>
+    </div>
     <div class="cs-live" aria-live="polite"></div>
     <div class="cs-wipe" aria-hidden="true"></div>
     <div class="cs-engage" aria-hidden="true"></div>
@@ -310,6 +313,9 @@ function render(): void {
       if (mode && mode.slots) qs.push(`pool=${mode.slots}`)
       if (cx.tokens !== v.spec.maxContext) qs.push(`ctx=${cx.tokens}`)
       el<HTMLAnchorElement>('.mb-cta').href = `zero-tvm.html${qs.length ? '?' + qs.join('&') : ''}`
+      // The room path shares the build choices; its no-JS fallback is the
+      // standalone host page for the same model.
+      el<HTMLAnchorElement>('.mb-cta-room').href = `share.html${v.param ? `?model=${v.param}` : ''}`
     }
 
     el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
@@ -536,10 +542,10 @@ function render(): void {
   // (landing-chat.ts, imported only now because its chain touches WebGPU
   // globals). The href still points at zero-tvm.html?model=&pool= — that is
   // what modified clicks, middle-click, and browsers without WebGPU get.
-  root.querySelector<HTMLAnchorElement>('.mb-cta')?.addEventListener('click', (e) => {
+  const engage = (e: MouseEvent, openRoom: boolean): void => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
     if (root.classList.contains('cs-chatting')) { e.preventDefault(); return }
-    if (!('gpu' in navigator)) return  // navigate — the chat page explains what is missing
+    if (!('gpu' in navigator)) return  // navigate — the fallback page explains what is missing
     const href = (e.currentTarget as HTMLAnchorElement).href
     e.preventDefault()
     if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -556,13 +562,18 @@ function render(): void {
       poolSlots: mode?.slots ?? 0,
       poolLabel: mode && mode.slots ? mode.label : '',
       ctxTokens: cx.tokens !== v.spec.maxContext ? cx.tokens : 0,
+      openRoom,
       mascot,
     })).catch((err) => {
       // The panel could not even mount — fall back to the standalone page.
       console.error('[landing] in-place chat failed, navigating:', err)
       location.href = href
     })
-  })
+  }
+  root.querySelector<HTMLAnchorElement>('.mb-cta')?.addEventListener('click', (e) => engage(e, false))
+  // The room path is the same summoning with the room strip already open on
+  // its CONSENT step — discoverable from the select screen, never auto-armed.
+  root.querySelector<HTMLAnchorElement>('.mb-cta-room')?.addEventListener('click', (e) => engage(e, true))
 
   // Idle: 18 s without input and the realm starts breathing on its own; 50 s
   // and the character falls ASLEEP — heavy lids, slow breath, dim ring — but
