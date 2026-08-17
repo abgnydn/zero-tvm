@@ -199,7 +199,11 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },
   [QWEN3_5_9B_MLX_4BIT.id]: { name: 'Qwen3.5-9B', params: '9B hybrid (DeltaNet)', sizeLabel: '~4.7 GB', rateLabel: '~43 t/s' },
-  [QWEN3_8_27B_4BIT.id]: { name: 'Qwen3.8-27B', params: '27B hybrid (DeltaNet)', sizeLabel: '~14.1 GB', rateLabel: '', ramNote: 'needs ~18 GB free RAM', pending: true },
+  // Validated against mlx_lm 2026-08-17: logits cosine 0.999996, top-5 5/5,
+  // all 24 greedy tokens exact ("The capital of France is **Paris**…"), 0 GPU
+  // errors, 85 shaders compile under its dims. rateLabel stays '' until a
+  // protocol round measures it.
+  [QWEN3_8_27B_4BIT.id]: { name: 'Qwen3.8-27B', params: '27B hybrid (DeltaNet)', sizeLabel: '~14.1 GB', rateLabel: '', ramNote: 'needs ~18 GB free RAM' },
   // ADD-MODEL:BRANDINGS
 }
 
