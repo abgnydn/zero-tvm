@@ -326,15 +326,11 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   // hook, and dequantises symmetric group-32 inline. Same rule chat.ts
   // applies; the failure mode is not a crash, it is wrong logits.
   const fused = !spec.qkNorm && spec.weightFormat !== 'mlx-safetensors'
-  // int8KV rides the fused path only — the quantize kernel reads the fused
-  // QKV scratch. Refuse rather than silently serving an f16 cache, which
-  // would make a memory measurement report the wrong number.
-  if (opts.int8KV && !fused) {
-    throw new Error(
-      `int8KV needs the fused QKV path; ${spec.id} takes the unfused one `
-      + `(${spec.qkNorm ? 'qk-norm' : 'MLX-affine weights'}). Only symmetric non-qk-norm specs qualify today.`,
-    )
-  }
+  // No fused-path check here any more: the quantize kernel reads a plain
+  // (k_slot, v_slot) pair, which the unfused chain has in B.kOut/B.vOut after
+  // RoPE. buildDecodeEngine owns what int8 still cannot cover (MLA, hybrid)
+  // and names each one; duplicating a stale rule here is what just refused a
+  // model the engine supports.
   const kv = opts.int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
   const engine = buildDecodeEngine(device, weights, kv, {
     spec, variants, fused, ...(opts.int8KV ? { int8KV: true } : {}), ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),

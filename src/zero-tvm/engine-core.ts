@@ -499,8 +499,18 @@ export function buildDecodeEngine(
   const S = opts.spec ?? PHI3
   const kvPages = Array.isArray(kv) ? kv : kv.pages
   const kvScales = Array.isArray(kv) ? undefined : kv.scales
-  if (int8Mode && (!fused || !kvScales)) {
-    throw new Error('buildDecodeEngine: int8KV requires fused mode and a KV cache with scales buffers')
+  if (int8Mode && !kvScales) {
+    throw new Error('buildDecodeEngine: int8KV needs a KV cache carrying scales buffers (allocKVPagesInt8)')
+  }
+  // int8 KV used to demand the FUSED path, which meant Phi-3 and nothing else
+  // — so the one quantized-KV feature here ran on no model where context is
+  // the constraint. The quantize kernel never actually needed fusion: it reads
+  // a plain (k_slot, v_slot) pair, and the unfused chain has exactly that in
+  // B.kOut/B.vOut once RoPE has run. Measured before lifting it, on the model
+  // that wanted it: 8-bit KV costs -0.09% perplexity at 1k and +0.10% at 4k,
+  // both within noise (docs/TURBOQUANT_PLAN.md).
+  if (int8Mode && S.mla) {
+    throw new Error('buildDecodeEngine: int8KV does not cover MLA — it caches a latent, not per-head K/V')
   }
   // Hybrid specs (Qwen3.5): layerKinds mixes 'gdn' and 'attn' layers. GDN
   // layers run the GatedDeltaNet chain; attention layers run the unfused
@@ -508,8 +518,15 @@ export function buildDecodeEngine(
   // attention → sigmoid gate). KV pages exist only for 'attn' layers,
   // indexed by attention-layer ordinal.
   const hybrid = S.layerKinds.includes('gdn')
-  if (hybrid && (fused || int8Mode)) {
-    throw new Error('buildDecodeEngine: hybrid (GDN) specs require the unfused f16-KV composition')
+  if (hybrid && fused) {
+    throw new Error('buildDecodeEngine: hybrid (GDN) specs require the unfused composition')
+  }
+  if (hybrid && int8Mode) {
+    // Next step, not a limit of the quantizer: on a hybrid only some layers
+    // hold KV, so kvL() is indexed by ATTENTION ordinal and the scales array
+    // has to follow the same indexing. Wiring that blind is how the Phi-3
+    // ropeFreqs P0 shipped, so it lands after the dense path is verified.
+    throw new Error('buildDecodeEngine: int8KV does not cover hybrid specs yet — dense attention only')
   }
   // Pipeline stage bounds. Default is the whole model, which is what every
   // existing caller gets — L0 === 0 and L1 === S.layers make every branch
@@ -551,7 +568,11 @@ export function buildDecodeEngine(
   // chain keeps the reference composition (its rope input comes from
   // gated_qkv_split and the win is 2 of 12 dispatches on 8 of 32 layers).
   // Scaled-RoPE specs keep the reference chain too (see the guard above).
-  const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm && !S.ropeScaling
+  // ?fuseqk folds qk_norm+RoPE+append into one kernel that writes f16 DIRECTLY
+  // into the pages, so it has no seam for a quantizer. int8 takes the explicit
+  // rope → quantize chain instead; the two are numerically equivalent, this
+  // only costs a dispatch.
+  const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm && !S.ropeScaling && !int8Mode
 
   // MLX-affine checkpoints run a restricted composition: every fused kernel
   // that dequantises inline (qkv_fused, qkv_fused_scratch, fused_ffn) is
@@ -1811,11 +1832,22 @@ export function buildDecodeEngine(
         ])
       } else {
         if (S.qkNorm) qkNormBG = qkNormBGFor()
-        kvAppBG = bg(device, P.kvAppend, [
-          B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!,
-        ])
+        // int8 swaps the APPEND for a quantizing append. Same inputs — RoPE has
+        // already written post-RoPE K and V here, which is exactly what the
+        // cache must hold — and one extra output, the per-row scales.
+        if (int8Mode) {
+          kvQuantizeBG = bg(device, P.kvQuantizeInt8,
+            [B.kOut!, B.vOut!, kvL(), kvScales![L], B.posMap, kvQuantU!])
+        } else {
+          kvAppBG = bg(device, P.kvAppend, [B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!])
+        }
       }
-      attnBG = attnF16BG()
+      attnBG = int8Mode
+        ? bg(device, P.attentionInt8, [
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), kvScales![L],
+          B.lengthInfo, B.attnOut, attnI8U!,
+        ])
+        : attnF16BG()
       oProjBG = bg(device, R.matmulOProj, withBias(
         [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
     } else if (int8Mode) {
@@ -2142,11 +2174,18 @@ export function buildDecodeEngine(
         if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
         // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
         dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
-        // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements)
-        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+        // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements).
+        // int8 quantizes on the way in: one workgroup per (kv head, side).
+        if (int8Mode) dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
+        else dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
       }
-      // Attention: Q + kvPages[L] → B.attnOut
-      attentionF16()
+      // Attention: Q + kvPages[L] → B.attnOut. int8 reads packed codes plus the
+      // per-row scale, so it is a DIFFERENT pipeline — swapping only the bind
+      // group leaves attention_sg bound to an int8 layout, which WebGPU rejects
+      // and then discards the whole submit for, silently. That reads as garbage
+      // output, not as an error.
+      if (int8Mode) dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
+      else attentionF16()
       dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
     } else if (int8Mode) {
       dispatch(enc, P.qkvFusedScratch, blk.qkv!, S.qkvPairs, 1, 1, 'qkvFused')
