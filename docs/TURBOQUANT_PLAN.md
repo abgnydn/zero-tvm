@@ -192,6 +192,70 @@ Nothing about the memory ceiling changes: 4 bits still puts the 4-bit
 Qwen3.6-35B's full 262k window near 1.25 GB of KV. The route there just got
 cheaper and the risk lower.
 
+## Phase 0b RESULT (2026-08-17) — real vectors say NO. TurboQuant is killed.
+
+Phase 0 ended conditional: the method wins only where a handful of channels
+carry outsized magnitude, and that could not be settled by inventing vectors.
+So this ran the same gate on real ones.
+
+**Where the vectors came from, and why no GPU was needed.** The prefix pool
+writes the KV cache to disk (`kv-pool.ts`), so `entry.bin` IS a dump of a real
+forward pass in the engine's own paged layout. `scripts/turboquant-real.py`
+reads it directly. Keys there are POST-RoPE, which is what attention scores
+against and therefore what a quantizer must compress. Only the cache tensor
+and meta.json's shape fields are read — never `meta.ids`, so no prompt content
+is involved.
+
+Layout confirmed before trusting a single number, because a misread would
+manufacture exactly this kind of result: computed bytes/layer match
+`meta.layerBytes` exactly; all 335 token slots are distinct; and adjacent
+tokens sit at **0.63** cosine against **0.39** for shuffled pairs, while a
+deliberately scrambled read (head and slot transposed) shows no structure at
+all (−0.003 vs 0.16). Real sequence structure only survives the correct
+mapping.
+
+**The premise is FALSE for our models** (qwen36q3, 10 attention layers, 2 KV
+heads, dim 256, 6,700 vectors of each kind):
+
+| | K (post-RoPE) | V | the proxy phase 0 assumed |
+|---|---|---|---|
+| per-channel mean\|x\|, max ÷ median | **3.1x** | **2.5x** | 20x |
+| mass in a vector's largest 4 of 256 coords | 8.5% | 8.2% | — |
+| per-vector kurtosis | 7.7 | 11.8 | Gaussian = 3 |
+
+Heavier-tailed than Gaussian, yes — but nowhere near the massive-activation
+regime the method is built for. There is no small set of dominant channels for
+a rotation to spread out.
+
+**And the gate agrees** (relative inner-product error, equal bits, queries
+drawn from the key distribution rather than isotropic):
+
+| bits | K: TurboQuant | K: int-b row | V: TurboQuant | V: int-b row |
+|---|---|---|---|---|
+| 3 | 0.194 | 0.210 (TQ 1.08x) | 0.240 | 0.241 (TQ 1.00x) |
+| 4 | 0.109 | **0.103 (int 1.06x)** | 0.129 | 0.132 (TQ 1.02x) |
+| 5 | 0.057 | **0.047 (int 1.19x)** | 0.076 | **0.071 (int 1.08x)** |
+
+TurboQuant's only edge is at 3 bits, where the absolute error (~0.2 relative)
+is far too large to ship, and it is a rounding error even there. At the 4 and
+5 bits that matter, plain per-row max-scaling — the scheme
+`kv_quantize_int8.wgsl` already implements — is BETTER, while costing no
+rotation, no sketch, no codebook and no second scalar.
+
+**Decision: kill TurboQuant for these models.** Phase 0's synthetic outlier
+proxy (4 channels x20) overstated the regime by ~7x, and the honest conclusion
+is that the method is aimed at a distribution our checkpoints do not have.
+Phase 1 — int4-per-row KV — stands on its own and is now the whole plan: same
+4x reduction, a small generalization of the shipped int8 path, and better
+inner-product error than the complicated alternative.
+
+**What would reopen it:** these are 335 tokens of one prompt on one model at
+short context. If outlier channels emerge at 32k+, or a future checkpoint
+shows a max÷median ratio in double digits, the reference in
+`scripts/turboquant-ref.py` is ready and the algebra is verified. Also worth
+noting the gate used keys as a stand-in for queries — real Q vectors are a
+different projection, and a sharper test would dump those too.
+
 ## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;
