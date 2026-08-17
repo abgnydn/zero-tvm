@@ -214,18 +214,58 @@ async function runJob(body, onDelta, isAborted) {
     console.log('[native]   a client that retries this will loop: same prompt, same empty answer.')
   }
   const parsed = body.tools?.length ? S.parseToolCalls(dialect, out) : { text: out, calls: [] }
-  const toolCalls = parsed.calls.map((c, i) => ({
+  // A call the parser could NOT read must never be handed over as if it were
+  // one. It arrives with no name or empty arguments, the client fails the
+  // tool, and — because decoding is deterministic — asking again with the
+  // identical prompt reproduces the identical broken call. That is how a
+  // truncated tool call becomes "6 errors in a row" and then a client-side
+  // loop detector firing on 5 identical calls. The usual cause is the token
+  // budget cutting the model off mid-call, which is why finishReason below
+  // reports 'length' rather than pretending the turn ended with tool calls.
+  const broken = parsed.calls.filter((c) => c.error || !c.name)
+  const usable = parsed.calls.filter((c) => !c.error && c.name)
+  const hitBudget = ids.length >= budget
+  for (const c of broken) {
+    console.log(`[native] TOOL CALL UNPARSEABLE — ${c.error ?? 'no function name'}`
+      + ` (${(c.raw ?? '').length} chars${hitBudget ? ', generation hit the token budget' : ''})`)
+  }
+  if (broken.length) {
+    console.log('[native]   not sending it: the client would fail the tool and retry the identical'
+      + ' prompt for the identical result. Returning the raw text so the next turn can see it.')
+  }
+  // The XML dialect cannot tell the STRING "42" from the number 42 — the block
+  // carries no types, as tool-calls.ts says outright, and it guesses by trying
+  // JSON.parse. That guess reaches the client as the wrong JSON type and the
+  // tool fails its own validation: a command of `true` or a path of `42` is
+  // rare but a `limit`-shaped string is not. We are handed the schema, so
+  // stop guessing where it can answer.
+  const propsFor = (name) =>
+    body.tools?.find((t) => t.function?.name === name)?.function?.parameters?.properties ?? {}
+  const retype = (c) => {
+    const props = propsFor(c.name)
+    const args = {}
+    for (const [k, v] of Object.entries(c.arguments ?? {})) {
+      args[k] = props[k]?.type === 'string' && typeof v !== 'string' && v !== null
+        ? String(v) : v
+    }
+    return args
+  }
+  const toolCalls = usable.map((c, i) => ({
     id: `call_${randomUUID().slice(0, 8)}_${i}`, type: 'function',
-    function: { name: c.name, arguments: JSON.stringify(c.arguments ?? {}) },
+    function: { name: c.name, arguments: JSON.stringify(retype(c)) },
   }))
   // Keep the RAW output against the structure the client will hand back, so
   // the next turn re-sends what the model actually wrote and the KV cache
   // still matches. Only for turns that carry calls — plain text round-trips
   // unchanged already.
-  if (parsed.calls.length) rememberRaw(parsed.text, parsed.calls, out)
+  if (usable.length) rememberRaw(parsed.text, usable, out)
   return {
-    text: parsed.text, toolCalls,
-    finishReason: toolCalls.length ? 'tool_calls' : ids.length >= budget ? 'length' : 'stop',
+    // With nothing usable, hand back what the model actually wrote rather than
+    // an empty string — an empty reply is the other way a client ends up
+    // resending the same prompt forever.
+    text: broken.length && !usable.length ? (parsed.text || out) : parsed.text,
+    toolCalls,
+    finishReason: hitBudget ? 'length' : toolCalls.length ? 'tool_calls' : 'stop',
     usage: { prompt_tokens: promptIds.length, completion_tokens: ids.length, total_tokens: promptIds.length + ids.length },
   }
 }

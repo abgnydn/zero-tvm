@@ -544,3 +544,30 @@ describe('parseToolCalls — incremental safety', () => {
     })
   }
 })
+
+describe('chatml-xml: values that contain the closing tag', () => {
+  it('keeps a parameter value that itself contains </parameter>', () => {
+    // A file body is an ordinary argument, and one quoting this dialect used
+    // to truncate at the first inner close and hand the tool a partial file.
+    const body = '<function=write>\n<parameter=content>\n<parameter=x>oops</parameter>\n</parameter>\n</function>'
+    const { calls } = parseToolCalls('chatml-xml', `<tool_call>${body}</tool_call>`)
+    expect(calls).toHaveLength(1)
+    expect(calls[0].error).toBeUndefined()
+    expect(calls[0].arguments.content).toBe('<parameter=x>oops</parameter>')
+  })
+
+  it('still splits two ordinary parameters correctly', () => {
+    const body = '<function=write>\n<parameter=path>\na.ts\n</parameter>\n<parameter=content>\nconst a = 1\n</parameter>\n</function>'
+    const { calls } = parseToolCalls('chatml-xml', `<tool_call>${body}</tool_call>`)
+    expect(calls[0].arguments).toEqual({ path: 'a.ts', content: 'const a = 1' })
+  })
+
+  it('flags a truncated call rather than returning a usable-looking one', () => {
+    // What the token budget produces when it cuts the model off mid-call. The
+    // host must not forward this: the client fails the tool and retries the
+    // identical prompt for the identical result.
+    const body = '<function=write>\n<parameter=content>\nconst a = 1'
+    const { calls } = parseToolCalls('chatml-xml', `<tool_call>${body}`)
+    if (calls.length) expect(calls[0].error).toBeTruthy()
+  })
+})

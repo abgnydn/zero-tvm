@@ -443,7 +443,17 @@ function parseXmlBody(body: string): ToolCall {
     if (p < 0) break
     const keyEnd = inner.indexOf('>', p)
     if (keyEnd < 0) return { name, arguments: args, raw: body, error: 'unterminated <parameter=...> tag' }
-    const end = inner.indexOf('</parameter>', keyEnd)
+    // Find the CLOSING tag, not merely the first one. A file body is an
+    // ordinary argument, and one quoting this dialect (`</parameter>` in the
+    // text) used to truncate the value there and hand the tool a partial file.
+    // The format has no escaping, so the disambiguator is what FOLLOWS: a real
+    // close is the last thing before the next `<parameter=` or the end of the
+    // block. Anything else is part of the value.
+    let end = -1
+    for (let q = inner.indexOf('</parameter>', keyEnd); q >= 0; q = inner.indexOf('</parameter>', q + 1)) {
+      const after = inner.slice(q + '</parameter>'.length).trim()
+      if (after === '' || after.startsWith('<parameter=')) { end = q; break }
+    }
     if (end < 0) return { name, arguments: args, raw: body, error: 'unterminated <parameter> value' }
     const key = inner.slice(p + '<parameter='.length, keyEnd)
     // The template writes `<parameter=k>\n` + value + `\n</parameter>` — strip
