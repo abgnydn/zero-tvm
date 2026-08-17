@@ -270,6 +270,9 @@ export interface DecodeEngine {
   }>
   /** Stats from the most recent generatePipelined prefill (reuse + chunking). */
   getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null
+  /** What ended the last turn — the id, how many tokens preceded it, and
+   *  whether it was a stop id or an out-of-vocab readback (an engine fault). */
+  getLastStop(): { id: number; generated: number; stop: boolean; inVocab: boolean } | null
   /** The expert ids the router chose on the LAST forward pass, laid out
    *  [layer][slot]. Null unless the engine was built with `traceMoe`. */
   readMoeTrace(): Promise<{ ids: Uint32Array; steps: number; stride: number } | null>
@@ -1467,6 +1470,9 @@ export function buildDecodeEngine(
   let absorbed: number[] = []
   let absorbedValid = true
   const prefixReuse = opts.prefixReuse ?? true
+  /** What ended the last turn. `stop` false with `inVocab` false means the
+   *  readback produced no valid token — an engine fault, not a decision. */
+  let lastStop: { id: number; generated: number; stop: boolean; inVocab: boolean } | null = null
   let lastPrefill: {
     promptLen: number; reused: number; chunks: number
     /** Why reuse did not cover more: how far the new prompt agreed with the
@@ -3043,6 +3049,10 @@ export function buildDecodeEngine(
     return lastPrefill
   }
 
+  function getLastStop(): typeof lastStop {
+    return lastStop
+  }
+
   /**
    * PAGING PHASE 1 (docs/PAGING_PLAN.md) — export the KV state that encodes
    * `absorbed`, as bytes a later engine can swallow.
@@ -4002,6 +4012,7 @@ export function buildDecodeEngine(
       // produce a valid token, which is an engine fault, not a model one.
       // Worth one line, because an empty reply makes an agent client resend
       // the identical prompt and pay the whole prefill again.
+      lastStop = { id: firstToken, generated: 0, stop: STOP.has(firstToken), inVocab: firstToken >= 0 && firstToken < S.vocab }
       console.log(
         `[engine] empty generation — first token id ${firstToken} after ${promptIds.length} prompt tokens: ` +
         (STOP.has(firstToken)
@@ -4044,7 +4055,14 @@ export function buildDecodeEngine(
 
       while (inFlight.length > 0) {
         const tok = await inFlight.shift()!
-        if (STOP.has(tok) || tok < 0 || tok >= S.vocab) break
+        if (STOP.has(tok) || tok < 0 || tok >= S.vocab) {
+          // Record WHY the turn ended. No threshold on "too short" here — the
+          // engine cannot know what the caller considers empty, and a constant
+          // guessing at it would be wrong at some length. The caller sees the
+          // parsed reply and can tell exactly; it reads this to explain it.
+          lastStop = { id: tok, generated: tokens.length, stop: STOP.has(tok), inVocab: tok >= 0 && tok < S.vocab }
+          break
+        }
         tokens.push(tok)
         onToken(tok)
         if (tokens.length >= maxTokens) break
@@ -4474,6 +4492,7 @@ export function buildDecodeEngine(
     resetKVTracking: guard('resetKVTracking', resetKVTracking),
     debugCompareReuse: guard('debugCompareReuse', debugCompareReuse),
     getLastPrefill: guard('getLastPrefill', getLastPrefill),
+    getLastStop: guard('getLastStop', getLastStop),
     destroy,
     maxContext: MAX_CONTEXT,
     spec: S,

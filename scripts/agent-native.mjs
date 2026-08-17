@@ -200,19 +200,6 @@ async function runJob(body, onDelta, isAborted) {
       + ` (${dec.toFixed(1)} tok/s) · ctx ${(promptIds.length + ids.length).toLocaleString()}/${spec.maxContext.toLocaleString()}`)
   }
 
-  // ZERO TOKENS is a distinct failure and needs its own line: the client sees
-  // an empty reply, retries the identical prompt, gets the identical empty
-  // reply (greedy decode is deterministic) and loops — 5 minutes per attempt
-  // on a long conversation. Roles and counts only; no message content.
-  if (ids.length === 0) {
-    const roles = messages.map((m) => m.role[0]).join('')
-    const lastMsg = messages[messages.length - 1]
-    console.log(`[native] EMPTY GENERATION — the model's first token ended the turn.`
-      + ` prompt ${promptIds.length} tok · ${messages.length} messages [${roles}]`
-      + ` · last role '${lastMsg?.role}' (${(lastMsg?.content ?? '').length} chars)`
-      + ` · tools ${body.tools?.length ?? 0} · stops ${JSON.stringify(spec.stops)}`)
-    console.log('[native]   a client that retries this will loop: same prompt, same empty answer.')
-  }
   const parsed = body.tools?.length ? S.parseToolCalls(dialect, out) : { text: out, calls: [] }
   // A call the parser could NOT read must never be handed over as if it were
   // one. It arrives with no name or empty arguments, the client fails the
@@ -258,12 +245,32 @@ async function runJob(body, onDelta, isAborted) {
   // the next turn re-sends what the model actually wrote and the KV cache
   // still matches. Only for turns that carry calls — plain text round-trips
   // unchanged already.
+  // THE failure worth reporting, and it needs no threshold: whatever the token
+  // count, a turn with no tool call and no non-whitespace text reaches the
+  // client as an empty reply. It then resends the identical prompt, and with
+  // deterministic decoding gets the identical nothing — minutes per attempt on
+  // a long conversation. Counting tokens instead would need a constant
+  // guessing at "too short", which is wrong at some length.
+  const visibleText = broken.length && !usable.length ? (parsed.text || out) : parsed.text
+  if (!toolCalls.length && !(visibleText ?? '').trim()) {
+    const st = engine.getLastStop?.() ?? null
+    const roles = messages.map((m) => m.role[0]).join('')
+    const last = messages[messages.length - 1]
+    console.log(`[native] EMPTY REPLY — the client sees nothing.`
+      + ` generated ${ids.length} token(s)`
+      + (st ? `, ended by id ${st.id} (${st.stop ? 'a stop id'
+        : st.inVocab ? 'not a stop id' : 'OUT OF RANGE — the readback returned no valid id, an ENGINE fault'})` : '')
+      + ` · prompt ${promptIds.length} tok · ${messages.length} messages [${roles}]`
+      + ` · last role '${last?.role}' (${(last?.content ?? '').length} chars)`
+      + ` · tools ${body.tools?.length ?? 0} · stops ${JSON.stringify(spec.stops)}`)
+    console.log('[native]   a client that retries this will loop: same prompt, same empty answer.')
+  }
   if (usable.length) rememberRaw(parsed.text, usable, out)
   return {
     // With nothing usable, hand back what the model actually wrote rather than
     // an empty string — an empty reply is the other way a client ends up
     // resending the same prompt forever.
-    text: broken.length && !usable.length ? (parsed.text || out) : parsed.text,
+    text: visibleText,
     toolCalls,
     finishReason: hitBudget ? 'length' : toolCalls.length ? 'tool_calls' : 'stop',
     usage: { prompt_tokens: promptIds.length, completion_tokens: ids.length, total_tokens: promptIds.length + ids.length },
