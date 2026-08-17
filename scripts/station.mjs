@@ -125,7 +125,11 @@ async function loadModel({ param, ctx, pool }) {
   loaded = { param, ctx: ctx || 0, pool: pool || 0 }
   const argv = [join(ROOT, 'scripts/agent-native.mjs'), param, '--port', String(ENGINE_PORT)]
   if (ctx) argv.push('--ctx', String(ctx))
-  if (!pool) argv.push('--pool', '0')            // --pool 0 = no KV pool reuse
+  // `pool` here is EXPERT SLOTS (a memory build), not the KV prefix pool.
+  // This used to pass it as --pool, so the default build (slots 0) sent
+  // `--pool 0` and silently turned OFF the disk cache that lets a prefill
+  // survive a restart — the one thing that makes a reload cheap.
+  if (pool) argv.push('--experts', String(pool))
   pushLog(`$ node ${argv.slice(1).join(' ')}`)
   child = spawn('node', argv, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
   child.stdout.on('data', pushLog)

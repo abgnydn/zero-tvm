@@ -24,10 +24,17 @@ import { panelHtml } from './native/panel.mjs'
 
 const args = process.argv.slice(2)
 const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
-const param = args.find((a) => !a.startsWith('--') && a !== flag('ctx') && a !== flag('port') && a !== flag('pool')) ?? 'qwen3mlx'
+const param = args.find((a) => !a.startsWith('--') && a !== flag('ctx') && a !== flag('port')
+  && a !== flag('pool') && a !== flag('experts')) ?? 'qwen3mlx'
 const CTX = Number(flag('ctx')) || 0
 const PORT = Number(flag('port')) || 8017
+// TWO different pools, and confusing them cost a 43k-token prefill twice.
+// --pool   = the KV prefix pool on disk: the prefill survives a restart.
+// --experts = expert SLOTS per MoE layer, a memory build. It disables chunked
+//   prefill (the pooled path structurally cannot chunk), so it trades minutes
+//   of prefill for gigabytes of RAM — never turn it on to serve long prompts.
 const POOL = flag('pool') !== '0'
+const EXPERTS = Number(flag('experts')) || 0
 
 await installShims({ unsafe: !args.includes('--safe') })
 // dist-lib is real resolved JS — the src tree's `.js`-suffixed TS imports
@@ -38,9 +45,11 @@ const S = await hostSurface()
 
 console.log(`[native] booting ${param}${CTX ? ` ctx=${CTX}` : ''} on dawn.node…`)
 const t0 = Date.now()
+if (EXPERTS) console.log(`[native] expert pool ${EXPERTS} slots/layer — saves RAM, but prefill runs PER TOKEN (no chunking)`)
 const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   model: param,
   ...(CTX ? { ctx: CTX } : {}),
+  ...(EXPERTS ? { expertPool: EXPERTS } : {}),
   onProgress: (p) => { if (p.stage === 'weights' || p.stage === 'ready') process.stdout.write(`\r[native] ${p.message}          `) },
 })
 console.log(`\n[native] ${info.name} ready in ${((Date.now() - t0) / 1000).toFixed(1)}s — ctx ${spec.maxContext.toLocaleString()}`)
