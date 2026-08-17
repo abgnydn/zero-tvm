@@ -3799,6 +3799,15 @@ export function buildDecodeEngine(
     // Cross-turn prefix reuse: skip prompt tokens the engine has provably
     // already absorbed (KV slots + GDN state) — see computeReuseStart.
     const startPos = computeReuseStart(promptIds)
+    // Snapshot the reuse inputs BEFORE prefill runs. Prefill calls
+    // noteAbsorbed for every token it processes, so reading `absorbed` after
+    // it has finished measures THIS turn's record, not the one the decision
+    // was made against — which made the first version of this diagnostic
+    // report a tautology ("lcp equals absorbed.length") on every miss.
+    const preLcp = absorbedLcp(promptIds)
+    const preAbsorbed = absorbed.length
+    const preGdnPos = gdnStatePos
+    const preValid = absorbedValid
     const last = promptIds.length - 1
     let prefillPos = startPos
     let chunks = 0
@@ -3824,10 +3833,9 @@ export function buildDecodeEngine(
       if ((prefillPos & 63) === 0) onPrefill?.(prefillPos, promptIds.length)
     }
     onPrefill?.(promptIds.length, promptIds.length)
-    const lcp = absorbedLcp(promptIds)
     lastPrefill = {
       promptLen: promptIds.length, reused: startPos, chunks,
-      lcp, absorbed: absorbed.length, gdnStatePos, hybrid, valid: absorbedValid,
+      lcp: preLcp, absorbed: preAbsorbed, gdnStatePos: preGdnPos, hybrid, valid: preValid,
     }
     if (startPos > 0 || chunks > 0) {
       console.log(
@@ -3839,15 +3847,15 @@ export function buildDecodeEngine(
     // expensive failure mode here, and it is invisible without this line: say
     // WHERE the agreement ended, so a caller can tell "the client changed an
     // earlier turn" from "the recurrent state is not where reuse needs it".
-    if (startPos === 0 && absorbed.length > 0) {
-      const why = !absorbedValid ? 'the absorbed record was invalidated (a gap in submitted positions)'
-        : lcp === 0 ? 'the new prompt diverges at token 0 — a different conversation, or the system prompt changed'
-        : lcp < absorbed.length
-          ? `the new prompt matches only ${lcp} of ${absorbed.length} absorbed tokens — it CHANGED an earlier turn `
+    if (startPos === 0 && preAbsorbed > 0) {
+      const why = !preValid ? 'the absorbed record was invalidated (a gap in submitted positions)'
+        : preLcp === 0 ? 'the new prompt diverges at token 0 — a different conversation, or the system prompt changed'
+        : preLcp < preAbsorbed
+          ? `the new prompt matches only ${preLcp} of ${preAbsorbed} absorbed tokens — it CHANGED an earlier turn `
             + '(a re-rendered assistant message or re-tokenized text will do this)'
-        : hybrid && gdnStatePos !== absorbed.length
-          ? `recurrent state sits at ${gdnStatePos}, not ${absorbed.length} — hybrid reuse is all-or-nothing`
-          : 'the prompt is not longer than what is absorbed'
+        : hybrid && preGdnPos !== preAbsorbed
+          ? `recurrent state sits at ${preGdnPos}, not ${preAbsorbed} — hybrid reuse is all-or-nothing`
+          : `lcp ${preLcp} == absorbed ${preAbsorbed} and state is aligned, but reuseStart still declined`
       console.log(`[engine] prefix reuse DECLINED — ${why}; re-prefilling all ${promptIds.length} tokens`)
     }
     // Last prefill step: readback to get the first generated token.
