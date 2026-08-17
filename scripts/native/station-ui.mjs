@@ -148,32 +148,42 @@ async function load(param){
 }
 async function unload(){await fetch('/api/unload',{method:'POST'});tick()}
 
+function residentGb(m){
+  // What actually occupies memory. A pool build holds fewer experts, so the
+  // chosen build's own label is the truth; sizeLabel is the DOWNLOAD, which
+  // is a different quantity and the wrong one for "will this fit".
+  const sel=$('pool-'+m.id)
+  if(sel){const g=/([\\d.]+)\\s*GB/.exec(sel.options[sel.selectedIndex].text);if(g)return parseFloat(g[1])}
+  return m.weightsGb
+}
 function estimate(m,ctx){
-  if(m.weightsGb==null)return ''
+  const w=residentGb(m)
+  if(w==null)return ''
   const kv=(ctx*m.kvBytesPerToken)/(1024**3)
-  return '≈ '+(m.weightsGb+kv).toFixed(1)+' GB  ('+m.weightsGb+' + '+kv.toFixed(1)+' KV)'
+  return '≈ '+(w+kv).toFixed(1)+' GB resident  ('+w+' weights + '+kv.toFixed(1)+' KV)'
 }
 function renderModels(loaded){
   $('models').innerHTML=MODELS.map((m)=>{
     const on=loaded&&loaded.param===m.param
-    const pools=m.poolModes.length>1?'<label>pool</label><select id="pool-'+m.param+'">'+
+    const pools=m.poolModes.length>1?'<label>pool</label><select id="pool-'+m.id+'" onchange="reEst(\\''+m.id+'\\')">'+
       m.poolModes.map((p)=>'<option value="'+p.slots+'">'+p.label+'</option>').join('')+'</select>':''
     return '<div class="card'+(on?' on':'')+'">'+
       '<div class="top"><span class="nm">'+m.name+'</span>'+
       '<span class="sub">'+m.params+'</span>'+
       (on?'<span class="sub" style="color:var(--accent)">● loaded</span>':'')+'</div>'+
       '<div class="facts">'+
-        '<span>weights <b>'+m.sizeLabel+'</b></span>'+
-        '<span>context <b>'+kfmt(m.defaultCtx)+'</b> of '+kfmt(m.maxCtx)+'</span>'+
+        '<span>download <b>'+m.sizeLabel+'</b></span>'+
+        '<span title="what the engine ships / what the checkpoint was trained for">'+
+          'context <b>'+kfmt(m.defaultCtx)+'</b> default, '+kfmt(m.maxCtx)+' max</span>'+
         '<span>KV <b>'+(m.kvBytesPerToken/1024)+' KB</b>/tok</span>'+
         (m.rateLabel?'<span>measured <b>'+m.rateLabel+'</b></span>':'<span>rate <b>unmeasured</b></span>')+
         (m.ramNote?'<span class="warn">'+m.ramNote+'</span>':'')+
       '</div>'+
       '<div class="cfg"><label>context</label>'+
-        '<input id="ctx-'+m.param+'" type="number" min="1024" max="'+m.maxCtx+'" step="1024" value="'+m.defaultCtx+
+        '<input id="ctx-'+m.id+'" type="number" min="1024" max="'+m.maxCtx+'" step="1024" value="'+m.defaultCtx+
         '" oninput="reEst(\\''+m.id+'\\')">'+pools+
-        '<button class="go" id="btn-'+m.param+'" onclick="load(\\''+m.param+'\\')">'+(on?'Reload':'Load')+'</button>'+
-        '<span class="est" id="est-'+m.param+'">'+estimate(m,m.defaultCtx)+'</span>'+
+        '<button class="go" id="btn-'+m.id+'" onclick="load(\\''+m.param+'\\')">'+(on?'Reload':'Load')+'</button>'+
+        '<span class="est" id="est-'+m.id+'">'+estimate(m,m.defaultCtx)+'</span>'+
       '</div></div>'
   }).join('')
 }
