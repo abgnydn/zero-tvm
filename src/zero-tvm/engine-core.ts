@@ -3402,6 +3402,12 @@ export function buildDecodeEngine(
       rope:   uniformBuf(device, [i32(1), i32(0), i32(0), u32(0)]),
       kvApp:  uniformBuf(device, [i32(0), i32(S.maxPages), i32(0), i32(0), u32(0)]),
       attn:   uniformBuf(device, [i32(0), i32(0), (() => { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, SM_SCALE, true); return a })()]),
+      // int8 chunk pair. The attention uniform carries two extra offsets the
+      // f16 one has no field for, so it cannot be shared.
+      kvQuant: uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]),
+      attnI8: uniformBuf(device, [i32(0), i32(0),
+        (() => { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, SM_SCALE, true); return a })(),
+        i32(0), i32(0)]),
       attnGate: uniformBuf(device, [u32(0)]),
       conv:   uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(0)]),
       convCommit: uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(CONV_COMMIT_WGS)]),
@@ -3550,8 +3556,17 @@ export function buildDecodeEngine(
           // bg() over an undefined buffer throws while BUILDING the engine.
           qkNorm: S.qkNorm ? bg(device, P.qkNorm, [CB.qkvOut, lw.qNormGamma!, lw.kNormGamma!, cU.qkNorm]) : undefined,
           rope: bg(device, P.rope, [CB.qOut, CB.kOut, CB.vOut, CB.qkvOut, CB.posMap, cU.rope, ropeFreqs!]),
-          kvApp: bg(device, P.kvAppend, [CB.kOut, CB.vOut, kvPages[kvIndex[L]], CB.posMap, cU.kvApp]),
-          attn: bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
+          // int8 replaces the append with a quantizing append and the attention
+          // with the int8 reader — the same swap the per-token path makes, and
+          // the dispatch below must move with it or WebGPU discards the submit.
+          kvApp: int8Mode
+            ? bg(device, P.kvQuantizeInt8,
+              [CB.kOut, CB.vOut, kvPages[kvIndex[L]], kvScales![kvIndex[L]], CB.posMap, cU.kvQuant])
+            : bg(device, P.kvAppend, [CB.kOut, CB.vOut, kvPages[kvIndex[L]], CB.posMap, cU.kvApp]),
+          attn: int8Mode
+            ? bg(device, P.attentionPrefillInt8, [CB.qOut, B.pageValues, kvPages[kvIndex[L]],
+              kvScales![kvIndex[L]], CB.attnOut, cU.attnI8])
+            : bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
           attnGate: gated ? bg(device, P.attnGate, [CB.attnOut, CB.gateRaw, cU.attnGate]) : undefined,
           oProj: dynBg(CB.hidden2, CB.attnOut, lw.oProjScales!, lw.oProjWeights!, cU.oProj, lw.oProjBiases),
           ...common,
@@ -3579,6 +3594,7 @@ export function buildDecodeEngine(
       device.queue.writeBuffer(cU.kvApp, 0, new Int32Array([n]))
       device.queue.writeBuffer(cU.kvApp, 16, new Uint32Array([n * KV_WGS]))
       device.queue.writeBuffer(cU.attn, 0, new Int32Array([n, start + 1]))
+      if (int8Mode) device.queue.writeBuffer(cU.attnI8, 0, new Int32Array([n, start + 1]))
       device.queue.writeBuffer(cU.attnGate, 0, new Uint32Array([n * ATTN_GATE_WGS]))
       device.queue.writeBuffer(cU.conv, 0, new Int32Array([start, n]))
       device.queue.writeBuffer(cU.conv, 12, new Uint32Array([n * GDN_CONV_WGS]))
@@ -3659,8 +3675,15 @@ export function buildDecodeEngine(
           if (blk.gatedSplit) dispatch(enc, P.gatedQkvSplit, blk.gatedSplit, n * CATTN_WGS, 1, 1, 'cGatedSplit')
           if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, n * QK_NORM_WGS, 1, 1, 'cQkNorm')
           dispatch(enc, P.rope, blk.rope!, n * QKV_WGS, 1, 1, 'cRope')
-          dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
-          dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
+          if (int8Mode) {
+            // (kv head, side) on x, the chunk's tokens on y — the token axis the
+            // quantizer grew so decode (y=1) and prefill share one kernel.
+            dispatch(enc, P.kvQuantizeInt8, blk.kvApp!, S.kvHeads * 2, n, 1, 'cKvQuantize')
+            dispatch(enc, P.attentionPrefillInt8, blk.attn!, n, S.heads, 1, 'cAttention')
+          } else {
+            dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
+            dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
+          }
           if (blk.attnGate) dispatch(enc, P.attnGate, blk.attnGate, n * ATTN_GATE_WGS, 1, 1, 'cAttnGate')
           gemmDispatch(enc, blk.oProj, S.d, 'cOProj')
         }
@@ -3755,13 +3778,12 @@ export function buildDecodeEngine(
     // int8 KV excluded: the chunk path binds the f16 kv_append/attention_prefill
     // kernels, which would write full-width values into half-size int8 pages —
     // silent corruption, not an error (lens round 2026-08-17).
-    !partial && !S.mla && !int8Mode && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
+    !partial && !S.mla && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
   {
     const why = chunkPrefill ? `on (cap ${chunkPrefill.cap}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''}${pooling ? ', pooled' : ''})`
       : S.mla ? 'off (per-token — MLA has no chunked attention path)'
-      : int8Mode ? 'off (per-token — int8 KV has no chunked append/attention path)'
       : pooling ? (POOL_SLOTS >= 96
           ? 'off (per-token — pooled chunking is opt-in until its AC timing pair exists: ?chunk=1)'
           : `off (per-token — pool of ${POOL_SLOTS} is under the 96-slot union floor for pooled chunks)`)

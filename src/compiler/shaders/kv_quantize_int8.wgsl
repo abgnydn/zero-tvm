@@ -55,6 +55,11 @@ fn kv_quantize_int8(
   let wg_id : i32 = i32(blockIdx.z * gridDim.x + blockIdx.x);
   if (u32(wg_id) >= podArgs.packGridDimX) { return; }
 
+  // TOKEN axis (grid y). Decode dispatches y=1 and lands on tok=0, which is
+  // exactly the single-slot behaviour this kernel had before; chunked prefill
+  // dispatches y=n and quantizes a whole chunk in one go. One kernel serves
+  // both, so there is no second copy of the packing to keep in step.
+  let tok : i32 = i32(blockIdx.y);
   let tid : i32 = i32(threadIdx.x);
 
   // Decompose wg_id → (kv head, side). side=0 for K, 1 for V.
@@ -62,7 +67,9 @@ fn kv_quantize_int8(
   let side : i32 = wg_id - head * 2;
 
   // Each thread reads EPT of the HEAD_DIM dims for this (head, side).
-  let slot_base : i32 = head * HEAD_DIM + tid * EPT;
+  // k_slot/v_slot are [token, KV_DIM]; tok is 0 on the decode path.
+  let tok_base : i32 = tok * KV_DIM;
+  let slot_base : i32 = tok_base + head * HEAD_DIM + tid * EPT;
   var m : f32 = 0.0;
   for (var e : i32 = 0; e < EPT; e = e + 1) {
     var v : f32;
@@ -94,7 +101,7 @@ fn kv_quantize_int8(
   let inv_scale : f32 = 1.0 / scale;
 
   // Compute destination page/slot.
-  let position : i32 = position_map[podArgs.position_map_elem_offset];
+  let position : i32 = position_map[podArgs.position_map_elem_offset + tok];
   let page_no : i32 = position / PAGE_SIZE;
   let slot : i32 = position - page_no * PAGE_SIZE;
 
@@ -117,16 +124,17 @@ fn kv_quantize_int8(
   var b1 : f32;
   var b2 : f32;
   var b3 : f32;
+  let pack_base : i32 = tok_base + head * HEAD_DIM + d0;
   if (side == 0) {
-    b0 = f32(k_slot[head * HEAD_DIM + d0]);
-    b1 = f32(k_slot[head * HEAD_DIM + d0 + 1]);
-    b2 = f32(k_slot[head * HEAD_DIM + d0 + 2]);
-    b3 = f32(k_slot[head * HEAD_DIM + d0 + 3]);
+    b0 = f32(k_slot[pack_base]);
+    b1 = f32(k_slot[pack_base + 1]);
+    b2 = f32(k_slot[pack_base + 2]);
+    b3 = f32(k_slot[pack_base + 3]);
   } else {
-    b0 = f32(v_slot[head * HEAD_DIM + d0]);
-    b1 = f32(v_slot[head * HEAD_DIM + d0 + 1]);
-    b2 = f32(v_slot[head * HEAD_DIM + d0 + 2]);
-    b3 = f32(v_slot[head * HEAD_DIM + d0 + 3]);
+    b0 = f32(v_slot[pack_base]);
+    b1 = f32(v_slot[pack_base + 1]);
+    b2 = f32(v_slot[pack_base + 2]);
+    b3 = f32(v_slot[pack_base + 3]);
   }
 
   let q0 : i32 = clamp(i32(round(b0 * inv_scale)), -127, 127);

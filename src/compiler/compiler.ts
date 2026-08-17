@@ -46,6 +46,7 @@ import kvQuantizeInt8Src from './shaders/kv_quantize_int8.wgsl?raw'
 import attentionInt8Src from './shaders/attention_int8.wgsl?raw'
 import attentionSrc from './shaders/attention.wgsl?raw'
 import attentionPrefillSrc from './shaders/attention_prefill.wgsl?raw'
+import attentionPrefillInt8Src from './shaders/attention_prefill_int8.wgsl?raw'
 import attentionSgSrc from './shaders/attention_sg.wgsl?raw'
 import attentionSplitkSrc from './shaders/attention_splitk.wgsl?raw'
 import attentionSplitkSgSrc from './shaders/attention_splitk_sg.wgsl?raw'
@@ -154,6 +155,10 @@ export interface Pipelines {
   attentionInt8: GPUComputePipeline    // int8-KV variant of paged attention
   attention: GPUComputePipeline
   attentionPrefill: GPUComputePipeline // chunked-prefill causal attention (per-token kv_len)
+  /** The same chunked causal attention reading the packed int8 cache. Without
+   *  it int8 KV forces per-token prefill, which is unusable on exactly the
+   *  long prompts it saves memory for. */
+  attentionPrefillInt8: GPUComputePipeline
   attentionSg: GPUComputePipeline | null  // subgroup variant; null if `subgroups` feature absent
   // ?splitk=N experiment (measured ~+3% at short context on M2 Max,
   // 2026-07-25; opt-in until a long-context A/B — BENCH.md):
@@ -359,6 +364,7 @@ export function compile(
     attentionInt8: createPipeline(device, attentionInt8Src, 'attention_int8'),
     attention: createPipeline(device, attentionSrc, 'attention'),
     attentionPrefill: createPipeline(device, attentionPrefillSrc, 'attention_prefill'),
+    attentionPrefillInt8: createPipeline(device, attentionPrefillInt8Src, 'attention_prefill_int8'),
     attentionSg: subgroups ? createPipeline(device, attentionSgSrc, 'attention_sg') : null,
     attentionSplitK: createPipeline(device, attentionSplitkSrc, 'attention_splitk'),
     attentionSplitKSg: subgroups ? createPipeline(device, attentionSplitkSgSrc, 'attention_splitk_sg') : null,
