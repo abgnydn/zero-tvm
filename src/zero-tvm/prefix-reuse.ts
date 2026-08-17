@@ -58,6 +58,36 @@ export function reuseStart(s: ReuseState, promptIds: number[]): number {
 }
 
 /**
+ * Which GDN rewind snapshot to replay from when `reuseStart` has declined.
+ *
+ * `ckptPos[s]` is the absorbed-token position slot `s` holds state for; -1 is
+ * empty. Returns the slot index, or -1 when none is usable and the caller must
+ * re-prefill from zero.
+ *
+ * TWO conditions, and the second is the subtle one:
+ *  - `<= lcp`: the snapshot must sit at or below where the prompts still
+ *    agree, so every KV slot beneath it still belongs to THIS prompt.
+ *  - `<= promptLen - 1`: at least one token must remain to run. Prefill's last
+ *    step is what produces the logits for the first generated token, so
+ *    rewinding to exactly promptLen would leave nothing to compute them with.
+ *
+ * That second clamp is also what makes an IDENTICAL prompt work — the retry
+ * case, where lcp === promptLen because the client resent a prompt the cache
+ * already holds in full. `reuseStart` refuses it outright (its hybrid branch
+ * needs a token to spare and cannot rewind the recurrence by one). Here the
+ * limit becomes promptLen - 1, so a snapshot taken at the last chunk boundary
+ * replays a handful of tokens instead of re-reading tens of thousands.
+ */
+export function rewindSlot(ckptPos: readonly number[], lcp: number, promptLen: number): number {
+  const limit = Math.min(lcp, promptLen - 1)
+  let best = -1
+  for (let s = 0; s < ckptPos.length; s++) {
+    if (ckptPos[s] > 0 && ckptPos[s] <= limit && (best < 0 || ckptPos[s] > ckptPos[best])) best = s
+  }
+  return best
+}
+
+/**
  * Record that position `position` now holds `id`.
  *
  * Two behaviours, and the second is the one with teeth:

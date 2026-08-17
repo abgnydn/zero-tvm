@@ -24,7 +24,7 @@ import { LoadedWeights } from './weight-loader.js'
 import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
-import { reuseStart, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
+import { reuseStart, rewindSlot, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
 import { ExpertPool } from './expert-pool.js'
 import type { SlabKind, SlabProj } from './slab-source.js'
 
@@ -3888,15 +3888,7 @@ export function buildDecodeEngine(
     // recurrent state exactly where an ordinary prefill would have.
     let rewoundTo = -1
     if (startPos === 0 && GDN_CKPT_SLOTS > 0 && absorbedValid && prefixReuse && absorbed.length > 0) {
-      // Usable only if the prompt AGREES with the absorbed record all the way
-      // down to the point (so the KV beneath it still belongs to THIS prompt)
-      // and it leaves at least one token to run — prefill must produce logits.
-      const limit = Math.min(absorbedLcp(promptIds), promptIds.length - 1)
-      let bestSlot = -1
-      for (let s = 0; s < GDN_CKPT_SLOTS; s++) {
-        if (gdnCkptPos[s] > 0 && gdnCkptPos[s] <= limit
-          && (bestSlot < 0 || gdnCkptPos[s] > gdnCkptPos[bestSlot])) bestSlot = s
-      }
+      const bestSlot = rewindSlot(gdnCkptPos, absorbedLcp(promptIds), promptIds.length)
       if (bestSlot >= 0) {
         rewoundTo = gdnCkptPos[bestSlot]
         restoreGdnCkpt(bestSlot)
@@ -4002,7 +3994,22 @@ export function buildDecodeEngine(
     const rbByPos = new Map<number, Promise<number>>()
     rbByPos.set(last, firstTokenPromise)
     const firstToken = await firstTokenPromise
-    if (STOP.has(firstToken) || firstToken < 0 || firstToken >= S.vocab) return tokens
+    if (STOP.has(firstToken) || firstToken < 0 || firstToken >= S.vocab) {
+      // THREE different failures used to share this silent return, and the
+      // caller could not tell them apart — so an empty reply was reported as
+      // "the model chose to stop" whether or not that was true. An id outside
+      // the vocab is not a decision at all: it means the readback did not
+      // produce a valid token, which is an engine fault, not a model one.
+      // Worth one line, because an empty reply makes an agent client resend
+      // the identical prompt and pay the whole prefill again.
+      console.log(
+        `[engine] empty generation — first token id ${firstToken} after ${promptIds.length} prompt tokens: ` +
+        (STOP.has(firstToken)
+          ? `a STOP id (stops ${[...STOP].join(',')}) — the model ended the turn immediately`
+          : `OUT OF RANGE for vocab ${S.vocab} — the readback did not return a valid id, so this is an engine fault`),
+      )
+      return tokens
+    }
     tokens.push(firstToken)
     onToken(firstToken)
     if (tokens.length >= maxTokens) return tokens

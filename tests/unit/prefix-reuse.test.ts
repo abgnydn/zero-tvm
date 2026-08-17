@@ -18,7 +18,7 @@
 // and ?chunk=0.
 
 import { describe, expect, it } from 'vitest'
-import { reuseStart, noteAbsorbed, type ReuseState } from '../../src/zero-tvm/prefix-reuse.ts'
+import { reuseStart, rewindSlot, noteAbsorbed, type ReuseState } from '../../src/zero-tvm/prefix-reuse.ts'
 
 const state = (over: Partial<ReuseState> = {}): ReuseState => ({
   absorbed: [], absorbedValid: true, prefixReuse: true, hybrid: false, gdnStatePos: 0, ...over,
@@ -176,5 +176,45 @@ describe('the agentic turn loop, end to end', () => {
 
     // Returning to A now costs the same three-token reuse, not five.
     expect(reuseStart(s, branchA)).toBe(3)
+  })
+})
+
+describe('rewindSlot — replaying from a GDN snapshot when reuseStart declines', () => {
+  const SLOTS = [1024, 2048, 3072, 4096]
+
+  it('picks the NEWEST snapshot at or below the divergence', () => {
+    // Prompt agrees to 3500 then changes; 4096 is past the divergence and its
+    // state describes tokens this prompt no longer contains.
+    expect(rewindSlot(SLOTS, 3500, 9000)).toBe(2)   // 3072
+  })
+
+  it('returns -1 when every snapshot is past the divergence', () => {
+    // A different conversation sharing only a short preamble: rewinding to
+    // 1024 would replay state for tokens the new prompt never had.
+    expect(rewindSlot(SLOTS, 900, 9000)).toBe(-1)
+  })
+
+  it('ignores empty slots', () => {
+    expect(rewindSlot([-1, -1, -1, -1], 5000, 9000)).toBe(-1)
+    expect(rewindSlot([-1, 2048, -1, -1], 5000, 9000)).toBe(1)
+  })
+
+  it('leaves at least one token to run on an IDENTICAL prompt', () => {
+    // The retry case: the client resent a prompt the cache already holds in
+    // full, so lcp === promptLen. reuseStart refuses this outright. A snapshot
+    // at promptLen - 1 is legal and replays exactly one token — enough to
+    // produce the logits prefill's last step is responsible for.
+    expect(rewindSlot([4095], 4096, 4096)).toBe(0)
+    // ...but one AT promptLen is not: it would leave nothing to compute with.
+    expect(rewindSlot([4096], 4096, 4096)).toBe(-1)
+  })
+
+  it('never rewinds to position 0 — that is a full re-prefill, not a rewind', () => {
+    expect(rewindSlot([0], 5000, 9000)).toBe(-1)
+  })
+
+  it('prefers a later snapshot even when an earlier one also qualifies', () => {
+    expect(rewindSlot([4096, 1024], 5000, 9000)).toBe(0)
+    expect(rewindSlot([1024, 4096], 5000, 9000)).toBe(1)
   })
 })
