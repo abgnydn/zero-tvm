@@ -316,6 +316,36 @@ queries are cached keys standing in for real Q vectors, which are a different
 projection. The attention-output metric is much closer to what matters than
 inner-product error, but it is still not perplexity.
 
+## Phase 1 QUALITY GATE (2026-08-17) — int8 KV is free on qwen36q3
+
+Run on the model that would use it, not by analogy to Phi-3 (which is the only
+spec the current int8 path serves, is architecturally unlike it, and is not
+even on this disk). `scripts/kv-quality-ab.py`, 12 windows x 1024 tokens:
+
+    f16 cache     ppl 21.8273   nll 3.08316
+    8-bit cache   ppl 21.8088   nll 3.08231
+    paired dNLL -0.000851 +/- 0.001648   z = -0.5   worse on 5/12 windows
+    perplexity cost: -0.09%
+
+Within noise, and the 8-bit arm was fractionally BETTER — a coin flip on 5 of
+12 windows is what no effect looks like. The offline attention-output number
+(1.2%) predicted this, so the two metrics agree at 8 bits.
+
+**The caveat that limits it: 1024-token windows.** Cache quantization error
+accumulates with context — every cached token is another rounded value the
+softmax sums over — and real prompts here are 14k-65k. Confirm at
+`--window 4096` before treating 8 bits as settled for long context.
+
+**Also worth running: `--kv-bits 4`.** The attention-output gate put 4-bit at
+0.207, seventeen times the 8-bit figure. If perplexity says otherwise, that
+proxy overstates damage and should stop being trusted for go/no-go.
+
+So the quality objection to int8 is answered, and the remaining question is
+priority, not safety: at the contexts actually in use it saves ~0.57 GB, and
+the work is three new WGSL kernels (int8 attention_prefill, int8 versions of
+the two subgroup decode variants, a quantizing writer for the unfused path)
+that this sandbox cannot GPU-test.
+
 ## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;
