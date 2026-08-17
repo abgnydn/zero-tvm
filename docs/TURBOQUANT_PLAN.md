@@ -119,7 +119,80 @@ The rotation is fixed and shared: a Hadamard matrix with a per-(layer, head)
 random sign vector, generated from a seed in the spec so it is reproducible
 and needs no storage.
 
-## Phases and gates
+## Phase 0 RESULT (2026-08-17) — measured, and it changes the plan
+
+`scripts/turboquant-ref.py`: Algorithms 1 and 2 transcribed from the PDF, then
+the estimator implemented a SECOND time by the route a kernel would take.
+
+**Settled by reading the paper:**
+
+- **The stated bits/channel INCLUDE the QJL bit.** Algorithm 2 line 2
+  instantiates the MSE quantizer at `b-1`. So "3.5 bits" is 2.5 bits of codes
+  plus the sketch, not 3.5 + 1. The table above stands.
+- **Their fractional bit-widths are an outlier split, not fractional coding**:
+  "in our 2.5-bit setup, 32 outlier channels are quantized at 3 bits, while
+  the remaining 96 channels use 2 bits … (32x3 + 96x2)/128 = 2.5". Two
+  independent TurboQuant instances over two channel groups.
+- **Stored per vector**: `(idx, qjl, ||r||)` — plus the vector norm, since
+  Algorithm 1 works on the unit sphere.
+- **The kernel identity holds**: `<q, S^T qjl> = <S q, qjl>`, so neither the
+  rotation nor the sketch ever touches a cached vector at read time. The query
+  is projected once per head; each cached token costs one sign-dot. The two
+  implementations agree to 1e-14, so the algebra a shader would rely on is
+  right.
+
+**Measured (inner-product error, relative, vs max-scaled int-b at EQUAL bits):**
+
+| data | 3 bits | 4 bits | 5 bits |
+|---|---|---|---|
+| isotropic Gaussian, d=256 | int 1.5x better | int 1.9x better | int 2.1x better |
+| outlier-heavy (4 ch x20), d=128 | int 1.1x better | **TQ 1.12x** | **TQ 1.33x** |
+| outlier-heavy (4 ch x20), d=256 | int 1.02x better | **TQ 1.68x** | **TQ 1.93x** |
+
+Three things follow, and two of them were not visible from the paper:
+
+1. **The method's value is entirely conditional on outliers.** On isotropic
+   data a rotation has nothing to fix and the QJL bit is simply spent, so
+   plain max-scaling wins by ~2x. This is not a criticism of the paper — it
+   is the regime it was designed for — but it means our gate can only be
+   settled on REAL key/value vectors, not synthetic ones. The outlier proxy
+   here (4 channels x20) is a guess at the shape.
+2. **It needs 4+ bits to win at all.** At 3 bits plain scaling is still ahead
+   even with outliers. So the paper's 2.5-bit operating point is not
+   reachable by this construction on our shapes, and the honest target is
+   4 bits — a **4x** KV reduction, not 6.4x.
+3. **The win grows with head dim** (1.68x at 256 vs 1.12x at 128), which is
+   the right direction: our long-context models — Qwen3.5/3.6/3.8 — are all
+   head-dim 256.
+
+**And the uncomfortable consequence, which the plan has to face:** at 4 bits,
+plain int4-per-row KV gets the SAME 4x memory reduction with none of the
+machinery — no rotation, no sketch, no codebook, no second scalar. TurboQuant
+buys ~1.7x lower inner-product error at that size, not extra compression.
+
+So the question the next phase must answer is no longer "does TurboQuant
+work" but **"is int4-per-row KV good enough end to end, and if not, does
+TurboQuant's error advantage rescue it?"** Building the complicated thing
+first would answer the wrong question.
+
+**Revised phase order:**
+
+- **Phase 0b — real vectors.** Dump K/V from a real forward pass (qwen36q3,
+  a long prompt) and re-run the gate on them. This decides whether the
+  outlier premise holds for OUR models, and settles the codebook shape.
+- **Phase 1 — int4-per-row KV first.** It is a small change to the shipped
+  int8 path (kv_quantize_int8 generalized, attention_int8 generalized), it
+  delivers the same 4x, and it is the baseline every later claim needs. If
+  paired perplexity at 32k is neutral, TurboQuant may not be needed at all.
+- **Phase 2+ — TurboQuant only if phase 1's quality is short**, in which case
+  the reference here is ready and the kernel work is the rotation, the
+  codebook lookup, and the sign-dot.
+
+Nothing about the memory ceiling changes: 4 bits still puts the 4-bit
+Qwen3.6-35B's full 262k window near 1.25 GB of KV. The route there just got
+cheaper and the risk lower.
+
+## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;
 write `scripts/turboquant-ref.py` implementing rotate → quantize → QJL
