@@ -3816,6 +3816,12 @@ export function buildDecodeEngine(
     // chunk. Short tails fall through to the per-token path below.
     if (chunkPrefill) {
       while (last - prefillPos >= CHUNK_MIN) {
+        // Cancellation during PREFILL. Only the decode loop used to poll this,
+        // so a client that gave up on a 40k-token prompt still paid for the
+        // whole read — minutes of GPU for an answer nobody would receive.
+        // Stopping here is safe: every chunk noted the positions it absorbed,
+        // so the record still describes the cache.
+        if (shouldStop?.()) return tokens
         const s = Math.min(chunkPrefill.cap, last - prefillPos)
         // Pooled chunks await a readback per MoE layer; unpooled ones resolve
         // immediately. One await covers both.
@@ -3830,7 +3836,10 @@ export function buildDecodeEngine(
     // skipping readback removes the CPU syncs.
     for (; prefillPos < last; prefillPos++) {
       submitStep(promptIds[prefillPos], prefillPos, false)
-      if ((prefillPos & 63) === 0) onPrefill?.(prefillPos, promptIds.length)
+      if ((prefillPos & 63) === 0) {
+        onPrefill?.(prefillPos, promptIds.length)
+        if (shouldStop?.()) return tokens
+      }
     }
     onPrefill?.(promptIds.length, promptIds.length)
     lastPrefill = {

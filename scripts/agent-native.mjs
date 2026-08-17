@@ -121,7 +121,7 @@ let lastStats = null
 let poolTried = false
 let saveTimer = null
 
-async function runJob(body, onDelta) {
+async function runJob(body, onDelta, isAborted) {
   let messages = normalize(body.messages)
   if (body.tools?.length) messages = S.withTools(dialect, messages, body.tools)
   const promptIds = S.buildChatPromptFor(spec, messages, tokenizer)
@@ -160,7 +160,7 @@ async function runJob(body, onDelta) {
       generated: (live?.generated ?? 0) + 1, budget, startedAt: tStart, firstAt: tFirst,
     }
     for (const st of stopStrs) if (st && out.endsWith(st)) { hit.stop = st; break }
-  }, () => hit.stop !== null,
+  }, () => hit.stop !== null || (isAborted?.() ?? false),
   (done, total) => { live = { phase: 'prefill', done, total, generated: 0, startedAt: tStart } })
   if (hit.stop) out = out.slice(0, out.length - hit.stop.length)
   {
@@ -191,6 +191,19 @@ async function runJob(body, onDelta) {
       + ` (${dec.toFixed(1)} tok/s) · ctx ${(promptIds.length + ids.length).toLocaleString()}/${spec.maxContext.toLocaleString()}`)
   }
 
+  // ZERO TOKENS is a distinct failure and needs its own line: the client sees
+  // an empty reply, retries the identical prompt, gets the identical empty
+  // reply (greedy decode is deterministic) and loops — 5 minutes per attempt
+  // on a long conversation. Roles and counts only; no message content.
+  if (ids.length === 0) {
+    const roles = messages.map((m) => m.role[0]).join('')
+    const lastMsg = messages[messages.length - 1]
+    console.log(`[native] EMPTY GENERATION — the model's first token ended the turn.`
+      + ` prompt ${promptIds.length} tok · ${messages.length} messages [${roles}]`
+      + ` · last role '${lastMsg?.role}' (${(lastMsg?.content ?? '').length} chars)`
+      + ` · tools ${body.tools?.length ?? 0} · stops ${JSON.stringify(spec.stops)}`)
+    console.log('[native]   a client that retries this will loop: same prompt, same empty answer.')
+  }
   const parsed = body.tools?.length ? S.parseToolCalls(dialect, out) : { text: out, calls: [] }
   const toolCalls = parsed.calls.map((c, i) => ({
     id: `call_${randomUUID().slice(0, 8)}_${i}`, type: 'function',
@@ -277,6 +290,15 @@ createServer(async (req, res) => {
 
   const id = randomUUID()
   const created = Math.floor(Date.now() / 1000)
+  // CLIENT WENT AWAY. Closing the connection is how every OpenAI client
+  // cancels, and it never reached the engine: a cancelled request kept the
+  // GPU for the rest of its prefill — minutes, for an answer nobody would
+  // read — and the station kept saying "generating". `close` also fires on a
+  // normal finish, so the writableEnded check is what distinguishes them.
+  let aborted = false
+  const onClose = () => { if (!res.writableEnded) aborted = true }
+  res.on('close', onClose)
+  const isAborted = () => aborted
   try {
     if (body.stream === true) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
@@ -286,7 +308,7 @@ createServer(async (req, res) => {
         choices: [{ index: 0, delta, finish_reason: finish }],
       })
       chunk({ role: 'assistant', content: '' })
-      const done = await runJob(body, (t) => chunk({ content: t }))
+      const done = await runJob(body, (t) => chunk({ content: t }), isAborted)
       if (done.toolCalls.length) chunk({ tool_calls: done.toolCalls.map((c, i) => ({ index: i, ...c })) })
       chunk({}, done.finishReason)
       if (body.stream_options?.include_usage) {
@@ -295,7 +317,7 @@ createServer(async (req, res) => {
       res.write('data: [DONE]\n\n')
       res.end()
     } else {
-      const done = await runJob(body, null)
+      const done = await runJob(body, null, isAborted)
       json(res, 200, {
         id: `chatcmpl-${id}`, object: 'chat.completion', created, model: spec.id,
         choices: [{
@@ -310,6 +332,8 @@ createServer(async (req, res) => {
     if (!res.headersSent) fail(res, 400, e.message)
     else { res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'server_error' } })}\n\n`); res.end() }
   } finally {
+    if (aborted) console.log('[native] client disconnected — generation stopped')
+    res.off?.('close', onClose)
     busy = false
     scheduleSave()
   }
