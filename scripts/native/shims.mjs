@@ -61,9 +61,19 @@ export async function installShims({ viteBase = 'http://localhost:5173', unsafe 
           const fh = await open(p, 'w')
           return {
             async write(chunk) {
-              const u8 = chunk instanceof ArrayBuffer ? new Uint8Array(chunk)
+              // STRINGS FIRST, and the catch-all THROWS. `new Uint8Array(str)`
+              // reads the string as a length, gets NaN, and writes zero bytes
+              // — so kv-pool's meta.json (its commit record, written as JSON
+              // text) came out empty on every save while entry.bin looked
+              // perfect. Restore then read "no entry" forever: 683 MB of
+              // payload on disk that could never be loaded, and not one error.
+              // The browser's FileSystemWritableFileStream takes strings, so
+              // this only ever broke under the native host.
+              const u8 = typeof chunk === 'string' ? new TextEncoder().encode(chunk)
+                : chunk instanceof ArrayBuffer ? new Uint8Array(chunk)
                 : ArrayBuffer.isView(chunk) ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
-                : new Uint8Array(chunk)
+                : null
+              if (!u8) throw new TypeError(`OPFS write: unsupported chunk ${Object.prototype.toString.call(chunk)}`)
               await fh.write(u8)
             },
             async close() { await fh.close() },
