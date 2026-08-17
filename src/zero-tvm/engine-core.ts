@@ -3828,6 +3828,17 @@ export function buildDecodeEngine(
         await chunkPrefill.record(promptIds, prefillPos, s)
         prefillPos += s
         chunks++
+        // WAIT for the GPU to actually finish this chunk. record() only
+        // SUBMITS on the unpooled path ("resolves immediately", above), so
+        // without this the CPU races through every chunk in milliseconds and
+        // then blocks on the final readback. Two things broke because of it:
+        // progress reported 100% while MINUTES of queued work remained, and
+        // every shouldStop poll above ran before any of that work had started
+        // — so a cancelled request kept grinding to completion with nothing
+        // left to poll. A chunk is ~8s of GPU against a few ms of recording,
+        // so the bubble this costs is a rounding error next to honest
+        // progress and a cancel that can land within one chunk.
+        await device.queue.onSubmittedWorkDone()
         onPrefill?.(prefillPos, promptIds.length)
       }
     }
@@ -3837,6 +3848,11 @@ export function buildDecodeEngine(
     for (; prefillPos < last; prefillPos++) {
       submitStep(promptIds[prefillPos], prefillPos, false)
       if ((prefillPos & 63) === 0) {
+        // Same reason as the chunk loop: submitStep fires without a readback,
+        // so on a spec that cannot chunk, the whole prompt queues up instantly
+        // and neither the progress nor the poll below means anything until the
+        // GPU catches up.
+        await device.queue.onSubmittedWorkDone()
         onPrefill?.(prefillPos, promptIds.length)
         if (shouldStop?.()) return tokens
       }
