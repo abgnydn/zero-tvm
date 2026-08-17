@@ -131,6 +131,11 @@ export interface DetectedModel {
   moe: DetectedMoe | null
   gdn: DetectedGdn | null
   attnGate: boolean           // gated attention (per-head [Q|gate] in q_proj)
+  /** GDN z-gate activation (`output_gate_type`). null = key absent (the
+   *  Qwen3.5/3.6 era, which IS swish). Checked, not ignored: gdn_norm_out
+   *  hard-codes silu(z), and silu = swish — any other value is a different
+   *  forward pass wearing the same tensor names. */
+  gdnOutputGate: string | null
   partialRotaryFactor: number | null
   /** config `layer_types`, verbatim — a POSITIVE per-layer block claim.
    *  null when the config has none (uniform attention assumed). */
@@ -182,6 +187,10 @@ export const CONFIG_KEYS_READ: ReadonlySet<string> = new Set([
   // Gated attention, which the engine RUNS (Qwen3.5/3.6). Unread, it made a
   // supported feature read as an unknown field.
   'attn_output_gate',
+  // GDN z-gate activation (Qwen3.8 spells it out; earlier configs omit it).
+  // Read into gdnOutputGate and CHECKED against the one gate the kernel
+  // implements — see the gdn-gate rule.
+  'output_gate_type',
   'quantization', 'quantization_config', 'partial_rotary_factor', 'layer_types',
   'linear_num_key_heads', 'linear_num_value_heads', 'linear_key_head_dim', 'linear_value_head_dim',
   'linear_conv_kernel_dim', 'full_attention_interval',
@@ -230,6 +239,16 @@ export const CONFIG_KEYS_IGNORED: ReadonlySet<string> = new Set([
   // its layer indices stop at 39 against num_hidden_layers 40, so the head the
   // config declares was never published with the weights.
   'mtp_num_hidden_layers', 'mtp_use_dedicated_embeddings',
+  // SAMPLING DEFAULTS (Qwen3.8 inlines them; generation_config repeats them).
+  // The forward pass computes logits; what a runner samples from them is that
+  // runner's business — the chat page has its own ?temp/?topp knobs and every
+  // reference comparison is greedy. No effect on a single logit.
+  'do_sample', 'generation_config', 'temperature', 'top_k', 'top_p',
+  // Packaging flag on multimodal roots ("this repo is only the text tower").
+  // Whether a vision tower is present is decided by the RECORDS themselves
+  // (the text-records filter plans only language_model.* / text tensors),
+  // not by this bit — either value leaves the text forward pass unchanged.
+  'language_model_only',
 ])
 
 export function checkModel(m: DetectedModel): CheckResult {
@@ -443,6 +462,14 @@ export function checkModel(m: DetectedModel): CheckResult {
     if (m.gdn.vHeads % m.gdn.kHeads !== 0) fail('gdn', `vHeads ${m.gdn.vHeads} % kHeads ${m.gdn.kHeads} != 0`, 'GVA grouping in gdn_recur.wgsl')
     if (m.gdn.headV % 32 !== 0 || m.gdn.headV > 256) fail('gdn', `headV ${m.gdn.headV}`, 'gdn_recur/gdn_norm_out workgroup sizing (32-lane rows, ≤256)')
     if (m.gdn.convK !== 4) fail('gdn', `conv kernel width ${m.gdn.convK} != 4`, 'gdn_conv.wgsl ring state is sized for width 4')
+    // The z-gate activation. gdn_norm_out hard-codes silu(z), and silu IS
+    // swish — a config naming any other gate is a different forward pass, and
+    // ignoring it would be the fluent-nonsense class of failure. Absent =
+    // swish (Qwen3.5/3.6 configs omit the key).
+    if (m.gdnOutputGate != null && m.gdnOutputGate !== 'swish') {
+      fail('gdn-gate', `output_gate_type '${m.gdnOutputGate}' — gdn_norm_out applies silu (= swish)`,
+        `a gdn_norm_out variant applying ${m.gdnOutputGate}(z)`)
+    }
     notes.push('GDN layers force the unfused f16-KV composition (no ?kv8, no fused QKV)')
   }
 

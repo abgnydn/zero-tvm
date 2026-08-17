@@ -347,6 +347,9 @@ const detected = {
   // isGdn stays as the fallback for configs that omit the key; it is a proxy
   // (both shipped GDN families happen to gate attention), not a definition.
   attnGate: tc.attn_output_gate != null ? tc.attn_output_gate === true : isGdn,
+  // Qwen3.8 names the GDN z-gate (at the multimodal root — tc merges it).
+  // null = key absent: the pre-3.8 configs, which are swish by construction.
+  gdnOutputGate: typeof tc.output_gate_type === 'string' ? tc.output_gate_type : null,
   partialRotaryFactor: num(tc.partial_rotary_factor),
   // Verbatim per-layer block claim — the checker refuses unknown kinds (LFM2's
   // 'conv' would otherwise detect as plain attention and fake-green).
