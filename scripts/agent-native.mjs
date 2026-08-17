@@ -241,6 +241,43 @@ async function runJob(body, onDelta, isAborted) {
     id: `call_${randomUUID().slice(0, 8)}_${i}`, type: 'function',
     function: { name: c.name, arguments: JSON.stringify(retype(c)) },
   }))
+  // A call can parse perfectly and still be REFUSED by the client, because the
+  // client validates it against the schema it sent us. That failure is
+  // invisible here — the logs carry no content by design — so a session shows
+  // "tool execution failed" while every line on this side looks healthy. We
+  // are not the tool runner and must not block the call; but the schema is in
+  // hand, so say when one cannot possibly validate. Parameter NAMES only.
+  for (const c of usable) {
+    const fn = body.tools?.find((t) => t.function?.name === c.name)?.function
+    if (!fn) {
+      console.log(`[native] TOOL CALL '${c.name}' — the client offered no tool by that name`)
+      continue
+    }
+    const props = fn.parameters?.properties ?? {}
+    const keys = Object.keys(c.arguments ?? {})
+    const missing = (fn.parameters?.required ?? []).filter((k) => !keys.includes(k))
+    const unknown = keys.filter((k) => !(k in props))
+    // TYPE matters as much as presence, and is easier to miss: a required
+    // string that arrives as null or a number is present, looks fine in a
+    // key-only log, and is refused by the client all the same. The XML dialect
+    // carries no types and guesses with JSON.parse, so `null` and `42` are
+    // exactly what it produces from ordinary text.
+    const typeOf = (v) => v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v
+    const wrong = keys.filter((k) => {
+      const want = props[k]?.type
+      if (!want) return false
+      const got = typeOf(c.arguments[k])
+      return want === 'integer' ? got !== 'number' : got !== want
+    }).map((k) => `${k}: want ${props[k].type}, got ${typeOf(c.arguments[k])}`)
+    if (missing.length || unknown.length || wrong.length) {
+      console.log(`[native] TOOL CALL '${c.name}' will not validate against the client's schema:`
+        + (missing.length ? ` MISSING required [${missing.join(', ')}]` : '')
+        + (unknown.length ? ` UNKNOWN [${unknown.join(', ')}]` : '')
+        + (wrong.length ? ` WRONG TYPE [${wrong.join('; ')}]` : '')
+        + ` · model sent [${keys.join(', ') || '(no parameters)'}]`
+        + ` · schema wants [${Object.keys(props).join(', ')}]`)
+    }
+  }
   // Keep the RAW output against the structure the client will hand back, so
   // the next turn re-sends what the model actually wrote and the KV cache
   // still matches. Only for turns that carry calls — plain text round-trips
