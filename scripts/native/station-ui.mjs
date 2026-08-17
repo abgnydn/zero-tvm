@@ -100,9 +100,14 @@ export function stationUi() {
     <div class="cell"><div class="v" id="reused">—</div><div class="k">prefix reused</div></div>
     <div class="cell"><div class="v" id="gt">—</div><div class="k">generated</div></div>
   </div>
-  <div class="cell" style="border:1px solid var(--line);border-top:0;border-radius:0 0 6px 6px">
+  <div class="cell" style="border:1px solid var(--line);border-top:0">
     <div class="v" id="ctxv">—</div><div class="k">context used</div>
     <div class="bar"><i id="ctxbar" style="width:0%"></i></div>
+  </div>
+  <div class="cell" style="border:1px solid var(--line);border-top:0;border-radius:0 0 6px 6px">
+    <div class="v" id="reusev">—</div><div class="k">cache reuse — prompt served from KV</div>
+    <div class="bar"><i id="reusebar" style="width:0%"></i></div>
+    <div class="note" id="reusenote" style="margin-top:8px"></div>
   </div>
   <div style="margin-top:10px">
     <button onclick="clearModel()" title="unload the model and free its memory">Clear</button>
@@ -121,7 +126,7 @@ export function stationUi() {
 <div id="histBox" style="display:none">
   <h2>Requests <button style="margin-left:8px;padding:2px 8px" onclick="clearHistory()">clear</button></h2>
   <table><thead><tr>
-    <th>time</th><th>prompt</th><th>reused</th><th>prefill</th><th>first tok</th><th>gen</th><th>decode</th><th>ctx after</th>
+    <th>time</th><th>prompt</th><th>cached</th><th>prefill</th><th>first tok</th><th>gen</th><th>decode</th><th>ctx after</th>
   </tr></thead><tbody id="hrows"></tbody></table>
 </div>
 
@@ -240,14 +245,16 @@ async function tick(){
     $('membar').style.width=Math.min(100,pct)+'%'
     $('membar').style.background=m.swappingNow?'linear-gradient(90deg,#e2685f88,#e2685f)'
       :pct>85?'linear-gradient(90deg,#d9a44188,#d9a441)':'linear-gradient(90deg,#f0a86088,var(--accent))'
-    $('memnote').textContent=m.note||(pct>85?'close to full — a second model will swap':'')
+    $('memnote').textContent=m.note
+      ||(m.compressedGb>=4?'macOS is compressing '+fmt(m.compressedGb,1)+' GB to keep up — pressure is high, and compression costs CPU'
+      :pct>85?'close to full — a second model will swap':'')
     $('memnote').className='note'+(m.swappingNow?' err':'')
   }
   // Request trend — the point is decode drifting down as the window fills.
   const H=s.history||[]
   $('histBox').style.display=H.length?'':'none'
   $('hrows').innerHTML=H.map((r)=>'<tr><td>'+new Date(r.at).toLocaleTimeString()+
-    '</td><td>'+fmt(r.promptTokens)+'</td><td>'+(r.reusedTokens==null?'—':r.reusedTokens===0?'none':fmt(r.reusedTokens))+
+    '</td><td>'+fmt(r.promptTokens)+'</td><td>'+(r.reusedTokens==null?'—':r.promptTokens?((r.reusedTokens/r.promptTokens)*100).toFixed(0)+'%':'—')+
     '</td><td>'+fmt(r.prefillTokPerSec)+
     '</td><td>'+(r.ttftMs/1000).toFixed(2)+'s</td><td>'+fmt(r.genTokens)+
     '</td><td>'+fmt(r.decodeTokPerSec,1)+'</td><td>'+fmt(r.contextUsed)+'</td></tr>').join('')
@@ -262,6 +269,20 @@ async function tick(){
     $('reused').innerHTML=l.reusedTokens==null?'—'
       :l.reusedTokens===0?'<span style="color:var(--err)">none</span>'
       :fmt(l.reusedTokens)+'<small>of '+fmt(l.promptTokens)+'</small>'
+    // The ratio is what explains TTFT: at 0% the turn re-reads the whole
+    // conversation, which on a long one is minutes rather than seconds.
+    if(l.reusedTokens==null){$('reusev').textContent='—';$('reusebar').style.width='0%';$('reusenote').textContent=''}
+    else{
+      const rp=l.promptTokens?(l.reusedTokens/l.promptTokens)*100:0
+      const fresh=l.promptTokens-l.reusedTokens
+      $('reusev').innerHTML=rp.toFixed(1)+'%<small>'+fmt(l.reusedTokens)+' cached · '+fmt(fresh)+' re-read</small>'
+      $('reusebar').style.width=Math.min(100,rp)+'%'
+      $('reusebar').style.background=rp>50?'linear-gradient(90deg,#54d18c88,var(--ok))'
+        :rp>0?'linear-gradient(90deg,#d9a44188,var(--warn))':'linear-gradient(90deg,#e2685f88,var(--err))'
+      $('reusenote').textContent=rp>50?'the cache is doing its job — only new tokens were prefilled'
+        :rp>0?'partial reuse — the prompt diverged partway through'
+        :'no reuse: the whole conversation was re-read. Expected on the FIRST turn after a load; on later turns it means the client changed an earlier message.'
+    }
     $('gt').textContent=fmt(l.genTokens)
     const ctx=s.engine.ctx||1,pct=(l.contextUsed/ctx)*100
     $('ctxv').innerHTML=fmt(l.contextUsed)+'<small>/ '+fmt(ctx)+' · '+pct.toFixed(1)+'%</small>'
