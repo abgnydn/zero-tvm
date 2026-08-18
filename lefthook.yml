@@ -12,11 +12,11 @@
 pre-commit:
   parallel: true
   commands:
-    biome:
-      glob: "*.{js,jsx,ts,tsx,mjs,cjs,json,jsonc,css}"
-      run: biome check --write --no-errors-on-unmatched {staged_files}
-      stage_fixed: true
-
+    # NO biome here. The formatter mangles this tree (see biome.README.md), and
+    # a blocking LINT would land 20 pre-existing findings on whoever next edits
+    # one of those files — making them fix unrelated warnings to commit their
+    # own change. `biome lint src/ scripts/` on demand; biome.json keeps the
+    # formatter off so nobody re-runs the rewrite by accident.
     gitleaks:
       run: gitleaks protect --staged --redact --no-banner
 
