@@ -23,7 +23,6 @@ Needs Metal, so it runs in your shell:
 from __future__ import annotations
 
 import argparse
-import json
 
 from mlx_lm import load, generate
 
@@ -66,6 +65,10 @@ def padding(target: int):
     return msgs
 
 
+# NB: `arguments` is a DICT, not a JSON string. The Qwen template does
+# `tool_call.arguments | items`, which raises "Can only get item pairs from a
+# mapping" on a string — the OpenAI wire format uses a string here and the
+# jinja does not.
 # The state our engine reaches right before it fails: three files read, the
 # arithmetic available. The only correct next move is attempt_completion("84").
 TAIL = [
@@ -73,17 +76,17 @@ TAIL = [
                                 "need, then call attempt_completion with just the number."},
     {"role": "assistant", "content": "", "tool_calls": [
         {"id": "c1", "type": "function",
-         "function": {"name": "read_file", "arguments": json.dumps({"path": "src/pipeline.ts"})}}]},
+         "function": {"name": "read_file", "arguments": {"path": "src/pipeline.ts"}}}]},
     {"role": "tool", "tool_call_id": "c1",
      "content": 'import { WIDTH } from "./dims.ts"\nimport { scale } from "./scale.ts"\n'
                 "export function capacity() { return scale(WIDTH) }"},
     {"role": "assistant", "content": "", "tool_calls": [
         {"id": "c2", "type": "function",
-         "function": {"name": "read_file", "arguments": json.dumps({"path": "src/dims.ts"})}}]},
+         "function": {"name": "read_file", "arguments": {"path": "src/dims.ts"}}}]},
     {"role": "tool", "tool_call_id": "c2", "content": "export const WIDTH = 12"},
     {"role": "assistant", "content": "", "tool_calls": [
         {"id": "c3", "type": "function",
-         "function": {"name": "read_file", "arguments": json.dumps({"path": "src/scale.ts"})}}]},
+         "function": {"name": "read_file", "arguments": {"path": "src/scale.ts"}}}]},
     {"role": "tool", "tool_call_id": "c3",
      "content": "export const FACTOR = 7\nexport function scale(n: number) { return n * FACTOR }"},
 ]
