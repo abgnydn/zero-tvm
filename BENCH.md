@@ -905,10 +905,15 @@ path untouched (`recordForward` unchanged; same 340 dispatches/token).
    reconstructed from the readback chain — and a new turn prefills only the
    delta past the longest reusable prefix. Trust rules: pure-attention
    specs reuse `min(LCP, len-1)` (KV rewrite is idempotent; stale slots are
-   overwritten in order). Hybrid GDN is all-or-nothing: the recurrence
-   can't rewind, so reuse requires the new prompt to extend EVERY absorbed
-   token with the state boundary exactly there, else full re-prefill (which
-   re-zeroes GDN state at position 0). Template mechanics measured:
+   overwritten in order). Hybrid GDN cannot rewind the recurrence a
+   token at a time, so reuse requires the new prompt to extend EVERY absorbed
+   token with the state boundary exactly there. **Since 2026-08-17 that no
+   longer means a full re-prefill when it fails**: four snapshots of the
+   recurrent state are kept at chunk boundaries and a divergence replays from
+   the nearest one at or below it (~4k tokens of lookback). Measured on a live
+   agent session where the client rewrote a trailing metadata block every turn:
+   392.50s cold became 12.76s and 26.30s on the following turns. Only a
+   divergence older than the ring prefills from zero (re-zeroing GDN state). Template mechanics measured:
    - *ChatML (Qwen3/Qwen3.5, non-thinking)*: past assistant turns are now
      re-rendered WITH the empty `<think>\n\n</think>\n\n` block (it was
      genuinely part of the generation prompt the model continued), making

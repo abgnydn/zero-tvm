@@ -69,16 +69,18 @@ export interface CreateEngineOptions {
   chunkGemm?: import('../zero-tvm/engine-core.js').DecodeEngineOptions['chunkGemm']
   /** Capture per-layer router choices for scripts/moe-trace.mjs. */
   traceMoe?: boolean
+  /** int8 KV cache — half the cache memory. Measured END TO END on the model
+   *  that wanted it, paired perplexity against an f16 cache: -0.09% at 1k
+   *  windows, +0.10% at 4k, both within noise (docs/TURBOQUANT_PLAN.md).
+   *  Runs on the unfused path, on hybrids and through chunked prefill; MLA is
+   *  the one exclusion, since it caches a latent rather than per-head K/V and
+   *  buildDecodeEngine throws for it. */
+  int8KV?: boolean
   /** Expert slots held per MoE layer instead of all of them — see
    *  DecodeEngineOptions.expertPool. MoE models only; below top-K + 1 the
    *  engine throws. Off by default. Passed to the LOADER as well as the
    *  engine: the stacked expert tensors are then never allocated, which is
    *  where the memory saving comes from. */
-  /** int8 KV cache — half the cache memory for a measured ~1.2% attention
-   *  output error (docs/TURBOQUANT_PLAN.md, phase 1 gate). Requires the FUSED
-   *  QKV path, which today means symmetric non-qk-norm specs: Phi-3 alone.
-   *  Exposed so that limit can be MEASURED end to end rather than argued. */
-  int8KV?: boolean
   expertPool?: number
   /** Run the next MoE layer's router a layer early and prefetch what it names
    *  (DecodeEngineOptions.expertSpeculate). Needs expertPool. */
@@ -328,9 +330,9 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   const fused = !spec.qkNorm && spec.weightFormat !== 'mlx-safetensors'
   // No fused-path check here any more: the quantize kernel reads a plain
   // (k_slot, v_slot) pair, which the unfused chain has in B.kOut/B.vOut after
-  // RoPE. buildDecodeEngine owns what int8 still cannot cover (MLA, hybrid)
-  // and names each one; duplicating a stale rule here is what just refused a
-  // model the engine supports.
+  // RoPE. buildDecodeEngine owns the one case int8 still cannot cover — MLA —
+  // and names it; duplicating a stale rule here is what refused a model the
+  // engine supports.
   const kv = opts.int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
   const engine = buildDecodeEngine(device, weights, kv, {
     spec, variants, fused, ...(opts.int8KV ? { int8KV: true } : {}), ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),

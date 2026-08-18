@@ -363,8 +363,19 @@ function render(): void {
     {
       const w = weightsGb(mode && mode.slots ? mode.label : b.sizeLabel)
       if (Number.isFinite(w)) {
-        const total = w + (cx.tokens * v.spec.kvBytesPerToken) / 2 ** 30
-        rows.push(['Footprint', `~${total.toFixed(1)} GB <span class="mb-hw">weights + KV</span>`])
+        // Hybrids also allocate the GDN rewind ring — four snapshots of the
+        // recurrent state so a late prompt divergence replays from the nearest
+        // chunk boundary instead of re-reading the conversation. It is real
+        // resident memory (0.19-0.24 GB), allocated whenever prefix reuse is
+        // on, which is the default. A row headed "will it fit?" that omits it
+        // is short by exactly the amount that decides a close call.
+        const sp = v.spec
+        const gdnLayers = sp.layerKinds.filter((k) => k === 'gdn').length
+        const ring = gdnLayers
+          ? (4 * gdnLayers * ((sp.gdnConvK - 1) * sp.gdnQkvDim * 2 + sp.gdnVHeads * sp.gdnStatePerHead * 4)) / 2 ** 30
+          : 0
+        const total = w + (cx.tokens * sp.kvBytesPerToken) / 2 ** 30 + ring
+        rows.push(['Footprint', `~${total.toFixed(1)} GB <span class="mb-hw">weights + KV${ring ? ' + state' : ''}</span>`])
       }
     }
     // Context bar: the CHOSEN build over the checkpoint's own maxSeq — a

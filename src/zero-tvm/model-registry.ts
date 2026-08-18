@@ -192,8 +192,8 @@ const BRANDINGS: Record<string, ModelBrand> = {
   [QWEN3_30B_A3B_4BIT.id]: { name: 'Qwen3-30B-A3B', params: '30B-A3B MoE', sizeLabel: '~17.2 GB', rateLabel: '~75 t/s', ramNote: 'needs ~20 GB free RAM',
     poolModes: [
       { slots: 0, label: 'Full · ~17 GB · ~75 t/s' },
-      { slots: 96, label: '¾ · ~13 GB est · ~15 t/s' },
-      { slots: 64, label: 'Half · ~9.5 GB est · ~15 t/s', note: 'long prompts run token-by-token' },
+      { slots: 96, label: '¾ · ~13 GB est' },
+      { slots: 64, label: 'Half · ~9.5 GB est', note: 'long prompts run token-by-token' },
     ] },  // 74.96 total, M2 Max (BENCH.md 2026-08-13); size = index.json total_size 17.17 GB — the old ~16.0 was short by 1.2 GB
   // Not a chat model. Its output is the pooled hidden state, so rateLabel stays
   // '' — tok/s is not the unit here.

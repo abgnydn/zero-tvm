@@ -139,7 +139,12 @@ All engines also do **cross-turn prefix reuse** (`?reuse=0` opts out): the
 engine tracks the exact absorbed (position, token) record and prefills only
 the delta on the next turn — hybrid reuse requires the new prompt to extend
 EVERY absorbed token (the ChatML non-thinking template re-renders past
-assistant turns WITH the empty `<think>` block so it does). WebLLM A/B
+assistant turns WITH the empty `<think>` block so it does). When that fails,
+a ring of **four GDN state snapshots taken at chunk boundaries** lets the turn
+replay from the nearest one at or below the divergence instead of prefilling
+from zero (~4k tokens of lookback, ~0.19-0.24 GB of VRAM). Agent clients that
+rewrite a trailing metadata block every turn hit this constantly: measured
+392.50s → 12.76s. WebLLM A/B
 needs `@mlc-ai/web-llm` ≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84
 prebuilt libs).
 

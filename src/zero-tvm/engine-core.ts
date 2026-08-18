@@ -384,8 +384,12 @@ export interface DecodeEngineOptions {
    * absorbed prefix prefills only the delta. Trust rules: pure-attention
    * specs reuse the longest common prefix (KV rewrite is idempotent); hybrid
    * specs additionally require the GDN state boundary to sit exactly at the
-   * end of the absorbed record (the recurrence is not rewindable) and fall
-   * back to a full re-prefill otherwise.
+   * end of the absorbed record, because the recurrence cannot be rewound a
+   * token at a time. When that fails they no longer pay a full re-prefill:
+   * four snapshots of the recurrent state are kept at chunk boundaries, and a
+   * divergence replays from the nearest one at or below it (~4k tokens of
+   * lookback). Only a divergence older than the ring falls back to prefilling
+   * from zero.
    */
   prefixReuse?: boolean
   /**

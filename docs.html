@@ -532,7 +532,7 @@
   <p class="lead">
     A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
     10 hand-written WGSL kernel roles, a BPE tokenizer, and raw WebGPU.
-    Measured +16.0% on total wall-clock throughput and +31.4% on decode against WebLLM's TVM-autotuned 85
+    Measured +16.0% on total wall-clock throughput and +31.4% on decode against WebLLM's TVM-autotuned
     kernels, identical weights, same session (M2 Max, 2026-07-30).
   </p>
 
@@ -612,7 +612,7 @@
   <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
 </ol>
 
-<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — split-K attention has been on by default since 2026-07-27 and adds a combine dispatch per layer; <code>?splitk=0</code> runs the 228-dispatch reference chain — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token using 85 distinct shaders.</p>
+<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — split-K attention has been on by default since 2026-07-27 and adds a combine dispatch per layer; <code>?splitk=0</code> runs the 228-dispatch reference chain — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token — around 11 distinct shaders on that path, of 85 captured across a whole session.</p>
 
 <!-- ARCHITECTURE -->
 <h2 id="overview">Architecture overview</h2>
@@ -1241,8 +1241,8 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Time to first token (~35-token prompt)</td><td>291 ms</td><td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM ahead</td></tr>
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
     <tr><td>Dispatches / token</td><td>260 default (228 with <code>?splitk=0</code>)</td><td>342</td></tr>
-    <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>85 TVM-generated shaders</td></tr>
-    <tr><td>Shipped JS bundle</td><td>~432 kB / ~116 kB gz (<code>zero-tvm.html</code>)</td><td>~6.0 MB / ~2.2 MB gz (@mlc-ai/web-llm 0.2.84)</td></tr>
+    <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>~11 TVM-generated on the decode path (85 captured across a session)</td></tr>
+    <tr><td>Shipped JS bundle</td><td>~460 kB / ~126 kB gz (<code>zero-tvm.html</code>)</td><td>~6.0 MB / ~2.2 MB gz (@mlc-ai/web-llm 0.2.84)</td></tr>
     <tr><td>Bandwidth utilization (total / decode)</td><td>~36% / ~44% of the 191 tok/s ceiling</td><td>~31% / ~33% of the same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>
     <tr><td>Readable kernels?</td><td>✓ Yes — every .wgsl file is in the repo</td><td>✗ No — emitted by the TVM compiler</td></tr>
@@ -1277,7 +1277,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <div class="callout warning">
   <div class="callout-title">WebLLM reaches the first token sooner than we do</div>
   <p>WebLLM's self-reported prefill runs at 251 tok/s on Phi-3 and 263–271 tok/s on Qwen3-4B. Against the ~35-token bench prompt that implies a TTFT of roughly <strong>150 ms</strong> on Phi-3, where we measure <strong>291 ms</strong>; on Qwen3-4B our <strong>453 ms</strong> is worse still. Only Qwen3.5-4B is a wash (our 171 ms vs an implied ~0.2 s). Stated plainly: <strong>we win sustained decode decisively and lose the first-token sprint on short inputs.</strong></p>
-  <p>It is specifically a <em>short</em>-prompt weakness. Chunked prefill measures 202 tok/s on an 816-token prompt (2026-07-29), and cross-turn prefix reuse removes prefill entirely on follow-up turns. What is not competitive is the fixed cost of a short, cold prefill on the attention-only specs, which still run prompt tokens one at a time. It is the top open item on BENCH.md's levers list.</p>
+  <p>It is specifically a <em>short</em>-prompt weakness. Chunked prefill measures 202 tok/s on an 816-token prompt (2026-07-29), and cross-turn prefix reuse removes prefill entirely on follow-up turns. What is not competitive is the fixed cost of a short, cold prefill on a cold prefill with nothing cached to reuse. It is the top open item on BENCH.md's levers list.</p>
 </div>
 
 <h3>How the result flipped (22% behind &rarr; +16% total / +31% decode ahead)</h3>

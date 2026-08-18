@@ -1,9 +1,19 @@
 # TurboQuant KV — plan
 
-Status: **planned, nothing built.** No claim in this file has been measured
-here; every number below is either arithmetic on our own specs (marked as
-such) or the paper's, attributed. It exists so the build can be judged before
-it is started, and killed early if the gates fail.
+Status: **TurboQuant KILLED, int8 KV BUILT AND SHIPPED** (2026-08-17/18). Read
+the phase sections in order — this file was written as a plan and then used as
+the log of the measurements that refuted it, so LATER SECTIONS SUPERSEDE
+EARLIER ONES wherever they disagree, and several do:
+
+- TurboQuant is dead for our checkpoints: its premise (a few dominant channels
+  for a rotation to spread) is false here — max ÷ median per-channel magnitude
+  is 3.1x, not the 20x the proxy assumed. See "Phase 0b RESULT".
+- Plain int8 KV won instead, was measured free end to end (paired perplexity
+  -0.09% / +0.10%, within noise), and now runs on the unfused path, on hybrids
+  and through chunked prefill. See "Phase 1 BUILT".
+- Everything above "Phase 0 RESULT" is the ORIGINAL PITCH, kept for the record.
+  Its memory table is TurboQuant-at-3.5-bits and does not describe anything
+  that exists.
 
 ## What the method is
 
@@ -29,7 +39,11 @@ products, so `<Rq, Rk> = <q, k>`. Rotate the query the same way at attention
 time and the score is unchanged; nothing downstream of attention learns that
 the cache is quantized.
 
-## Why this engine, specifically
+## Why this engine, specifically — SUPERSEDED (the original pitch)
+
+> The table below prices TurboQuant at 3.5 bits, which phase 0b killed. It is
+> kept because the memory ceiling it describes is real; the route to it is not.
+
 
 KV is our ceiling, and the context picker (2026-08-16) put a price tag on it
 in the UI, which makes the cost impossible to ignore. Arithmetic on our own
@@ -58,7 +72,7 @@ a per-(page, slot, head, side) f16 scale, and an attention variant
 "identical online-softmax math". `allocKVPagesInt8` sizes the buffers. That
 is the same three-piece skeleton this needs.
 
-**But int8-KV is nearly unreachable today, and that is the lesson.** It is
+**But int8-KV was nearly unreachable when this was written, and that was the lesson** (fixed 2026-08-17/18 — see "Phase 1 BUILT"): It is
 gated to the fused-QKV path, which means Phi-3 alone — none of the MLX
 checkpoints, neither MoE, no hybrid. And it was excluded from chunked prefill
 on 2026-08-17 because the chunk path binds the f16 append/attention kernels

@@ -470,7 +470,7 @@ export function checkModel(m: DetectedModel): CheckResult {
       fail('gdn-gate', `output_gate_type '${m.gdnOutputGate}' — gdn_norm_out applies silu (= swish)`,
         `a gdn_norm_out variant applying ${m.gdnOutputGate}(z)`)
     }
-    notes.push('GDN layers force the unfused f16-KV composition (no ?kv8, no fused QKV)')
+    notes.push('GDN layers force the unfused composition (no fused QKV); int8 KV (?kv8=1) IS supported')
   }
 
   // ── tokenizer & template ───────────────────────────────────
@@ -484,7 +484,10 @@ export function checkModel(m: DetectedModel): CheckResult {
   }
 
   // ── notes that gate flags, not support ─────────────────────
-  if (m.headDim !== null && m.headDim > 128) notes.push('int8 KV (?kv8=1) unavailable — kv_quantize_int8 packs headDim ≤ 128')
+  // The headDim > 128 note said int8 KV was unavailable, because the pack
+  // phase gave each of 32 threads one word and stopped. Fixed 2026-08-17:
+  // threads now stride words by 32, so a row wider than the workgroup is
+  // covered, and qwen35 (headDim 256) is token-identical to f16.
   // The chunked-prefill half of this note was true until 2026-08-11, when
   // int4_matmul_batched_dyn_affine landed; hybrid + affine has chunked ever
   // since, and qwen36q3 (hybrid GDN + affine + MoE) is token-identity gated on

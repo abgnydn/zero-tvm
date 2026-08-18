@@ -7,7 +7,7 @@ sdk: static
 pinned: true
 license: mit
 thumbnail: https://huggingface.co/spaces/abgunaydin/zero-tvm/resolve/main/og.png
-short_description: Phi-3, Qwen3 and Qwen3.5 in the browser on hand-written WGSL
+short_description: Phi-3 to a 35B sparse MoE, in the browser on hand-written WGSL
 tags:
   - webgpu
   - llm
@@ -27,7 +27,7 @@ models:
 
 Models from a 3.8B dense to a 35B sparse MoE, running in the browser on hand-written WGSL. No TVM, no ONNX, no WASM runtime.
 
-The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles (70 WGSL shaders — 42 files + 28 generated int4 variants, counting subgroup / tiled / int8 / affine / MoE variants) and about 2,000 lines of TypeScript** — and runs models WebLLM ships (same weights, measured faster) as well as one it does not: Qwen3.6-35B-A3B, a 256-expert sparse MoE.
+The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that emits **85 autotuned WGSL kernels**. This Space replaces that entire stack with **10 kernel roles** of hand-written WGSL — and runs models WebLLM ships (same weights, measured faster) as well as one it does not: Qwen3.6-35B-A3B, a 256-expert sparse MoE.
 
 The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
 
@@ -37,8 +37,7 @@ Measured on an Apple M2 Max (Chrome 150, WebLLM v0.2.80, identical Phi-3-mini-q4
 
 | | WebLLM (TVM) | Zero-TVM |
 |---|---|---|
-| Unique WGSL kernels | **85** | **10 roles / 42 files (+28 generated)** |
-| Total WGSL lines | **12,962** (generated) | **4,228** (hand-written) |
+| WGSL kernels | **85 autotuned** | **10 hand-written roles** |
 | Dispatches per decode step | **342** | **228** |
 | Total throughput (prefill + decode) | **59.95 tok/s** | **69.55 tok/s** — **+16.0%** |
 | Decode only | **63.23 tok/s** (self-reported) | **83.10 tok/s** — **+31.4%** |
@@ -55,11 +54,11 @@ Exact medians, full methodology, and the optimization experiments that were meas
 
 ## Run it
 
-After this Space loads, open **[zero-tvm.html](./zero-tvm.html)** to launch the chat UI.
+The Space opens on a character-select entrance: pick a model and it loads and chats in place. [`zero-tvm.html`](./zero-tvm.html) is the same chat as a direct link, if you want to deep-link a specific model.
 
 On first load you'll see a "Download & Start" gate — clicking it streams ~1.8 GB of Phi-3-mini-q4f16_1 weights from the Hugging Face mirror at [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC) into OPFS (Origin Private File System).
 
-Subsequent loads are instant. **Both `zero-tvm.html` and `compiler-chat.html` share the same cached weights** via a Service Worker that intercepts the Phi-3 mirror URLs — visiting either page after the first download is gate-free.
+Subsequent loads are instant: a Service Worker intercepts the mirror URLs, so every page sharing those weights is gate-free after the first download.
 
 **Requirements**: Chrome / Edge with WebGPU enabled and the `shader-f16` feature available (default on macOS Apple-Silicon, enabled on most modern Windows / Linux GPUs).
 
@@ -73,15 +72,14 @@ All three pairs re-measured 2026-07-30 under the corrected protocol — same ses
 
 ## Pages in this Space
 
-- [`index.html`](./index.html) — landing page, shader catalog, compare table
-- [`zero-tvm.html`](./zero-tvm.html) — **the chat demo** (start here)
-- [`webllm-bench.html`](./webllm-bench.html) — head-to-head harness vs WebLLM on identical weights
-- [`compiler-chat.html`](./compiler-chat.html) — same Phi-3-mini weights, run via WebLLM (for direct comparison; reuses the shared cache, no extra download)
-- [`architecture.html`](./architecture.html) — kernel architecture explainer
-- [`shaders.html`](./shaders.html) — browseable WGSL source
-- [`demo.html`](./demo.html) — dispatch visualization
+- [`index.html`](./index.html) — the entrance: pick a model, chat in place (start here)
+- [`zero-tvm.html`](./zero-tvm.html) — the chat surface as a direct link
 - [`validate.html`](./validate.html) — multi-prompt smoke test
-- [`docs.html`](./docs.html) — annotated reference
+- [`docs.html`](./docs.html) — annotated reference, including the kernel walkthrough
+
+Six pages were removed on 2026-08-14 — `architecture`, `demo`, `compiler-chat`,
+`dump`, `shaders`, `webllm-bench`. Three of them started multi-gigabyte
+downloads on page load. `docs.html` carries what the first two explained.
 
 ## URL flags
 
