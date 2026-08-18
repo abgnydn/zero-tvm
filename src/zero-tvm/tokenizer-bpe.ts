@@ -514,7 +514,10 @@ export function buildDeepSeekChatPrompt(
 }
 
 export function buildLlama3ChatPrompt(
-  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  // 'ipython' is a real Llama-3 role, not a leak: renderToolResults returns
+  // tool results in ipython turns and the loop below renders any role as its
+  // own header, so this only widens the type to what the body already did.
+  messages: Array<{ role: 'system' | 'user' | 'assistant' | 'ipython'; content: string }>,
   tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
   // dateString exists so tests can pin the fixture date; live chat renders
   // today's, exactly like mlx_lm running the template with strftime_now.

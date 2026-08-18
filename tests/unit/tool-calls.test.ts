@@ -24,6 +24,7 @@ import {
   parseToolCalls,
   renderAssistantCalls,
   renderToolResults,
+  foldToolResults,
   withTools,
   type ToolCall,
   type ToolChatMessage,
@@ -278,6 +279,103 @@ describe('renderToolResults', () => {
       { role: 'user', content: 'thanks' },
     ])
     expect(out).toBe(LLAMA3_CALL_AND_RESULT)
+  })
+})
+
+/**
+ * The vendor fixture with our ONE deliberate divergence applied: in
+ * non-thinking mode our builder re-renders PAST assistant turns with the empty
+ * <think> block, because those tokens really were generated and it makes each
+ * turn a token-level extension of the last, which is what cross-turn prefix
+ * reuse matches on (tokenizer-bpe.ts buildChatPrompt). The fixture's TRAILING
+ * generation prompt already carries the block — that is the template's own
+ * enable_thinking=false branch — so only interior turns need it, hence the
+ * lookahead.
+ */
+const asWeRender = (fixture: string) =>
+  fixture.replace(/<\|im_start\|>assistant\n(?!<think>)/g, '<|im_start|>assistant\n<think>\n\n</think>\n\n')
+
+describe('foldToolResults — the step both hosts skipped', () => {
+  // The shipped behaviour was `role === 'tool' ? 'user'` with the tool's output
+  // as the whole content. These assert against the vendor fixtures, so they
+  // fail on that: an unwrapped result cannot produce the template's text.
+
+  it('wraps a Qwen3.6 result in <tool_response> — the whole round matches vendor', () => {
+    const call: ToolCall = { name: 'get_weather', arguments: { city: 'İstanbul', days: 2 } }
+    const out = chatml(foldToolResults('chatml-xml', [
+      { role: 'user', content: 'weather in Istanbul?' },
+      { role: 'assistant', content: renderAssistantCalls('chatml-xml', '', [call]) },
+      { role: 'tool', content: '18C, clear' },
+      { role: 'user', content: 'thanks' },
+    ]))
+    expect(out).toBe(asWeRender(QWEN36_CALL_AND_RESULT))
+    // Name the failure the old code produced, so a regression reads clearly.
+    expect(out).toContain('<|im_start|>user\n<tool_response>\n18C, clear\n</tool_response><|im_end|>')
+    expect(out).not.toContain('<|im_start|>user\n18C, clear<|im_end|>')
+  })
+
+  it('does the same for the Qwen3-era JSON dialect', () => {
+    const call: ToolCall = { name: 'get_weather', arguments: { city: 'İstanbul', days: 2 } }
+    expect(chatml(foldToolResults('chatml-json', [
+      { role: 'user', content: 'weather in Istanbul?' },
+      { role: 'assistant', content: renderAssistantCalls('chatml-json', '', [call]) },
+      { role: 'tool', content: '18C, clear' },
+      { role: 'user', content: 'thanks' },
+    ]))).toBe(asWeRender(QWEN3_CALL_AND_RESULT))
+  })
+
+  it('collapses CONSECUTIVE results into one turn, as the template does', () => {
+    const a: ToolCall = { name: 'get_weather', arguments: { city: 'A' } }
+    const b: ToolCall = { name: 'get_weather', arguments: { city: 'B' } }
+    const folded = foldToolResults('chatml-xml', [
+      { role: 'user', content: 'both?' },
+      { role: 'assistant', content: renderAssistantCalls('chatml-xml', '', [a, b]) },
+      { role: 'tool', content: '18C' },
+      { role: 'tool', content: '21C' },
+      { role: 'user', content: 'thanks' },
+    ])
+    // Four turns, not five: the two results share one <|im_start|>user block.
+    expect(folded).toHaveLength(4)
+    expect(chatml(folded)).toBe(asWeRender(QWEN36_TWO_CALLS))
+  })
+
+  it('a run broken by another role starts a new turn', () => {
+    // Two separate rounds are two separate turns. Collapsing them would put a
+    // later round's output inside an earlier round's block.
+    const folded = foldToolResults('chatml-xml', [
+      { role: 'tool', content: 'first' },
+      { role: 'user', content: 'and now?' },
+      { role: 'tool', content: 'second' },
+    ])
+    expect(folded.map((m) => m.role)).toEqual(['user', 'user', 'user'])
+    expect(folded[0].content).toBe('<tool_response>\nfirst\n</tool_response>')
+    expect(folded[1].content).toBe('and now?')
+    expect(folded[2].content).toBe('<tool_response>\nsecond\n</tool_response>')
+  })
+
+  it('gives each Llama-3 result its own ipython turn, quoted', () => {
+    const out = llama3(foldToolResults('llama3', [
+      { role: 'user', content: 'weather in Istanbul?' },
+      { role: 'assistant', content: renderAssistantCalls('llama3', '', [{ name: 'get_weather', arguments: { city: 'İstanbul', days: 2 } }]) },
+      { role: 'tool', content: '18C, clear' },
+      { role: 'user', content: 'thanks' },
+    ]))
+    expect(out).toBe(LLAMA3_CALL_AND_RESULT)
+  })
+
+  it('leaves a conversation with no tool turns byte-identical', () => {
+    const msgs: ToolChatMessage[] = [
+      { role: 'system', content: 'You are terse.' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello' },
+    ]
+    expect(foldToolResults('chatml-xml', msgs)).toEqual(msgs)
+  })
+
+  it('survives a conversation that is nothing but results', () => {
+    expect(foldToolResults('chatml-xml', [{ role: 'tool', content: 'x' }]))
+      .toEqual([{ role: 'user', content: '<tool_response>\nx\n</tool_response>' }])
+    expect(foldToolResults('chatml-xml', [])).toEqual([])
   })
 })
 

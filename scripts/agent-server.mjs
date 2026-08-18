@@ -90,14 +90,19 @@ function flattenContent(content) {
 /**
  * OpenAI roles → what the chat templates understand.
  * `developer` is the newer spelling of `system` and clients do send it.
- * `tool` turns are folded to `user`, which is what every template in this repo
- * renders a tool response as.
+ *
+ * `tool` is passed through UNCHANGED. It used to be folded to `user` right
+ * here, which reads as harmless — a tool response does render in a user turn —
+ * but the content also has to be wrapped in the template's <tool_response>
+ * markers, and that needs the dialect, which only the tab knows. Folding early
+ * destroyed the role and the wrapping never happened. agent-host.ts calls
+ * foldToolResults once it has the dialect.
  */
 function normalizeMessages(messages) {
   const out = []
   for (const m of messages ?? []) {
-    const role = m.role === 'developer' ? 'system' : m.role === 'tool' ? 'user' : m.role
-    if (role !== 'system' && role !== 'user' && role !== 'assistant') continue
+    const role = m.role === 'developer' ? 'system' : m.role
+    if (role !== 'system' && role !== 'user' && role !== 'assistant' && role !== 'tool') continue
     out.push({ role, content: flattenContent(m.content), toolCalls: m.tool_calls, toolCallId: m.tool_call_id })
   }
   return out

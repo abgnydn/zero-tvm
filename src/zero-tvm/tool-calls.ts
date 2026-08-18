@@ -325,6 +325,50 @@ export function renderToolResults(dialect: ToolDialect, results: string[]): Tool
   }]
 }
 
+/**
+ * Fold OpenAI `tool` turns into the turns a chat template understands.
+ *
+ * This is the step both hosts were missing. They mapped role 'tool' to 'user'
+ * and passed the tool's output through as the turn's whole content, so the
+ * model received
+ *
+ *     <|im_start|>user\nexport const WIDTH = 12<|im_end|>
+ *
+ * where its own template produces
+ *
+ *     <|im_start|>user\n<tool_response>\nexport const WIDTH = 12\n</tool_response><|im_end|>
+ *
+ * Nothing errors on the unwrapped form. The model reads a tool's output as
+ * something the USER typed, which it mostly survives for one or two results and
+ * stops surviving once a conversation is deep enough to need the frame.
+ *
+ * renderToolResults has done the wrapping correctly, and had tests, since it was
+ * written — it simply had no callers. Hence this: ONE fold, called by both
+ * hosts, rather than two hand-rolled copies free to drift apart again.
+ *
+ * Consecutive tool turns collapse into a single turn, because that is what the
+ * ChatML templates do (one `<|im_start|>user` opened before the first result and
+ * closed after the last). A run broken by any other role starts a new turn.
+ */
+export function foldToolResults(
+  dialect: ToolDialect,
+  messages: Array<{ role: ToolChatMessage['role'] | 'tool'; content: string }>,
+): ToolChatMessage[] {
+  const out: ToolChatMessage[] = []
+  let run: string[] = []
+  const flush = () => {
+    if (run.length) out.push(...renderToolResults(dialect, run))
+    run = []
+  }
+  for (const m of messages) {
+    if (m.role === 'tool') { run.push(m.content); continue }
+    flush()
+    out.push(m as ToolChatMessage)
+  }
+  flush()
+  return out
+}
+
 // ============================================================
 // Parse
 // ============================================================

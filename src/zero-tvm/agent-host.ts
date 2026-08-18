@@ -30,7 +30,7 @@ import { parseVariantFlags, type VariantFlags } from './variants.js'
 import { poolSave, poolTryRestore, type PoolConfig } from './kv-pool.js'
 import { specFromSearch, buildChatPromptFor, modelBranding } from './model-select.js'
 import {
-  withTools, parseToolCalls, renderAssistantCalls,
+  withTools, parseToolCalls, renderAssistantCalls, foldToolResults,
   type ToolDef, type ToolDialect, type ToolChatMessage,
 } from './tool-calls.js'
 
@@ -263,7 +263,7 @@ async function run(job: Job): Promise<void> {
     // call from the transcript, and from turn 2 onward the model would not see
     // what it had already done. Render it back in this dialect's own syntax,
     // which is the same text the model emitted in the first place.
-    let messages: ToolChatMessage[] = job.messages.map((m) => {
+    let messages: ToolChatMessage[] = foldToolResults(dialect, job.messages.map((m) => {
       if (m.role !== 'assistant' || !m.toolCalls?.length) return { role: m.role, content: m.content }
       const calls = m.toolCalls.map((c) => {
         let args: Record<string, unknown> = {}
@@ -271,7 +271,7 @@ async function run(job: Job): Promise<void> {
         return { name: c.function?.name ?? '', arguments: args }
       })
       return { role: m.role, content: renderAssistantCalls(dialect, m.content ?? '', calls) }
-    })
+    }))
     if (job.tools?.length) messages = withTools(dialect, messages, job.tools)
 
     const promptIds = buildChatPromptFor(spec, messages as Parameters<typeof buildChatPromptFor>[1], tokenizer)

@@ -23,6 +23,7 @@ import { randomUUID } from 'node:crypto'
 import { installShims } from './native/shims.mjs'
 import { panelHtml } from './native/panel.mjs'
 import { startWeightsMirror } from './native/weights-mirror.mjs'
+import { makeNormalizer } from './native/messages.ts'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -104,55 +105,7 @@ const poolCfg = () => ({
 
 // ---- the same request semantics as the browser host ------------------------
 
-const flattenContent = (c) => typeof c === 'string' ? c
-  : Array.isArray(c) ? c.map((p) => typeof p === 'string' ? p : p?.type === 'text' ? (p.text ?? '') : '').join('') : ''
-
-/**
- * VERBATIM ASSISTANT TURNS — what the model wrote, not a reconstruction.
- *
- * A client hands assistant turns back as STRUCTURE (content + tool_calls),
- * because that is what the OpenAI shape carries. Re-rendering that structure
- * produces text that is *equivalent* but rarely byte-identical to what the
- * model emitted — different whitespace inside a <tool_call> block is enough.
- * Different text means different tokens, which means the new prompt stops
- * matching the KV cache at the FIRST assistant turn, and the engine has to
- * re-prefill the entire conversation. Measured on a real Cline session: a
- * 16,454-token prompt re-prefilled in full, 98s to first token, when only
- * 4,733 tokens were new.
- *
- * So the raw output is kept, keyed by the structure the client will send
- * back, and substituted on the next turn. Bounded, and a miss simply falls
- * back to re-rendering — the old behaviour, never an error.
- */
-const RAW_CACHE = new Map()
-const RAW_CACHE_MAX = 64
-const rawKey = (content, calls) => JSON.stringify([content ?? '',
-  (calls ?? []).map((c) => [c.name, JSON.stringify(c.arguments ?? {})])])
-function rememberRaw(text, calls, raw) {
-  const k = rawKey(text, calls)
-  RAW_CACHE.delete(k)
-  RAW_CACHE.set(k, raw)
-  while (RAW_CACHE.size > RAW_CACHE_MAX) RAW_CACHE.delete(RAW_CACHE.keys().next().value)
-}
-
-function normalize(messages) {
-  const out = []
-  for (const m of messages ?? []) {
-    const role = m.role === 'developer' ? 'system' : m.role === 'tool' ? 'user' : m.role
-    if (role !== 'system' && role !== 'user' && role !== 'assistant') continue
-    let content = flattenContent(m.content)
-    if (m.role === 'assistant' && m.tool_calls?.length) {
-      const calls = m.tool_calls.map((c) => {
-        let a = {}; try { a = JSON.parse(c.function?.arguments || '{}') } catch { /* keep {} */ }
-        return { name: c.function?.name ?? '', arguments: a }
-      })
-      const raw = RAW_CACHE.get(rawKey(content, calls))
-      content = raw ?? S.renderAssistantCalls(dialect, content ?? '', calls)
-    }
-    out.push({ role, content })
-  }
-  return out
-}
+const { normalize, rememberRaw } = makeNormalizer(S, dialect)
 
 let busy = false
 /** What the CURRENT request is doing, for anything watching: prompt
