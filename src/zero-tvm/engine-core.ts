@@ -785,22 +785,38 @@ export function buildDecodeEngine(
   /** Absorbed-token position each slot's state sits at; -1 = empty. */
   const gdnCkptPos: number[] = new Array(GDN_CKPT_SLOTS).fill(-1)
   let gdnCkptNext = 0
-  for (let slot = 0; slot < GDN_CKPT_SLOTS; slot++) {
-    const conv: (GPUBuffer | null)[] = []
-    const recur: (GPUBuffer | null)[] = []
-    for (let L = 0; L < S.layers; L++) {
-      if (gdnConvState[L]) {
-        conv.push(makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `gdnCkptConv_${slot}_${L}`))
-        recur.push(makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `gdnCkptRecur_${slot}_${L}`))
-      } else { conv.push(null); recur.push(null) }
+
+  /**
+   * Allocate the ring on FIRST USE, not at build time.
+   *
+   * Only the chunked-prefill loop ever writes a snapshot, and whether chunking
+   * exists is decided thousands of lines below this — from subgroup support,
+   * `?chunk=0` and the pooled-expert path. Allocating up front burned 0.19 GB
+   * (qwen35) to 0.57 GB (qwen38) on every engine that can never fill it:
+   * devices without subgroups, anyone passing ?chunk=0, and the pooled builds
+   * whose whole purpose is using less memory. Worst on the weakest hardware,
+   * which is exactly backwards.
+   */
+  function ensureGdnCkptBuffers(): void {
+    if (GDN_CKPT_SLOTS === 0 || gdnCkptConv.length > 0) return
+    for (let slot = 0; slot < GDN_CKPT_SLOTS; slot++) {
+      const conv: (GPUBuffer | null)[] = []
+      const recur: (GPUBuffer | null)[] = []
+      for (let L = 0; L < S.layers; L++) {
+        if (gdnConvState[L]) {
+          conv.push(makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `gdnCkptConv_${slot}_${L}`))
+          recur.push(makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `gdnCkptRecur_${slot}_${L}`))
+        } else { conv.push(null); recur.push(null) }
+      }
+      gdnCkptConv.push(conv)
+      gdnCkptRecur.push(recur)
     }
-    gdnCkptConv.push(conv)
-    gdnCkptRecur.push(recur)
   }
 
   /** Snapshot the live GDN state as the rewind point for `pos`. */
   function saveGdnCkpt(pos: number): void {
     if (GDN_CKPT_SLOTS === 0) return
+    ensureGdnCkptBuffers()
     const slot = gdnCkptNext
     const enc = device.createCommandEncoder()
     for (let L = 0; L < S.layers; L++) {
@@ -815,6 +831,9 @@ export function buildDecodeEngine(
   }
 
   function restoreGdnCkpt(slot: number): void {
+    // Unreachable before a save (gdnCkptPos is all -1 until then), but the ring
+    // is now lazily allocated, so state the dependency rather than rely on it.
+    if (gdnCkptConv.length === 0) return
     const enc = device.createCommandEncoder()
     for (let L = 0; L < S.layers; L++) {
       const c = gdnConvState[L], r = gdnRecurState[L]

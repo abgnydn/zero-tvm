@@ -224,7 +224,7 @@ Where the sections above interrogated TVM's compiled runtime from the outside, Z
 
 > For **one specific model** (Phi-3 Mini, Q4F16_1) on **one specific runtime** (the browser, via WebGPU), how much of the compiler / runtime stack is actually load-bearing?
 
-The answer this repo ships: 11 hand-written WGSL shaders ([`src/compiler/shaders/`](src/compiler/shaders/)), ~14 kB of TypeScript runtime ([`src/compiler/runtime.ts`](src/compiler/runtime.ts) + [`src/zero-tvm/`](src/zero-tvm/)), and no ML framework runtime in the hot path. Decode uses 228 dispatches/token on this repo's forward pass, versus the 342 dispatches/token measured from TVM-WebLLM running the same Q4 weights.
+The answer this repo ships: ten hand-written WGSL kernel roles ([`src/compiler/shaders/`](src/compiler/shaders/)), ~14 kB of TypeScript runtime ([`src/compiler/runtime.ts`](src/compiler/runtime.ts) + [`src/zero-tvm/`](src/zero-tvm/)), and no ML framework runtime in the hot path. Decode uses 228 dispatches/token on this repo's forward pass, versus the 342 dispatches/token measured from TVM-WebLLM running the same Q4 weights.
 
 ## Timing Context
 
@@ -286,7 +286,7 @@ Speed (2026-07-30 same-session head-to-head): Zero-TVM measures 69.55 tok/s tota
 
 ## What This Repo Is NOT
 
-- **Not a compiler.** Nothing here emits WGSL. The 11 shaders are human-written.
+- **Not a compiler.** Nothing here emits WGSL. The ten kernel roles are human-written.
 - **Not cross-architecture.** Hard-coded to Phi-3 Mini with Q4F16_1 weights. No Llama / Qwen / Gemma path without shader work.
 - **Not cross-runtime.** Browser WebGPU only. No Node / Bun / Deno target.
 - **Not a production replacement for Transformers.js v4.** It does fewer things, on purpose.
