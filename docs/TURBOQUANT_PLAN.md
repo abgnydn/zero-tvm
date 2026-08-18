@@ -426,6 +426,41 @@ absurd — this repo shipped the 3-bit expert build at +8.4% — but there is no
 reason to spend quality on a first implementation when the free option
 delivers the same kernels.
 
+## Phase 1 BUILT (2026-08-17/18) — int8 KV runs where context is the cost
+
+Shipped and GPU-verified. int8 KV had been gated to the fused QKV path, which
+is Phi-3 and nothing else: a 4k window where the cache never binds. It now runs
+on the unfused path, on hybrids, and through chunked prefill.
+
+| model | result |
+|---|---|
+| llama32 (dense MLX, head-dim 64) | 5/6 greedy answers token-identical; 6,211-token chunked prompt token-identical |
+| qwen35 (hybrid, head-dim 256) | **6/6** token-identical; 7,037-token chunked prompt token-identical |
+| qwen36q3 (hybrid MoE, the one that wanted it) | 5/6 token-identical, the sixth a correct paraphrase |
+
+Cost: ~5-8% of prefill throughput (llama32 681→625 tok/s, qwen35 443→419) for
+the quantize dispatch and the unpack in the score loop. Memory on qwen36q3 is
+**1.98x** — 2.50 GB → 1.26 GB at 131k, 5.00 GB → 2.52 GB at 262k.
+
+**Two bugs found by building it, both silent:**
+
+1. `allocKVPagesInt8` counted `spec.layers` where `allocKVPages` counts
+   ATTENTION layers. Equal while int8 was fused-only; on Qwen3.6 that is 40
+   buffers for 10 KV layers, quadrupling the memory the feature exists to
+   halve.
+2. **The pack phase covered only the first 32 words of a row.** Each of 32
+   threads wrote one u32 and returned, which is correct only while
+   `KV_I8_ROW_WORDS` (HEAD_DIM/4) <= 32 — true for Phi-3 (24) and Qwen3 (32),
+   false at HEAD_DIM 256, where 64 words meant **dims 128..255 were never
+   written** and each row's top half kept whatever the buffer held. Every
+   head-dim-256 model we ship is affected: Qwen3.5, Qwen3.6, Qwen3.8.
+   It produced fluent, plausible, WRONG text — "12" for 17+25 where f16 said
+   "42" — not noise. That is the kind of latent bug that ships, and it was
+   only ever reachable once int8 left Phi-3.
+
+Still excluded, by a throw that names the reason: MLA (caches a latent, not
+per-head K/V).
+
 ## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;
