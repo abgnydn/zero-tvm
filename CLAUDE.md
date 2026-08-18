@@ -104,8 +104,8 @@ keeps the QKV matmul unfused (QK-norm is incompatible with the fused QKV
 kernel) but since the 2026-07-29 tuning round runs the fused
 `qk_norm_rope_append` kernel after it (**8 dispatches/layer**; `?fuseqk=0`
 restores the 10-dispatch reference chain) and the `_vec4h` K%512 matmul
-variants on d=2560 / ffn=9728 (`?vec4h=0` opts out). Still no int8-KV —
-see BENCH.md's Qwen sections for the measured WebLLM gap.
+variants on d=2560 / ffn=9728 (`?vec4h=0` opts out). int8 KV works here since 2026-08-17 (`?kv8=1`,
+opt-in) — see BENCH.md's Qwen sections for the measured WebLLM gap.
 
 ```bash
 node scripts/download-weights.mjs --model qwen3   # ~2.3 GB → .weights-local/

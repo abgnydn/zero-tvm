@@ -1277,7 +1277,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <div class="callout warning">
   <div class="callout-title">WebLLM reaches the first token sooner than we do</div>
   <p>WebLLM's self-reported prefill runs at 251 tok/s on Phi-3 and 263–271 tok/s on Qwen3-4B. Against the ~35-token bench prompt that implies a TTFT of roughly <strong>150 ms</strong> on Phi-3, where we measure <strong>291 ms</strong>; on Qwen3-4B our <strong>453 ms</strong> is worse still. Only Qwen3.5-4B is a wash (our 171 ms vs an implied ~0.2 s). Stated plainly: <strong>we win sustained decode decisively and lose the first-token sprint on short inputs.</strong></p>
-  <p>It is specifically a <em>short</em>-prompt weakness. Chunked prefill measures 202 tok/s on an 816-token prompt (2026-07-29), and cross-turn prefix reuse removes prefill entirely on follow-up turns. What is not competitive is the fixed cost of a short, cold prefill on a cold prefill with nothing cached to reuse. It is the top open item on BENCH.md's levers list.</p>
+  <p>It is specifically a <em>short</em>-prompt weakness. Chunked prefill measures 202 tok/s on an 816-token prompt (2026-07-29), and cross-turn prefix reuse removes prefill entirely on follow-up turns. What is not competitive is the fixed cost of a short, cold prefill with nothing cached to reuse. It is the top open item on BENCH.md's levers list.</p>
 </div>
 
 <h3>How the result flipped (22% behind &rarr; +16% total / +31% decode ahead)</h3>

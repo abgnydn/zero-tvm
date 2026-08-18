@@ -15,12 +15,18 @@ tags:
   - on-device
   - wgsl
 models:
-  - Qwen/Qwen3.5-4B
-  - Qwen/Qwen3-4B
   - microsoft/Phi-3-mini-4k-instruct
-  - mlc-ai/Qwen3.5-4B-q4f16_1-MLC
-  - mlc-ai/Qwen3-4B-q4f16_1-MLC
+  - Qwen/Qwen3-4B
+  - Qwen/Qwen3.5-4B
+  - meta-llama/Llama-3.2-1B-Instruct
   - mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC
+  - mlc-ai/Qwen3-4B-q4f16_1-MLC
+  - mlc-ai/Qwen3.5-4B-q4f16_1-MLC
+  - mlx-community/Qwen3-4B-4bit
+  - mlx-community/Qwen3-30B-A3B-4bit
+  - mlx-community/Llama-3.2-1B-Instruct-4bit
+  - lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit
+  - abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp
 ---
 
 # Zero-TVM
@@ -58,7 +64,7 @@ The Space opens on a character-select entrance: pick a model and it loads and ch
 
 Picking a character starts the download immediately — the sheet shows the weight size before you click, and there is no second confirmation. It streams ~2 GB of Phi-3-mini-q4f16_1 weights from the Hugging Face mirror at [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC) into OPFS (Origin Private File System).
 
-Subsequent loads are instant: a Service Worker intercepts the mirror URLs, so every page sharing those weights is gate-free after the first download.
+Subsequent loads are instant — the weights stay in OPFS, so returning to a model you have already downloaded starts it straight away.
 
 **Requirements**: Chrome / Edge with WebGPU enabled and the `shader-f16` feature available (default on macOS Apple-Silicon, enabled on most modern Windows / Linux GPUs).
 

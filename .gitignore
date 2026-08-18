@@ -19,4 +19,8 @@ docs/webgpu-placement/real_chunked_scan.onnx
 # working draft, not for publication
 docs/tjs-1599-comment.md
 docs/gpuweb-6338-comment.md
+# Same class as the two above: an unpublished draft. It was tracked by mistake,
+# and it carries a shader FILE COUNT — the thing CLAUDE.md forbids publishing,
+# which went stale the day it was written.
+docs/reddit-webgpu-moe-draft.md
 .station.json

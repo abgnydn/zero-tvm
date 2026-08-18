@@ -296,9 +296,29 @@ It IS a minimal-surface-area demonstration that for one fixed model shape, the c
 
 ## Experimental: int8 KV Cache
 
-An opt-in int8 KV cache path is checked in but not enabled by default. It adds three shaders — [`qkv_fused_scratch.wgsl`](src/compiler/shaders/qkv_fused_scratch.wgsl), [`kv_quantize_int8.wgsl`](src/compiler/shaders/kv_quantize_int8.wgsl), [`attention_int8.wgsl`](src/compiler/shaders/attention_int8.wgsl) — and flips the per-layer decode path to write K,V into a scratch f16 slot, quantize that slot to int8 with a per-(head, slot, K|V) f16 scale, and dequant on read inside the attention shader.
+An opt-in int8 KV cache halves KV memory. As of 2026-08-17/18 it runs on the
+unfused path, on hybrid (GDN) specs and through chunked prefill — it was gated
+to the fused QKV composition before that, which meant Phi-3 alone and so no
+model where context is the constraint. MLA is the one exclusion: it caches a
+latent rather than per-head K/V.
 
-Trade-off: one extra dispatch per layer (32 → 260 total/token), KV memory halved from ~1.6 GB to ~800 MB for the 4K context. Toggle is `USE_INT8_KV` in [`src/zero-tvm/chat.ts`](src/zero-tvm/chat.ts). The code compiles and the math is self-consistent, but it has not been validated for output parity against the f16 baseline on real hardware — do not flip it for production use without running your own correctness check.
+Shaders: [`kv_quantize_int8.wgsl`](src/compiler/shaders/kv_quantize_int8.wgsl)
+(quantise on append, one f16 scale per (page, slot, head, K|V)),
+[`attention_int8.wgsl`](src/compiler/shaders/attention_int8.wgsl) (decode) and
+[`attention_prefill_int8.wgsl`](src/compiler/shaders/attention_prefill_int8.wgsl)
+(chunked prefill); the fused path additionally uses
+[`qkv_fused_scratch.wgsl`](src/compiler/shaders/qkv_fused_scratch.wgsl).
+
+Enable with `?kv8=1` on the chat page, or `int8KV` via the library. Cost is one
+extra dispatch per layer and ~5-8% of prefill throughput; memory is 1.98x
+smaller.
+
+VALIDATED, which the earlier version of this section said it was not: paired
+perplexity against an f16 cache on Qwen3.6-35B-A3B measured -0.09% at 1k
+windows and +0.10% at 4k, both within noise; greedy output is token-identical
+to f16 on llama32 (5/6 prompts, sixth differs by a trailing period), qwen35
+(6/6) and qwen36q3 (5/6, sixth a correct paraphrase). See
+docs/TURBOQUANT_PLAN.md for the measurements and for why 4-bit was rejected.
 
 ## Planned: Multi-Token Batched Forward
 

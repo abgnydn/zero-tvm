@@ -390,7 +390,7 @@ inner-product error was used to judge what only attention output could answer.
 **Stop using offline error metrics for go/no-go. They rank; they do not
 decide.**
 
-For scale: this repo shipped the 3-bit expert build at +8.4% perplexity. A
+For scale: this repo shipped the 3-bit expert build at +10.4% perplexity. A
 KV quantizer at +0.55% is an order of magnitude inside that.
 
 The verdict banding in `kv-quality-ab.py` was fixed as a result: 4-bit landed
@@ -436,7 +436,7 @@ from a working 8-bit path rather than a fresh one — with the 32k measurement
 as its gate.
 
 For scale, the trade being declined: +0.77% buys 3.9x instead of 2.0x. Not
-absurd — this repo shipped the 3-bit expert build at +8.4% — but there is no
+absurd — this repo shipped the 3-bit expert build at +10.4% — but there is no
 reason to spend quality on a first implementation when the free option
 delivers the same kernels.
 

@@ -11,7 +11,7 @@ same file as this table's source, so they cannot drift far.
 | Area | Supported | Not supported | Lifting it needs |
 |---|---|---|---|
 | Weight format | MLC q4f16_1 shards (group 32, symmetric); MLX safetensors (group 64, affine, 4-bit; 8-bit router; 3-bit expert stacks via convert-q3-experts) | f16/bf16 unquantised, GPTQ/AWQ, other group sizes | new dequant paths in int4_matmul.gen.ts |
-| Attention | MHA and GQA, headDim %32 ≤256, full RoPE or partial (rotary fraction), qk-norm optional, gated attention (Qwen3.5/3.6), paged f16 KV; int8 KV for headDim ≤128 | sliding window, MLA, ALiBi, softcap, attention biases | windowed/MLA variants of attention.wgsl; bias epilogue in matmuls |
+| Attention | MHA and GQA, headDim %32 ≤256, full RoPE or partial (rotary fraction), qk-norm optional, gated attention (Qwen3.5/3.6), paged f16 KV; int8 KV on any headDim (packing strides, so 256 is covered) | sliding window, MLA, ALiBi, softcap, attention biases | windowed/MLA variants of attention.wgsl; bias epilogue in matmuls |
 | RoPE | plain theta (any base), partial rotary factor, llama3 and yarn frequency scaling (precomputed inv_freq table; yarn also scales attention logits by mscale^2) | longrope frequency scaling | a frequency formula in model-spec.ts ropeInvFreqTable() — rope.wgsl already reads the table |
 | FFN | SwiGLU dense (fused kernel for MLC, matmul+silu_mul chain for MLX-affine) | GeGLU / ReLU / non-gated FFN, FFN biases | activation-parameterised fused_ffn.wgsl + silu_mul.wgsl |
 | Norm | RMSNorm with plain gamma | LayerNorm (beta), Gemma-style (1+gamma), post-norm sandwiches | variants of rms_norm/add_norm.wgsl |
