@@ -7,7 +7,7 @@ sdk: static
 pinned: true
 license: mit
 thumbnail: https://huggingface.co/spaces/abgunaydin/zero-tvm/resolve/main/og.png
-short_description: Phi-3 to a 35B sparse MoE, in the browser on hand-written WGSL
+short_description: Phi-3 to a 35B MoE in the browser, on hand-written WGSL
 tags:
   - webgpu
   - llm

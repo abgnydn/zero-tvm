@@ -29,6 +29,27 @@ echo "==> Building dist/"
 
 [[ -f "$ROOT/hf-space/README.md" ]] || { echo "Missing hf-space/README.md" >&2; exit 1; }
 
+# Validate the YAML card BEFORE pushing. HF enforces these in a pre-receive
+# hook, which means a violation costs a full build, an LFS upload of every
+# asset, and a rejection — after which the Space still serves the old card.
+# A 62-character short_description cost exactly that once.
+node -e '
+  const fs = require("fs")
+  const t = fs.readFileSync(process.argv[1], "utf8")
+  const m = /^---\n([\s\S]*?)\n---/.exec(t)
+  if (!m) { console.error("hf-space/README.md has no YAML front matter"); process.exit(1) }
+  const fm = m[1]
+  const fail = (s) => { console.error("HF card invalid: " + s); process.exit(1) }
+  const sd = /^short_description:\s*(.+)$/m.exec(fm)
+  if (!sd) fail("no short_description")
+  const v = sd[1].trim().replace(/^["\x27]|["\x27]$/g, "")
+  if (v.length > 60) fail(`short_description is ${v.length} chars, HF allows 60 — "${v}"`)
+  for (const k of ["title", "sdk", "emoji"]) {
+    if (!new RegExp("^" + k + ":", "m").test(fm)) fail("missing required key: " + k)
+  }
+  console.log(`==> HF card OK (short_description ${v.length}/60 chars)`)
+' "$ROOT/hf-space/README.md"
+
 # Throwaway work dir (kept under .tests-cache/ so it's already gitignored).
 WORK_DIR="$(mktemp -d "$ROOT/.tests-cache/space-deploy.XXXXXX" 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/space-deploy.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
