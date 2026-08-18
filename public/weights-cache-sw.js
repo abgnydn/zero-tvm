@@ -2,8 +2,8 @@
 /**
  * weights-cache-sw.js — Phi-3 weight cache, shared by any page that loads those weights.
  *
- * Both zero-tvm's hand-written loader and WebLLM (used by compiler-chat /
- * webllm-bench) fetch the same files from the HF mirror at
+ * Both zero-tvm's hand-written loader and WebLLM fetch the same files from the
+ * HF mirror at
  * `huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC/resolve/main/*`.
  * Without this SW each cache their own copy, so visiting both pages downloads
  * 1.8 GB twice. This SW intercepts those URLs and serves from a shared OPFS
