@@ -57,7 +57,12 @@ export interface VariantFlags {
   qkvTile2: boolean
   sgFfn: boolean
   matmul: MatmulVariant
-  /** int8 KV cache opt-in (?kv8=1). Consumed by the page's KV allocation, not by pipeline resolution. */
+  /** int8 KV cache — DEFAULT ON since 2026-08-18; `?kv8=0` opts out. It halves
+   *  the cache for a cost measured end to end at -0.09% perplexity on 1k
+   *  windows and +0.10% on 4k, both within noise, and greedy output that is
+   *  token-identical to f16 on llama32, qwen35 and qwen36q3
+   *  (docs/TURBOQUANT_PLAN.md). Consumed by the page's KV allocation, not by
+   *  pipeline resolution. MLA specs ignore it — they cache a latent. */
   int8KV: boolean
   /** vec4-load int4 matmuls — default ON (measured +4.5% on M2 Max); ?vec4=0 to disable. */
   vec4: boolean
@@ -136,7 +141,7 @@ export function parseVariantFlags(
     //   sg     — naive 32-thread + subgroupAdd (experimental, slower than scalar on Apple)
     //   scalar — original 64-thread tree reduction
     matmul: (q.get('matmul') ?? (sgAll ? 'tiled' : 'scalar')) as MatmulVariant,
-    int8KV: q.get('kv8') === '1',
+    int8KV: q.get('kv8') !== '0',
     // vec4 loads: measured +7% decode on M2 Max (BENCH.md 2026-07-25 A/B),
     // default ON where the sg32 builds exist; ?vec4=0 / ?vec4qkv=0 to A/B off.
     vec4: sgAll && q.get('vec4') !== '0',

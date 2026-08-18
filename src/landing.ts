@@ -32,10 +32,25 @@ interface Group { name: string; params: string; variants: Variant[] }
  *  the build rather than a figure typed into the page. */
 const ctxLabel = (t: number): string => (t >= 1024 ? `${Math.round(t / 1024)}k` : String(t))
 
+/** Whether the engine this page hands off to will quantise its KV cache.
+ *  Default ON; `?kv8=0` opts out — the SAME rule variants.ts applies, read
+ *  here rather than assumed, so the price shown is the price charged. */
+const INT8_KV = new URLSearchParams(location.search).get('kv8') !== '0'
+
+/** KV bytes per token AS ALLOCATED. int8 KV is the default (`?kv8=0` opts
+ *  out), so the cache is half the f16 width plus one f16 scale per
+ *  (token, kv head, side) — the scales are ~0.05% here, included because a
+ *  figure headed "will it fit" should not round away the thing it allocates.
+ *  MLA caches a latent and the int8 path does not cover it, so it stays f16. */
+const kvBytesPerToken = (spec: ModelSpec, int8: boolean): number =>
+  int8 && !spec.mla
+    ? spec.kvBytesPerToken / 2 + 2 * spec.kvHeads * 2
+    : spec.kvBytesPerToken
+
 /** What a context window costs: KV bytes, from the spec's own per-token rate.
  *  Computed, never typed — the same rule as every other figure here. */
-const kvPrice = (spec: ModelSpec, tokens: number): string => {
-  const b = tokens * spec.kvBytesPerToken
+const kvPrice = (spec: ModelSpec, tokens: number, int8: boolean): string => {
+  const b = tokens * kvBytesPerToken(spec, int8)
   return b >= 2 ** 30 ? `${(b / 2 ** 30).toFixed(1)} GB KV` : `${Math.round(b / 2 ** 20)} MB KV`
 }
 
@@ -338,7 +353,7 @@ function render(): void {
     // carries its true KV price, computed from the spec's own per-token rate.
     el('.mb-ctxs').innerHTML = ctxs.length < 2 ? '' : ctxs.map((c, i) =>
       `<button class="mb-variant mb-ctx" data-x="${i}" role="tab" aria-selected="${i === xi}">`
-      + `${c.name} · ${ctxLabel(c.tokens)} · ~${kvPrice(v.spec, c.tokens)}</button>`).join('')
+      + `${c.name} · ${ctxLabel(c.tokens)} · ~${kvPrice(v.spec, c.tokens, INT8_KV)}</button>`).join('')
     ;(el('.mb-ctxs-label') as HTMLElement).hidden = ctxs.length < 2
 
     el('.mb-variants').innerHTML = g.variants.length < 2 ? '' : g.variants.map((x, i) =>
@@ -376,7 +391,7 @@ function render(): void {
         const ring = gdnLayers
           ? (4 * gdnLayers * ((sp.gdnConvK - 1) * sp.gdnQkvDim * 2 + sp.gdnVHeads * sp.gdnStatePerHead * 4)) / 2 ** 30
           : 0
-        footprintGb = w + (cx.tokens * sp.kvBytesPerToken) / 2 ** 30 + ring
+        footprintGb = w + (cx.tokens * kvBytesPerToken(sp, INT8_KV)) / 2 ** 30 + ring
         rows.push(['Footprint', `~${footprintGb.toFixed(1)} GB <span class="mb-hw">weights + KV${ring ? ' + state' : ''}</span>`])
       }
     }
@@ -437,7 +452,7 @@ function render(): void {
       ? `needs ~${needGb} GB free RAM${qualifier ? ` — ${qualifier}` : ''}`
       : authored
     const ctxNote = cx.tokens > v.spec.maxContext
-      ? `long context allocates ~${kvPrice(v.spec, cx.tokens)} at boot, on top of the weights`
+      ? `long context allocates ~${kvPrice(v.spec, cx.tokens, INT8_KV)} at boot, on top of the weights`
       : ''
     ram.textContent = [baseNote, ctxNote].filter(Boolean).join(' — ')
     ram.hidden = !(baseNote || ctxNote)
