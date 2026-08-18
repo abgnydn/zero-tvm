@@ -42,6 +42,17 @@ const get = (p, q) => new Promise((res, rej) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function load(param) {
+  // ECONNREFUSED here is the ordinary case — the station is a separate process
+  // and it is easy to forget. A raw stack trace for that is noise.
+  try {
+    await get(8017, '/api/state')
+  } catch (e) {
+    if (e.code === 'ECONNREFUSED') {
+      console.error('no station on 127.0.0.1:8017 — start it first:\n\n  npm run station\n')
+      process.exit(1)
+    }
+    throw e
+  }
   // KV8=0 loads an f16 cache — the control for "is this the model or our
   // quantizer?". int8 was measured at 1k and 4k windows only, and the failure
   // being chased sits at 24k.
