@@ -36,6 +36,14 @@ p = argparse.ArgumentParser()
 p.add_argument("--model", required=True)
 p.add_argument("--depths", default="0,8000,24000", help="approx tokens of prior conversation")
 p.add_argument("--max-tokens", type=int, default=700)
+# Our engine renders the NON-thinking form: the generation prompt ends with an
+# empty <think>\n\n</think> block, pinned byte-exact against this vendor
+# template in tests/unit/tool-calls.test.ts. apply_chat_template DEFAULTS to
+# thinking on, so the first two runs of this script compared a thinking model
+# against a non-thinking engine and the rows were meaningless. --thinking runs
+# the other arm deliberately.
+p.add_argument("--thinking", action="store_true",
+               help="render WITH the thinking block (default: match our engine, which does not)")
 a = p.parse_args()
 
 TOOLS = [
@@ -99,11 +107,22 @@ TAIL = [
 
 model, tokenizer = load(a.model)
 print(f"{a.model}\n")
+
+# Print the end of the rendered prompt before measuring anything. It is the one
+# place the engine and the reference must agree, it is three lines long, and
+# reading it would have caught the thinking mismatch on the first run instead of
+# the third. Ours ends: '<|im_start|>assistant\n<think>\n\n</think>\n\n'
+_probe = tokenizer.apply_chat_template(
+    [{"role": "system", "content": SYSTEM}] + TAIL, tools=TOOLS,
+    add_generation_prompt=True, enable_thinking=a.thinking)
+print(f"  thinking={a.thinking} · rendered prompt ends: "
+      f"{tokenizer.decode(_probe[-14:])!r}\n")
 print(f"  {'depth':>8} {'prompt tok':>11} {'gen':>6}     called?     how it ENDED")
 
 for d in [int(x) for x in a.depths.split(",")]:
     msgs = [{"role": "system", "content": SYSTEM}] + padding(d) + TAIL
-    prompt = tokenizer.apply_chat_template(msgs, tools=TOOLS, add_generation_prompt=True)
+    prompt = tokenizer.apply_chat_template(
+        msgs, tools=TOOLS, add_generation_prompt=True, enable_thinking=a.thinking)
     ntok = len(prompt)
     out = generate(model, tokenizer, prompt=prompt, max_tokens=a.max_tokens, verbose=False)
     called = "<tool_call>" in out or "attempt_completion" in out
@@ -128,4 +147,9 @@ print("""
     every depth YES          -> ours: same conversation, same checkpoint, and we
                                 emit prose where mlx_lm emits the call
     depth 0 NO               -> fix this harness before reading anything else
+
+  And check the rendered tail above against what our engine sends. A run whose
+  prompt ends in a THINKING generation prompt is not comparable to our output
+  at all, whatever the rows say — the model answers instead of calling, at
+  every depth, and that is the template's behaviour rather than a finding.
 """)
