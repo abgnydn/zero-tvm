@@ -33,7 +33,9 @@
                   overflow: auto; margin: .6rem 0 0 }
 </style>
 <h1>zero-tvm · agent host</h1>
-<div class="sub">This tab runs the model. <code>scripts/agent-server.mjs</code> gives it an OpenAI-shaped address.</div>
+<div class="sub">This tab runs the model. <code>scripts/agent-server.mjs</code> gives it an OpenAI-shaped address on :8017.
+  <br><small>Alternative, and the one to prefer for real use: <code>npm run station</code> runs the engine in-process on
+  dawn.node (no browser tab, no throttling) and takes the same :8017. They cannot both hold the port — run one.</small></div>
 
 <div class="card">
   <div id="status">booting…</div>

@@ -7,6 +7,45 @@ from `0.1.0`.
 
 ## [Unreleased]
 
+### 2026-08-17/18 — agent serving: the cache stops re-reading, int8 KV goes wide
+
+Driven by a real Cline session on qwen36q3 that cost ~5.5 minutes per turn.
+Four independent faults, none of which was "the cache doesn't work".
+
+- **GDN rewind ring.** Hybrid prefix reuse was all-or-nothing: the recurrence
+  cannot be rewound a token at a time, so ONE changed token late in a prompt
+  re-read the whole conversation. Agent clients regenerate a trailing metadata
+  block every turn, so this fired constantly — 16 changed tokens discarded
+  43,693 good ones. Four snapshots of the recurrent state are now kept at chunk
+  boundaries and a divergence replays from the nearest one: **392.50s → 12.76s**
+  on the session that prompted it. Lookback is 4 × CHUNK_CAP. Allocated lazily,
+  so engines that never chunk do not pay the 0.19–0.57 GB.
+- **The KV disk pool had never worked.** The native OPFS shim wrote strings as
+  a LENGTH, so every `meta.json` — the commit record — was zero bytes beside a
+  payload of hundreds of megabytes. Restores reported "no entry" forever.
+- **Cancel did nothing**, and prefill progress was measuring submissions rather
+  than work: `record()` only submits, so the CPU walked 43 chunks in
+  milliseconds and then blocked on one un-cancellable readback.
+- **int8 KV left the fused path.** It required fused QKV, which meant Phi-3
+  alone — a 4k window, the one model where the cache never binds. It now runs
+  unfused, on hybrids, and through chunked prefill (new
+  `attention_prefill_int8.wgsl`), **1.98× smaller cache** for a measured
+  −0.09%/+0.10% perplexity, i.e. nothing. 4-bit was measured too and REJECTED:
+  +0.77% at 4k windows, growing with context.
+- **`kv_quantize_int8` packed only the first 32 words of a row**, so every
+  head-dim-256 spec left dims 128..255 holding stale bytes — fluent wrong text,
+  not noise. Latent since the kernel was written; only reachable once int8 left
+  Phi-3.
+- **Tool calls**: unparseable ones are no longer forwarded (they made clients
+  fail the tool and retry an identical prompt — six errors then a loop),
+  truncation reports `finish_reason: length`, and schema mismatches are named.
+- **Station** (`npm run station`): owns model lifecycle on :8017, proxying to
+  the engine on :8019, so a model swap never changes a client's URL.
+
+TurboQuant was investigated and **killed**: its premise is a few dominant
+channels for a rotation to spread, and our K/V measure 3.1× max-over-median,
+not the 20× assumed. docs/TURBOQUANT_PLAN.md carries the measurements.
+
 ### Added — Qwen3.6-35B-A3B: the first MoE, the first MLX checkpoint, and a 3-bit build
 
 - **`?model=qwen36`** — Qwen3.6-35B-A3B (30 GDN + 10 attention layers, 256

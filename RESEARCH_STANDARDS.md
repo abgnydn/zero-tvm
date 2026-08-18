@@ -191,8 +191,11 @@ state which it's checking against in `meta.hypothesis`.
 
 This is the architectural rule. The differentiator of `zero-tvm` is
 the **hand-written, fused WGSL kernel stack** — proving you can match
-WebLLM's TVM-autotuned 85 kernels with 10 hand-written kernel roles
-by out-fusing the default emission pipeline. So:
+WebLLM's TVM-autotuned emission with 10 hand-written kernel roles by
+out-fusing the default pipeline. (State that carefully: 85 is what a whole
+WebLLM session dumps; RESEARCH.md:275 counts ~11 active on the decode path,
+which is the path the comparison is about. Quoting 85 against 10 overstates by
+~8x, in our favour, against our own writeup.) So:
 
 - **Hand-written and owned** (the contribution):
   - All 10 WGSL kernel roles / 37 files: `qkv_fused.wgsl` (Q/K/V proj

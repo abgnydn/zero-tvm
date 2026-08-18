@@ -90,22 +90,24 @@ greedy decode against `mlx_lm` on the same checkpoint.
 The directory layout is the narrative arc of the project. Each page is a milestone.
 
 ```
-index.html              (landing page — model picker; cards render from model-registry.ts)
-                                                       dispatches, our shaders replay
-                                                       279 of 342 of them
-zero-tvm.html           → src/zero-tvm/chat.ts     (2) The result: all dispatches
-                                                       replaced, WebLLM never touched
-validate.html           → src/zero-tvm/validate.ts Multi-prompt smoke test driving
-                                                       src/zero-tvm/engine-core.ts
-                                                       against the same local weights
-                                                       for a fair head-to-head
-                                                       llama.cpp's WebGPU backend via
-                                                       wllama. GGUF, NOT the same
-                                                       weight bytes — runtime AND
-                                                       quantization differ (BENCH.md)
-
-test-chain.html         → src/compiler/test-chain.ts
+index.html      → src/landing.ts        The entrance: a character-select over the
+                                        roster, cards rendered from model-registry.ts.
+                                        ENTER mounts the chat in place.
+zero-tvm.html   → src/zero-tvm/chat.ts  The same chat as a direct link, for
+                                        deep-linking one model (?model=…).
+validate.html   → src/zero-tvm/validate.ts   Multi-prompt smoke test driving
+                                        engine-core.ts against local weights.
+docs.html                               The annotated reference, including the
+                                        kernel walkthrough and the WebLLM
+                                        comparison with its withdrawn pairs.
+share.html      → src/zero-tvm/share.ts Host a model for another device over
+                                        WebRTC, or join a room as a guest.
 ```
+
+Six pages were removed on 2026-08-14 — `architecture`, `demo`, `compiler-chat`,
+`dump`, `shaders`, `webllm-bench`. Three of them started multi-gigabyte
+downloads on load. `docs.html` carries what the explainers covered; the
+comparison harness lives in `src/webllm-bench/` and is run from a shell.
 
 ```
 src/

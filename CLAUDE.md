@@ -379,6 +379,49 @@ retries 5xx with backoff and hangs ~2 min. One request at a time: a single KV
 cache; concurrent generations would interleave. Keep the host tab visible —
 Chrome throttles backgrounded tabs to ~1/3 throughput.
 
+## Station (`scripts/station.mjs`) — the desktop surface
+
+`npm run agent` spawns an engine and walks away, so swapping models meant
+killing a process by hand and every client's endpoint went down with it. The
+station OWNS lifecycle: it holds :8017, runs the engine as a CHILD on :8019,
+and proxies `/v1` through — so a model swap never changes the URL a client is
+configured with.
+
+```bash
+npm run station          # then http://127.0.0.1:8017/
+```
+
+Everything the UI shows is measured or registry-derived; it estimates nothing.
+`/api/state` carries phase, the loaded model, the child's recent log and the
+request history; the engine's own `/health` carries `last` (per-request
+prefill/decode rates, TTFT, context used), `live` (in-flight progress), and the
+flags below.
+
+Serving another machine: `tailscale serve --bg --http=1234 8017`. **`tailscale
+serve` is a VHOST proxy** — the raw tailnet IP 404s ("404 page not found" is
+the Go mux), only the MagicDNS name matches. LM Studio worked by IP because it
+binds 0.0.0.0; this binds 127.0.0.1 by design, since it has no auth.
+
+### Engine flags (`scripts/agent-native.mjs`)
+
+| flag | what it does |
+|---|---|
+| `--ctx N` | context window; the KV allocation follows it |
+| `--pool 0` | turn OFF the KV prefix pool on disk (on by default) |
+| `--kv8` | int8 KV cache — half the cache memory, opt-in |
+| `--experts N` | expert SLOTS per MoE layer, a memory build |
+
+**Two different things are called "pool" and confusing them cost a 43k-token
+prefill twice.** `--pool` is the KV prefix cache on disk, which is what makes a
+prefill survive a restart. `--experts` is a memory build that holds fewer
+expert tensors — and it DISABLES chunked prefill, because the pooled path
+structurally cannot chunk, so it trades minutes of prefill for gigabytes of
+RAM. Never turn it on to serve long prompts.
+
+`--kv8` and `--pool` are mutually exclusive today: `exportKV`/`importKV` refuse
+under int8, so the pool silently never saves. `/health` reports
+`poolInertUnderKv8` when both are set.
+
 ## Quality vs fidelity (`docs/QUALITY.md`)
 
 Everything the repo verified before 2026-08-10 was **fidelity** — does the

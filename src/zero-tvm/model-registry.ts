@@ -151,9 +151,9 @@ const BRANDINGS: Record<string, ModelBrand> = {
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · 3-bit experts',
     sizeLabel: '~16.4 GB', rateLabel: '~66 t/s',
     poolModes: [
-      { slots: 0, label: 'Full · 15.7 GB · ~66 t/s' },
-      { slots: 128, label: 'Half · ~8.4 GB · ~15 t/s' },
-      { slots: 64, label: 'Quarter · ~4.8 GB · ~12 t/s', note: 'long prompts run token-by-token' },
+      { slots: 0, label: 'Full · 15.7 GB resident · ~66 t/s' },
+      { slots: 128, label: 'Half · ~8.4 GB resident · ~15 t/s', note: 'pooled rates are the 2026-08-15 AC round, whose own unpooled control read 58.6 t/s — compare against that, not the 66 above' },
+      { slots: 64, label: 'Quarter · ~4.8 GB resident · ~12 t/s', note: 'long prompts run token-by-token' },
     ],   // 65.56 total, M2 Max (BENCH.md 2026-08-13)
     ramNote: 'needs ~20 GB free RAM',
   },
@@ -161,7 +161,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · full 4-bit',
     sizeLabel: '~19.5 GB',
     poolModes: [
-      { slots: 0, label: 'Full · 19.7 GB' },
+      { slots: 0, label: 'Full · 19.7 GB resident' },
       // No rate: the 4-bit build has never been measured pooled (BENCH.md
       // records it as unmeasured) — the ~15 that used to sit here was the q3
       // build's number wearing the wrong card. Lens round 2026-08-17.

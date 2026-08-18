@@ -189,7 +189,7 @@ function render(): void {
       </div>
     </aside>
     ${'gpu' in navigator ? '<div class="cs-deeds" role="list" aria-label="Deeds"></div>' : ''}
-    <div class="cs-roster-head" aria-hidden="true">Roster · ${GROUPS.length}</div>
+    <div class="cs-roster-head" aria-hidden="true">Roster</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter">
       <a class="mb-cta btn btn-primary">Enter chat ▸</a>

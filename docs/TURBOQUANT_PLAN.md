@@ -11,7 +11,10 @@ EARLIER ONES wherever they disagree, and several do:
 - Plain int8 KV won instead, was measured free end to end (paired perplexity
   -0.09% / +0.10%, within noise), and now runs on the unfused path, on hybrids
   and through chunked prefill. See "Phase 1 BUILT".
-- Everything above "Phase 0 RESULT" is the ORIGINAL PITCH, kept for the record.
+- Everything above "Phase 0 RESULT" is the ORIGINAL PITCH, kept for the record,
+  AS ARE the three sections at the very END of this file (Predictions, Kill
+  criteria, Open questions) — they were written before any measurement, and the
+  "later supersedes earlier" rule does NOT reach them. Each is labelled.
   Its memory table is TurboQuant-at-3.5-bits and does not describe anything
   that exists.
 
@@ -511,7 +514,7 @@ question and the answer may differ between decode (memory-bound) and prefill.
 path. Gate: `chunk-prefill-test` token-identical with TurboQuant on, on every
 chunking spec. Without this it is int8 again.
 
-## Predictions, so the measurement can refute them
+## Predictions, so the measurement can refute them — SUPERSEDED (written before phase 0)
 
 1. Decode throughput **improves** on the big-context models: attention is
    memory-bound at long context and this cuts KV traffic ~4.5x. If decode
@@ -522,7 +525,7 @@ chunking spec. Without this it is int8 again.
    not, the honest outcome is publishing the cost the way the 3-bit expert
    build's +10.4% was published, not quietly shipping it.
 
-## Kill criteria
+## Kill criteria — SUPERSEDED (written before phase 0)
 
 - Phase 1 fails to beat int8 per bit → stop; the complexity buys nothing.
 - Phase 3 shows a perplexity cost comparable to the 3-bit expert build → the
@@ -530,7 +533,7 @@ chunking spec. Without this it is int8 again.
 - Phase 4 shows a decode regression that does not close → ship it opt-in as a
   memory feature with the speed cost published, or not at all.
 
-## Open questions
+## Open questions — SUPERSEDED (written before phase 0)
 
 - Does "3.5 bits per channel" include the QJL bit? (Decides the table above.)
 - Per-coordinate quantizer: does the Beta concentration let one shared
