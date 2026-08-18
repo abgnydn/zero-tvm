@@ -314,10 +314,22 @@ async function fetchBufWithRetry(
 // cold-start e2e testing instant without re-downloading 2 GB over the network.
 const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
 
-/** Dev-mirror base for a spec: /local-weights/<repo-name>/ (null in prod).
+/** An ABSOLUTE mirror base set by a non-browser host (scripts/agent-native.mjs
+ *  serves .weights-local over http and sets this). The vite mirror is a
+ *  relative URL and a DEV-only build flag, so the native host could never use
+ *  it: it re-downloaded every checkpoint from HuggingFace with the bytes
+ *  already sitting on the same disk — 14 GB and ~40 minutes per new model. */
+const hostMirror = (): string | null =>
+  (globalThis as unknown as { __ZT_WEIGHTS_MIRROR__?: string }).__ZT_WEIGHTS_MIRROR__ ?? null
+
+/** Dev-mirror base for a spec: /local-weights/<repo-name>/ (null in prod
+ *  unless a host has set an absolute base).
  *  Exported for cache-probe: a primed mirror counts as "on this device". */
 export function localMirrorBase(spec: ModelSpec): string | null {
-  return DEV ? `/local-weights/${spec.hfRepo.split('/')[1]}/` : null
+  const repo = spec.hfRepo.split('/')[1]
+  const host = hostMirror()
+  if (host) return `${host.replace(/\/$/, '')}/${repo}/`
+  return DEV ? `/local-weights/${repo}/` : null
 }
 
 /**

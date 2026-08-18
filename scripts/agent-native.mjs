@@ -21,6 +21,9 @@ import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { installShims } from './native/shims.mjs'
 import { panelHtml } from './native/panel.mjs'
+import { startWeightsMirror } from './native/weights-mirror.mjs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const args = process.argv.slice(2)
 const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
@@ -46,6 +49,16 @@ const EXPERTS = Number(flag('experts')) || 0
 const KV8 = flag('kv8') !== '0'
 
 await installShims({ unsafe: !args.includes('--safe') })
+// Serve .weights-local BEFORE the loader runs. Without it the native host
+// re-downloads from HuggingFace even when the checkpoint is already on this
+// disk — the browser avoids that via vite's mirror, which is DEV-only and
+// relative, so it never applied here.
+{
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '.weights-local')
+  const mirror = await startWeightsMirror(root)
+  if (mirror) console.log(`[native] weights mirror: ${mirror.repos.length} checkpoint(s) on disk → ${mirror.base}`)
+  else console.log('[native] no local weights mirror (.weights-local empty) — fetching from HuggingFace')
+}
 // dist-lib is real resolved JS — the src tree's `.js`-suffixed TS imports
 // cannot load under Node, which is why the host rides the library build.
 const lib = await import('../dist-lib/index.js')
