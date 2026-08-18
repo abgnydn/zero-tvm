@@ -166,7 +166,17 @@ async function runEpisode(label, maxSteps = 12, padTokens = 0) {
       // What it said instead matters: prose CONTAINING the answer means the
       // model solved it and only failed to emit the call — instruction
       // following, not arithmetic. Prose without it means it lost the thread.
-      console.log(`    prose instead of a call: ${JSON.stringify((m.content ?? '').slice(0, 220))}`)
+      //
+      // Print the END as well as the start, and say whether the budget ran
+      // out. This model's own template invites reasoning BEFORE the call, so
+      // the call is the LAST thing generated — a run cut off at max_tokens
+      // looks, from the front, exactly like a model that chose prose. The
+      // reference harness was misread that way once already.
+      const text = m.content ?? ''
+      const fin = j.choices?.[0]?.finish_reason ?? '?'
+      console.log(`    prose instead of a call (finish_reason=${fin}, ${text.length} chars)`)
+      console.log(`      starts: ${JSON.stringify(text.slice(0, 180))}`)
+      if (text.length > 180) console.log(`      ends:   ${JSON.stringify(text.slice(-180))}`)
       break
     }
     const args = (() => { try { return JSON.parse(c.function.arguments) } catch { return {} } })()

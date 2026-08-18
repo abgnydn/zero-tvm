@@ -15,6 +15,12 @@ So this asks mlx_lm the same question with the SAME conversation, built by the
 checkpoint's OWN chat template via apply_chat_template(tools=...). If mlx_lm
 emits a <tool_call> block where we emit prose, the fault is on our side.
 
+DEPTH 0 IS THE CONTROL. Our engine emits the call there every time, so if the
+reference does not, this script is measuring itself and the deeper rows say
+nothing. The first version failed exactly that way: Qwen3.6's template invites
+reasoning BEFORE the call, --max-tokens was 120, and the run ended mid-reasoning
+at every depth including 0.
+
 Needs Metal, so it runs in your shell:
 
     cd ~/dev/ml-research && uv run python ~/dev/zero-tvm/scripts/toolcall-depth-ref.py \
@@ -29,7 +35,7 @@ from mlx_lm import load, generate
 p = argparse.ArgumentParser()
 p.add_argument("--model", required=True)
 p.add_argument("--depths", default="0,8000,24000", help="approx tokens of prior conversation")
-p.add_argument("--max-tokens", type=int, default=120)
+p.add_argument("--max-tokens", type=int, default=700)
 a = p.parse_args()
 
 TOOLS = [
@@ -93,7 +99,7 @@ TAIL = [
 
 model, tokenizer = load(a.model)
 print(f"{a.model}\n")
-print(f"  {'depth':>8} {'prompt tok':>11}  emitted a tool call?   what it produced")
+print(f"  {'depth':>8} {'prompt tok':>11} {'gen':>6}     called?     how it ENDED")
 
 for d in [int(x) for x in a.depths.split(",")]:
     msgs = [{"role": "system", "content": SYSTEM}] + padding(d) + TAIL
@@ -101,14 +107,25 @@ for d in [int(x) for x in a.depths.split(",")]:
     ntok = len(prompt)
     out = generate(model, tokenizer, prompt=prompt, max_tokens=a.max_tokens, verbose=False)
     called = "<tool_call>" in out or "attempt_completion" in out
-    first = out.strip().replace("\n", " ")[:90]
-    print(f"  {d:>8} {ntok:>11}  {'YES' if called else 'NO ':<21}  {first!r}")
+    # Qwen3.6's own template invites reasoning BEFORE the call ("you may provide
+    # optional reasoning ... BEFORE the function call, but NOT after"), so the
+    # call is the LAST thing generated, not the first. Two consequences the
+    # first version of this script got wrong: 120 tokens truncated the reasoning
+    # before the model ever reached the call, and printing the first 90
+    # characters showed the reasoning instead of the answer.
+    gen = len(tokenizer.encode(out))
+    cap = "CUT" if gen >= a.max_tokens - 1 else "   "
+    tail = out.strip().replace("\n", " ")[-90:]
+    print(f"  {d:>8} {ntok:>11} {gen:>6}{cap}  {'YES' if called else 'NO ':<10}  …{tail!r}")
 
 print("""
-  Reading this:
-    reference emits the call at depth, ours does not  -> OUR rendering decays; a bug
-    reference ALSO stops emitting at depth            -> the model; nothing to fix here
-    both emit it                                      -> the difference is our tool
-                                                         DIALECT or where the tools
-                                                         block sits, worth diffing next
+  Reading this — depth 0 is the CONTROL and must be YES. Our engine emits the
+  call there every time, so a NO at depth 0 means this harness is broken (too
+  few max tokens, wrong tools, wrong template) and the deeper rows mean nothing.
+  A "CUT" in the gen column is that failure: it never reached the call.
+
+    depth 0 YES, deeper NO   -> the MODEL loses the format with length; not ours
+    every depth YES          -> ours: same conversation, same checkpoint, and we
+                                emit prose where mlx_lm emits the call
+    depth 0 NO               -> fix this harness before reading anything else
 """)
