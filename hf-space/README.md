@@ -37,14 +37,14 @@ Measured on an Apple M2 Max (Chrome 150, WebLLM v0.2.80, identical Phi-3-mini-q4
 
 | | WebLLM (TVM) | Zero-TVM |
 |---|---|---|
-| WGSL kernels | **85 autotuned** | **10 hand-written roles** |
-| Dispatches per decode step | **342** | **228** |
+| WGSL kernels (decode path) | **~11 TVM-generated** (85 captured across a session) | **10 hand-written roles** |
+| Dispatches per decode step | **342** | **260** default (228 with `?splitk=0`) |
 | Total throughput (prefill + decode) | **59.95 tok/s** | **69.55 tok/s** — **+16.0%** |
 | Decode only | **63.23 tok/s** (self-reported) | **83.10 tok/s** — **+31.4%** |
 | Time to first token (~35-tok prompt) | **~150 ms** (implied) | **291 ms** — *WebLLM wins this one* |
-| JS bundle (excl. weights) | **5.9 MB** / 2.1 MB gz | **157 kB** / 33 kB gz |
+| JS bundle (excl. weights) | **~6.0 MB** / ~2.2 MB gz | **~460 kB** / ~126 kB gz |
 
-**The hand-written kernels don't just keep up with the autotuning compiler — on this hardware they beat it on throughput.** For decoder-only LLMs of this shape, most of the compiler's complexity budget isn't buying much — the expensive parts are matmul, attention, and int4 dequant. Everything else is plumbing. ~10 kernels of plumbing, instead of 85.
+**The hand-written kernels don't just keep up with the autotuning compiler — on this hardware they beat it on throughput.** For decoder-only LLMs of this shape, most of the compiler's complexity budget isn't buying much — the expensive parts are matmul, attention, and int4 dequant. Everything else is plumbing, and ten hand-written roles cover it.
 
 **The gap grows with how recent the architecture is** — +16% / +31% (total / decode) on 2024's Phi-3, +32% / +58% on 2025's Qwen3-4B, +100% / +114% on 2026's Qwen3.5-4B. Consistent with compiler stacks having had less time to tune newer architectures; an observation across three points on one machine, not a proven law.
 
@@ -56,7 +56,7 @@ Exact medians, full methodology, and the optimization experiments that were meas
 
 The Space opens on a character-select entrance: pick a model and it loads and chats in place. [`zero-tvm.html`](./zero-tvm.html) is the same chat as a direct link, if you want to deep-link a specific model.
 
-On first load you'll see a "Download & Start" gate — clicking it streams ~1.8 GB of Phi-3-mini-q4f16_1 weights from the Hugging Face mirror at [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC) into OPFS (Origin Private File System).
+Picking a character starts the download immediately — the sheet shows the weight size before you click, and there is no second confirmation. It streams ~2 GB of Phi-3-mini-q4f16_1 weights from the Hugging Face mirror at [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC) into OPFS (Origin Private File System).
 
 Subsequent loads are instant: a Service Worker intercepts the mirror URLs, so every page sharing those weights is gate-free after the first download.
 

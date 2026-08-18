@@ -607,7 +607,7 @@
 <p>The engine has three phases per generated token:</p>
 
 <ol>
-  <li><strong>Prefill</strong> — process each prompt token sequentially, building up the KV cache</li>
+  <li><strong>Prefill</strong> — process the prompt in chunks (per token on specs that cannot chunk), building up the KV cache</li>
   <li><strong>First decode</strong> — the last prefill step produces the first generated token</li>
   <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
 </ol>
