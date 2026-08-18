@@ -478,6 +478,37 @@ the quantize dispatch and the unpack in the score loop. Memory on qwen36q3 is
 Still excluded, by a throw that names the reason: MLA (caches a latent, not
 per-head K/V).
 
+## int8 IS THE DEFAULT, and it costs nothing else (2026-08-18)
+
+Two things that were nearly left on the table.
+
+**It shipped switched off.** int8 was measured free and then left behind
+`?kv8=1`, which is the same trap this file opens by warning about — a correct
+feature nobody can switch on is how int8 spent months stranded on Phi-3. It is
+the browser default now; `?kv8=0` opts out. The entrance reads the same flag
+the engine does, so its KV, footprint and RAM figures quote what is actually
+allocated rather than the f16 rate. On Qwen3.8-27B the 256k window goes from
+30.7 GB of footprint to 22.7 — from more than a 32 GB Mac has, to inside it.
+
+**The "trade" against the disk pool did not exist.** `exportKV`/`importKV`
+refused under int8Mode, commented "f16-only per the plan's §7", which reads
+like a ruling. It was not one: the snapshot had nowhere to put the per-row
+scales, and the pool fingerprint ALREADY keys on `int8kv`, so an f16 entry
+could never reach an int8 engine. The snapshot carries scales now (on-disk
+format 1 → 2, so an old scaleless entry is a clean miss rather than a restore
+of garbage). Verified across a real engine restart:
+
+    kv8 = true · pool = true
+    seed                     reused    0/1018 · ttft 1.95s
+    pool: saved 1033 tokens
+    — RESTART, GPU state destroyed —
+    first req after restart  reused 1033/1052 · ttft 0.18s
+    pool: restored 1033 tokens
+
+Half the cache AND a prefill that outlives the process. The lesson is the one
+this file keeps relearning: an inherited exclusion with a confident comment is
+still a claim. Check what it costs before quoting it as a constraint.
+
 ## Phases and gates (original — superseded above where they conflict)
 
 **Phase 0 — settle the algorithm (no code).** Read the PDF and the QJL paper;
