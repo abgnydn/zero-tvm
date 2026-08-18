@@ -1216,6 +1216,98 @@ async function testAttentionPrefill(device) {
   return { name: 'attention_prefill seq=5', pass: bad === 0, detail: `${bad} mismatches vs per-token decode attention (must be bit-exact)` }
 }
 
+// ── attention_prefill_int8 — chunk BIT-EXACT vs per-token int8 decode ───────
+// The f16 pair above proves chunked attention equals per-token attention. This
+// proves the SAME for the int8 pair, on identical quantized bytes, so the only
+// thing under test is the chunked kernel's own indexing: its page walk, its
+// (page, head, slot, side) word base, and its scale lookup. An error in any of
+// those shifts which cached row a query scores against — fluent wrong output,
+// never a crash, which is how the int8 packing bug reached three models.
+async function testAttentionPrefillInt8(device) {
+  const r = rng(41)
+  const BASE = 3, SEQ = 5, T = BASE + SEQ
+  const NUM_PAGES = 1
+
+  // Quantize per (head, slot, side) exactly as kv_quantize_int8 does: one f16
+  // scale over HEAD_DIM values, symmetric, max/127.
+  const words = new Uint32Array(NUM_PAGES * Q.kvI8PageWords)
+  const scales = new Uint16Array(NUM_PAGES * Q.kvScalesPerPage)
+  for (let h = 0; h < Q.kvHeads; h++) {
+    for (let t = 0; t < T; t++) {
+      for (let side = 0; side < 2; side++) {
+        const row = arr(Q.headDim, () => toF16(r() - 0.5))
+        let maxAbs = 0
+        for (const v of row) maxAbs = Math.max(maxAbs, Math.abs(v))
+        const scale = Math.max(maxAbs / 127, 1e-8)
+        scales[h * Q.kvScalesPerHead + t * Q.kvScalesPerSlot + side] = f32ToF16Bits(toF16(scale))
+        const base = h * Q.kvI8HeadWords + t * Q.kvI8SlotWords + side * Q.kvI8RowWords
+        for (let w = 0; w < Q.kvI8RowWords; w++) {
+          let packed = 0
+          for (let b = 0; b < 4; b++) {
+            const q = Math.max(-127, Math.min(127, Math.round(row[w * 4 + b] / scale)))
+            packed |= (q & 0xff) << (b * 8)
+          }
+          words[base + w] = packed >>> 0
+        }
+      }
+    }
+  }
+  const pagesI8 = buffer(device, words, BU.STORAGE | BU.COPY_DST)
+  const scaleBuf = buffer(device, scales, BU.STORAGE | BU.COPY_DST)
+  const qAll = arr(SEQ * Q.qDim, () => toF16(r() * 2 - 1))
+  const pageVals = buffer(device, new Int32Array([0]), BU.STORAGE | BU.COPY_DST)
+  const indptr = buffer(device, new Int32Array([0, NUM_PAGES]), BU.STORAGE | BU.COPY_DST)
+
+  // Reference: the int8 DECODE kernel, one token at a time.
+  const decodeI8 = pipelineFor(device, wgsl('attention_int8.wgsl'), 'attention_int8')
+  const ref = new Uint16Array(SEQ * Q.qDim)
+  {
+    const qBuf = device.createBuffer({ size: Q.qDim * 2, usage: BU.STORAGE | BU.COPY_DST })
+    const out = device.createBuffer({ size: Q.qDim * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+    for (let t = 0; t < SEQ; t++) {
+      device.queue.writeBuffer(qBuf, 0, f16Array(qAll.slice(t * Q.qDim, (t + 1) * Q.qDim)))
+      device.queue.writeBuffer(out, 0, new Uint16Array(Q.qDim))
+      const lenBuf = buffer(device, new Int32Array([BASE + 1 + t]), BU.STORAGE | BU.COPY_DST)
+      const pod = podBuffer(device, [
+        { i32: 1 }, { i32: NUM_PAGES }, { i32: NUM_PAGES },
+        { i32: 0 }, { i32: 0 }, { i32: 0 }, { i32: 0 }, { i32: 0 },
+        { f32: 1 / Math.sqrt(Q.headDim) }, { u32: 1 },
+      ])
+      const bytes = await runCompute(
+        device, decodeI8,
+        [qBuf, indptr, pageVals, pagesI8, scaleBuf, lenBuf, out, pod],
+        [1, Q.heads], 6, Q.qDim * 2,
+      )
+      ref.set(new Uint16Array(bytes), t * Q.qDim)
+    }
+  }
+
+  // Chunked: one dispatch over the same pages, per-token causal kv_len.
+  const prefillI8 = pipelineFor(device, wgsl('attention_prefill_int8.wgsl'), 'attention_prefill_int8')
+  const qBatch = buffer(device, f16Array(qAll), BU.STORAGE | BU.COPY_DST)
+  const outBatch = device.createBuffer({
+    size: SEQ * Q.qDim * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST,
+  })
+  device.queue.writeBuffer(outBatch, 0, new Uint16Array(SEQ * Q.qDim))
+  const pod = podBuffer(device, [
+    { i32: SEQ }, { i32: BASE + 1 }, { f32: 1 / Math.sqrt(Q.headDim) },
+    { i32: 0 }, { i32: 0 },
+  ])
+  const bytes = await runCompute(
+    device, prefillI8,
+    [qBatch, pageVals, pagesI8, scaleBuf, outBatch, pod],
+    [SEQ, Q.heads], 4, SEQ * Q.qDim * 2,
+  )
+  const got = new Uint16Array(bytes)
+  let bad = 0
+  for (let i = 0; i < ref.length; i++) if (got[i] !== ref[i]) bad++
+  return {
+    name: 'attention_prefill_int8 seq=5',
+    pass: bad === 0,
+    detail: `${bad} mismatches vs per-token int8 decode attention (must be bit-exact)`,
+  }
+}
+
 // ── silu_mul — chunked FFN epilogue vs CPU ───────────────────────────────────
 async function testSiluMul(device) {
   const r = rng(38)
@@ -1319,6 +1411,7 @@ function testKvQuantizeInt8Wide(device) {
 
 const TESTS = [
   { label: 'kv_quantize_int8_wide', fn: testKvQuantizeInt8Wide },
+  { label: 'attention_prefill_int8', fn: testAttentionPrefillInt8 },
   { label: 'gdn_conv', fn: testGdnConv },
   { label: 'gdn_gates', fn: testGdnGates },
   { label: 'gdn_recur_seq', fn: (d) => testGdnRecurSeq(d, recurFixture) },
