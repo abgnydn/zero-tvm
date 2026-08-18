@@ -447,6 +447,45 @@ Phase 0 is complete and its four results are load-bearing:
 `sites.json` is synced from `~/sites-shared/sites.ts`. Edit URLs,
 taglines, and the `sameAs` identity list there.
 
+## Pre-push gates (`lefthook.yml`)
+
+`lefthook install` once per clone. pre-commit is the house template (biome +
+gitleaks on staged files). pre-push is where this repo differs, because its
+bugs differ: **every defect that reached a user here was SILENT** — fluent
+wrong output, never a crash.
+
+- `npm run typecheck`
+- `npm run test` (~3 s headless)
+- `node scripts/regression-test-gate.mjs` — **a commit whose SUBJECT claims a
+  fix and which touches `src/`, `scripts/` or `workers/` must also touch a
+  test.** Escape when the fix genuinely needs hardware this machine cannot
+  give a hook: `SKIP_TEST_GATE=1 git push`, and say why in the message.
+
+Why the third one exists, from this repo's own history: the Phi-3 `ropeFreqs`
+P0 ran broken for ten days through two deploys; `kv_quantize_int8` wrote half
+of every head-dim-256 row and produced *fluent wrong text* rather than noise,
+while the suite covering it tested head-dim 128, so re-introducing it would
+still have passed; a GDN rewind restored a dead conversation's state in 2,929
+of 20,000 simulated conversations while six live turns looked perfect. None of
+those were caught by reading a diff.
+
+**The test that matters is the one that FAILS on the old code.** Write it, run
+it against the bug, watch it fail, then fix. A test written after the fix and
+never seen red proves nothing.
+
+The GPU suites are NOT in the hook — they need hardware CI and the agent
+sandbox do not have. They are the gate for anything touching WGSL or the
+engine, and they run in a human's shell:
+
+```bash
+npm run test:kernels:qwen35   # hybrid + the int8 pack at head-dim 256
+npm run test:kernels:mlx      # loader replay, byte-exact
+node scripts/chunk-prefill-test.mjs <spec>   # token identity
+```
+
+A hook that skipped those silently would be worse than one that names them,
+because it would read as coverage.
+
 ## Known gaps
 
 - **No ESLint.** Fixed 2026-08-10: ci.yml calls `npm run typecheck` directly

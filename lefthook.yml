@@ -1,0 +1,49 @@
+# lefthook.yml — git hooks for zero-tvm.
+#   lefthook install     # once, per clone
+#
+# pre-commit follows the house template (~/dev/templates/lefthook.yml): format
+# and lint STAGED files only, restage what it fixes, and refuse secrets.
+#
+# pre-push is where this repo differs, because its bugs differ. Every defect
+# that reached a user here was SILENT — fluent wrong output, not a crash — so
+# the gate is not "does it compile" but "does something run, and did the fix
+# bring the test that would have caught it".
+
+pre-commit:
+  parallel: true
+  commands:
+    biome:
+      glob: "*.{js,jsx,ts,tsx,mjs,cjs,json,jsonc,css}"
+      run: biome check --write --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
+
+    gitleaks:
+      run: gitleaks protect --staged --redact --no-banner
+
+pre-push:
+  parallel: false
+  commands:
+    # 1. It has to typecheck. Cheap, catches the stupid half.
+    typecheck:
+      run: npm run typecheck
+
+    # 2. It has to pass the headless suite. ~3s; there is no excuse to skip it.
+    unit:
+      run: npm run test
+
+    # 3. A commit that claims a fix has to bring a test. See the script's header
+    #    for why this is worth an occasional false positive; SKIP_TEST_GATE=1
+    #    is the deliberate escape for fixes that need a GPU.
+    regression-test:
+      run: node scripts/regression-test-gate.mjs
+
+# NOT run here, and deliberately: the kernel suites (test:kernels*) and e2e need
+# a real GPU, which CI and the agent sandbox do not have. They are the gates for
+# anything touching WGSL or the engine, and they run in a human's shell:
+#
+#     npm run test:kernels:qwen35     # hybrid + int8 pack at head-dim 256
+#     npm run test:kernels:mlx        # loader replay, byte-exact
+#     node scripts/chunk-prefill-test.mjs <spec>   # token identity
+#
+# A pre-push hook that silently skipped them would be worse than one that names
+# them, because it would read as coverage.

@@ -1242,7 +1242,83 @@ async function testSiluMul(device) {
 
 // ── test roster ──────────────────────────────────────────────────────────────
 const recurFixture = buildRecurFixture()
+// ── kv_quantize_int8 at HEAD_DIM 256 — the width that broke ────────────────
+// The pack phase used to give each of 32 threads ONE u32 word and return,
+// which covers a row only while KV_I8_ROW_WORDS (HEAD_DIM/4) <= 32. True for
+// Phi-3 (24) and Qwen3-4B (32) — and the Qwen3-4B suite is where this kernel
+// was tested, so the gap was invisible. At HEAD_DIM 256 it is 64 words, so
+// dims 128..255 were never written and each cached row's top half kept
+// whatever the buffer already held. It did not crash: it produced fluent,
+// wrong text ("12" for 17+25). This asserts the WHOLE row, so re-introducing
+// the single-word pack fails here rather than in someone's chat.
+function testKvQuantizeInt8Wide(device) {
+  const r = rng(29)
+  const HD = Q.headDim, POS = 20, NUM_PAGES = 2
+  const pageNo = (POS / Q.pageSize) | 0, slot = POS % Q.pageSize
+  const kSlot = arr(Q.kvDim, () => toF16(r() * 2 - 1))
+  const vSlot = arr(Q.kvDim, () => toF16(r() * 2 - 1))
+  const pipe = pipelineFor(device, wgsl('kv_quantize_int8.wgsl'), 'kv_quantize_int8')
+
+  // POISON the pages so an unwritten dim cannot masquerade as a correct zero —
+  // the original bug left stale bytes, and a zeroed buffer would have hidden it.
+  const poison = new Uint32Array(NUM_PAGES * Q.kvI8PageWords).fill(0x7f7f7f7f)
+  const pagesI8 = device.createBuffer({
+    size: NUM_PAGES * Q.kvI8PageWords * 4, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC,
+  })
+  device.queue.writeBuffer(pagesI8, 0, poison)
+  const scalesBuf = device.createBuffer({
+    size: NUM_PAGES * Q.kvScalesPerPage * 2, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC,
+  })
+  device.queue.writeBuffer(scalesBuf, 0, new Uint16Array(NUM_PAGES * Q.kvScalesPerPage))
+  const WGS = Q.kvHeads * 2
+  const buffers = [
+    buffer(device, f16Array(kSlot), BU.STORAGE | BU.COPY_DST),
+    buffer(device, f16Array(vSlot), BU.STORAGE | BU.COPY_DST),
+    pagesI8,
+    scalesBuf,
+    buffer(device, new Int32Array([POS]), BU.STORAGE | BU.COPY_DST),
+    buffer(device, new Uint32Array([0, 0, 0, WGS]), BU.UNIFORM | BU.COPY_DST),
+  ]
+  return runComputeReads(device, pipe, buffers, [WGS], [
+    { index: 2, bytes: NUM_PAGES * Q.kvI8PageWords * 4 },
+    { index: 3, bytes: NUM_PAGES * Q.kvScalesPerPage * 2 },
+  ]).then(([pageBytes, scaleBytes]) => {
+    const gotWords = new Uint32Array(pageBytes)
+    const gotScales = Array.from(new Uint16Array(scaleBytes), f16BitsToF32)
+    let bad = 0, worstDim = -1, unwritten = 0
+    for (let head = 0; head < Q.kvHeads; head++) {
+      for (let side = 0; side < 2; side++) {
+        const src = side === 0 ? kSlot : vSlot
+        let maxAbs = 0
+        for (let d = 0; d < HD; d++) maxAbs = Math.max(maxAbs, Math.abs(src[head * HD + d]))
+        const scale = Math.max(maxAbs / 127, 1e-8)
+        const scaleIdx = pageNo * Q.kvScalesPerPage + head * Q.kvScalesPerHead
+                       + slot * Q.kvScalesPerSlot + side
+        const gotScale = gotScales[scaleIdx]
+        for (let d = 0; d < HD; d++) {
+          const w = gotWords[pageNo * Q.kvI8PageWords + head * Q.kvI8HeadWords
+                           + slot * Q.kvI8SlotWords + side * Q.kvI8RowWords + ((d / 4) | 0)]
+          const raw = (w >>> ((d % 4) * 8)) & 0xff
+          const q = raw > 127 ? raw - 256 : raw
+          const ref = Math.max(-127, Math.min(127, Math.round(src[head * HD + d] / scale)))
+          if (Math.abs(q - ref) > 1) { bad++; if (worstDim < 0) worstDim = d }
+          if (raw === 0x7f && ref !== 127) unwritten++
+        }
+        if (Math.abs(gotScale - toF16(scale)) > Math.abs(scale) * 2e-3) bad++
+      }
+    }
+    return {
+      name: `kv_quantize_int8 headDim=${HD} (${Q.kvI8RowWords} words > 32 threads)`,
+      pass: bad === 0,
+      detail: bad === 0
+        ? `all ${HD} dims x ${Q.kvHeads} heads x 2 sides packed`
+        : `${bad} wrong, first at dim ${worstDim}; ${unwritten} still hold the poison byte`,
+    }
+  })
+}
+
 const TESTS = [
+  { label: 'kv_quantize_int8_wide', fn: testKvQuantizeInt8Wide },
   { label: 'gdn_conv', fn: testGdnConv },
   { label: 'gdn_gates', fn: testGdnGates },
   { label: 'gdn_recur_seq', fn: (d) => testGdnRecurSeq(d, recurFixture) },
