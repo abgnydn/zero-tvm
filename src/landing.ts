@@ -359,7 +359,9 @@ function render(): void {
     if (b.rateLabel && !(mode && mode.slots)) rows.push(['Speed', `${b.rateLabel} <span class="mb-hw">M2 Max</span>`])
     // Boot footprint: resident weights (the chosen build's label) + the
     // chosen window's KV — the number that answers "will it fit?", assembled
-    // from the same sources every other figure reads.
+    // from the same sources every other figure reads. Kept in scope because
+    // the RAM warning below has to agree with it.
+    let footprintGb = NaN
     {
       const w = weightsGb(mode && mode.slots ? mode.label : b.sizeLabel)
       if (Number.isFinite(w)) {
@@ -374,8 +376,8 @@ function render(): void {
         const ring = gdnLayers
           ? (4 * gdnLayers * ((sp.gdnConvK - 1) * sp.gdnQkvDim * 2 + sp.gdnVHeads * sp.gdnStatePerHead * 4)) / 2 ** 30
           : 0
-        const total = w + (cx.tokens * sp.kvBytesPerToken) / 2 ** 30 + ring
-        rows.push(['Footprint', `~${total.toFixed(1)} GB <span class="mb-hw">weights + KV${ring ? ' + state' : ''}</span>`])
+        footprintGb = w + (cx.tokens * sp.kvBytesPerToken) / 2 ** 30 + ring
+        rows.push(['Footprint', `~${footprintGb.toFixed(1)} GB <span class="mb-hw">weights + KV${ring ? ' + state' : ''}</span>`])
       }
     }
     // Context bar: the CHOSEN build over the checkpoint's own maxSeq — a
@@ -421,7 +423,19 @@ function render(): void {
     // A pooled build's note replaces the full model's RAM warning — picking
     // less memory IS the answer to that warning. A long-context build adds
     // its own: the KV is allocated EAGERLY at boot, so the price is upfront.
-    const baseNote = mode && mode.slots ? (mode.note ?? '') : (b.ramNote ?? '')
+    // DERIVED from the footprint, not a fixed string. ramNote is authored per
+    // model and cannot know which context the reader just picked, so at 256k
+    // it kept promising the 16k answer — the one row headed "will it fit?"
+    // disagreeing with the warning beside it. 1.15x rounded reproduces the
+    // authored notes at their default windows (Qwen3.8: 15.7 -> 18) and keeps tracking
+    // when the picker moves. Any prose in the authored note survives; only its
+    // number is replaced.
+    const needGb = Number.isFinite(footprintGb) ? Math.round(footprintGb * 1.15) : NaN
+    const authored = mode && mode.slots ? (mode.note ?? '') : (b.ramNote ?? '')
+    const qualifier = authored.replace(/needs\s*~?[\d.]+\s*GB free RAM/i, '').replace(/^[\s—-]+/, '').trim()
+    const baseNote = Number.isFinite(needGb)
+      ? `needs ~${needGb} GB free RAM${qualifier ? ` — ${qualifier}` : ''}`
+      : authored
     const ctxNote = cx.tokens > v.spec.maxContext
       ? `long context allocates ~${kvPrice(v.spec, cx.tokens)} at boot, on top of the weights`
       : ''
