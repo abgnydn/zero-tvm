@@ -133,11 +133,16 @@ export function allocKVPagesInt8(device: GPUDevice, spec: ModelSpec = PHI3): { p
   const scalesPerPage = spec.kvScalesPerPage        // Phi-3: 1024 f16 per page
   const pagesBytes = spec.maxPages * bytesPerPage
   const scalesBytes = spec.maxPages * scalesPerPage * 2
+  // One pair per ATTENTION layer, matching allocKVPages and the engine's
+  // attention-ordinal indexing. This counted spec.layers while int8 was
+  // fused-only, where the two are equal — on a hybrid it would allocate 40
+  // buffers for 10 KV layers and quadruple the memory this exists to halve.
+  const attnLayerCount = spec.layerKinds.filter((k) => k === 'attn').length
   return {
-    pages: Array.from({ length: spec.layers }, (_, i) =>
+    pages: Array.from({ length: attnLayerCount }, (_, i) =>
       makeBuf(device, pagesBytes, `kvPagesI8_${i}`)
     ),
-    scales: Array.from({ length: spec.layers }, (_, i) =>
+    scales: Array.from({ length: attnLayerCount }, (_, i) =>
       makeBuf(device, scalesBytes, `kvScales_${i}`)
     ),
   }
@@ -520,13 +525,6 @@ export function buildDecodeEngine(
   const hybrid = S.layerKinds.includes('gdn')
   if (hybrid && fused) {
     throw new Error('buildDecodeEngine: hybrid (GDN) specs require the unfused composition')
-  }
-  if (hybrid && int8Mode) {
-    // Next step, not a limit of the quantizer: on a hybrid only some layers
-    // hold KV, so kvL() is indexed by ATTENTION ordinal and the scales array
-    // has to follow the same indexing. Wiring that blind is how the Phi-3
-    // ropeFreqs P0 shipped, so it lands after the dense path is verified.
-    throw new Error('buildDecodeEngine: int8KV does not cover hybrid specs yet — dense attention only')
   }
   // Pipeline stage bounds. Default is the whole model, which is what every
   // existing caller gets — L0 === 0 and L1 === S.layers make every branch
@@ -1812,10 +1810,18 @@ export function buildDecodeEngine(
         [B.cAttnOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, cAttnU!], lw.qkvBiases, 'c_attn'))
       gatedSplitBG = bg(device, P.gatedQkvSplit, [B.qkvOut!, B.attnGateRaw!, B.cAttnOut!, gatedSplitU!])
       if (S.qkNorm) qkNormBG = qkNormBGFor()
-      kvAppBG = bg(device, P.kvAppend, [
-        B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!,
-      ])
-      attnBG = attnF16BG()
+      if (int8Mode) {
+        kvQuantizeBG = bg(device, P.kvQuantizeInt8,
+          [B.kOut!, B.vOut!, kvL(), kvScales![kvIndex[L]], B.posMap, kvQuantU!])
+      } else {
+        kvAppBG = bg(device, P.kvAppend, [B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!])
+      }
+      attnBG = int8Mode
+        ? bg(device, P.attentionInt8, [
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), kvScales![kvIndex[L]],
+          B.lengthInfo, B.attnOut, attnI8U!,
+        ])
+        : attnF16BG()
       attnGateBG = bg(device, P.attnGate, [B.attnOut, B.attnGateRaw!, attnGateU!])
       oProjBG = bg(device, R.matmulOProj, withBias(
         [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
@@ -2158,8 +2164,13 @@ export function buildDecodeEngine(
       dispatch(enc, P.gatedQkvSplit, blk.gatedSplit!, C_ATTN_WGS, 1, 1, 'gatedQkvSplit')
       if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
       dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
-      dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
-      attentionF16()
+      if (int8Mode) {
+        dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
+        dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
+      } else {
+        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+        attentionF16()
+      }
       dispatch(enc, P.attnGate, blk.attnGate!, ATTN_GATE_WGS, 1, 1, 'attnGate')
       dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
     } else if (!fused) {

@@ -113,47 +113,52 @@ fn kv_quantize_int8(
     scales[scale_idx] = f16(scale);
   }
 
-  // Pack phase — per-word indexing: thread `t` in [0, KV_I8_ROW_WORDS)
-  // writes one u32 word containing dims [t*4, t*4+4). The max-phase EPT
-  // split does not align to 4-dim groups, so re-read those dims.
-  // (KV_I8_ROW_WORDS = HEAD_DIM/4 ≤ 32 for both specs.)
-  if (tid >= KV_I8_ROW_WORDS) { return; }
+  // Pack phase — thread `t` writes words t, t+32, t+64 …, so a row WIDER than
+  // 32 words is still covered. It used to write exactly one word each and
+  // return, which is correct only while KV_I8_ROW_WORDS (HEAD_DIM/4) <= 32.
+  // That held for every spec int8 could reach while it was fused-only —
+  // Phi-3 24, Qwen3 32 — and is false at HEAD_DIM 256, where 64 words meant
+  // dims 128..255 were NEVER written and each row's top half kept whatever
+  // the buffer already held. Coherent, wrong output; found the moment int8
+  // reached a head-dim-256 hybrid.
+  // The max-phase EPT split does not align to 4-dim groups, so re-read dims.
+  for (var w : i32 = tid; w < KV_I8_ROW_WORDS; w = w + 32) {
+    let d0 : i32 = w * 4;
+    let pack_base : i32 = tok_base + head * HEAD_DIM + d0;
+    var b0 : f32;
+    var b1 : f32;
+    var b2 : f32;
+    var b3 : f32;
+    if (side == 0) {
+      b0 = f32(k_slot[pack_base]);
+      b1 = f32(k_slot[pack_base + 1]);
+      b2 = f32(k_slot[pack_base + 2]);
+      b3 = f32(k_slot[pack_base + 3]);
+    } else {
+      b0 = f32(v_slot[pack_base]);
+      b1 = f32(v_slot[pack_base + 1]);
+      b2 = f32(v_slot[pack_base + 2]);
+      b3 = f32(v_slot[pack_base + 3]);
+    }
 
-  let d0 : i32 = tid * 4;
-  var b0 : f32;
-  var b1 : f32;
-  var b2 : f32;
-  var b3 : f32;
-  let pack_base : i32 = tok_base + head * HEAD_DIM + d0;
-  if (side == 0) {
-    b0 = f32(k_slot[pack_base]);
-    b1 = f32(k_slot[pack_base + 1]);
-    b2 = f32(k_slot[pack_base + 2]);
-    b3 = f32(k_slot[pack_base + 3]);
-  } else {
-    b0 = f32(v_slot[pack_base]);
-    b1 = f32(v_slot[pack_base + 1]);
-    b2 = f32(v_slot[pack_base + 2]);
-    b3 = f32(v_slot[pack_base + 3]);
+    let q0 : i32 = clamp(i32(round(b0 * inv_scale)), -127, 127);
+    let q1 : i32 = clamp(i32(round(b1 * inv_scale)), -127, 127);
+    let q2 : i32 = clamp(i32(round(b2 * inv_scale)), -127, 127);
+    let q3 : i32 = clamp(i32(round(b3 * inv_scale)), -127, 127);
+
+    let packed : u32 =
+        (u32(q0) & 0xffu)
+      | ((u32(q1) & 0xffu) << 8u)
+      | ((u32(q2) & 0xffu) << 16u)
+      | ((u32(q3) & 0xffu) << 24u);
+
+    // word_idx: page[page_no] · head[h] · slot[s] · side · dim_quad[w]
+    let word_idx : i32 = page_no * KV_I8_PAGE_WORDS
+                       + head * KV_I8_HEAD_WORDS
+                       + slot * KV_I8_SLOT_WORDS
+                       + side * KV_I8_ROW_WORDS
+                       + w
+                       + podArgs.pages_elem_offset;
+    pages_i8[word_idx] = packed;
   }
-
-  let q0 : i32 = clamp(i32(round(b0 * inv_scale)), -127, 127);
-  let q1 : i32 = clamp(i32(round(b1 * inv_scale)), -127, 127);
-  let q2 : i32 = clamp(i32(round(b2 * inv_scale)), -127, 127);
-  let q3 : i32 = clamp(i32(round(b3 * inv_scale)), -127, 127);
-
-  let packed : u32 =
-      (u32(q0) & 0xffu)
-    | ((u32(q1) & 0xffu) << 8u)
-    | ((u32(q2) & 0xffu) << 16u)
-    | ((u32(q3) & 0xffu) << 24u);
-
-  // word_idx: page[page_no] · head[h] · slot[s] · side · dim_quad[tid]
-  let word_idx : i32 = page_no * KV_I8_PAGE_WORDS
-                     + head * KV_I8_HEAD_WORDS
-                     + slot * KV_I8_SLOT_WORDS
-                     + side * KV_I8_ROW_WORDS
-                     + tid
-                     + podArgs.pages_elem_offset;
-  pages_i8[word_idx] = packed;
 }
