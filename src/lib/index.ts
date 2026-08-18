@@ -103,6 +103,14 @@ export interface CreateEngineOptions {
   /** Chunk capacity in tokens (DecodeEngineOptions.chunkCap; default 256 with
    *  the matrix unit, 64 without). Exposed for the CHUNK_CAP sweep. */
   chunkCap?: number
+  /** Cross-turn prefix reuse on/off (DecodeEngineOptions.prefixReuse — the
+   *  chat page's ?reuse=0). The native host had no way to turn it off, so
+   *  "does the reuse path corrupt a long conversation?" had no control arm:
+   *  every multi-turn run on this surface reused, including the ones whose
+   *  output went wrong. Off means each turn prefills the whole prompt from
+   *  zero — minutes on a deep conversation, which is why it is a diagnostic
+   *  and not a default. */
+  prefixReuse?: boolean
   /** Pooled chunked prefill (engine pooledChunkedPrefill) — opt-in, awaiting
    *  its AC timing pair; token-identity already gated. */
   pooledChunkedPrefill?: boolean
@@ -342,6 +350,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
     ...(opts.specWidth ? { specWidth: opts.specWidth } : {}),
     ...(opts.poolOptimistic ? { poolOptimistic: true } : {}),
     ...(opts.chunkedPrefill === false ? { chunkedPrefill: false } : {}),
+    ...(opts.prefixReuse === false ? { prefixReuse: false } : {}),
     ...(opts.chunkCap ? { chunkCap: opts.chunkCap } : {}),
     ...(opts.pooledChunkedPrefill ? { pooledChunkedPrefill: true } : {}),
   })

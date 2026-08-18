@@ -28,6 +28,7 @@ import { dirname, join } from 'node:path'
 import { sampleMemory } from './native/sysmem.mjs'
 import { SHIPPED_MODELS, modelBranding, specWithCtx } from '../src/zero-tvm/model-registry.ts'
 import { stationUi } from './native/station-ui.mjs'
+import { engineArgs } from './native/engine-args.ts'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const PORT = Number(process.env.PORT) || 8017
@@ -114,7 +115,7 @@ async function waitReady(timeoutMs = 12 * 60_000) {
   return false
 }
 
-async function loadModel({ param, ctx, pool, kv8 }) {
+async function loadModel({ param, ctx, pool, kv8, reuse }) {
   stopEngine()
   await new Promise((r) => setTimeout(r, 400))   // let the port free
   logLines = []
@@ -123,14 +124,7 @@ async function loadModel({ param, ctx, pool, kv8 }) {
   lastSeenAt = null
   phase = 'loading'
   loaded = { param, ctx: ctx || 0, pool: pool || 0 }
-  const argv = [join(ROOT, 'scripts/agent-native.mjs'), param, '--port', String(ENGINE_PORT)]
-  if (ctx) argv.push('--ctx', String(ctx))
-  // `pool` here is EXPERT SLOTS (a memory build), not the KV prefix pool.
-  // This used to pass it as --pool, so the default build (slots 0) sent
-  // `--pool 0` and silently turned OFF the disk cache that lets a prefill
-  // survive a restart — the one thing that makes a reload cheap.
-  if (pool) argv.push('--experts', String(pool))
-  if (kv8 === false) argv.push('--kv8', '0')   // int8 is the default; this is the opt-out
+  const argv = [join(ROOT, 'scripts/agent-native.mjs'), ...engineArgs({ param, port: ENGINE_PORT, ctx, pool, kv8, reuse })]
   pushLog(`$ node ${argv.slice(1).join(' ')}`)
   child = spawn('node', argv, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
   child.stdout.on('data', pushLog)
@@ -246,7 +240,7 @@ createServer(async (req, res) => {
     // Clamp here as well as in the engine, so the UI can show what it will get.
     const ctx = Math.min(Number(body.ctx) || hit.defaultCtx, hit.maxCtx)
     json(res, 202, { accepted: { param: hit.param, ctx, pool: Number(body.pool) || 0 } })
-    void loadModel({ param: hit.param, ctx, pool: Number(body.pool) || 0, kv8: body.kv8 !== false })
+    void loadModel({ param: hit.param, ctx, pool: Number(body.pool) || 0, kv8: body.kv8 !== false, reuse: body.reuse !== false })
     return
   }
 

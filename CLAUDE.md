@@ -409,6 +409,7 @@ binds 0.0.0.0; this binds 127.0.0.1 by design, since it has no auth.
 | `--ctx N` | context window; the KV allocation follows it |
 | `--pool 0` | turn OFF the KV prefix pool on disk (on by default) |
 | `--kv8 0` | turn OFF the int8 KV cache (on by default, same as the browser) |
+| `--reuse 0` | turn OFF cross-turn prefix reuse AND the GDN rewind ring (a diagnostic) |
 | `--experts N` | expert SLOTS per MoE layer, a memory build |
 
 **Two different things are called "pool" and confusing them cost a 43k-token

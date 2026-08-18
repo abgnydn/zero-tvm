@@ -5,6 +5,7 @@
 //   npm i --no-save webgpu                # once (the dawn.node prebuilt)
 //   npm run dev                           # weights mirror (localhost only)
 //   node scripts/agent-native.mjs qwen3mlx [--ctx N] [--port 8017] [--pool 0]
+//                                    [--kv8 0] [--reuse 0]
 //
 // Same /v1 surface as agent-server.mjs, but where that file relays jobs to a
 // browser tab over SSE, this one calls the engine directly — the whole
@@ -28,7 +29,8 @@ import { fileURLToPath } from 'node:url'
 const args = process.argv.slice(2)
 const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
 const param = args.find((a) => !a.startsWith('--') && a !== flag('ctx') && a !== flag('port')
-  && a !== flag('pool') && a !== flag('experts') && a !== flag('kv8')) ?? 'qwen3mlx'
+  && a !== flag('pool') && a !== flag('experts') && a !== flag('kv8')
+  && a !== flag('reuse')) ?? 'qwen3mlx'
 const CTX = Number(flag('ctx')) || 0
 const PORT = Number(flag('port')) || 8017
 // TWO different pools, and confusing them cost a 43k-token prefill twice.
@@ -47,6 +49,12 @@ const EXPERTS = Number(flag('experts')) || 0
 // Cost: ~5-8% of prefill throughput (llama32 681 -> 625 tok/s, qwen35
 // 443 -> 419) against half the KV memory.
 const KV8 = flag('kv8') !== '0'
+// Cross-turn prefix reuse: DEFAULT ON, `--reuse 0` opts out. Purely a
+// diagnostic — the browser has ?reuse=0 and this surface had nothing, so when a
+// deep multi-turn conversation went wrong there was no arm that answered
+// "does it still go wrong when every turn prefills from zero?". Expect it to
+// be slow: a 24k-token turn re-prefills 24k tokens.
+const REUSE = flag('reuse') !== '0'
 
 await installShims({ unsafe: !args.includes('--safe') })
 // Serve .weights-local BEFORE the loader runs. Without it the native host
@@ -71,11 +79,13 @@ console.log(KV8
   ? '[native] int8 KV cache (default) — half the cache memory; --kv8 0 for f16'
   : '[native] f16 KV cache — int8 disabled by --kv8 0')
 if (EXPERTS) console.log(`[native] expert pool ${EXPERTS} slots/layer — saves RAM, but prefill runs PER TOKEN (no chunking)`)
+if (!REUSE) console.log('[native] cross-turn prefix reuse OFF (--reuse 0) — every turn re-prefills from zero')
 const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   model: param,
   ...(CTX ? { ctx: CTX } : {}),
   ...(EXPERTS ? { expertPool: EXPERTS } : {}),
   ...(KV8 ? { int8KV: true } : {}),
+  ...(REUSE ? {} : { prefixReuse: false }),
   onProgress: (p) => { if (p.stage === 'weights' || p.stage === 'ready') process.stdout.write(`\r[native] ${p.message}          `) },
 })
 console.log(`\n[native] ${info.name} ready in ${((Date.now() - t0) / 1000).toFixed(1)}s — ctx ${spec.maxContext.toLocaleString()}`)
@@ -422,7 +432,7 @@ createServer(async (req, res) => {
     // there is no way to tell a host that will save its prefill from one that
     // will not — the two behave identically until the NEXT boot, and the flag
     // spent weeks silently off because the station passed the wrong one.
-    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, kv8: KV8, last: lastStats, live })
+    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, kv8: KV8, reuse: REUSE, last: lastStats, live })
     return
   }
   if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {
