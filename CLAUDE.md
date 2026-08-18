@@ -408,7 +408,7 @@ binds 0.0.0.0; this binds 127.0.0.1 by design, since it has no auth.
 |---|---|
 | `--ctx N` | context window; the KV allocation follows it |
 | `--pool 0` | turn OFF the KV prefix pool on disk (on by default) |
-| `--kv8` | int8 KV cache — half the cache memory, opt-in |
+| `--kv8 0` | turn OFF the int8 KV cache (on by default, same as the browser) |
 | `--experts N` | expert SLOTS per MoE layer, a memory build |
 
 **Two different things are called "pool" and confusing them cost a 43k-token
@@ -418,9 +418,12 @@ expert tensors — and it DISABLES chunked prefill, because the pooled path
 structurally cannot chunk, so it trades minutes of prefill for gigabytes of
 RAM. Never turn it on to serve long prompts.
 
-`--kv8` and `--pool` are mutually exclusive today: `exportKV`/`importKV` refuse
-under int8, so the pool silently never saves. `/health` reports
-`poolInertUnderKv8` when both are set.
+int8 KV and the disk pool used to be mutually exclusive — `exportKV`/`importKV`
+refused under int8 — which is why int8 was opt-in here longer than in the
+browser. The snapshot carries the per-row scales now (on-disk format 2), so
+both run together: verified across a real restart at `pool: restored 1033
+tokens` with `kv8=true`. Cost of int8 is ~5-8% of prefill throughput against
+half the KV memory.
 
 ## Quality vs fidelity (`docs/QUALITY.md`)
 

@@ -130,7 +130,7 @@ async function loadModel({ param, ctx, pool, kv8 }) {
   // `--pool 0` and silently turned OFF the disk cache that lets a prefill
   // survive a restart — the one thing that makes a reload cheap.
   if (pool) argv.push('--experts', String(pool))
-  if (kv8) argv.push('--kv8')
+  if (kv8 === false) argv.push('--kv8', '0')   // int8 is the default; this is the opt-out
   pushLog(`$ node ${argv.slice(1).join(' ')}`)
   child = spawn('node', argv, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
   child.stdout.on('data', pushLog)
@@ -246,7 +246,7 @@ createServer(async (req, res) => {
     // Clamp here as well as in the engine, so the UI can show what it will get.
     const ctx = Math.min(Number(body.ctx) || hit.defaultCtx, hit.maxCtx)
     json(res, 202, { accepted: { param: hit.param, ctx, pool: Number(body.pool) || 0 } })
-    void loadModel({ param: hit.param, ctx, pool: Number(body.pool) || 0, kv8: !!body.kv8 })
+    void loadModel({ param: hit.param, ctx, pool: Number(body.pool) || 0, kv8: body.kv8 !== false })
     return
   }
 

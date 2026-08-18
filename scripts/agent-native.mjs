@@ -25,7 +25,7 @@ import { panelHtml } from './native/panel.mjs'
 const args = process.argv.slice(2)
 const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
 const param = args.find((a) => !a.startsWith('--') && a !== flag('ctx') && a !== flag('port')
-  && a !== flag('pool') && a !== flag('experts')) ?? 'qwen3mlx'
+  && a !== flag('pool') && a !== flag('experts') && a !== flag('kv8')) ?? 'qwen3mlx'
 const CTX = Number(flag('ctx')) || 0
 const PORT = Number(flag('port')) || 8017
 // TWO different pools, and confusing them cost a 43k-token prefill twice.
@@ -35,10 +35,15 @@ const PORT = Number(flag('port')) || 8017
 //   of prefill for gigabytes of RAM — never turn it on to serve long prompts.
 const POOL = flag('pool') !== '0'
 const EXPERTS = Number(flag('experts')) || 0
-// --kv8 halves the KV cache. Here so the quality cost can be MEASURED end to
-// end (identical prompts, greedy, first divergent token) rather than argued
-// from an offline error metric. Fused path only, so Phi-3 today.
-const KV8 = args.includes('--kv8')
+// int8 KV: DEFAULT ON, `--kv8 0` opts out. Same default as the browser, and for
+// the same reason — it was measured free end to end (paired perplexity -0.09%
+// at 1k windows / +0.10% at 4k, both within noise; greedy output
+// token-identical to f16 on three models) and halves the cache. The one thing
+// that used to argue against it here, that the KV disk pool went inert under
+// int8, stopped being true when the pool learned to carry the scales.
+// Cost: ~5-8% of prefill throughput (llama32 681 -> 625 tok/s, qwen35
+// 443 -> 419) against half the KV memory.
+const KV8 = flag('kv8') !== '0'
 
 await installShims({ unsafe: !args.includes('--safe') })
 // dist-lib is real resolved JS — the src tree's `.js`-suffixed TS imports
@@ -49,7 +54,9 @@ const S = await hostSurface()
 
 console.log(`[native] booting ${param}${CTX ? ` ctx=${CTX}` : ''} on dawn.node…`)
 const t0 = Date.now()
-if (KV8) console.log('[native] int8 KV cache — half the cache memory; the disk pool carries its scales, so a prefill still survives a restart')
+console.log(KV8
+  ? '[native] int8 KV cache (default) — half the cache memory; --kv8 0 for f16'
+  : '[native] f16 KV cache — int8 disabled by --kv8 0')
 if (EXPERTS) console.log(`[native] expert pool ${EXPERTS} slots/layer — saves RAM, but prefill runs PER TOKEN (no chunking)`)
 const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   model: param,
