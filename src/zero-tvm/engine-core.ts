@@ -24,7 +24,7 @@ import { LoadedWeights } from './weight-loader.js'
 import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
-import { reuseStart, rewindSlot, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
+import { reuseStart, rewindSlot, dropSnapshotsAbove, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
 import { ExpertPool } from './expert-pool.js'
 import type { SlabKind, SlabProj } from './slab-source.js'
 
@@ -3944,6 +3944,11 @@ export function buildDecodeEngine(
     onPrefill?: (done: number, total: number) => void,
   ): Promise<number[]> {
     const tokens: number[] = []
+    // Clear it FIRST. It is written only on the stop-id / bad-readback exits,
+    // so a turn that ended by hitting maxTokens, by cancellation, or in the
+    // prefill early returns used to leave the PREVIOUS turn's record standing
+    // — and the host prints it as this turn's reason for an empty reply.
+    lastStop = null
     if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
     if (promptIds.length === 0 || maxTokens <= 0) return tokens
     // Refuse oversized prompts up front — prefilling at position >= MAX_CONTEXT
@@ -3982,6 +3987,10 @@ export function buildDecodeEngine(
         // Truncate the record to match: everything above the rewind point is
         // about to be rewritten by the replay — noteAbsorbed's own rewind case.
         absorbed.length = rewoundTo
+        // ...and the SNAPSHOTS above it describe that same doomed sequence.
+        // Leaving them is how a later turn restores an older turn's recurrent
+        // state onto the current cache: silent, fluent, wrong.
+        dropSnapshotsAbove(gdnCkptPos, rewoundTo)
         startPos = rewoundTo
       }
     }

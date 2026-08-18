@@ -88,6 +88,27 @@ export function rewindSlot(ckptPos: readonly number[], lcp: number, promptLen: n
 }
 
 /**
+ * Void every snapshot ABOVE a rewind point, in place.
+ *
+ * A rewind to `pos` replays the sequence from there, so any snapshot taken
+ * higher describes tokens that are about to be overwritten — the state of a
+ * conversation that no longer exists. Snapshots at or below `pos` are still
+ * good: the prompt agreed with the record down to there, so the prefix they
+ * encode is unchanged.
+ *
+ * Missing this is silent and rare, which is the worst combination. It needs
+ * two rewinds whose points are NOT monotonically increasing, so a client that
+ * rewrites the same trailing block every turn never triggers it — the case the
+ * ring was verified against. A randomized 12-turn simulation hit it in 2,929
+ * of 20,000 conversations at CHUNK_CAP 1024; the failure is one turn restoring
+ * an earlier turn's recurrent state onto the current KV cache, which is fluent
+ * wrong output rather than a crash.
+ */
+export function dropSnapshotsAbove(ckptPos: number[], pos: number): void {
+  for (let s = 0; s < ckptPos.length; s++) if (ckptPos[s] > pos) ckptPos[s] = -1
+}
+
+/**
  * Record that position `position` now holds `id`.
  *
  * Two behaviours, and the second is the one with teeth:

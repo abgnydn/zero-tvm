@@ -18,7 +18,7 @@
 // and ?chunk=0.
 
 import { describe, expect, it } from 'vitest'
-import { reuseStart, rewindSlot, noteAbsorbed, type ReuseState } from '../../src/zero-tvm/prefix-reuse.ts'
+import { reuseStart, rewindSlot, dropSnapshotsAbove, noteAbsorbed, type ReuseState } from '../../src/zero-tvm/prefix-reuse.ts'
 
 const state = (over: Partial<ReuseState> = {}): ReuseState => ({
   absorbed: [], absorbedValid: true, prefixReuse: true, hybrid: false, gdnStatePos: 0, ...over,
@@ -216,5 +216,53 @@ describe('rewindSlot — replaying from a GDN snapshot when reuseStart declines'
   it('prefers a later snapshot even when an earlier one also qualifies', () => {
     expect(rewindSlot([4096, 1024], 5000, 9000)).toBe(0)
     expect(rewindSlot([1024, 4096], 5000, 9000)).toBe(1)
+  })
+})
+
+describe('dropSnapshotsAbove — a rewind invalidates every snapshot above it', () => {
+  it('voids the doomed ones and keeps the prefix ones', () => {
+    const ring = [1024, 2048, 3072, 4096]
+    dropSnapshotsAbove(ring, 2048)
+    expect(ring).toEqual([1024, 2048, -1, -1])
+  })
+
+  it('keeps a snapshot exactly AT the rewind point', () => {
+    // The prompt agreed with the record down to there, so the prefix that slot
+    // encodes is unchanged — it is the best rewind point, not a stale one.
+    const ring = [2048]
+    dropSnapshotsAbove(ring, 2048)
+    expect(ring).toEqual([2048])
+  })
+
+  it('leaves empty slots alone', () => {
+    const ring = [-1, 4096, -1]
+    dropSnapshotsAbove(ring, 1024)
+    expect(ring).toEqual([-1, -1, -1])
+  })
+
+  it('stops a NON-MONOTONIC rewind pair from restoring a dead conversation', () => {
+    // The failure an adversarial simulation found in 2,929 of 20,000 randomized
+    // conversations, reduced to its shape. A client that rewrites the SAME
+    // trailing block every turn produces increasing rewind points and never
+    // reaches it, which is why six live rewinding turns looked clean.
+    const ring = [646, -1, -1, -1]
+
+    // turn 6 diverges at 747, rewinds to 646, replays, snapshots at 1254
+    let slot = rewindSlot(ring, 747, 1255)
+    expect(ring[slot]).toBe(646)
+    dropSnapshotsAbove(ring, 646)
+    ring[1] = 1254
+
+    // turn 7 diverges at 1245 — BELOW 1254 — and rewinds to 646 again. Slot 1
+    // now describes turn 6's tokens, which this replay is about to overwrite.
+    slot = rewindSlot(ring, 1245, 1363)
+    expect(ring[slot]).toBe(646)
+    dropSnapshotsAbove(ring, 646)
+    expect(ring[1]).toBe(-1)      // without this, turn 8 restores turn 6's state
+    ring[2] = 1362
+
+    // turn 8 agrees to 1308. The only legal point is 646, not the dead 1254.
+    slot = rewindSlot(ring, 1308, 1732)
+    expect(ring[slot]).toBe(646)
   })
 })
