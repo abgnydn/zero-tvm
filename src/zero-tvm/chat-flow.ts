@@ -110,17 +110,26 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
       })
-      // qkNorm specs (Qwen3) run the unfused composition — qkv_fused folds
-      // RoPE+append into the projection with no per-head norm hook, and the
-      // int8-KV path rides on qkv_fused_scratch, so ?kv8 is gated off too
-      // until an unfused-int8 composition is verified end-to-end.
-      // ...and MLX-affine specs likewise: qkv_fused dequantises symmetric
-      // group-32 inline, so affine checkpoints take the unfused matmul path
-      // whether or not they carry qkNorm.
+      // int8 KV no longer needs the fused QKV path. It rode qkv_fused_scratch
+      // when it was written, which meant Phi-3 alone — a 4k window, the one
+      // model where the cache is never the constraint. The quantizer only ever
+      // needed a (k_slot, v_slot) pair, which the unfused chain has in
+      // kOut/vOut after RoPE, so it now covers unfused, hybrid and chunked
+      // prefill. Verified token-identical against f16 on llama32, qwen35 and
+      // qwen36q3 (docs/TURBOQUANT_PLAN.md, "Phase 1 BUILT").
+      //
+      // This gate outlived the rule it encoded and was refusing ?kv8=1 for
+      // every model the engine now supports — the same stale duplicate that
+      // had to be removed from lib/index.ts. MLA is the one real exclusion:
+      // it caches a latent, not per-head K/V, so the kernel does not apply.
+      // Which QKV composition this spec takes, independent of int8 now. Both
+      // qkNorm specs and MLX-affine checkpoints go unfused: qkv_fused folds
+      // RoPE+append into the projection with no per-head norm hook, and
+      // dequantises symmetric group-32 inline.
       const fused = !s.qkNorm && s.weightFormat !== 'mlx-safetensors'
-      const int8KV = flags.int8KV && fused
+      const int8KV = flags.int8KV && !s.mla
       if (flags.int8KV && !int8KV) {
-        bootLog(`?kv8=1 ignored for ${s.id} — int8 KV requires the fused QKV path (Phi-3 only for now)`)
+        bootLog(`?kv8=1 ignored for ${s.id} — int8 KV does not cover MLA, which caches a latent rather than per-head K/V`)
       }
       // KV cache: int8 halves memory at the cost of one extra dispatch per layer.
       const kvMiB = Math.round(
