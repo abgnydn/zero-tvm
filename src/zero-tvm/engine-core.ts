@@ -830,10 +830,15 @@ export function buildDecodeEngine(
     gdnCkptNext = (gdnCkptNext + 1) % GDN_CKPT_SLOTS
   }
 
-  function restoreGdnCkpt(slot: number): void {
-    // Unreachable before a save (gdnCkptPos is all -1 until then), but the ring
-    // is now lazily allocated, so state the dependency rather than rely on it.
-    if (gdnCkptConv.length === 0) return
+  /** @returns false if the ring holds nothing to restore — the caller MUST
+   *  then abandon the rewind. Returning void here was a latent trap: the call
+   *  site goes on to set gdnStatePos, truncate `absorbed` and skip the
+   *  prefill, so a guard that fired silently would produce fluent wrong output
+   *  rather than a loud failure. Unreachable today (positions only leave -1
+   *  inside saveGdnCkpt, after allocation), which is exactly why it should not
+   *  depend on staying unreachable. */
+  function restoreGdnCkpt(slot: number): boolean {
+    if (gdnCkptConv.length === 0) return false
     const enc = device.createCommandEncoder()
     for (let L = 0; L < S.layers; L++) {
       const c = gdnConvState[L], r = gdnRecurState[L]
@@ -842,6 +847,7 @@ export function buildDecodeEngine(
       enc.copyBufferToBuffer(gdnCkptRecur[slot][L]!, 0, r, 0, r.size)
     }
     device.queue.submit([enc.finish()])
+    return true
   }
 
   /** Anything that moves the state without replaying tokens voids every slot.
@@ -3809,9 +3815,11 @@ export function buildDecodeEngine(
   // quarter-pool configurations) keep per-token prefill.
   const pooledChunkOK = !pooling || (POOL_SLOTS >= 96 && !optimistic && opts.pooledChunkedPrefill === true)
   const chunkPrefill: ChunkPrefill | null =
-    // int8 KV excluded: the chunk path binds the f16 kv_append/attention_prefill
-    // kernels, which would write full-width values into half-size int8 pages —
-    // silent corruption, not an error (lens round 2026-08-17).
+    // int8 KV chunks too, since 2026-08-18: the chunk path swaps in
+    // kv_quantize_int8 (batched on a token axis) and attention_prefill_int8,
+    // BOTH bind group and dispatch. Binding one without the other is what
+    // WebGPU discards the whole submit for, silently — which reads as garbage
+    // output rather than an error, and is how this was caught.
     !partial && !S.mla && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
       ? buildChunkPrefill()
       : null
@@ -3999,9 +4007,8 @@ export function buildDecodeEngine(
     let rewoundTo = -1
     if (startPos === 0 && GDN_CKPT_SLOTS > 0 && absorbedValid && prefixReuse && absorbed.length > 0) {
       const bestSlot = rewindSlot(gdnCkptPos, absorbedLcp(promptIds), promptIds.length)
-      if (bestSlot >= 0) {
+      if (bestSlot >= 0 && restoreGdnCkpt(bestSlot)) {
         rewoundTo = gdnCkptPos[bestSlot]
-        restoreGdnCkpt(bestSlot)
         gdnStatePos = rewoundTo
         // Truncate the record to match: everything above the rewind point is
         // about to be rewritten by the replay — noteAbsorbed's own rewind case.
@@ -4550,6 +4557,10 @@ export function buildDecodeEngine(
     // Add a buffer above, add it here. `B` and the chunk-prefill closure carry
     // their own members by construction; the uniforms have to be named.
     const owned: (GPUBuffer | null)[] = [
+      // The rewind ring, per its own rule above. It is allocated LAZILY, so
+      // these arrays are empty on an engine that never chunked — flat() over
+      // nothing, rather than a special case.
+      ...gdnCkptConv.flat(), ...gdnCkptRecur.flat(),
       ...Object.values(B), ...gdnStateBufs, ...readRing, ffnGateUp,
       qkvU, oProjU, ffnDnU, ffnGateUpU, ffnSiluU, lmHdU, embU, normU, ffnU, argmaxU,
       samplerU, samplePartials, ropeU, ropeFreqs, kvAppU, qkNormU, qkFuseU,
