@@ -33,9 +33,6 @@ const PORT = Number(flag('port')) || 8017
 // --experts = expert SLOTS per MoE layer, a memory build. It disables chunked
 //   prefill (the pooled path structurally cannot chunk), so it trades minutes
 //   of prefill for gigabytes of RAM — never turn it on to serve long prompts.
-// The KV disk pool and int8 KV are mutually exclusive TODAY: exportKV and
-// importKV both refuse under int8Mode (engine-core.ts), so arming both means
-// the pool silently never saves. Report the truth rather than two green lights.
 const POOL = flag('pool') !== '0'
 const EXPERTS = Number(flag('experts')) || 0
 // --kv8 halves the KV cache. Here so the quality cost can be MEASURED end to
@@ -52,8 +49,7 @@ const S = await hostSurface()
 
 console.log(`[native] booting ${param}${CTX ? ` ctx=${CTX}` : ''} on dawn.node…`)
 const t0 = Date.now()
-if (KV8) console.log('[native] int8 KV cache — half the cache memory'
-  + (POOL ? '. NOTE: the KV disk pool is inert under int8, so a prefill will not survive a restart' : ''))
+if (KV8) console.log('[native] int8 KV cache — half the cache memory; the disk pool carries its scales, so a prefill still survives a restart')
 if (EXPERTS) console.log(`[native] expert pool ${EXPERTS} slots/layer — saves RAM, but prefill runs PER TOKEN (no chunking)`)
 const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   model: param,
@@ -71,7 +67,7 @@ console.log(`\n[native] ${info.name} ready in ${((Date.now() - t0) / 1000).toFix
 const dialect = spec.chatTemplateId === 'llama3' ? 'llama3'
   : ['qwen36', 'qwen3-8-27b'].some((p) => spec.id.startsWith(p)) ? 'chatml-xml' : 'chatml-json'
 const poolCfg = () => ({
-  spec, weightRevision: spec.hfRepo, variants, fused: false, int8KV: false,
+  spec, weightRevision: spec.hfRepo, variants, fused: false, int8KV: KV8,
   prefillPath: !spec.moe && variants.subgroups ? 'chunked' : 'per-token',
   adapter: { vendor: 'dawn-node', architecture: 'native' },
 })
@@ -406,7 +402,7 @@ createServer(async (req, res) => {
     // there is no way to tell a host that will save its prefill from one that
     // will not — the two behave identically until the NEXT boot, and the flag
     // spent weeks silently off because the station passed the wrong one.
-    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL && !KV8, poolInertUnderKv8: POOL && KV8, experts: EXPERTS, kv8: KV8, last: lastStats, live })
+    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, kv8: KV8, last: lastStats, live })
     return
   }
   if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {

@@ -205,11 +205,11 @@ export interface DecodeEngine {
   /** Paging Phase 1 — read the absorbed prefix's KV (+ GDN state) out as
    *  bytes, or null when this engine's state is not poolable (MLA, int8,
    *  pipeline stage, invalid record, mid-chunk hybrid state). */
-  exportKV(): Promise<{ tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] } | null>
+  exportKV(): Promise<{ tokens: number; ids: number[]; layers: ArrayBuffer[]; scales: ArrayBuffer[]; gdn: ArrayBuffer[] } | null>
   /** Write a saved prefix back and claim it in the absorbed record. The
    *  CALLER guarantees fingerprint equality (kv-pool.ts); these bytes carry
    *  no self-identification. */
-  importKV(snap: { tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] }): boolean
+  importKV(snap: { tokens: number; ids: number[]; layers: ArrayBuffer[]; scales?: ArrayBuffer[]; gdn: ArrayBuffer[] }): boolean
   /**
    * Per-token NLL over a sequence — the perplexity primitive. `nll[p]` is
    * `-log P(ids[p+1] | ids[0..p])`, so the result has `ids.length - 1` entries.
@@ -3147,17 +3147,28 @@ export function buildDecodeEngine(
    * rewound, so a restored hybrid entry is exact-length attach only (the
    * reuseStart rules already enforce that).
    *
-   * Refused for MLA (flat position*L cache, unpooled in Phase 1), int8 KV
-   * (f16-only per the plan's §7 — a pool keyed on layout would split), and
-   * pipeline stages.
+   * Refused for MLA (flat position*L cache, unpooled in Phase 1) and pipeline
+   * stages.
+   *
+   * int8 USED to be refused here too, and it cost more than it looked: with
+   * int8 the default, that exclusion would have silently disabled the
+   * prefill-survives-a-restart cache for everyone. The reason was never
+   * fundamental — the snapshot had nowhere to put the per-row scales — and the
+   * pool fingerprint already keys on int8kv (prefix-pool.ts), so an f16 entry
+   * can never be handed to an int8 engine. The scales ride along now.
    */
-  async function exportKV(): Promise<{ tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] } | null> {
-    if (partial || MLA || int8Mode) return null
+  async function exportKV(): Promise<
+    { tokens: number; ids: number[]; layers: ArrayBuffer[]; scales: ArrayBuffer[]; gdn: ArrayBuffer[] } | null
+  > {
+    if (partial || MLA) return null
     if (!absorbedValid || absorbed.length === 0) return null
     if (hybrid && gdnStatePos !== absorbed.length) return null   // mid-chunk state: not attachable
     const tokens = absorbed.length
-    const bytesPerPage = S.kvPageStride * 2
-    const byteLen = Math.ceil(tokens / S.pageSize) * bytesPerPage
+    const pages = Math.ceil(tokens / S.pageSize)
+    // int8 pages are packed u32 words, not f16 values — a different width, so
+    // the length must follow the mode rather than the f16 stride.
+    const byteLen = pages * (int8Mode ? S.kvI8PageWords * 4 : S.kvPageStride * 2)
+    const scaleLen = pages * S.kvScalesPerPage * 2
     const CHUNK = 64 * 1024 * 1024
     const readBack = async (src: GPUBuffer, len: number): Promise<ArrayBuffer> => {
       const out = new Uint8Array(len)
@@ -3175,7 +3186,9 @@ export function buildDecodeEngine(
       return out.buffer
     }
     const layers: ArrayBuffer[] = []
-    for (const pages of kvPages) layers.push(await readBack(pages, byteLen))
+    for (const buf of kvPages) layers.push(await readBack(buf, byteLen))
+    const scales: ArrayBuffer[] = []
+    if (int8Mode && kvScales) for (const buf of kvScales) scales.push(await readBack(buf, scaleLen))
     const gdn: ArrayBuffer[] = []
     if (hybrid) {
       for (let L = 0; L < S.layers; L++) {
@@ -3184,7 +3197,7 @@ export function buildDecodeEngine(
         gdn.push(await readBack(gdnRecurState[L]!, gdnRecurState[L]!.size))
       }
     }
-    return { tokens, ids: [...absorbed], layers, gdn }
+    return { tokens, ids: [...absorbed], layers, scales, gdn }
   }
 
   /**
@@ -3194,12 +3207,22 @@ export function buildDecodeEngine(
    * responsible for fingerprint equality — bytes from a different variant set
    * or weight revision are a different model, and nothing here can tell.
    */
-  function importKV(snap: { tokens: number; ids: number[]; layers: ArrayBuffer[]; gdn: ArrayBuffer[] }): boolean {
-    if (partial || MLA || int8Mode) return false
+  function importKV(snap: {
+    tokens: number; ids: number[]; layers: ArrayBuffer[]; scales?: ArrayBuffer[]; gdn: ArrayBuffer[]
+  }): boolean {
+    if (partial || MLA) return false
     if (snap.layers.length !== kvPages.length) return false
+    // An int8 engine needs one scales buffer per layer. A snapshot without them
+    // is an f16 entry, which the fingerprint should already have excluded —
+    // refuse rather than restore codes with nobody's scale.
+    if (int8Mode && (!kvScales || (snap.scales?.length ?? 0) !== kvScales.length)) return false
+    if (!int8Mode && (snap.scales?.length ?? 0) > 0) return false
     if (snap.tokens > MAX_CONTEXT || snap.ids.length !== snap.tokens) return false
     for (let i = 0; i < kvPages.length; i++) {
       device.queue.writeBuffer(kvPages[i], 0, snap.layers[i])
+    }
+    if (int8Mode && kvScales && snap.scales) {
+      for (let i = 0; i < kvScales.length; i++) device.queue.writeBuffer(kvScales[i], 0, snap.scales[i])
     }
     if (hybrid) {
       let g = 0

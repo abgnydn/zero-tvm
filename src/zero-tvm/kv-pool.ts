@@ -36,7 +36,11 @@ import { computeFingerprint, type ComputeConfig, type Hash128 } from './prefix-p
 const POOL_DIR = 'zero-tvm-kvpool'
 /** Bump on any change to the entry layout — a stale entry must read as a
  *  miss, never as bytes. */
-const FORMAT = 1
+// 2: entries carry the int8 per-row SCALES alongside the pages. A format-1
+// entry has none, and an int8 engine cannot use codes without them — the
+// version bump is what makes an old entry a clean miss instead of a restore
+// of scaleless garbage.
+const FORMAT = 2
 
 export interface PoolConfig {
   spec: ModelSpec
@@ -81,6 +85,8 @@ interface EntryMeta {
   tokens: number
   ids: number[]
   layerBytes: number
+  /** Per-layer scales byte length; 0 on an f16 entry. */
+  scaleBytes: number
   layerCount: number
   gdnBytes: number[]
   savedAt: number
@@ -103,6 +109,7 @@ export async function poolSave(engine: DecodeEngine, cfg: PoolConfig): Promise<{
     tokens: snap.tokens,
     ids: snap.ids,
     layerBytes: snap.layers[0]?.byteLength ?? 0,
+    scaleBytes: snap.scales[0]?.byteLength ?? 0,
     layerCount: snap.layers.length,
     gdnBytes: snap.gdn.map((g) => g.byteLength),
     savedAt: Date.now(),
@@ -111,6 +118,7 @@ export async function poolSave(engine: DecodeEngine, cfg: PoolConfig): Promise<{
   // the two leaves bytes without meta, which reads as a miss, not corruption.
   const bin = await (await dir.getFileHandle('entry.bin', { create: true })).createWritable()
   for (const l of snap.layers) await bin.write(l)
+  for (const sc of snap.scales) await bin.write(sc)
   for (const g of snap.gdn) await bin.write(g)
   await bin.close()
   const mw = await (await dir.getFileHandle('meta.json', { create: true })).createWritable()
@@ -149,7 +157,8 @@ export async function poolTryRestore(
   for (let i = 0; i < meta.tokens; i++) {
     if (promptIds[i] !== meta.ids[i]) return { restored: 0, reason: `id mismatch at ${i}` }
   }
-  const expect = meta.layerBytes * meta.layerCount + meta.gdnBytes.reduce((a, b) => a + b, 0)
+  const expect = (meta.layerBytes + meta.scaleBytes) * meta.layerCount
+    + meta.gdnBytes.reduce((a, b) => a + b, 0)
   if (bin.byteLength !== expect) return { restored: 0, reason: 'entry truncated' }
 
   const layers: ArrayBuffer[] = []
@@ -159,11 +168,18 @@ export async function poolTryRestore(
     off += meta.layerBytes
   }
   const gdn: ArrayBuffer[] = []
+  const scales: ArrayBuffer[] = []
+  if (meta.scaleBytes > 0) {
+    for (let i = 0; i < meta.layerCount; i++) {
+      scales.push(bin.slice(off, off + meta.scaleBytes))
+      off += meta.scaleBytes
+    }
+  }
   for (const g of meta.gdnBytes) {
     gdn.push(bin.slice(off, off + g))
     off += g
   }
-  const ok = engine.importKV({ tokens: meta.tokens, ids: meta.ids, layers, gdn })
+  const ok = engine.importKV({ tokens: meta.tokens, ids: meta.ids, layers, scales, gdn })
   return ok ? { restored: meta.tokens } : { restored: 0, reason: 'engine refused the snapshot' }
 }
 
