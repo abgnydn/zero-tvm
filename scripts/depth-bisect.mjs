@@ -53,17 +53,28 @@ await get(8017, '/api/state').catch((e) => {
 // Baseline FIRST. If the shipped configuration happens to pass today, every
 // other arm is uninterpretable and the run should be read as "did not
 // reproduce" rather than as evidence about any subsystem.
+// Every arm runs at the SAME depth. Dropping the slow one to a shallower prompt
+// was the obvious way to make it finish and it is wrong: the baseline SOLVES at
+// 8k, so an arm that also solves there has shown nothing.
+//
+// What is capped instead is the number of model calls. Per-token prefill is
+// ~6 tok/s on a 27B against a few hundred chunked, so a 16k prompt is ~39
+// MINUTES per call and twelve is eight hours — but the FIRST call is what
+// fails: at 16k it invents a tool name before reading anything. One call
+// answers the same question at the same depth.
+const SLOW_ARM_STEPS = process.env.SLOW_STEPS ?? '1'
+
 const ARMS = [
   { name: 'baseline (everything on)', env: {} },
   { name: 'int8 KV off', env: { KV8: '0' } },
-  { name: 'chunked prefill off', env: { CHUNK: '0' } },
+  { name: 'chunked prefill off', env: { CHUNK: '0', STEPS: SLOW_ARM_STEPS } },
   { name: 'cross-turn reuse off', env: { REUSE: '0' } },
-  { name: 'all three off', env: { KV8: '0', CHUNK: '0', REUSE: '0' } },
+  { name: 'all three off', env: { KV8: '0', CHUNK: '0', REUSE: '0', STEPS: SLOW_ARM_STEPS } },
 ]
 
-const run = (env) => new Promise((res) => {
+const run = (env, depth) => new Promise((res) => {
   const p = spawn('node', ['scripts/agentic-eval.mjs', PARAM], {
-    cwd: ROOT, env: { ...process.env, ...env, PAD: String(DEPTH) },
+    cwd: ROOT, env: { ...process.env, ...env, PAD: String(depth) },
   })
   let out = ''
   p.stdout.on('data', (c) => { out += c })
@@ -74,8 +85,12 @@ const run = (env) => new Promise((res) => {
 console.log(`${PARAM} · depth ${DEPTH.toLocaleString()} · ${ARMS.length} arms\n`)
 const rows = []
 for (const arm of ARMS) {
-  process.stdout.write(`  ${arm.name.padEnd(26)} … `)
-  const out = await run(arm.env)
+  const slow = arm.env.CHUNK === '0'
+  process.stdout.write(`  ${arm.name.padEnd(26)} ${slow ? `${SLOW_ARM_STEPS}-step ` : '       '}… `)
+  const out = await run(arm.env, DEPTH)
+  // A capped arm cannot reach attempt_completion, so SOLVED is not available to
+  // it. Invention is the signal either way: the failure being bisected is a tool
+  // name that was never offered.
   const solved = /SOLVED/.test(out)
   const trace = /trace\s+(.*)/.exec(out)?.[1] ?? ''
   // A tool name we never offered is the specific failure here, and it is not
@@ -93,7 +108,10 @@ if (base.solved && !base.invented.length) {
   console.log('  The BASELINE passed, so nothing was reproduced and no arm below means anything.')
   console.log('  Raise DEPTH until the baseline fails, then re-run.')
 } else {
-  const fixed = rows.slice(1, 4).filter((r) => r.solved && !r.invented.length)
+  // "fixed" means the invented tool names STOPPED. A capped arm never reaches
+  // attempt_completion, so requiring SOLVED would score every capped arm as a
+  // failure regardless of what it showed.
+  const fixed = rows.slice(1, 4).filter((r) => !r.invented.length)
   if (fixed.length === 1) {
     console.log(`  Turning off "${fixed[0].arm}" fixes it and the others do not.`)
     console.log('  That subsystem is the cause. Its kernels are where to look.')
@@ -101,7 +119,7 @@ if (base.solved && !base.invented.length) {
     console.log(`  More than one arm fixes it (${fixed.map((r) => r.arm).join('; ')}).`)
     console.log('  They interact, or the failure is marginal enough that any perturbation')
     console.log('  moves it. Re-run before concluding — a graded failure can flip on noise.')
-  } else if (rows[4].solved && !rows[4].invented.length) {
+  } else if (!rows[4].invented.length) {
     console.log('  No single arm fixes it, but all three off does. It is a combination.')
   } else {
     console.log('  NONE of them fix it, including all three off. The depth-dependent')

@@ -68,7 +68,14 @@ async function load(param) {
   // different arithmetic order and only reachable on prompts long enough to
   // chunk. scripts/depth-bisect.mjs drives all three.
   const chunk = process.env.CHUNK !== '0'
-  await post(8017, '/api/load', { param, ctx: 32768, pool: 0, kv8, reuse, chunk })
+  // CHECK the load response. The station refuses with 409 while the engine is
+  // still generating, and polling for phase === 'ready' sails straight past
+  // that — it was already ready, just busy with someone else's request. The
+  // next chat call then gets an error body, and an error body scored as an
+  // empty completion reads as "the model answered with prose". One such run was
+  // reported as a model failure before this check existed.
+  const acc = await post(8017, '/api/load', { param, ctx: 32768, pool: 0, kv8, reuse, chunk })
+  if (acc?.error) throw new Error(`/api/load refused: ${acc.error}`)
   for (let i = 0; i < 200; i++) {
     await sleep(2000)
     const s = await get(8017, '/api/state')
@@ -175,6 +182,12 @@ async function runEpisode(label, maxSteps = 12, padTokens = 0) {
     const j = await post(8017, '/v1/chat/completions', {
       model: 'ztvm', messages: msgs, tools: TOOLS, max_tokens: 300, temperature: 0, stream: false,
     })
+    // A response with no choices is an ERROR, not an empty answer. Reporting it
+    // as prose turns "the server refused" into "the model failed", which is the
+    // wrong finding about the wrong component.
+    if (!j?.choices?.length) {
+      throw new Error(`no completion from the engine: ${JSON.stringify(j).slice(0, 300)}`)
+    }
     const m = j.choices?.[0]?.message ?? {}
     const c = (m.tool_calls ?? [])[0]
     if (!c) {
@@ -236,6 +249,13 @@ async function runEpisode(label, maxSteps = 12, padTokens = 0) {
 }
 
 const PAD = Number(process.env.PAD ?? 0)
+// STEPS caps the model calls. The loop is normally allowed 12, but the FIRST
+// call is what fails at depth — it invents a tool name before reading anything
+// — and a per-token arm costs ~39 minutes per call at 16k, so twelve of them is
+// eight hours. One call at the SAME depth answers the same question. Changing
+// the depth instead would not: the baseline solves at 8k, so an arm that also
+// solves there says nothing.
+const STEPS = Number(process.env.STEPS ?? 12)
 const models = process.argv.slice(2)
 if (!models.length) { console.error('usage: agentic-eval.mjs <param> [param...]'); process.exit(1) }
 const results = {}
@@ -245,7 +265,7 @@ for (const p of models) {
   const h = await get(8019, '/health')
   console.log(`  loaded ${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse} · chunk=${h.chunk}`)
   const arm = `kv8=${h.kv8} reuse=${h.reuse} chunk=${h.chunk}`
-  results[p] = await runEpisode(`${p} · ${PAD ? `~${Math.round(PAD / 1000)}k-token history` : 'short'} · ${arm}`, 12, PAD)
+  results[p] = await runEpisode(`${p} · ${PAD ? `~${Math.round(PAD / 1000)}k-token history` : 'short'} · ${arm}${STEPS < 12 ? ` · ${STEPS}-step` : ''}`, STEPS, PAD)
 }
 console.log('\n=== VERDICT ===')
 for (const [p, r] of Object.entries(results)) {
