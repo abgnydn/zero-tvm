@@ -31,6 +31,7 @@
 import { describe, expect, it } from 'vitest'
 import { buildChatPrompt } from '../../src/zero-tvm/tokenizer-bpe.ts'
 import { foldToolResults, renderAssistantCalls, type ToolChatMessage } from '../../src/zero-tvm/tool-calls.ts'
+import { SHIPPED_MODELS, specForParam } from '../../src/zero-tvm/model-registry.ts'
 
 const capture = { encode: (t: string) => [t] as unknown as number[] }
 /** Same cast tool-calls.test.ts uses: ToolChatMessage carries llama3's
@@ -132,5 +133,70 @@ describe('tool results follow the same trim rule', () => {
 
   it('qwen35 trims it', () => {
     expect(render(round('chatml-xml'), 'qwen35')).toBe(TOOL_UNTRIMMED_QWEN35)
+  })
+})
+
+describe('the spec → generation dispatch', () => {
+  // buildChatPromptFor is the ONE line carrying this fix from the spec to the
+  // renderer, for all five pages that build a prompt. Nothing tested it: a lens
+  // swapped 'qwen38' and 'qwen35' in model-select.ts — which renders every
+  // Qwen3.5/3.6 conversation under Qwen3.8's rule and vice versa — and the
+  // whole suite stayed green. Everything above this block passes `generation`
+  // explicitly and so cannot see a dispatch error.
+  //
+  // Imported through the registry, not model-select, for the usual reason:
+  // model-select pulls in weight-loader, which reads GPUBufferUsage at module
+  // scope. The dispatch is re-derived here from chatTemplateId, which is what
+  // buildChatPromptFor switches on, and each expectation is a DIFFERENT
+  // rendering — so a transposition changes the output, not just a label.
+  const GEN: Record<string, 'qwen3' | 'qwen35' | 'qwen38'> = {
+    chatml: 'qwen3', 'chatml-q35': 'qwen35', 'chatml-q38': 'qwen38',
+  }
+  // A MID-ROUND assistant turn is the only shape that separates all three rules:
+  // it sits after the last real user query (the tool result does not count as
+  // one) and is not the trailing message. qwen3 needs `loop.last` and so emits
+  // nothing; qwen35 emits; qwen38 emits on every turn including the finished
+  // one. A plain chat cannot tell qwen3 and qwen35 apart at all, which is why
+  // the first version of this test asserted three distinct outputs and got two.
+  // Needs BOTH a finished-round turn and a mid-round one. a0 sits before the
+  // last real user query, so only qwen38 keeps its block; a1 sits after it and
+  // is not trailing, so qwen3 drops it (no loop.last, no reasoning) while q35
+  // and q38 keep it. Three rules, three outputs. A shape with only one of the
+  // two collapses two of them together — which is how the first two versions of
+  // this test asserted three and measured two.
+  const round = [
+    { role: 'user' as const, content: 'q1' },
+    { role: 'assistant' as const, content: 'a0' },
+    { role: 'user' as const, content: 'go' },
+    { role: 'assistant' as const, content: 'a1' },
+    { role: 'user' as const, content: '<tool_response>\nr\n</tool_response>' },
+  ]
+
+  it('each template id renders a DIFFERENT prompt for the same conversation', () => {
+    const out = (['chatml', 'chatml-q35', 'chatml-q38'] as const).map((id) => render(round, GEN[id]))
+    expect(new Set(out).size).toBe(3)
+  })
+
+  it('the three ids map to the three rules, checked by output not by name', () => {
+    const B = '<think>\n\n</think>\n\n'
+    const body = (a0: string, a1: string) =>
+      '<|im_start|>user\nq1<|im_end|>\n'
+      + `<|im_start|>assistant\n${a0}a0<|im_end|>\n`
+      + '<|im_start|>user\ngo<|im_end|>\n'
+      + `<|im_start|>assistant\n${a1}a1<|im_end|>\n`
+      + '<|im_start|>user\n<tool_response>\nr\n</tool_response><|im_end|>\n'
+      + `<|im_start|>assistant\n${B}`
+    expect(render(round, GEN.chatml)).toBe(body('', ''))
+    expect(render(round, GEN['chatml-q35'])).toBe(body('', B))
+    expect(render(round, GEN['chatml-q38'])).toBe(body(B, B))
+  })
+
+  it('every ChatML spec in the registry maps to a generation', () => {
+    // A spec carrying a chatTemplateId with no entry here would fall through to
+    // the 'qwen3' default and render silently wrong.
+    for (const m of SHIPPED_MODELS) {
+      const id = specForParam(m.param).chatTemplateId
+      if (id.startsWith('chatml')) expect(GEN[id], `${m.param} → ${id}`).toBeDefined()
+    }
   })
 })

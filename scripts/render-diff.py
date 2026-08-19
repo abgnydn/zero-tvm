@@ -105,6 +105,14 @@ SHAPES = {
                                {"role": "tool", "content": "  padded  \n"}],
     "assistant is last turn": [{"role": "user", "content": "hi"},
                                {"role": "assistant", "content": "partial"}],
+    # The one shape that CANNOT agree, kept in the battery so it is on the
+    # record rather than quietly excluded: jinja raises "No user query found in
+    # messages" on the q35/q38 templates, while lastQueryIndex falls back to the
+    # last index and renders. A chat surface showing a partial conversation
+    # should not throw, so this divergence is deliberate — the row prints
+    # "jinja RAISED" instead of same/DIFFERS.
+    "no user message at all": [{"role": "system", "content": "sys"},
+                               {"role": "assistant", "content": "hello"}],
 }
 
 msgs = PLAIN if a.plain else case.conversation(a.depth, wire=False)

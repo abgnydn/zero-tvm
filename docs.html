@@ -531,7 +531,7 @@
   <h1>Zero TVM Documentation</h1>
   <p class="lead">
     A complete LLM inference engine in the browser — <strong>no WebLLM, no TVM, no ONNX, no WASM runtime</strong>.
-    10 hand-written WGSL kernel roles, a BPE tokenizer, and raw WebGPU.
+    10 hand-written WGSL kernel roles, two tokenizers — Phi-3's SentencePiece-style one and the byte-level BPE every other model uses, and raw WebGPU.
     Measured +16.0% on total wall-clock throughput and +31.4% on decode against WebLLM's TVM-autotuned
     kernels, identical weights, same session (M2 Max, 2026-07-30).
   </p>
@@ -612,7 +612,7 @@
   <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
 </ol>
 
-<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — split-K attention adds a combine dispatch per layer; it has no int8 variant, so the int8 default turns it off and reaching the 228-dispatch reference chain now needs <code>?kv8=0&amp;splitk=0</code> — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token — around 11 distinct shaders on that path, of 85 captured across a whole session.</p>
+<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — the int8 KV cache adds a <code>kv_quantize</code> pass per layer, making 8 (<code>engine-core.ts</code>: fused f16 is 7, fused int8 is 8). Split-K attention also costs a dispatch per layer, but it has no int8 variant, so the default turns it off — the 228-dispatch reference chain needs <code>?kv8=0&amp;splitk=0</code> — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token — around 11 distinct shaders on that path, of 85 captured across a whole session.</p>
 
 <!-- ARCHITECTURE -->
 <h2 id="overview">Architecture overview</h2>
@@ -622,7 +622,7 @@
 <div class="table-scroll"><table>
   <thead><tr><th>File</th><th>Role</th></tr></thead>
   <tbody>
-    <tr><td><code>src/zero-tvm/engine-core.ts</code></td><td>THE decode engine. <code>buildDecodeEngine</code> allocates buffers, builds bind groups, runs the decode loop. Both pages drive this one file.</td></tr>
+    <tr><td><code>src/zero-tvm/engine-core.ts</code></td><td>THE decode engine. <code>buildDecodeEngine</code> allocates buffers, builds bind groups, runs the decode loop. Five call sites drive this one file: the chat page and the entrance's in-place chat (<code>chat-flow.ts</code>), validate, the room host, the agent host, and the native library entry.</td></tr>
     <tr><td><code>src/zero-tvm/chat.ts</code></td><td>Thin page module for <code>zero-tvm.html</code>: boots the engine with URL-flag variants and streams. <code>chat-flow.ts</code> is the turn loop, shared with the entrance.</td></tr>
     <tr><td><code>src/zero-tvm/weight-loader.ts</code></td><td>MLC layout: fetches ndarray-cache.json, downloads shards, uploads to GPU buffers.</td></tr>
     <tr><td><code>src/zero-tvm/weight-loader-mlx.ts</code></td><td>MLX layout: byte-RANGE reads out of multi-GB safetensors shards, never a whole file. Most of the roster loads through this one.</td></tr>

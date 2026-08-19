@@ -4091,26 +4091,27 @@ export function buildDecodeEngine(
         // and neither the progress nor the poll below means anything until the
         // GPU catches up.
         await device.queue.onSubmittedWorkDone()
-        // Rewind points on THIS path too. They used to be taken only inside
-        // the chunk loop, so any configuration that cannot chunk — a pooled
-        // MoE build (the entrance's Half and Quarter options), a hybrid on a
-        // browser without subgroups, ?chunk=0 — kept an all -1 ring and
-        // rewindSlot could never return a slot. That was invisible while the
-        // template put an empty <think> block on every past assistant turn,
-        // because the prompt was then an exact token extension of the absorbed
-        // sequence and reuseStart succeeded without any rewind. Rendering the
-        // block the way the templates actually do (2026-08-19) ended that, and
-        // on those configurations hybrid reuse would have gone from full to
-        // ZERO — a whole-conversation re-prefill every turn.
-        //
-        // The 64-token cadence is the sync that already exists here, not a new
-        // one. Four slots therefore look back 256 tokens, which is short — but
-        // the cross-turn divergence sits a few tokens before the END of the
-        // previous prompt, so the nearest snapshot at or below it is within 64.
-        // Deep lookback is not what this case needs; a recent one is.
-        // COST NOT MEASURED: this is a GDN state copy per 64 prompt tokens on
-        // a path that previously took none.
-        saveGdnCkpt(prefillPos)
+        // NO rewind point here, and the attempt to add one is recorded because
+        // it was wrong twice. The problem is real: snapshots are taken only
+        // inside the chunk loop, so a build that cannot chunk keeps an all -1
+        // ring. But taking one HERE does not solve it and introduces a worse
+        // bug.
+        //   - "a short chat cannot chunk" is false. CHUNK_MIN is 8, so a
+        //     36-token prompt chunks in one chunk and this line never runs.
+        //   - the chunk loop's snapshot already lands at `last`, ABOVE the
+        //     divergence (which sits where the generation prompt's <think>
+        //     suffix was, a few tokens earlier), so rewindSlot returns -1 and
+        //     startPos is 0 regardless.
+        //   - saveGdnCkpt's argument is a COUNT of absorbed tokens: the chunk
+        //     loop calls it after `prefillPos += s`, matching gdnStatePos =
+        //     start + n. submitStep sets gdnStatePos = position + 1, so a
+        //     snapshot taken here is one SHORT, and restoring it replays that
+        //     token twice into the recurrence.
+        // The real rewind point is the start of the trailing generation prompt,
+        // which only the CALLER knows — the engine would have to be told. Until
+        // then, hybrid cross-turn reuse falls back to a full re-prefill on any
+        // conversation shorter than CHUNK_CAP. Named in docs rather than
+        // papered over.
         onPrefill?.(prefillPos, promptIds.length)
         if (shouldStop?.()) return tokens
       }
