@@ -41,6 +41,13 @@ const get = (p, q) => new Promise((res, rej) => {
 })
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+// Module scope: load() requests these and the caller ASSERTS the engine came
+// back with them. They were declared inside load(), which is why the assertion
+// referenced names that did not exist there.
+const KV8 = process.env.KV8 !== '0'
+const REUSE = process.env.REUSE !== '0'
+const CHUNK = process.env.CHUNK !== '0'
+
 async function load(param) {
   // ECONNREFUSED here is the ordinary case — the station is a separate process
   // and it is easy to forget. A raw stack trace for that is noise.
@@ -56,18 +63,15 @@ async function load(param) {
   // KV8=0 loads an f16 cache — the control for "is this the model or our
   // quantizer?". int8 was measured at 1k and 4k windows only, and the failure
   // being chased sits at 24k.
-  const kv8 = process.env.KV8 !== '0'
   // REUSE=0 turns off cross-turn prefix reuse AND the GDN rewind ring, so every
   // turn prefills the whole prompt from zero. It is the control for "does our
   // cross-turn machinery corrupt a deep conversation?" — the failing turn is
   // the FOURTH one, and turns 2-4 all ride reused state. Slow on purpose: a
   // 24k-token turn re-prefills 24k tokens.
-  const reuse = process.env.REUSE !== '0'
   // CHUNK=0 is the third length-dependent arm: chunked prefill batches GEMMs
   // over token blocks instead of running per-token matvecs, which is a
   // different arithmetic order and only reachable on prompts long enough to
   // chunk. scripts/depth-bisect.mjs drives all three.
-  const chunk = process.env.CHUNK !== '0'
   // CHECK the load response. The station refuses with 409 while the engine is
   // still generating, and polling for phase === 'ready' sails straight past
   // that — it was already ready, just busy with someone else's request. The
@@ -78,7 +82,7 @@ async function load(param) {
   // generating for someone else — and both clear on their own. Throwing on
   // those makes the harness unusable right after a restart, when the station
   // auto-loads the last model. Anything else is a real refusal.
-  const req = { param, ctx: 32768, pool: 0, kv8, reuse, chunk }
+  const req = { param, ctx: 32768, pool: 0, kv8: KV8, reuse: REUSE, chunk: CHUNK }
   for (let i = 0; ; i++) {
     const acc = await post(8017, '/api/load', req)
     if (!acc?.error) break
@@ -281,7 +285,7 @@ for (const p of models) {
   // someone else's flags — you ask for reuse off, the engine has it on, and the
   // arm silently measures the baseline again. Every arm of a bisection is a
   // claim about a flag; an unchecked flag makes the whole run meaningless.
-  const want = { kv8, reuse, chunk }
+  const want = { kv8: KV8, reuse: REUSE, chunk: CHUNK }
   const bad = Object.entries(want).filter(([k, v]) => h[k] !== v)
   if (bad.length) {
     throw new Error(`engine flags do not match the request: `
