@@ -33,6 +33,10 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 p = argparse.ArgumentParser()
 p.add_argument("--model", required=True)
 p.add_argument("--param", default="qwen36q3", help="our ?model= param for the same checkpoint")
+p.add_argument("--plain", action="store_true",
+               help="a plain multi-turn chat with NO tools — what the public chat page "
+                    "sends. The tool case exercises none of that path, and the chat "
+                    "page shares the same builder.")
 p.add_argument("--depth", type=int, default=0,
                help="tokens of padding. The divergence is structural, so 0 shows it "
                     "in a readable diff; raise it only to check length changes nothing.")
@@ -63,13 +67,23 @@ extra = {}
 if a.template:
     extra["chat_template"] = chat_template(pathlib.Path(a.template))
 
+# --plain: user/assistant alternation and no tools. The tool case can be
+# byte-perfect while this is not — a finished round renders differently from an
+# open one, and the chat page only ever sends finished rounds.
+PLAIN = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"},
+         {"role": "user", "content": "q2"}, {"role": "assistant", "content": "a2"},
+         {"role": "user", "content": "q3"}]
+
+msgs = PLAIN if a.plain else case.conversation(a.depth, wire=False)
+tools = [] if a.plain else case.TOOLS
+
 theirs = tok.apply_chat_template(
-    case.conversation(a.depth, wire=False), tools=case.TOOLS,
+    msgs, tools=tools or None,
     add_generation_prompt=True, enable_thinking=False, tokenize=False, **extra)
 
 with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-    json.dump({"messages": case.conversation(a.depth, wire=True),
-               "tools": case.TOOLS, "param": a.param}, f)
+    json.dump({"messages": PLAIN if a.plain else case.conversation(a.depth, wire=True),
+               "tools": tools, "param": a.param}, f)
     case_path = f.name
 
 r = subprocess.run(["node", "scripts/render-dump.mjs", case_path],
@@ -80,7 +94,7 @@ if r.returncode != 0:
 ours = r.stdout
 
 if ours == theirs:
-    print(f"IDENTICAL — {len(ours)} chars, depth {a.depth}.\n"
+    print(f"IDENTICAL — {len(ours)} chars, {'plain chat' if a.plain else f'depth {a.depth}'}.\n"
           "The prompt is not where the difference is. Look at the engine next.")
     sys.exit(0)
 
