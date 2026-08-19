@@ -52,12 +52,21 @@ KV is our ceiling, and the context picker (2026-08-16) put a price tag on it
 in the UI, which makes the cost impossible to ignore. Arithmetic on our own
 specs, at the paper's two operating points:
 
-| model | KV/token today | at 3.5 b | at 2.5 b | KV at 262k: today → 3.5 b |
-|---|---:|---:|---:|---|
-| Qwen3.6-35B-A3B (both builds) | 20 KB | 4.4 KB | 3.1 KB | 5.00 GB → **1.09 GB** |
-| Qwen3.8-27B | 64 KB | 14.0 KB | 10.0 KB | 16.00 GB → 3.50 GB |
-| Qwen3.5-9B | 32 KB | 7.0 KB | 5.0 KB | 8.00 GB → 1.75 GB |
-| Qwen3-30B-A3B | 96 KB | 21.0 KB | 15.0 KB | 24.00 GB → 5.25 GB |
+The `f16` column was "KV/token today" when this was written. It is not today
+any more: int8 KV became the DEFAULT on 2026-08-18, so the shipped figure is the
+`int8` column — half the f16 width plus one f16 scale per (token, kv head, side)
+per attention layer. Quoting the f16 number as ours overstates the cache by 2x,
+which happened once already.
+
+| model | f16 | **int8 (SHIPPED)** | at 3.5 b | at 2.5 b | KV at 262k: int8 → 3.5 b |
+|---|---:|---:|---:|---:|---|
+| Qwen3.6-35B-A3B (both builds) | 20 KB | **10.1 KB** | 4.4 KB | 3.1 KB | 2.52 GB → **1.09 GB** |
+| Qwen3.8-27B | 64 KB | **32.3 KB** | 14.0 KB | 10.0 KB | 8.06 GB → 3.50 GB |
+| Qwen3.5-9B | 32 KB | **16.1 KB** | 7.0 KB | 5.0 KB | 4.03 GB → 1.75 GB |
+| Qwen3-30B-A3B | 96 KB | **48.8 KB** | 21.0 KB | 15.0 KB | 12.19 GB → 5.25 GB |
+
+That halves the headroom TurboQuant would buy on top: against the int8 baseline
+3.5 b is a further 2.3x, not the 4.6x the f16 column implies.
 
 The headline that decides whether this is worth building: **the 4-bit
 Qwen3.6-35B — the build with no quantization quality cost at all — would hold
