@@ -18,9 +18,13 @@ export interface LoadRequest {
   kv8?: boolean
   reuse?: boolean
   chunk?: boolean
+  /** Chunk capacity in tokens. Varying it changes the NUMBER of chunk
+   *  boundaries without leaving the chunked path — the cheap way to test a
+   *  boundary-dependent defect. */
+  cap?: number
 }
 
-export function engineArgs({ param, port, ctx, pool, kv8, reuse, chunk }: LoadRequest): string[] {
+export function engineArgs({ param, port, ctx, pool, kv8, reuse, chunk, cap }: LoadRequest): string[] {
   const argv = [param, '--port', String(port)]
   if (ctx) argv.push('--ctx', String(ctx))
   if (pool) argv.push('--experts', String(pool))
@@ -28,5 +32,6 @@ export function engineArgs({ param, port, ctx, pool, kv8, reuse, chunk }: LoadRe
   // Diagnostic only (no UI control): the arm where every turn prefills from zero.
   if (reuse === false) argv.push('--reuse', '0')
   if (chunk === false) argv.push('--chunk', '0')
+  if (cap) argv.push('--cap', String(cap))
   return argv
 }

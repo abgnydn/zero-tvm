@@ -115,7 +115,7 @@ async function waitReady(timeoutMs = 12 * 60_000) {
   return false
 }
 
-async function loadModel({ param, ctx, pool, kv8, reuse, chunk }) {
+async function loadModel({ param, ctx, pool, kv8, reuse, chunk, cap }) {
   stopEngine()
   await new Promise((r) => setTimeout(r, 400))   // let the port free
   logLines = []
@@ -124,7 +124,7 @@ async function loadModel({ param, ctx, pool, kv8, reuse, chunk }) {
   lastSeenAt = null
   phase = 'loading'
   loaded = { param, ctx: ctx || 0, pool: pool || 0 }
-  const argv = [join(ROOT, 'scripts/agent-native.mjs'), ...engineArgs({ param, port: ENGINE_PORT, ctx, pool, kv8, reuse, chunk })]
+  const argv = [join(ROOT, 'scripts/agent-native.mjs'), ...engineArgs({ param, port: ENGINE_PORT, ctx, pool, kv8, reuse, chunk, cap })]
   pushLog(`$ node ${argv.slice(1).join(' ')}`)
   child = spawn('node', argv, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
   child.stdout.on('data', pushLog)
@@ -240,7 +240,7 @@ createServer(async (req, res) => {
     // Clamp here as well as in the engine, so the UI can show what it will get.
     const ctx = Math.min(Number(body.ctx) || hit.defaultCtx, hit.maxCtx)
     json(res, 202, { accepted: { param: hit.param, ctx, pool: Number(body.pool) || 0 } })
-    void loadModel({ param: hit.param, ctx, pool: Number(body.pool) || 0, kv8: body.kv8 !== false, reuse: body.reuse !== false, chunk: body.chunk !== false })
+    void loadModel({ param: hit.param, ctx, pool: Number(body.pool) || 0, kv8: body.kv8 !== false, reuse: body.reuse !== false, chunk: body.chunk !== false, cap: Number(body.cap) || 0 })
     return
   }
 

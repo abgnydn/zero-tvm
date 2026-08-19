@@ -31,7 +31,7 @@ const args = process.argv.slice(2)
 const flag = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : null }
 const param = args.find((a) => !a.startsWith('--') && a !== flag('ctx') && a !== flag('port')
   && a !== flag('pool') && a !== flag('experts') && a !== flag('kv8')
-  && a !== flag('reuse') && a !== flag('chunk')) ?? 'qwen3mlx'
+  && a !== flag('reuse') && a !== flag('chunk') && a !== flag('cap')) ?? 'qwen3mlx'
 const CTX = Number(flag('ctx')) || 0
 const PORT = Number(flag('port')) || 8017
 // TWO different pools, and confusing them cost a 43k-token prefill twice.
@@ -63,6 +63,12 @@ const REUSE = flag('reuse') !== '0'
 // token-identical to per-token, not bit-equal, so a divergence that appears
 // only with it on is a real finding rather than rounding.
 const CHUNK = flag('chunk') !== '0'
+// Chunk capacity in tokens (default 1024 with the matrix unit, 64 without).
+// Exposed because varying it is the FAST way to test chunk-boundary defects:
+// both arms stay on the chunked path, so a 16k prompt costs seconds either way,
+// while the number of boundaries changes 16x. The per-token arm answers the
+// same question in 46 minutes.
+const CAP = Number(flag('cap')) || 0
 
 await installShims({ unsafe: !args.includes('--safe') })
 // Serve .weights-local BEFORE the loader runs. Without it the native host
@@ -89,6 +95,7 @@ console.log(KV8
 if (EXPERTS) console.log(`[native] expert pool ${EXPERTS} slots/layer — saves RAM, but prefill runs PER TOKEN (no chunking)`)
 if (!REUSE) console.log('[native] cross-turn prefix reuse OFF (--reuse 0) — every turn re-prefills from zero')
 if (!CHUNK) console.log('[native] chunked prefill OFF (--chunk 0) — prompt runs token by token, much slower')
+if (CAP) console.log(`[native] chunk cap ${CAP} tokens (default is 1024 with the matrix unit)`)
 const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   model: param,
   ...(CTX ? { ctx: CTX } : {}),
@@ -96,6 +103,7 @@ const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   ...(KV8 ? { int8KV: true } : {}),
   ...(REUSE ? {} : { prefixReuse: false }),
   ...(CHUNK ? {} : { chunkedPrefill: false }),
+  ...(CAP ? { chunkCap: CAP } : {}),
   onProgress: (p) => { if (p.stage === 'weights' || p.stage === 'ready') process.stdout.write(`\r[native] ${p.message}          `) },
 })
 console.log(`\n[native] ${info.name} ready in ${((Date.now() - t0) / 1000).toFixed(1)}s — ctx ${spec.maxContext.toLocaleString()}`)
@@ -406,7 +414,7 @@ createServer(async (req, res) => {
     // there is no way to tell a host that will save its prefill from one that
     // will not — the two behave identically until the NEXT boot, and the flag
     // spent weeks silently off because the station passed the wrong one.
-    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, kv8: KV8, reuse: REUSE, chunk: CHUNK, last: lastStats, live })
+    json(res, 200, { ok: true, hosting: spec.id, native: true, busy, ctx: spec.maxContext, pool: POOL, experts: EXPERTS, kv8: KV8, reuse: REUSE, chunk: CHUNK, cap: CAP || null, last: lastStats, live })
     return
   }
   if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {

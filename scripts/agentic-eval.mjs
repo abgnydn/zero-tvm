@@ -47,6 +47,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const KV8 = process.env.KV8 !== '0'
 const REUSE = process.env.REUSE !== '0'
 const CHUNK = process.env.CHUNK !== '0'
+const CAP = Number(process.env.CAP) || 0
 
 async function load(param) {
   // ECONNREFUSED here is the ordinary case — the station is a separate process
@@ -82,7 +83,7 @@ async function load(param) {
   // generating for someone else — and both clear on their own. Throwing on
   // those makes the harness unusable right after a restart, when the station
   // auto-loads the last model. Anything else is a real refusal.
-  const req = { param, ctx: 32768, pool: 0, kv8: KV8, reuse: REUSE, chunk: CHUNK }
+  const req = { param, ctx: 32768, pool: 0, kv8: KV8, reuse: REUSE, chunk: CHUNK, cap: CAP }
   for (let i = 0; ; i++) {
     const acc = await post(8017, '/api/load', req)
     if (!acc?.error) break
@@ -279,7 +280,7 @@ for (const p of models) {
   console.log(`\n=== ${p} ===`)
   await load(p)
   const h = await get(8019, '/health')
-  console.log(`  loaded ${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse} · chunk=${h.chunk}`)
+  console.log(`  loaded ${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse} · chunk=${h.chunk}${h.cap ? ` · cap=${h.cap}` : ''}`)
   // ASSERT the engine is running what was asked for. The station remembers the
   // last configuration and auto-loads it on restart, so a run can inherit
   // someone else's flags — you ask for reuse off, the engine has it on, and the

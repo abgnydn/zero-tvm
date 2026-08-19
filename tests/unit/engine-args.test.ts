@@ -62,6 +62,16 @@ describe('engineArgs', () => {
       .toContain('--kv8 0 --reuse 0 --chunk 0')
   })
 
+  it('carries a chunk cap only when one was chosen', () => {
+    // Varying the cap changes how many chunk BOUNDARIES a prompt crosses while
+    // staying on the chunked path, which is the cheap way to test a
+    // boundary-dependent defect: seconds per arm instead of the 46 minutes a
+    // per-token run costs at 16k.
+    expect(args()).not.toContain('--cap')
+    expect(args({ cap: 0 })).not.toContain('--cap')
+    expect(args({ cap: 4096 }).join(' ')).toContain('--cap 4096')
+  })
+
   it('carries ctx only when one was chosen', () => {
     expect(args({ ctx: 32768 }).join(' ')).toContain('--ctx 32768')
     expect(args({ ctx: 0 })).not.toContain('--ctx')
