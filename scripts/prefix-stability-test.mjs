@@ -2,16 +2,24 @@
 // PREFIX-STABILITY — is an agent's prompt append-only in TOKEN IDS?
 //
 //   node scripts/prefix-stability-test.mjs <transcript.jsonl>
-//       [--template chatml|llama3|deepseek] [--max 24000] [--mutate]
+//       [--template chatml|chatml-q35|chatml-q38|llama3|deepseek] [--max 24000] [--mutate]
 //   node scripts/prefix-stability-test.mjs --list
 //
 // This is the gate in docs/PAGING_PLAN.md §0.2, and it decides whether the
 // prefix pool is worth five weeks. The pool can only reuse a prefix that is
-// still a PREFIX, token for token. Everything about the engine's cross-turn
-// reuse already assumes it — tokenizer-bpe.ts:446 says a re-rendered ChatML
-// transcript "makes each turn's prompt an exact token-level extension of the
-// previous turn's absorbed sequence" — but that is a comment, tested only
-// against short synthetic chats.
+// still a PREFIX, token for token.
+//
+// The premise this opened with is GONE as of 2026-08-19. It cited a
+// tokenizer-bpe.ts comment claiming a re-rendered ChatML transcript "makes each
+// turn's prompt an exact token-level extension of the previous turn's absorbed
+// sequence". That property came from putting an empty <think> block on every
+// past assistant turn, which is not what any Qwen template does; rendering them
+// correctly ended it. On chatml and chatml-q35 a turn's prompt now diverges from
+// the absorbed sequence a few tokens before the end of the previous prompt.
+// chatml-q38 still extends, because its template really does keep the block on
+// every turn. So this script now measures a property that holds for one of the
+// three generations, and the number it reports is the answer for the template
+// you pass — not for ChatML.
 //
 // The reason it might be false: buildChatPromptFor renders the WHOLE
 // transcript to one string and calls encode() once. BPE merges across
@@ -50,8 +58,15 @@ const args = process.argv.slice(2)
 // already known to break and the one this script cannot reach.
 const tIdx = args.indexOf('--template')
 const TEMPLATE = tIdx >= 0 ? args[tIdx + 1] : 'chatml'
+// One ChatML entry per GENERATION. They disagree about which past assistant
+// turns keep a <think> block and whether content is trimmed, and this script
+// exists to measure whether one turn's prompt extends the last one's — which is
+// exactly what that rule decides. A single 'chatml' entry rendered every
+// transcript under the Qwen3 rule and reported its answer for qwen35/36/38 too.
 const TEMPLATES = {
-  chatml: { dir: 'Qwen3-4B-4bit', build: (m, t) => buildChatML(m, t, { thinking: false }) },
+  chatml: { dir: 'Qwen3-4B-4bit', build: (m, t) => buildChatML(m, t, { thinking: false, generation: 'qwen3' }) },
+  'chatml-q35': { dir: 'Qwen3.5-9B-MLX-4bit', build: (m, t) => buildChatML(m, t, { thinking: false, generation: 'qwen35' }) },
+  'chatml-q38': { dir: 'Qwen3.8-27B-4bit', build: (m, t) => buildChatML(m, t, { thinking: false, generation: 'qwen38' }) },
   llama3: { dir: 'Llama-3.2-1B-Instruct-4bit', build: buildLlama3ChatPrompt },
   deepseek: { dir: 'Qwen3-4B-4bit', build: buildDeepSeekChatPrompt },
 }

@@ -244,7 +244,12 @@ const tokKind = !tok ? 'unknown'
 // ordinary BPE tokens. config.eos_token_id is only the fallback.
 const addedId = (content) => tok?.added_tokens?.find((t) => t.content === content)?.id ?? null
 const eosIds = [tc.eos_token_id].flat().filter((v) => typeof v === 'number')
-const stops = chatTemplate === 'chatml'
+// startsWith, not ===: 'chatml-q35' and 'chatml-q38' are the same ChatML
+// specials with a different past-turn <think> rule. An `=== 'chatml'` test
+// drops them to the eosIds fallback, which model-spec.ts warns is "stale Qwen3
+// ids that map to ORDINARY BPE tokens in this vocab" — the model would then
+// never stop.
+const stops = chatTemplate.startsWith('chatml')
   ? [addedId('<|im_end|>'), addedId('<|endoftext|>')].filter((v) => v !== null)
   : chatTemplate === 'llama3'
   ? [addedId('<|eot_id|>'), addedId('<|end_of_text|>')].filter((v) => v !== null)
