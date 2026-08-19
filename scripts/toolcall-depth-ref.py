@@ -67,8 +67,11 @@ print(f"{a.model}\n")
 # place the engine and the reference must agree, it is three lines long, and
 # reading it would have caught the thinking mismatch on the first run instead of
 # the third. Ours ends: '<|im_start|>assistant\n<think>\n\n</think>\n\n'
+# The SELECTED case, not always the tail — this line printed a </tool_response>
+# ending for --case eval-turn1, which has no tool history at all.
 _probe = tokenizer.apply_chat_template(
-    case.conversation(0), tools=TOOLS,
+    case.eval_turn1(0) if a.case == "eval-turn1" else case.conversation(0),
+    tools=case.EVAL_TOOLS if a.case == "eval-turn1" else TOOLS,
     add_generation_prompt=True, enable_thinking=a.thinking)
 print(f"  thinking={a.thinking} · rendered prompt ends: "
       f"{tokenizer.decode(_probe[-14:])!r}\n")
