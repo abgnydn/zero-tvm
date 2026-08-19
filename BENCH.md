@@ -914,12 +914,19 @@ path untouched (`recordForward` unchanged; same 340 dispatches/token).
    agent session where the client rewrote a trailing metadata block every turn:
    392.50s cold became 12.76s and 26.30s on the following turns. Only a
    divergence older than the ring prefills from zero (re-zeroing GDN state). Template mechanics measured:
-   - *ChatML (Qwen3/Qwen3.5, non-thinking)*: past assistant turns are now
-     re-rendered WITH the empty `<think>\n\n</think>\n\n` block (it was
-     genuinely part of the generation prompt the model continued), making
-     each turn an exact token-level extension of the absorbed sequence —
-     the ≤1-token overrun is the `<|im_end|>` stop id, which the next
-     prompt also contains. Turn 3 below reuses 922 of 950 tokens.
+   - *ChatML (Qwen3/Qwen3.5, non-thinking)*: **this mechanism was removed on
+     2026-08-19 and the Qwen rows below are historical.** It re-rendered past
+     assistant turns WITH the empty `<think>\n\n</think>\n\n` block, which made
+     each turn an exact token-level extension of the absorbed sequence — the
+     ≤1-token overrun being the `<|im_end|>` stop id. That is not what any Qwen
+     template does: Qwen3 keeps the block only on a trailing assistant turn,
+     Qwen3.5/3.6 only on the current tool round, and only Qwen3.8 keeps it on
+     every turn. Rendering them correctly (`chatml` / `chatml-q35` /
+     `chatml-q38`) ended the extension property, so a turn's prompt now diverges
+     a few tokens before the end of the previous prompt and reuse restarts from
+     the nearest rewind point at or below it. Qwen3.8 is unaffected. The Qwen
+     numbers in the table below were measured under the old renderer and have
+     NOT been re-measured.
    - *Phi-3 (SPM)*: the previous prompt reuses in full; the generated text
      re-encodes with a boundary merge at `<|assistant|>\n` ↔ first response
      token, so reuse conservatively restarts there when the merge differs
@@ -931,8 +938,12 @@ path untouched (`recordForward` unchanged; same 340 dispatches/token).
    | Model | turn-3 TTFT before | after | reused | speedup |
    |---|---:|---:|---:|---:|
    | Phi-3    | 15,405 ms | **269 ms** | 1086/1105 | 57× |
-   | Qwen3-4B | 14,554 ms | **438 ms** |  922/950  | 33× |
-   | Qwen3.5  | 14,340 ms | **194 ms** |  922/950  | 74× |
+   | Qwen3-4B † | 14,554 ms | **438 ms** |  922/950  | 33× |
+   | Qwen3.5 †  | 14,340 ms | **194 ms** |  922/950  | 74× |
+
+   † measured under the pre-2026-08-19 ChatML renderer, whose token-level
+   extension property no longer holds (see above). Phi-3 uses a different
+   builder and is unaffected.
 
    (Qwen3.5 turn-2, where the reusable prefix is ~58%: 12,083 → 1,790 ms —
    reuse + chunking compose.)

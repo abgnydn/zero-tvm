@@ -4,17 +4,17 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Docs — Zero-TVM</title>
-  <meta name="description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser on 10 hand-written WGSL kernel roles.">
+  <meta name="description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser, on hand-written WGSL. The Phi-3 forward pass is 10 kernel roles.">
   <meta name="theme-color" content="#0a0a0c">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <meta property="og:type" content="article">
   <meta property="og:url" content="https://zerotvm.com/docs.html">
   <meta property="og:title" content="Docs — Zero-TVM">
-  <meta property="og:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser on 10 hand-written WGSL kernel roles.">
+  <meta property="og:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser, on hand-written WGSL. The Phi-3 forward pass is 10 kernel roles.">
   <meta property="og:image" content="https://zerotvm.com/og.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Docs — Zero-TVM">
-  <meta name="twitter:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser on 10 hand-written WGSL kernel roles.">
+  <meta name="twitter:description" content="Zero-TVM docs: shader catalog, decode pipeline, weight loader, URL flags, benchmarks. LLMs up to a 35B MoE in the browser, on hand-written WGSL. The Phi-3 forward pass is 10 kernel roles.">
   <meta name="twitter:image" content="https://zerotvm.com/og.png">
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -577,7 +577,7 @@
     <div class="step-line"><div class="step-dot">2</div><div class="step-line-seg"></div></div>
     <div class="step-content">
       <h5>Wait for weights</h5>
-      <p>First load downloads ~2 GB. Subsequent loads are instant from OPFS. On a small machine, <code>?ctx=</code> shrinks the context window and with it the KV allocation (~1.5 GB at Phi-3’s default 4K). Progress shown per shard in the log panel.</p>
+      <p>First load downloads ~2 GB. Subsequent loads are instant from OPFS. On a small machine, <code>?ctx=</code> shrinks the context window and with it the KV allocation (~0.77 GB at Phi-3’s default 4K with the int8 cache, ~1.5 GB under <code>?kv8=0</code>). Progress shown per shard in the log panel.</p>
     </div>
   </div>
   <div class="step-row">
@@ -612,7 +612,7 @@
   <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
 </ol>
 
-<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — split-K attention has been on by default since 2026-07-27 and adds a combine dispatch per layer; <code>?splitk=0</code> runs the 228-dispatch reference chain — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token — around 11 distinct shaders on that path, of 85 captured across a whole session.</p>
+<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — split-K attention adds a combine dispatch per layer; it has no int8 variant, so the int8 default turns it off and reaching the 228-dispatch reference chain now needs <code>?kv8=0&amp;splitk=0</code> — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token — around 11 distinct shaders on that path, of 85 captured across a whole session.</p>
 
 <!-- ARCHITECTURE -->
 <h2 id="overview">Architecture overview</h2>
@@ -622,9 +622,12 @@
 <div class="table-scroll"><table>
   <thead><tr><th>File</th><th>Role</th></tr></thead>
   <tbody>
-    <tr><td><code>src/zero-tvm/chat.ts</code></td><td>Main decode engine + UI. Allocates buffers, builds bind groups, runs the decode loop.</td></tr>
-    <tr><td><code>src/zero-tvm/weight-loader.ts</code></td><td>Fetches ndarray-cache.json, downloads shards, uploads to GPU buffers.</td></tr>
-    <tr><td><code>src/zero-tvm/tokenizer.ts</code></td><td>BPE tokenizer: encode text → token IDs, decode IDs → text.</td></tr>
+    <tr><td><code>src/zero-tvm/engine-core.ts</code></td><td>THE decode engine. <code>buildDecodeEngine</code> allocates buffers, builds bind groups, runs the decode loop. Both pages drive this one file.</td></tr>
+    <tr><td><code>src/zero-tvm/chat.ts</code></td><td>Thin page module for <code>zero-tvm.html</code>: boots the engine with URL-flag variants and streams. <code>chat-flow.ts</code> is the turn loop, shared with the entrance.</td></tr>
+    <tr><td><code>src/zero-tvm/weight-loader.ts</code></td><td>MLC layout: fetches ndarray-cache.json, downloads shards, uploads to GPU buffers.</td></tr>
+    <tr><td><code>src/zero-tvm/weight-loader-mlx.ts</code></td><td>MLX layout: byte-RANGE reads out of multi-GB safetensors shards, never a whole file. Most of the roster loads through this one.</td></tr>
+    <tr><td><code>src/zero-tvm/tokenizer.ts</code></td><td>Phi-3's SentencePiece-style tokenizer: encode text → token IDs, decode IDs → text.</td></tr>
+    <tr><td><code>src/zero-tvm/tokenizer-bpe.ts</code></td><td>Byte-level BPE for every Qwen and Llama build, plus the chat templates — including the three ChatML generations, which disagree about whitespace and about which past turns keep a <code>&lt;think&gt;</code> block.</td></tr>
     <tr><td><code>src/compiler/compiler.ts</code></td><td>Compiles every shader — the hand-written WGSL files plus the generated int4-matmul variants (tiled/subgroup/affine/MoE) — into <code>GPUComputePipeline</code> objects.</td></tr>
   </tbody>
 </table></div>
@@ -681,7 +684,7 @@
 
 <h3>Key steps</h3>
 <ul>
-  <li><strong>Pre-tokenization</strong> — Metaspace: spaces become <code>▁</code>, words are split on whitespace</li>
+  <li><strong>Pre-tokenization</strong> — Metaspace: spaces become <code>▁</code>. There is NO word splitting: BPE runs over the whole section, so a run of spaces can merge into one token.</li>
   <li><strong>BPE encoding</strong> — merge pairs by rank from the merge table in tokenizer.json</li>
   <li><strong>Special tokens</strong> — <code>&lt;|system|&gt;</code>, <code>&lt;|user|&gt;</code>, <code>&lt;|assistant|&gt;</code>, <code>&lt;|end|&gt;</code></li>
   <li><strong>Chat template</strong> — Phi-3 format applied by <code>buildChatPrompt()</code></li>
@@ -714,8 +717,9 @@ What is the capital of Australia?&lt;|end|&gt;
   <tbody>
     <tr><td><code>PAGE_SIZE</code></td><td>16</td><td>slots per page</td></tr>
     <tr><td><code>MAX_PAGES</code></td><td>257</td><td>≈ 4096 context tokens</td></tr>
-    <tr><td>Bytes per page</td><td>196,608</td><td>32 heads × 16 slots × 96 dims × 2 (K+V) × 2 bytes</td></tr>
-    <tr><td>Total KV buffer</td><td>~50 MB per layer</td><td>32 layers = ~1.6 GB</td></tr>
+    <tr><td>Bytes per page (int8, default)</td><td>98,304 + 2,048</td><td>packed i8 K+V, plus one f16 scale per (page, slot, head, side)</td></tr>
+    <tr><td>Bytes per page (<code>?kv8=0</code>)</td><td>196,608</td><td>32 heads × 16 slots × 96 dims × 2 (K+V) × 2 bytes</td></tr>
+    <tr><td>Total KV buffer</td><td>~24.6 MB per layer</td><td>32 layers ≈ 0.77 GB (int8); ~48.2 MB / ~1.51 GB with <code>?kv8=0</code></td></tr>
   </tbody>
 </table></div>
 
@@ -727,7 +731,7 @@ What is the capital of Australia?&lt;|end|&gt;
 <p>Each call to <code>decodeToken(tokenId, position)</code> submits one command encoder with the full forward pass:</p>
 
 <div class="code-block">
-  <div class="code-label">src/zero-tvm/chat.ts · decodeToken()</div>
+  <div class="code-label">src/zero-tvm/engine-core.ts · decodeToken()</div>
   <pre><code><span class="cm">// Per-token GPU state written via writeBuffer</span>
 B.inputIds   ← [tokenId]          <span class="cm">// i32</span>
 B.posMap     ← [position]         <span class="cm">// i32</span>
@@ -867,7 +871,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
         <tr><td><code>@6</code></td><td><code>uniform</code></td><td>attention config (scale, pages)</td></tr>
       </tbody>
     </table></div>
-    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 × HEADS workgroups (1 × 32). An <code>attention_int8.wgsl</code> variant reads an int8-quantized KV cache; enable via <code>?kv8=1</code>.</p>
+    <p style="margin-top:0.5rem;"><strong>Dispatch:</strong> 1 × HEADS workgroups (1 × 32). An <code>attention_int8.wgsl</code> variant reads the int8-quantized KV cache, which is the default since 2026-08-18; <code>?kv8=0</code> returns to the f16 <code>attention.wgsl</code>.</p>
   </div>
 </div>
 
@@ -979,7 +983,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <div class="shader-doc-card">
     <h4>🎯 10 · Argmax Sampler <span class="pill purple">argmax.wgsl</span></h4>
     <p>
-      Parallel-reduction argmax over the 32,064-entry logit buffer produced by the LM-head <code>int4_matmul</code>. Replaces TVM's ~20-dispatch sampling chain (penalty → softmax → cumsum → argsort → gather → …) with a single dispatch. Greedy decoding only; top-k / top-p not wired up yet.
+      Parallel-reduction argmax over the 32,064-entry logit buffer produced by the LM-head <code>int4_matmul</code>. Replaces TVM's ~20-dispatch sampling chain (penalty → softmax → cumsum → argsort → gather → …) with a single dispatch. Greedy by default. Temperature, top-p and min-p run through <code>sampler.wgsl</code>, set from the chat header; temperature 0 returns to this <code>argmax</code> kernel rather than a degenerate sampler.
     </p>
     <div class="table-scroll"><table class="binding-table">
       <thead><tr><th>Binding</th><th>Type</th><th>Role</th></tr></thead>
@@ -996,17 +1000,19 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <h2 id="phi3">Phi-3 model constants</h2>
 
 <div class="code-block">
-  <div class="code-label">src/compiler/compiler.ts</div>
-  <pre><code><span class="kw">export const</span> PHI3 = {
-  D:        <span class="num">3072</span>,   <span class="cm">// hidden dimension</span>
-  HEADS:    <span class="num">32</span>,     <span class="cm">// attention heads</span>
-  HEAD_DIM: <span class="num">96</span>,     <span class="cm">// D / HEADS</span>
-  LAYERS:   <span class="num">32</span>,     <span class="cm">// transformer layers</span>
-  FFN:      <span class="num">8192</span>,   <span class="cm">// FFN intermediate dimension</span>
-  VOCAB:    <span class="num">32064</span>,  <span class="cm">// vocabulary size</span>
-  PAGE_SIZE:<span class="num">16</span>,     <span class="cm">// KV cache slots per page</span>
-  MAX_PAGES:<span class="num">257</span>,    <span class="cm">// max pages (≈ 4096 context)</span>
-}</code></pre>
+  <div class="code-label">src/compiler/model-spec.ts</div>
+  <pre><code><span class="kw">export const</span> PHI3: ModelSpec = makeModelSpec({
+  d:        <span class="num">3072</span>,   <span class="cm">// hidden dimension</span>
+  heads:    <span class="num">32</span>,     <span class="cm">// attention heads</span>
+  kvHeads:  <span class="num">32</span>,     <span class="cm">// no GQA on Phi-3</span>
+  headDim:  <span class="num">96</span>,     <span class="cm">// d / heads</span>
+  layers:   <span class="num">32</span>,     <span class="cm">// transformer layers</span>
+  ffn:      <span class="num">8192</span>,   <span class="cm">// FFN intermediate dimension</span>
+  vocab:    <span class="num">32064</span>,  <span class="cm">// vocabulary size</span>
+  pageSize: <span class="num">16</span>,     <span class="cm">// KV cache slots per page</span>
+  maxPages: <span class="num">257</span>,    <span class="cm">// max pages (≈ 4096 context)</span>
+})   <span class="cm">// one spec among many — the engine is spec-parameterized,</span>
+     <span class="cm">// and every derived address is computed from these.</span></code></pre>
 </div>
 
 <!-- Q4F16 -->
@@ -1128,7 +1134,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   (~16.4&nbsp;GB, needs ~20&nbsp;GB free RAM, ~66&nbsp;tok/s on a quiet 32&nbsp;GB
   M2&nbsp;Max); <code>?model=qwen36</code> is full 4-bit (~19.5&nbsp;GB, needs
   ~24&nbsp;GB free RAM). The MoE block runs in 7 dispatches with the expert index in
-  grid&nbsp;<code>z</code>; every layer is validated against mlx_lm's own modules
+  grid&nbsp;<code>z</code>; the GDN, attention and MoE blocks and a full decoder layer are validated against mlx_lm's own modules
   (<code>npm run test:kernels:real</code>). Full engineering notes live in the repo:
   <a href="https://github.com/abgnydn/zero-tvm#readme">README</a>,
   <a href="https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md">BENCH.md</a>,
@@ -1137,15 +1143,19 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 
 <h2 id="porting">Port to Phi-4-mini or Qwen3</h2>
 
-<p>Both are available as MLC Q4F16 packages. The Qwen3 port has since landed (see <a href="#qwen3">Qwen3-4B</a> above) — these are the steps it followed, and the recipe for the next model:</p>
+<p>Both are available as MLC Q4F16 packages. Adding a model is a pipeline now, not a hand edit — <code>npm run add-model -- &lt;hf-repo&gt;</code> probes the checkpoint, checks it against the constraint matrix, generates the <code>ModelSpec</code> and the registry row, and runs a compile gate under the new dimensions. It comes back green, or with a per-failure report naming the kernel that is missing.</p>
+
+<p>What it automates, which is what the five hand steps below used to be:</p>
 
 <ol>
-  <li><strong>Update <code>PHI3</code> constants</strong> in <code>compiler.ts</code> — D, HEADS, HEAD_DIM, LAYERS, FFN, VOCAB</li>
-  <li><strong>Check parameter names</strong> — fetch <code>ndarray-cache.json</code> and log all keys. Update <code>weight-loader.ts</code> candidates to match</li>
-  <li><strong>Check for GQA</strong> — if KV heads ≠ Q heads (grouped-query attention), the attention shader needs a small change to repeat KV heads</li>
-  <li><strong>Update chat template</strong> — each model has its own special tokens and prompt format</li>
-  <li><strong>Update HuggingFace base URL</strong> — change <code>PHI3_MODEL_BASE</code> in <code>weight-loader.ts</code></li>
+  <li><strong>Dimensions</strong> — d, heads, kv heads, head dim, layers, FFN, vocab, read from <code>config.json</code> into a spec in <code>model-spec.ts</code> (not <code>compiler.ts</code>, and not a <code>PHI3</code> edit — <code>PHI3</code> is one spec among many now)</li>
+  <li><strong>Tensor names</strong> — resolved from the checkpoint's own index rather than guessed</li>
+  <li><strong>GQA</strong> — the attention kernels take KV-head repetition from the spec; no shader edit</li>
+  <li><strong>Chat template</strong> — detected from the checkpoint's <code>chat_template</code>. Getting this wrong does not error, so the detector returns <code>unknown</code> rather than guessing, and one ChatML family alone needs three answers</li>
+  <li><strong>Weights base</strong> — the spec carries its own HF repo</li>
 </ol>
+
+<p>What it cannot do is add a kernel. A model whose blocks are already covered is mechanical; a new architecture block (the MoE router, gated DeltaNet, MLA) is WGSL work, and the pipeline's job there is to say precisely which kernel is missing.</p>
 
 <div class="callout tip">
   <div class="callout-title">Phi-4-mini is the easiest port</div>
@@ -1240,7 +1250,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Decode only</td><td>83.10 tok/s</td><td>63.23 tok/s (self-reported)</td></tr>
     <tr><td>Time to first token (~35-token prompt)</td><td>291 ms</td><td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM ahead</td></tr>
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
-    <tr><td>Dispatches / token</td><td>260 default (228 with <code>?splitk=0</code>)</td><td>342</td></tr>
+    <tr><td>Dispatches / token</td><td>260 default (228 with <code>?kv8=0&amp;splitk=0</code>)</td><td>342</td></tr>
     <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>~11 TVM-generated on the decode path (85 captured across a session)</td></tr>
     <tr><td>Shipped JS bundle</td><td>~460 kB / ~126 kB gz (<code>zero-tvm.html</code>)</td><td>~6.0 MB / ~2.2 MB gz (@mlc-ai/web-llm 0.2.84)</td></tr>
     <tr><td>Bandwidth utilization (total / decode)</td><td>~36% / ~44% of the 191 tok/s ceiling</td><td>~31% / ~33% of the same ceiling</td></tr>
@@ -1277,7 +1287,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
 <div class="callout warning">
   <div class="callout-title">WebLLM reaches the first token sooner than we do</div>
   <p>WebLLM's self-reported prefill runs at 251 tok/s on Phi-3 and 263–271 tok/s on Qwen3-4B. Against the ~35-token bench prompt that implies a TTFT of roughly <strong>150 ms</strong> on Phi-3, where we measure <strong>291 ms</strong>; on Qwen3-4B our <strong>453 ms</strong> is worse still. Only Qwen3.5-4B is a wash (our 171 ms vs an implied ~0.2 s). Stated plainly: <strong>we win sustained decode decisively and lose the first-token sprint on short inputs.</strong></p>
-  <p>It is specifically a <em>short</em>-prompt weakness. Chunked prefill measures 202 tok/s on an 816-token prompt (2026-07-29), and cross-turn prefix reuse removes prefill entirely on follow-up turns. What is not competitive is the fixed cost of a short, cold prefill with nothing cached to reuse. It is the top open item on BENCH.md's levers list.</p>
+  <p>It is specifically a <em>short</em>-prompt weakness. Chunked prefill measures 202 tok/s on an 816-token prompt (2026-07-29), and cross-turn prefix reuse removes most of a follow-up turn's prefill. (On the Qwen templates that has not been re-measured since the 2026-08-19 chat-template fix, which ended the token-level extension the old figures were measured under.) What is not competitive is the fixed cost of a short, cold prefill with nothing cached to reuse. It is the top open item on BENCH.md's levers list.</p>
 </div>
 
 <h3>How the result flipped (22% behind &rarr; +16% total / +31% decode ahead)</h3>
@@ -1287,10 +1297,10 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
   <li><strong>vec4 loads, now default</strong>. Re-declaring weight + activation buffers as <code>array&lt;vec4&lt;u32&gt;&gt;</code> in the int4 matmuls and <code>qkv_fused</code> measured +7.1% on M2 Max; opt out with <code>?vec4=0</code> / <code>?vec4qkv=0</code>.</li>
   <li><strong>Tiled + subgroup kernels</strong>. The 4-row tiled subgroup FFN and the <code>_sg</code> matmul/attention/argmax variants are the default path on Apple sg32 hardware.</li>
 </ul>
-<p>Still default since 2026-07-27 (`?splitk=0` to disable): split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured opt-in config of that era (<code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code>, 68.36 tok/s on 2026-07-25) is now simply the default path. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (260 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
+<p>Default from 2026-07-27 until int8 KV shipped on 2026-08-18, which has no split-K variant and so disables it — reachable now only with <code>?kv8=0</code>: split-K attention (<code>?splitk=N</code>, ~+3% at short context, needs a long-context A/B); the best measured opt-in config of that era (<code>?vec4=1&amp;vec4qkv=1&amp;splitk=8</code>, 68.36 tok/s on 2026-07-25) is now simply the default path. Falsified and not shipped: FFN prologue fusion (<code>?fuseprologue=1</code>, −13.7% on M2 Max). Dispatch overhead was never the gap — Zero-TVM already submitted fewer dispatches per token (260 vs 342) when it was slower. Full A/B tables in BENCH.md.</p>
 
 <h3>The memory-bandwidth ceiling</h3>
-<p>Phi-3-mini Q4F16_1 touches ~2.09 GB of weights per decode token (the weight-shape table above, summed: 32 layers plus the LM head; the embedding contributes one row). On M2 Max's 400 GB/s memory bus that's ~5.2 ms/token, or ~191 tok/s theoretical max. Zero-TVM's measured decode-only median sits at roughly 44% of that ceiling (36% on total, which pays prefill too); WebLLM's at roughly 33% decode-only / 31% total (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV shaves a bit, which is why it's exposed behind a flag).</p>
+<p>Phi-3-mini Q4F16_1 touches ~2.09 GB of weights per decode token (the weight-shape table above, summed: 32 layers plus the LM head; the embedding contributes one row). On M2 Max's 400 GB/s memory bus that's ~5.2 ms/token, or ~191 tok/s theoretical max. Zero-TVM's measured decode-only median sits at roughly 44% of that ceiling (36% on total, which pays prefill too); WebLLM's at roughly 33% decode-only / 31% total (exact medians in the table above). Neither engine can exceed the ceiling without changing weight layout or quantization (int8 KV halves the cache rather than the weights, so it moves this very little; it is the default since 2026-08-18, and <code>?kv8=0</code> opts out).</p>
 
 </main>
 </div>

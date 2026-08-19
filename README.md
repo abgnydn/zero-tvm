@@ -81,9 +81,12 @@ it against the constraint matrix, generates the `ModelSpec`, registers it on
 every surface (landing cards, switcher, `?model=` URL), and compiles every
 kernel under the new dims. If the model needs a kernel that doesn't exist, the
 same command says exactly which one — [docs/COMPAT.md](docs/COMPAT.md) is the
-full support matrix. Numerical trust comes from
-`scripts/validate-model.mjs`, which diffs the browser engine's logits and
-greedy decode against `mlx_lm` on the same checkpoint.
+full support matrix. `scripts/validate-model.mjs` checks **fidelity**: that the
+engine computes what `mlx_lm` computes on the same checkpoint, by diffing logits
+and greedy decode. That is not a quality claim and cannot be one — it runs
+against the SAME quantized weights, so a checkpoint quantized into gibberish
+passes it. [docs/QUALITY.md](docs/QUALITY.md) demonstrates exactly that and
+holds the tools that do measure quality.
 
 ## The repository as an argument
 
@@ -124,7 +127,7 @@ src/
     chat.ts               thin chat page: DOM state, boot wiring
                           (via loading-ui's bootEngine), streaming render.
     variants.ts           URL-flag A/B harness (?sg/?matmul=/
-                          ?kv8=1 …) and variant→pipeline resolution.
+                          ?kv8=0 …) and variant→pipeline resolution.
     markdown.ts           minimal streaming Markdown renderer.
     bench-console.ts      window.bench / benchBatched / specSim
                           devtools harnesses for the chat page.
@@ -158,7 +161,7 @@ src/
       rms_norm.wgsl
       rope.wgsl                  (legacy, subsumed by qkv_fused)
       kv_append.wgsl             (legacy, subsumed by qkv_fused)
-      kv_quantize_int8.wgsl      int8-KV opt-in path
+      kv_quantize_int8.wgsl      int8-KV path (default; ?kv8=0 opts out)
       qkv_fused.wgsl             Q/K/V proj + RoPE + paged-KV append, 1 dispatch/layer
       qkv_fused_sg.wgsl          subgroup-reduce variant (default on Apple)
       qkv_fused_scratch.wgsl     int8-KV-compatible variant (writes full V to scratch)
@@ -166,7 +169,7 @@ src/
       qkv_fused_tiled2sg.wgsl    experimental 2-subgroup tile variant (regressed)
       attention.wgsl             Paged attention (vLLM-style page table)
       attention_sg.wgsl          subgroup-reduce variant (default on Apple)
-      attention_int8.wgsl        int8-KV opt-in path
+      attention_int8.wgsl        int8-KV path (default; ?kv8=0 opts out)
       fused_ffn.wgsl             Gate + up + SiLU, fused
       fused_ffn_tiled_sg.wgsl    tile + subgroup variant
       int4_matmul.gen.ts         generator for the int4 matmul family — the 9
@@ -196,7 +199,10 @@ is the harder one: a native MLX runtime with no browser between it and the GPU.
 Both sides load the **same files** — `.weights-local/` symlinks LM Studio's own
 store, so there is one copy on disk and the only difference left is the
 runtime. `lmstudio-community/Qwen3.5-9B-MLX-4bit`, ~1010-token prompt, 128
-decode tokens, three interleaved rounds, medians, one M2 Max.
+decode tokens, three interleaved rounds, medians, one M2 Max. Measured
+2026-08-14, with the f16 KV cache — int8 became the native host's default on
+2026-08-18 at a measured 5-8% of prefill throughput, so the prefill row would
+need re-running to describe today's default.
 
 | | zero-tvm | LM Studio | |
 |---|---:|---:|---|
@@ -213,7 +219,8 @@ per-token cost below, which is structural and checkable in the spec; the
 ceiling comparison needs both sides configured deliberately and re-run.
 
 KV cost per token is structural rather than tuning: it lives on 8 of 32 layers,
-so a token costs ~32 KiB against their ~101 KiB. That ratio is what lets a given
+so a token costs ~16 KiB with the int8 cache that is now the default (~32 KiB
+under `?kv8=0`) against their ~101 KiB. That ratio is what lets a given
 KV budget hold more tokens; it is not itself a measured context comparison.
 The restore figure is a category difference — our prefix cache is in
 OPFS and survives a reload or a crash, theirs is in RAM and ends with the

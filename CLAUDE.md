@@ -138,11 +138,19 @@ gates/norm batched, ONE `gdn_recur` dispatch per layer per chunk, causal
 All engines also do **cross-turn prefix reuse** (`?reuse=0` opts out): the
 engine tracks the exact absorbed (position, token) record and prefills only
 the delta on the next turn — hybrid reuse requires the new prompt to extend
-EVERY absorbed token (the ChatML non-thinking template re-renders past
-assistant turns WITH the empty `<think>` block so it does). When that fails,
-a ring of **four GDN state snapshots taken at chunk boundaries** lets the turn
-replay from the nearest one at or below the divergence instead of prefilling
-from zero (~0.19-0.24 GB of VRAM). Lookback is 4 x CHUNK_CAP, so ~4k tokens
+EVERY absorbed token. It used to, because the ChatML builder re-rendered every
+past assistant turn WITH an empty `<think>` block — which no Qwen template
+does. Since 2026-08-19 the builder follows each checkpoint's own rule
+(`chatml` / `chatml-q35` / `chatml-q38` in `tokenizer-bpe.ts`), so on the first
+two a turn's prompt diverges a few tokens before the end of the previous one
+and reuse goes through the rewind ring instead. Qwen3.8 still extends, because
+its template really does keep the block on every turn.
+A ring of **four GDN state snapshots** lets the turn replay from the nearest one
+at or below the divergence instead of prefilling from zero (~0.19-0.24 GB of
+VRAM). They are taken at chunk boundaries AND, since 2026-08-19, every 64 tokens
+on the per-token path — without that, any build that cannot chunk (a pooled MoE,
+a hybrid without subgroups, `?chunk=0`) kept an empty ring and got no reuse at
+all. Lookback is 4 x CHUNK_CAP, so ~4k tokens
 where the matrix unit gives cap 1024 and only ~256 on a browser without it. Agent clients that
 rewrite a trailing metadata block every turn hit this constantly: measured
 392.50s → 12.76s. WebLLM A/B
