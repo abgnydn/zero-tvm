@@ -118,6 +118,13 @@ export interface ModelBrand {
   rateLabel: string
   /** Present when the model needs more memory than a typical machine has. */
   ramNote?: string
+  /** A MEASURED quality cost this build pays for its size, shown on the sheet.
+   *  The 3-bit 35B is offered first in its group and looks strictly better than
+   *  the 4-bit on every figure the card renders — size, speed, RAM. It is not:
+   *  it is +10.4% perplexity. A decision surface that shows only the flattering
+   *  half of a trade is not neutral, and this is where the roster records what
+   *  a variant costs. */
+  qualityNote?: string
   /** Spec generated and compile-gated but NOT yet numerics-validated against
    *  its reference (mlx_lm logits + greedy). The entrance hides pending
    *  characters — a live roster card is a claim the model runs, and this
@@ -149,7 +156,8 @@ const BRANDINGS: Record<string, ModelBrand> = {
     // 19 GB, which is the difference between running and not running on a
     // 32 GB machine. See docs/QUALITY.md.
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · 3-bit experts',
-    sizeLabel: '~16.4 GB', rateLabel: '~66 t/s',
+    sizeLabel: '~16.4 GB download', rateLabel: '~66 t/s',
+    qualityNote: '+10.4% perplexity against the 4-bit build (paired, worse on 24 of 24 windows) — what the 3 GB saves costs',
     poolModes: [
       { slots: 0, label: 'Full · 15.7 GB resident · ~66 t/s' },
       { slots: 128, label: 'Half · ~8.4 GB resident · ~15 t/s', note: 'pooled rates are the 2026-08-15 AC round, whose own unpooled control read 58.6 t/s — compare against that, not the 66 above' },
@@ -159,7 +167,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   },
   [QWEN36_35B_A3B.id]: {
     name: 'Qwen3.6-35B-A3B', params: '35B-A3B MoE · full 4-bit',
-    sizeLabel: '~19.5 GB',
+    sizeLabel: '~19.5 GB download',
     poolModes: [
       { slots: 0, label: 'Full · 19.7 GB resident' },
       // No rate: the 4-bit build has never been measured pooled (BENCH.md

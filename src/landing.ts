@@ -39,12 +39,16 @@ const INT8_KV = new URLSearchParams(location.search).get('kv8') !== '0'
 
 /** KV bytes per token AS ALLOCATED. int8 KV is the default (`?kv8=0` opts
  *  out), so the cache is half the f16 width plus one f16 scale per
- *  (token, kv head, side) — the scales are ~0.05% here, included because a
- *  figure headed "will it fit" should not round away the thing it allocates.
+ *  (token, kv head, side) PER ATTENTION LAYER — allocKVPagesInt8 makes one
+ *  scales buffer per attention layer, and leaving the layer count out understated
+ *  Phi-3 by 2% (771.5 MB shown against 787.1 MB allocated) and Llama-3.2 by
+ *  more. A figure headed "will it fit" must not round away the thing it
+ *  allocates, and must not round it in the reassuring direction.
  *  MLA caches a latent and the int8 path does not cover it, so it stays f16. */
 const kvBytesPerToken = (spec: ModelSpec, int8: boolean): number =>
   int8 && !spec.mla
-    ? spec.kvBytesPerToken / 2 + 2 * spec.kvHeads * 2
+    ? spec.kvBytesPerToken / 2
+      + 4 * spec.kvHeads * spec.layerKinds.filter((k) => k === 'attn').length
     : spec.kvBytesPerToken
 
 /** What a context window costs: KV bytes, from the spec's own per-token rate.
@@ -445,7 +449,19 @@ function render(): void {
     // authored notes at their default windows (Qwen3.8: 15.7 -> 18) and keeps tracking
     // when the picker moves. Any prose in the authored note survives; only its
     // number is replaced.
-    const needGb = Number.isFinite(footprintGb) ? Math.round(footprintGb * 1.15) : NaN
+    // max(derived, authored): the derived figure tracks the context picker, but
+    // int8 halving the cache must never WEAKEN a hand-authored RAM warning. It
+    // did — qwen36q3 rendered "needs ~19 GB" under an authored ~20, qwen36 ~23
+    // against ~24, qwen38 ~17 against ~18 — so the entrance was quietly telling
+    // people a model fits in less than the author had measured it needing.
+    const derivedGb = Number.isFinite(footprintGb) ? Math.round(footprintGb * 1.15) : NaN
+    const authoredGb = Number.parseFloat(
+      /needs\s*~?([\d.]+)\s*GB free RAM/i.exec(
+        (mode && mode.slots ? (mode.note ?? '') : (b.ramNote ?? '')),
+      )?.[1] ?? '')
+    const needGb = Number.isFinite(derivedGb) && Number.isFinite(authoredGb)
+      ? Math.max(derivedGb, Math.round(authoredGb))
+      : Number.isFinite(derivedGb) ? derivedGb : Math.round(authoredGb)
     const authored = mode && mode.slots ? (mode.note ?? '') : (b.ramNote ?? '')
     const qualifier = authored.replace(/needs\s*~?[\d.]+\s*GB free RAM/i, '').replace(/^[\s—-]+/, '').trim()
     const baseNote = Number.isFinite(needGb)
@@ -454,8 +470,8 @@ function render(): void {
     const ctxNote = cx.tokens > v.spec.maxContext
       ? `long context allocates ~${kvPrice(v.spec, cx.tokens, INT8_KV)} at boot, on top of the weights`
       : ''
-    ram.textContent = [baseNote, ctxNote].filter(Boolean).join(' — ')
-    ram.hidden = !(baseNote || ctxNote)
+    ram.textContent = [baseNote, ctxNote, b.qualityNote].filter(Boolean).join(' — ')
+    ram.hidden = !(baseNote || ctxNote || b.qualityNote)
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))

@@ -480,7 +480,7 @@ export function checkModel(m: DetectedModel): CheckResult {
   }
   if (m.chatTemplate === 'unknown') {
     fail('template', 'chat template is none of Phi-3, ChatML, Llama-3 or DeepSeek',
-      'a renderer branch in model-select.ts buildChatPromptFor (phi3, chatml non-thinking, llama3 and deepseek exist)')
+      'a renderer branch in model-select.ts buildChatPromptFor (phi3, chatml (three generations), llama3 and deepseek exist)')
   }
 
   // ── notes that gate flags, not support ─────────────────────
@@ -520,7 +520,7 @@ export const SUPPORT_MATRIX: MatrixRow[] = [
   { area: 'Linear attention', supported: 'GatedDeltaNet (Qwen3.5/3.6): GVA, headV %32 ≤256, conv width 4', not: 'Mamba/S4, RWKV, conv hybrids (LFM2 layer_types \'conv\'), other conv widths', needs: 'new recurrence kernels' },
   { area: 'Embedding / head', supported: 'quantised embedding (symmetric or affine), tied or untied lm_head, vocab %4', not: 'unquantised embedding tables', needs: 'f16 gather path' },
   { area: 'Tokenizer', supported: 'SentencePiece (Phi-3), byte-level BPE (Qwen/Llama-style tokenizer.json)', not: 'tekken, WordPiece, custom pipelines', needs: 'new pipeline beside tokenizer-bpe.ts' },
-  { area: 'Chat template', supported: 'Phi-3, ChatML (non-thinking), Llama-3 header template, DeepSeek prose turns', not: 'Gemma turns, Mistral [INST], thinking-mode rendering', needs: 'renderer branch in model-select.ts — the single highest-leverage gap in the survey (docs/PORTING.md): it blocks 29 of 51 refused repos and is the SOLE blocker on 5' },
+  { area: 'Chat template', supported: 'Phi-3, Llama-3 header template, DeepSeek prose turns, and ChatML in its THREE non-thinking generations — chatml (Qwen3), chatml-q35 (Qwen3.5/3.6), chatml-q38 (Qwen3.8). They differ on whether message content is trimmed, whether </think> is split out of an assistant turn, and which past turns keep an empty <think> block; the tool-call dialect follows the same split', not: 'Gemma turns, Mistral [INST], thinking-mode rendering', needs: 'renderer branch in model-select.ts — the single highest-leverage gap in the survey (docs/PORTING.md): it blocks 29 of 51 refused repos and is the SOLE blocker on 5' },
   { area: 'Decoding', supported: 'greedy argmax (default), seeded temperature / top-p / min-p sampling, streaming, cross-turn prefix reuse', not: 'top-k, repetition/presence penalties, beam search, batch > 1', needs: 'a rank selection pass beside sampler.wgsl\'s mass threshold; a per-sequence token-count buffer for penalties' },
 ]
 

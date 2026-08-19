@@ -7,6 +7,55 @@ from `0.1.0`.
 
 ## [Unreleased]
 
+### 2026-08-19 — the agentic loop at depth: three prompt bugs, none of them a kernel
+
+qwen36q3 through the station at ~24k tokens of history read all three files it
+needed, computed the right answer, and then replied in prose instead of calling
+the tool. Perfect at ~500 tokens. int8 KV was cleared first (`KV8=0` failed
+identically), then cross-turn reuse and the rewind ring. The fault was in the
+prompt we build, above the engine; no WGSL was involved.
+
+Settled by asking mlx_lm the same question with the same conversation through
+the checkpoint's own jinja (`scripts/toolcall-depth-ref.py`): it emits the call
+at 0 / 8k / 24k where we emitted prose.
+
+- **Tool results were sent unwrapped.** Both hosts mapped `role: 'tool'` to
+  `'user'` and passed the tool's output through as the turn's whole content;
+  the template wants `<tool_response>…</tool_response>`. `renderToolResults`
+  had done this correctly, with tests, since it was written — and had **zero
+  callers**. The model read every tool result as something the user had typed.
+- **An empty `<think>` block on every past assistant turn.** No Qwen template
+  does that. At 24k it was 286 spurious blocks and 5,434 characters. The real
+  rule is three generations, now three `chatTemplateId` values: `chatml`
+  (Qwen3 — only a trailing turn), `chatml-q35` (Qwen3.5/3.6 — the current tool
+  round), `chatml-q38` (Qwen3.8 — every turn, because its condition opens
+  `preserve_thinking is undefined` and nothing defines it).
+- **The tool dialect was wrong for both Qwen3.5 builds**, which were served the
+  Qwen3-era JSON dialect against templates that ship the XML form. It was a
+  prefix match on the model's NAME, hand-written in both hosts; it is derived
+  from the chat-template id now, in one place.
+- **`|trim` and the `</think>` split**, found by the same method after the
+  first two: Qwen3 trims nothing, 3.5+ trims every message; 3.5/3.6 split a
+  `</think>` back out of assistant text and 3.8 does not. Reachable from a
+  remote guest's history in a room.
+- **The rewind ring was only filled by chunked prefill.** Invisible until now —
+  the spurious `<think>` block had made every turn an exact token extension, so
+  reuse never needed a rewind. Rendering correctly ended that, and any build
+  that cannot chunk (a pooled MoE, a hybrid without subgroups, `?chunk=0`)
+  would have gone from full reuse to none. Snapshots now come from the
+  per-token path too.
+- `detectChatTemplate` learned the three generations, so `add-model` stops
+  reintroducing this — Qwen3.8 shipped with the wrong id on 2026-08-17 and was
+  hand-corrected two days later.
+
+All six ChatML specs now render byte-identical to their own templates, verified
+by `scripts/render-diff.py` (which diffs our prompt against the checkpoint's
+jinja) at depth 0, 8000 and 24000 and across a battery of awkward shapes. The
+24k eval goes from prose to SOLVED: 3/3 files, no wasted reads.
+
+Published copy corrected in the same pass — the int8 default, the KV figures,
+split-K's availability, and the prefix-reuse claims this batch made false.
+
 ### 2026-08-17/18 — agent serving: the cache stops re-reading, int8 KV goes wide
 
 Driven by a real Cline session on qwen36q3 that cost ~5.5 minutes per turn.
