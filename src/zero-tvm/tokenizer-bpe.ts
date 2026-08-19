@@ -471,6 +471,34 @@ function lastQueryIndex(messages: ReadonlyArray<{ role: string; content: string 
   return messages.length - 1
 }
 
+/** jinja `x.lstrip('\n')` / `rstrip` / `strip` — NEWLINES ONLY, not whitespace.
+ *  Distinct from `|trim`, which strips all whitespace; the templates use both
+ *  and they are not interchangeable. */
+const lstripNl = (t: string) => t.replace(/^\n+/, '')
+const rstripNl = (t: string) => t.replace(/\n+$/, '')
+
+/**
+ * The templates' own handling of an assistant turn that already contains a
+ * `</think>` block: the reasoning is split back out of the content, so it can
+ * be re-emitted (or dropped) according to the past-turn rule rather than
+ * passed through inline.
+ *
+ * We pass no `reasoning_content` field, so only the `'</think>' in content`
+ * branch can fire — and it fires on ordinary text. The chat page stores the
+ * model's RAW output as history (chat-flow.ts), and a room host renders a
+ * remote GUEST's history verbatim (room-host.ts), so a turn containing the
+ * literal `</think>` is reachable without anything unusual happening.
+ */
+function splitReasoning(content: string): { content: string; reasoning: string } {
+  if (!content.includes('</think>')) return { content, reasoning: '' }
+  const parts = content.split('</think>')
+  const before = parts[0]
+  return {
+    content: lstripNl(parts[parts.length - 1]),
+    reasoning: lstripNl(rstripNl(before).split('<think>').pop() ?? ''),
+  }
+}
+
 export function buildChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   // Only encode() is needed, so the SPM Tokenizer shape (no stopIds) is
@@ -487,6 +515,11 @@ export function buildChatPrompt(
   // below are read off the checkpoints' own tokenizer_config.json.
   const gen = opts?.generation ?? 'qwen3'
   const q = lastQueryIndex(messages)
+  // Qwen3.5 and later run every message's content through jinja's `|trim`;
+  // the Qwen3-era template interpolates `message.content` verbatim. Trimming
+  // on the wrong one moves whitespace at a turn boundary, which no test would
+  // see and the model answers slightly off distribution for.
+  const trims = gen !== 'qwen3'
   let text = ''
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]
@@ -498,11 +531,30 @@ export function buildChatPrompt(
     // carry no reasoning_content, so in practice a past turn there gets nothing
     // — only a trailing assistant turn does. Qwen3.5 and later dropped that
     // gate, which is why the two generations are separate ids.
-    const inRound = msg.role === 'assistant' && i > q
-    const think = msg.role === 'assistant' && (gen === 'qwen38'
-      || (inRound && (gen === 'qwen35' || i === messages.length - 1)))
-    const content = think ? `<think>\n\n</think>\n\n${msg.content}` : msg.content
-    text += `<|im_start|>${msg.role}\n${content}<|im_end|>\n`
+    const raw = trims ? msg.content.trim() : msg.content
+    if (msg.role !== 'assistant') {
+      text += `<|im_start|>${msg.role}\n${raw}<|im_end|>\n`
+      continue
+    }
+    // Qwen3.8 has NO split: its assistant branch only reads a `reasoning_content`
+    // FIELD, which we never send, so a `</think>` inside the text passes
+    // through whole. Qwen3 and Qwen3.5/3.6 split it back out. Splitting on 3.8
+    // cuts the reply at the tag and re-emits half of it as reasoning.
+    const split = gen === 'qwen38' ? { content: raw, reasoning: '' } : splitReasoning(raw)
+    const inRound = i > q
+    // Qwen3 needs `loop.last or reasoning_content`; 3.5/3.6 dropped that gate;
+    // 3.8 opens its condition with `preserve_thinking is undefined`, which
+    // nothing defines, so it always fires.
+    const think = gen === 'qwen38'
+      || (inRound && (gen === 'qwen35' || i === messages.length - 1 || !!split.reasoning))
+    // Qwen3 emits `reasoning_content.strip('\n')` + `content.lstrip('\n')`;
+    // 3.5+ emits a `|trim`-ed reasoning and the content as-is. Both already
+    // stripped above, so these only differ on which stripper ran.
+    const reasoning = gen === 'qwen3' ? lstripNl(rstripNl(split.reasoning)) : split.reasoning.trim()
+    const body = think
+      ? `<think>\n${reasoning}\n</think>\n\n${gen === 'qwen3' ? lstripNl(split.content) : split.content}`
+      : split.content
+    text += `<|im_start|>${msg.role}\n${body}<|im_end|>\n`
   }
   text += '<|im_start|>assistant\n'
   if (opts?.thinking === false) text += '<think>\n\n</think>\n\n'

@@ -339,9 +339,15 @@ export function renderToolResults(dialect: ToolDialect, results: string[]): Tool
   if (dialect === 'llama3') {
     return results.map((r) => ({ role: 'ipython' as const, content: tojson(r) }))
   }
+  // Qwen3.5 and later run every message's content through jinja's `|trim`
+  // before wrapping it; the Qwen3-era template does not trim at all. The
+  // dialect is the right discriminator because it splits on exactly the same
+  // generation boundary (see toolDialectFor). A tool whose output ends in a
+  // newline — which is most of them — diverges otherwise.
+  const body = dialect === 'chatml-xml' ? results.map((r) => r.trim()) : results
   return [{
     role: 'user',
-    content: results.map((r) => `<tool_response>\n${r}\n</tool_response>`).join('\n'),
+    content: body.map((r) => `<tool_response>\n${r}\n</tool_response>`).join('\n'),
   }]
 }
 
