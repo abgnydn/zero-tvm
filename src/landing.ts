@@ -17,7 +17,7 @@
  * The mascot and the cached badge are additive; both fail to silence.
  */
 
-import { SHIPPED_MODELS, modelBranding, quantLabel, specWithCtx } from './zero-tvm/model-registry.js'
+import { SHIPPED_MODELS, kvBytesPerTokenShown as kvBytesPerToken, modelBranding, quantLabel, specWithCtx } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
@@ -36,20 +36,6 @@ const ctxLabel = (t: number): string => (t >= 1024 ? `${Math.round(t / 1024)}k` 
  *  Default ON; `?kv8=0` opts out — the SAME rule variants.ts applies, read
  *  here rather than assumed, so the price shown is the price charged. */
 const INT8_KV = new URLSearchParams(location.search).get('kv8') !== '0'
-
-/** KV bytes per token AS ALLOCATED. int8 KV is the default (`?kv8=0` opts
- *  out), so the cache is half the f16 width plus one f16 scale per
- *  (token, kv head, side) PER ATTENTION LAYER — allocKVPagesInt8 makes one
- *  scales buffer per attention layer, and leaving the layer count out understated
- *  Phi-3 by 2% (771.5 MB shown against 787.1 MB allocated) and Llama-3.2 by
- *  more. A figure headed "will it fit" must not round away the thing it
- *  allocates, and must not round it in the reassuring direction.
- *  MLA caches a latent and the int8 path does not cover it, so it stays f16. */
-const kvBytesPerToken = (spec: ModelSpec, int8: boolean): number =>
-  int8 && !spec.mla
-    ? spec.kvBytesPerToken / 2
-      + 4 * spec.kvHeads * spec.layerKinds.filter((k) => k === 'attn').length
-    : spec.kvBytesPerToken
 
 /** What a context window costs: KV bytes, from the spec's own per-token rate.
  *  Computed, never typed — the same rule as every other figure here. */

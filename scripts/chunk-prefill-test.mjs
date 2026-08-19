@@ -66,13 +66,34 @@ try {
       same ? `${chunked.length} tokens over ${IDS.length}-token prompt`
         : `diverges at ${at}: ${chunked[at]} vs ${perToken[at]}`)
   }
-  check('chunking actually ran', sawChunks > 0,
-    sawChunks ? `${sawChunks} chunks recorded` : 'ZERO chunks — this run proves nothing, raise PROMPT')
+  // SCALE IS PART OF THE CLAIM. This gate asserts that chunked prefill equals
+  // per-token, and it has passed for months at PROMPT=150 — which, with
+  // CHUNK_CAP at 1024, is a SINGLE chunk. One chunk crosses no boundary and
+  // exercises no per-chunk accumulation, so the property most likely to break
+  // was never under test. It broke: qwen38 at 16k emits a tool name that was
+  // never offered, and per-token on the same prompt emits the right one.
+  //
+  // So a single chunk no longer counts as having tested chunking. Two is the
+  // minimum that crosses a boundary; the size of each chunk matters
+  // independently, which is what CAP is for.
+  check('chunking actually ran', sawChunks >= 2,
+    sawChunks >= 2 ? `${sawChunks} chunks recorded (${IDS.length} tokens)`
+      : sawChunks === 1
+        ? `ONE chunk — crosses no boundary, so this proves nothing about chunking. `
+          + `Raise PROMPT above the cap (or lower CAP): PROMPT=${IDS.length} needs ~${IDS.length * 2} to split.`
+        : 'ZERO chunks — this run proves nothing, raise PROMPT')
   const gpuErrs = await page.evaluate(() => window.__gpuErrs())
   check('gpu errors', gpuErrs === 0, String(gpuErrs))
   for (const l of [...new Set(logs)]) console.log(`      ${l}`)
 } finally {
   await stopHarness()
 }
-console.log(failed ? '\nchunked prefill DIVERGES from per-token' : '\nchunked prefill agrees with per-token')
+console.log(failed
+  ? '\nchunked prefill DIVERGES from per-token'
+  : `\nchunked prefill agrees with per-token at ${IDS.length} tokens / ${sawChunks} chunks`)
+if (!failed && IDS.length < 4000) {
+  console.log('  NOTE: this is a SHORT prompt. The defect found on 2026-08-19 needed ~16k')
+  console.log('  tokens and got worse with chunk SIZE, so a short pass does not cover it:')
+  console.log(`    PROMPT=16000 TOKENS=8 node scripts/chunk-prefill-test.mjs ${process.argv[2] ?? '<spec>'}`)
+}
 process.exit(failed ? 1 : 0)

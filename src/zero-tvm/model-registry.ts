@@ -106,6 +106,29 @@ export const WEIGHTS_OPFS_DIR = 'zero-tvm-weights'
  * WebGPU at all — and weight-loader reads GPUBufferUsage at module scope.
  */
 /**
+ * KV bytes per token AS ALLOCATED — the number the entrance turns into "will
+ * this fit".
+ *
+ * Lives here rather than in landing.ts because landing.ts touches the DOM and
+ * cannot be imported by a unit test. It was there, a test re-implemented the
+ * formula to check it, and the mutation gate caught that immediately: mutating
+ * the real one left the copy passing. A figure this load-bearing has to be
+ * tested at the definition, not next to it.
+ *
+ * int8 is the default (`?kv8=0` opts out): half the f16 width plus one f16
+ * scale per (token, kv head, side) PER ATTENTION LAYER — allocKVPagesInt8 makes
+ * one scales buffer per attention layer, and leaving the layer count out
+ * understated Phi-3 by 2% in the reassuring direction. MLA caches a latent and
+ * the int8 path does not cover it, so it stays f16.
+ */
+export function kvBytesPerTokenShown(spec: ModelSpec, int8: boolean): number {
+  return int8 && !spec.mla
+    ? spec.kvBytesPerToken / 2
+      + 4 * spec.kvHeads * spec.layerKinds.filter((k) => k === 'attn').length
+    : spec.kvBytesPerToken
+}
+
+/**
  * How this build is quantised, in the checkpoint's own terms.
  *
  * The sheet used to say nothing here unless a model shipped TWO builds, because
