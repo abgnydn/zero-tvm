@@ -21,7 +21,7 @@
 //
 //   node scripts/multi-turn-ab.mjs                 # qwen35
 //   MODEL=qwen36q3 node scripts/multi-turn-ab.mjs
-import { bootAndWaitReady, newPage, startHarness, stopHarness } from '../tests/e2e/harness.js'
+import { bootAndWaitReady, newPage, startHarness, stopHarness } from '../tests/e2e/harness.ts'
 
 const MODEL = process.env.MODEL ?? 'qwen35'
 const BOOT_TIMEOUT_MS = 10 * 60_000

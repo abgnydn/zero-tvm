@@ -35,4 +35,9 @@ if (tools?.length) turns = withTools(dialect, turns, tools)
 
 // Hand back the text instead of ids — what is being compared is the prompt.
 const capture = { encode: (t) => [t] }
-process.stdout.write(buildChatPrompt(turns, capture, { thinking: false, generation })[0])
+// join(''), not [0]: buildChatPrompt encodes the history and the generation
+// prompt separately now (so it can report the boundary index the engine uses as
+// its rewind point), so the capture stub gets TWO strings back. Reading [0]
+// silently dropped the generation prompt and made every comparison here read
+// DIFFERS by exactly its length.
+process.stdout.write(buildChatPrompt(turns, capture, { thinking: false, generation }).join(''))
