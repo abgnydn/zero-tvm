@@ -17,7 +17,7 @@
  * The mascot and the cached badge are additive; both fail to silence.
  */
 
-import { SHIPPED_MODELS, modelBranding, specWithCtx } from './zero-tvm/model-registry.js'
+import { SHIPPED_MODELS, modelBranding, quantLabel, specWithCtx } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
@@ -371,6 +371,11 @@ function render(): void {
     // with no measurement renders no speed row rather than a guess.
     const rows: Array<[string, string]> = [
       ['Weights', b.sizeLabel],
+      // Stated for EVERY model, not only the ones offering a choice. The
+      // picker above renders only when a group ships two builds, so without
+      // this row five of seven characters showed no quantisation and read as
+      // full precision. None of them are.
+      ['Quantisation', quantLabel(v.spec)],
       ['Context', `${ctxLabel(cx.tokens)} tokens`],
     ]
     // Suppressed when a pooled build is chosen: the measured rate belongs to

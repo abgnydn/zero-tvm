@@ -105,6 +105,28 @@ export const WEIGHTS_OPFS_DIR = 'zero-tvm-weights'
  * peer-weights.ts replicates this directory on machines that may have no
  * WebGPU at all — and weight-loader reads GPUBufferUsage at module scope.
  */
+/**
+ * How this build is quantised, in the checkpoint's own terms.
+ *
+ * The sheet used to say nothing here unless a model shipped TWO builds, because
+ * the only place quantisation appeared was the variant picker — and a picker
+ * needs a choice. So five of seven groups displayed no quantisation at all,
+ * which reads as "not quantised". Every model on this roster is 4-bit; the
+ * engine has no unquantised path (constraints.ts refuses f16/bf16 weights).
+ *
+ * DERIVED, never authored: a hand-typed label drifts from the checkpoint the
+ * moment a variant is added, and this is a claim about what the user is about
+ * to download.
+ */
+export function quantLabel(spec: ModelSpec): string {
+  const mlx = spec.weightFormat === 'mlx-safetensors'
+  const fmt = mlx ? 'MLX affine · group 64' : 'MLC q4f16_1 · group 32'
+  // The 3-bit build requantises the EXPERT STACKS only; everything else —
+  // attention, router, the shared expert — stays at 4-bit, and a flat "3-bit"
+  // would overstate what was given up.
+  return spec.moe?.bits === 3 ? `3-bit experts, 4-bit elsewhere · ${fmt}` : `4-bit · ${fmt}`
+}
+
 export function opfsDirFor(spec: ModelSpec): string {
   return spec.id === PHI3.id ? WEIGHTS_OPFS_DIR : `${WEIGHTS_OPFS_DIR}.${spec.id}`
 }
