@@ -63,7 +63,12 @@ async function load(param) {
   // the FOURTH one, and turns 2-4 all ride reused state. Slow on purpose: a
   // 24k-token turn re-prefills 24k tokens.
   const reuse = process.env.REUSE !== '0'
-  await post(8017, '/api/load', { param, ctx: 32768, pool: 0, kv8, reuse })
+  // CHUNK=0 is the third length-dependent arm: chunked prefill batches GEMMs
+  // over token blocks instead of running per-token matvecs, which is a
+  // different arithmetic order and only reachable on prompts long enough to
+  // chunk. scripts/depth-bisect.mjs drives all three.
+  const chunk = process.env.CHUNK !== '0'
+  await post(8017, '/api/load', { param, ctx: 32768, pool: 0, kv8, reuse, chunk })
   for (let i = 0; i < 200; i++) {
     await sleep(2000)
     const s = await get(8017, '/api/state')
@@ -238,8 +243,8 @@ for (const p of models) {
   console.log(`\n=== ${p} ===`)
   await load(p)
   const h = await get(8019, '/health')
-  console.log(`  loaded ${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse}`)
-  const arm = `kv8=${h.kv8} reuse=${h.reuse}`
+  console.log(`  loaded ${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse} · chunk=${h.chunk}`)
+  const arm = `kv8=${h.kv8} reuse=${h.reuse} chunk=${h.chunk}`
   results[p] = await runEpisode(`${p} · ${PAD ? `~${Math.round(PAD / 1000)}k-token history` : 'short'} · ${arm}`, 12, PAD)
 }
 console.log('\n=== VERDICT ===')

@@ -17,14 +17,16 @@ export interface LoadRequest {
   pool?: number
   kv8?: boolean
   reuse?: boolean
+  chunk?: boolean
 }
 
-export function engineArgs({ param, port, ctx, pool, kv8, reuse }: LoadRequest): string[] {
+export function engineArgs({ param, port, ctx, pool, kv8, reuse, chunk }: LoadRequest): string[] {
   const argv = [param, '--port', String(port)]
   if (ctx) argv.push('--ctx', String(ctx))
   if (pool) argv.push('--experts', String(pool))
   if (kv8 === false) argv.push('--kv8', '0')   // int8 is the default; this is the opt-out
   // Diagnostic only (no UI control): the arm where every turn prefills from zero.
   if (reuse === false) argv.push('--reuse', '0')
+  if (chunk === false) argv.push('--chunk', '0')
   return argv
 }

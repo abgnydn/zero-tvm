@@ -44,14 +44,32 @@ describe('engineArgs', () => {
     expect(args({ reuse: false }).join(' ')).toContain('--reuse 0')
   })
 
+  it('chunked prefill is ON unless explicitly refused', () => {
+    expect(args()).not.toContain('--chunk')
+    expect(args({ chunk: true })).not.toContain('--chunk')
+    expect(args({ chunk: false }).join(' ')).toContain('--chunk 0')
+  })
+
+  it('the three length-dependent subsystems can be refused independently', () => {
+    // int8 KV, chunked prefill and cross-turn reuse are the only things whose
+    // behaviour changes with prompt LENGTH, so a depth-dependent defect is
+    // bisected by turning them off one at a time. That only works if each flag
+    // is separate — one combined "safe mode" would prove nothing about which.
+    expect(args({ kv8: false }).join(' ')).not.toContain('--chunk')
+    expect(args({ chunk: false }).join(' ')).not.toContain('--kv8')
+    expect(args({ reuse: false }).join(' ')).not.toContain('--chunk')
+    expect(args({ kv8: false, chunk: false, reuse: false }).join(' '))
+      .toContain('--kv8 0 --reuse 0 --chunk 0')
+  })
+
   it('carries ctx only when one was chosen', () => {
     expect(args({ ctx: 32768 }).join(' ')).toContain('--ctx 32768')
     expect(args({ ctx: 0 })).not.toContain('--ctx')
   })
 
   it('composes the flags a diagnostic run actually asks for', () => {
-    expect(args({ ctx: 32768, kv8: false, reuse: false })).toEqual([
-      'qwen36q3', '--port', '8019', '--ctx', '32768', '--kv8', '0', '--reuse', '0',
+    expect(args({ ctx: 32768, kv8: false, reuse: false, chunk: false })).toEqual([
+      'qwen36q3', '--port', '8019', '--ctx', '32768', '--kv8', '0', '--reuse', '0', '--chunk', '0',
     ])
   })
 })
