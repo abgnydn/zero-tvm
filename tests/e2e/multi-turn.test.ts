@@ -110,10 +110,20 @@ describe('multi-turn prefix reuse (phi-3)', () => {
     expect(reply2.toLowerCase()).toContain('alice')
 
     // Hybrid reuse is all-or-nothing: turn 2 either extends EVERY absorbed
-    // token (reused == full turn-1 sequence incl. the stop-id overrun) or
-    // falls back to 0. Assert the reuse actually engaged — this is the
-    // regression gate for the GDN state-boundary rules and the non-thinking
-    // template's history rendering.
+    // token or falls back to 0. It no longer extends. Until 2026-08-19 the
+    // ChatML builder put an empty <think> block on every past assistant turn,
+    // which made turn 2 an exact token extension of turn 1 — and is not what
+    // any Qwen template does. Rendering it correctly means turn 2 now diverges
+    // a few tokens before the end of turn 1's prompt, so reuse comes from the
+    // GDN REWIND RING instead of from direct extension.
+    //
+    // The assertion still holds, and the reason it holds is the other half of
+    // that change: snapshots are now taken on the per-token prefill path as
+    // well as at chunk boundaries. A two-turn chat is far too short to chunk,
+    // so before that fix this ring was empty and reuse here would have been 0.
+    // That makes this the regression gate for BOTH halves — if it reports 0,
+    // the ring stopped being filled; if it reports the full turn-1 length, the
+    // <think> block is back on past turns.
     console.log(`[multi-turn qwen35] prefill logs: ${JSON.stringify(prefillLogs)}`)
     const turn2Log = prefillLogs.filter((l) => reusedFrom(l) > 0).pop()
     expect(turn2Log, 'expected a prefill log with reused prefix > 0 (GDN state reuse)').toBeDefined()
