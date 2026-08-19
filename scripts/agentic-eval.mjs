@@ -74,8 +74,20 @@ async function load(param) {
   // next chat call then gets an error body, and an error body scored as an
   // empty completion reads as "the model answered with prose". One such run was
   // reported as a model failure before this check existed.
-  const acc = await post(8017, '/api/load', { param, ctx: 32768, pool: 0, kv8, reuse, chunk })
-  if (acc?.error) throw new Error(`/api/load refused: ${acc.error}`)
+  // Two of the station's refusals are TRANSIENT — it is mid-load, or still
+  // generating for someone else — and both clear on their own. Throwing on
+  // those makes the harness unusable right after a restart, when the station
+  // auto-loads the last model. Anything else is a real refusal.
+  const req = { param, ctx: 32768, pool: 0, kv8, reuse, chunk }
+  for (let i = 0; ; i++) {
+    const acc = await post(8017, '/api/load', req)
+    if (!acc?.error) break
+    const transient = /already loading|generating right now/i.test(acc.error)
+    if (!transient) throw new Error(`/api/load refused: ${acc.error}`)
+    if (i === 0) console.log(`  waiting: ${acc.error}`)
+    if (i > 150) throw new Error(`/api/load still refusing after 5 min: ${acc.error}`)
+    await sleep(2000)
+  }
   for (let i = 0; i < 200; i++) {
     await sleep(2000)
     const s = await get(8017, '/api/state')
@@ -264,6 +276,18 @@ for (const p of models) {
   await load(p)
   const h = await get(8019, '/health')
   console.log(`  loaded ${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse} · chunk=${h.chunk}`)
+  // ASSERT the engine is running what was asked for. The station remembers the
+  // last configuration and auto-loads it on restart, so a run can inherit
+  // someone else's flags — you ask for reuse off, the engine has it on, and the
+  // arm silently measures the baseline again. Every arm of a bisection is a
+  // claim about a flag; an unchecked flag makes the whole run meaningless.
+  const want = { kv8, reuse, chunk }
+  const bad = Object.entries(want).filter(([k, v]) => h[k] !== v)
+  if (bad.length) {
+    throw new Error(`engine flags do not match the request: `
+      + bad.map(([k, v]) => `${k} wanted ${v}, engine reports ${h[k]}`).join('; ')
+      + ' — the station may have auto-loaded a remembered configuration')
+  }
   const arm = `kv8=${h.kv8} reuse=${h.reuse} chunk=${h.chunk}`
   results[p] = await runEpisode(`${p} · ${PAD ? `~${Math.round(PAD / 1000)}k-token history` : 'short'} · ${arm}${STEPS < 12 ? ` · ${STEPS}-step` : ''}`, STEPS, PAD)
 }
