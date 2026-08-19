@@ -29,12 +29,16 @@ import { dirname, join } from 'node:path'
 import { startHarness, stopHarness, newPage } from '../tests/e2e/harness.ts'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
-const MODEL = process.env.MODEL ?? ''
+// The group NAME to select, e.g. "Qwen3-30B-A3B". Not a ?model= param: the
+// entrance starts at `gi = 0` and ignores the URL entirely (landing.ts:231), so
+// a capture run with MODEL=qwen30b silently rendered the DEFAULT character and
+// the banner shipped with the wrong one. Selection has to be a click.
+const WANT = process.env.MASCOT ?? process.env.MODEL ?? ''
 const OUT = join(ROOT, 'docs')
 
 await startHarness()
 try {
-  const page = await newPage(`/index.html${MODEL ? `?model=${MODEL}` : ''}`)
+  const page = await newPage('/index.html')
   await page.setViewport({ width: 1600, height: 900, deviceScaleFactor: 2 })
 
   // The entrance draws the mascot on a canvas inside the model sheet. Wait for
@@ -47,10 +51,32 @@ try {
   // Two animation frames after first paint, so the idle animation is settled.
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))))
 
+  // Pick the character by clicking its roster dot. Each dot carries the group
+  // name in its title, so this matches on what the UI itself displays.
+  if (WANT) {
+    const picked = await page.evaluate((want) => {
+      const dots = [...document.querySelectorAll('.mb-dot')]
+      const hit = dots.find((d) => (d.getAttribute('title') || '').toLowerCase().includes(want.toLowerCase()))
+      if (!hit) return { ok: false, have: dots.map((d) => d.getAttribute('title')) }
+      hit.click()
+      return { ok: true, name: hit.getAttribute('title') }
+    }, WANT)
+    if (!picked.ok) {
+      throw new Error(`no roster entry matching "${WANT}". Available: ${picked.have.join(', ')}`)
+    }
+    console.log(`selected: ${picked.name}`)
+    // The mascot re-skins on selection; give it frames to settle before the shot.
+    await page.evaluate(() => new Promise((r) => setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(r)), 400)))
+  }
+
   const canvas = await page.$('canvas.mb-mascot')
   if (!canvas) throw new Error('no mascot canvas on the entrance')
   mkdirSync(OUT, { recursive: true })
-  const mascot = await canvas.screenshot({ omitBackground: true, encoding: 'binary' })
+  // omitBackground does nothing here — the mascot canvas PAINTS its own
+  // background, so the screenshot is opaque and the banner showed the character
+  // inside a visible dark rectangle. The fix is to composite over that exact
+  // colour rather than to try to remove it, so the seam disappears.
+  const mascot = await canvas.screenshot({ encoding: 'binary' })
   writeFileSync(join(OUT, 'mascot.png'), mascot)
   console.log(`docs/mascot.png  ${(mascot.length / 1024).toFixed(0)} KB`)
 
@@ -67,9 +93,17 @@ try {
     c.id = 'banner-capture'
     const g = c.getContext('2d')
     const css = getComputedStyle(document.documentElement)
-    const ink = css.getPropertyValue('--ink').trim() || '#e8e6e3'
-    const accent = css.getPropertyValue('--accent').trim() || '#e8955a'
-    const bg = css.getPropertyValue('--bg').trim() || '#0b1020'
+    const ink = css.getPropertyValue('--text').trim() || '#edf0f6'
+    const accent = css.getPropertyValue('--accent').trim() || '#f0a860'
+    // Sample the mascot canvas's OWN corner pixel and paint the whole banner
+    // that colour. Reading --bg gave a different value and left the character
+    // sitting in a visible box; matching the source makes the seam vanish
+    // without touching the image.
+    const probe = document.createElement('canvas')
+    probe.width = probe.height = 1
+    probe.getContext('2d').drawImage(img, 0, 0, 1, 1, 0, 0, 1, 1)
+    const [pr, pg, pb] = probe.getContext('2d').getImageData(0, 0, 1, 1).data
+    const bg = `rgb(${pr}, ${pg}, ${pb})`
     g.fillStyle = bg; g.fillRect(0, 0, W, H)
     // Character on the right, text on the left — the same reading order the
     // entrance uses.
