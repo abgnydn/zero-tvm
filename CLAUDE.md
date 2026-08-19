@@ -146,15 +146,20 @@ two a turn's prompt diverges a few tokens before the end of the previous one.
 Qwen3.8 still extends, because its template really does keep the block on every
 turn.
 
-**Hybrid reuse is currently BROKEN by that for short conversations.** The
-snapshots are taken at chunk boundaries, and the last boundary lands at the end
-of the prompt — ABOVE the divergence — so `rewindSlot` finds nothing at or below
-it and the turn re-prefills from zero. Anything shorter than one `CHUNK_CAP` is
-affected, on every GDN hybrid. The rewind point that would work is the start of
-the trailing generation prompt, which only the CALLER knows; taking one on the
-per-token path was tried on 2026-08-19 and reverted (it never fired, and it
-mislabelled the snapshot by one token, which replays a token into the
-recurrence).
+The rewind point that makes hybrid reuse survive that is the START OF THE
+TRAILING GENERATION PROMPT — the next turn re-renders this turn's reply in its
+place, so that index is exactly where the two sequences diverge. Only the caller
+knows it, so `buildChatPromptFor(spec, msgs, tok, split)` reports it and
+`generatePipelined(..., rewindAt)` takes it: the chunk loop shortens a chunk so a
+boundary lands on it, and the per-token path snapshots there. Chat, the entrance,
+and both agent hosts pass it.
+
+Two things that must stay true, both got wrong once: `saveGdnCkpt`'s argument is
+a COUNT of absorbed tokens (`submitStep` sets `gdnStatePos = position + 1`, so a
+per-token snapshot is `prefillPos + 1` — labelling it one short replays a token
+into the recurrence, and a gate asserting `reused > 0` still passes); and
+snapshots on the `CHUNK_CAP` grid alone are useless here, because the last
+boundary lands at the END of the prompt, above the divergence.
 A ring of **four GDN state snapshots** lets the turn replay from the nearest one
 at or below the divergence instead of prefilling from zero (~0.19-0.24 GB of
 VRAM). They are taken at chunk boundaries AND, since 2026-08-19, every 64 tokens

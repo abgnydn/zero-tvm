@@ -504,7 +504,15 @@ export function buildChatPrompt(
   // Only encode() is needed, so the SPM Tokenizer shape (no stopIds) is
   // accepted too — the model-select factory routes either kind here.
   tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
-  opts?: { thinking?: boolean; generation?: ChatMLGeneration },
+  opts?: {
+    thinking?: boolean
+    generation?: ChatMLGeneration
+    /** Out-param: receives the token index where the generation prompt starts.
+     *  An out-param rather than a changed return type because five call sites
+     *  and four sibling builders return `number[]`, and only the callers that
+     *  drive multi-turn conversations need this. */
+    split?: { genStart: number }
+  },
 ): number[] {
   // Which past assistant turns carry the empty <think> block. This was
   // UNCONDITIONAL — every assistant turn got one — and that is not what any
@@ -556,9 +564,19 @@ export function buildChatPrompt(
       : split.content
     text += `<|im_start|>${msg.role}\n${body}<|im_end|>\n`
   }
-  text += '<|im_start|>assistant\n'
-  if (opts?.thinking === false) text += '<think>\n\n</think>\n\n'
-  return tokenizer.encode(text)
+  // Encode the history and the generation prompt SEPARATELY, so the boundary
+  // between them is a known token index. That is exact rather than an estimate:
+  // the generation prompt opens with `<|im_start|>`, an ADDED token, and byte-
+  // level BPE never merges across one — so the concatenation is identical to
+  // encoding the whole string. (Verified in tokenizer-bpe.test.ts against the
+  // single-encode path for every template this builder serves.)
+  let genPrompt = '<|im_start|>assistant\n'
+  if (opts?.thinking === false) genPrompt += '<think>\n\n</think>\n\n'
+  const history = tokenizer.encode(text)
+  // Where the NEXT turn will diverge: it re-renders this turn's reply in place
+  // of this generation prompt. The engine takes its GDN rewind snapshot here.
+  if (opts?.split) opts.split.genStart = history.length
+  return [...history, ...tokenizer.encode(genPrompt)]
 }
 
 // ============================================================

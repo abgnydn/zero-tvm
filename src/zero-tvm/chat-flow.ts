@@ -414,6 +414,11 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     promptIds: number[],
     priorIds: number[],
     onContinue: () => void,
+    /** Where the trailing generation prompt starts — the point the NEXT turn
+     *  diverges from this one, and so where the engine must put its GDN rewind
+     *  snapshot. Without it, hybrid cross-turn reuse falls back to a full
+     *  re-prefill on every conversation shorter than one prefill chunk. */
+    rewindAt?: number,
   ): Promise<GenResult> {
     // The per-reply cap is the KV room the prompt leaves behind, not a magic
     // constant: the engine refuses to step past maxContext anyway, so this is
@@ -449,7 +454,7 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
         ai.render(fullResponse)
         const elapsed = (performance.now() - t0) / 1000
         setStats(`${count} tok · ${(count / elapsed).toFixed(1)} tok/s`)
-      }, () => stopRequested)
+      }, () => stopRequested, undefined, rewindAt)
     } catch (e) {
       fullResponse += `\n\n_[Error: ${e}]_`
       log(`Error: ${e}`)
@@ -496,7 +501,8 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     // under way — retire the button but keep the "this was cut short" text.
     $('messages')?.querySelectorAll('.truncation-btn').forEach((b) => b.remove())
     const ai = addAiMsg()
-    const promptIds = buildChatPromptFor(SPEC, history, tokenizer)
+    const split = { genStart: 0 }
+    const promptIds = buildChatPromptFor(SPEC, history, tokenizer, split)
     // Every turn re-prefills the whole history, so once it no longer fits the
     // KV window the only way forward is a fresh conversation. Refuse cleanly
     // instead of letting prefill corrupt the cache.
@@ -515,7 +521,8 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     // a stable identity to bind its Continue button to.
     const entry: Turn = { role: 'assistant', content: '' }
     history.push(entry)
-    const r = await runGeneration(ai, promptIds, [], () => { void continueTurn(entry, ai) })
+    const r = await runGeneration(ai, promptIds, [], () => { void continueTurn(entry, ai) },
+      split.genStart)
     entry.content = r.text
     entry.ids = r.ids
     persist()
@@ -550,9 +557,11 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     if (history[history.length - 1] !== entry) return
     setBusy(true); stopRequested = false
     await opts.lock?.acquire()
-    const promptIds = buildChatPromptFor(SPEC, history.slice(0, -1), tokenizer)
+    const contSplit = { genStart: 0 }
+    const promptIds = buildChatPromptFor(SPEC, history.slice(0, -1), tokenizer, contSplit)
       .concat(entry.ids)
-    const r = await runGeneration(ai, promptIds, entry.ids, () => { void continueTurn(entry, ai) })
+    const r = await runGeneration(ai, promptIds, entry.ids, () => { void continueTurn(entry, ai) },
+      contSplit.genStart)
     entry.content = r.text
     entry.ids = r.ids
     persist()

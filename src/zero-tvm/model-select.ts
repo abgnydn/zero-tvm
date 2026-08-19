@@ -57,6 +57,13 @@ export function buildChatPromptFor(
   spec: ModelSpec,
   messages: ChatMessage[],
   tokenizer: Tokenizer,
+  /** Out-param: receives the token index where the trailing generation prompt
+   *  begins — the exact point the NEXT turn's prompt diverges from this one.
+   *  generatePipelined takes it as `rewindAt` and puts a GDN rewind snapshot
+   *  there, which is what makes hybrid cross-turn reuse work at all. Only the
+   *  ChatML builders report it today; the others leave it untouched, and the
+   *  engine reads an unset value as "no rewind point". */
+  split?: { genStart: number },
 ): number[] {
   // ModelSpec.chatTemplateId (model-spec.ts) still declares only the four
   // original ids, and `===` against a literal outside a union is a type ERROR
@@ -72,6 +79,7 @@ export function buildChatPromptFor(
     return buildChatMLPrompt(messages, tokenizer, {
       thinking: false,
       generation: id === 'chatml-q38' ? 'qwen38' : id === 'chatml-q35' ? 'qwen35' : 'qwen3',
+      ...(split ? { split } : {}),
     })
   }
   if (id === 'deepseek') {

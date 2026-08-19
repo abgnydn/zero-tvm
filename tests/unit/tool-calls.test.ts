@@ -47,14 +47,14 @@ type TemplateMessages = Array<{ role: 'system' | 'user' | 'assistant'; content: 
 const asTemplate = (m: ToolChatMessage[]) => m as TemplateMessages
 
 const chatml = (m: ToolChatMessage[]) =>
-  (buildChatPrompt(asTemplate(m), capture, { thinking: false }) as unknown as string[])[0]
+  (buildChatPrompt(asTemplate(m), capture, { thinking: false }) as unknown as string[]).join('')
 /** Qwen3.5+ rule: every assistant turn in the CURRENT round keeps its <think>
  *  block. Identical to `chatml` on any conversation whose last turn is a real
  *  user query, which is why the pre-existing fixtures do not distinguish them. */
 const chatml35 = (m: ToolChatMessage[]) =>
-  (buildChatPrompt(asTemplate(m), capture, { thinking: false, generation: 'qwen35' }) as unknown as string[])[0]
+  (buildChatPrompt(asTemplate(m), capture, { thinking: false, generation: 'qwen35' }) as unknown as string[]).join('')
 const llama3 = (m: ToolChatMessage[]) =>
-  (buildLlama3ChatPrompt(asTemplate(m), capture, { dateString: '07 Aug 2026' }) as unknown as string[])[0]
+  (buildLlama3ChatPrompt(asTemplate(m), capture, { dateString: '07 Aug 2026' }) as unknown as string[]).join('')
 
 const TOOLS: ToolDef[] = [
   {

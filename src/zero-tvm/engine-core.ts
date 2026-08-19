@@ -238,6 +238,12 @@ export interface DecodeEngine {
     maxTokens: number,
     onToken: (id: number) => void,
     shouldStop?: () => boolean,
+    onPrefill?: (done: number, total: number) => void,
+    /** Token index where the trailing generation prompt begins — the point the
+     *  NEXT turn's prompt will diverge from this one. The engine puts a GDN
+     *  rewind snapshot exactly there. Optional and advisory; out-of-range
+     *  values and non-hybrid specs ignore it. */
+    rewindAt?: number,
   ): Promise<number[]>
   /** Run a forward pass through prefill of `promptIds` and return f32 logits at the final position. */
   forwardLogits(promptIds: number[]): Promise<Float32Array>
@@ -3992,6 +3998,21 @@ export function buildDecodeEngine(
      *  is MINUTES of wall clock during which a caller otherwise has nothing
      *  to show. Purely observational: it never gates or syncs. */
     onPrefill?: (done: number, total: number) => void,
+    /** Token index where the trailing GENERATION PROMPT begins — the exact
+     *  point the NEXT turn's prompt will diverge from this one's absorbed
+     *  record, because the next turn re-renders this turn's reply in place of
+     *  the generation prompt.
+     *
+     *  Hybrid reuse is all-or-nothing, so it needs a GDN snapshot at or BELOW
+     *  the divergence. Snapshots are otherwise taken only at chunk boundaries,
+     *  and the last boundary lands at the END of the prompt — above it — so
+     *  rewindSlot found nothing and every short conversation re-prefilled from
+     *  zero. Guessing a point is not possible at prefill time; the caller knows
+     *  it exactly, because it built the string.
+     *
+     *  Only a hint: out-of-range values are ignored, and a spec with no GDN
+     *  state ignores it entirely. */
+    rewindAt?: number,
   ): Promise<number[]> {
     const tokens: number[] = []
     // Clear it FIRST. It is written only on the stop-id / bad-readback exits,
@@ -4044,6 +4065,10 @@ export function buildDecodeEngine(
       }
     }
     const last = promptIds.length - 1
+    // Normalised once. Out of range, already reused past, or a spec with no GDN
+    // state to snapshot -> 0, which both paths read as "no rewind point".
+    const rewindPoint = rewindAt !== undefined && GDN_CKPT_SLOTS > 0
+      && rewindAt > startPos && rewindAt < promptIds.length ? rewindAt : 0
     let prefillPos = startPos
     let chunks = 0
     // Chunked prefill (hybrid + subgroups): all but the last prompt token run
@@ -4057,7 +4082,12 @@ export function buildDecodeEngine(
         // Stopping here is safe: every chunk noted the positions it absorbed,
         // so the record still describes the cache.
         if (shouldStop?.()) return tokens
-        const s = Math.min(chunkPrefill.cap, last - prefillPos)
+        // Short the chunk so a boundary falls ON the rewind point. Without
+        // this the boundaries are on a CHUNK_CAP grid and the divergence sits
+        // between two of them — or, on any conversation shorter than one
+        // chunk, above the only boundary there is.
+        const stopAt = rewindPoint > prefillPos && rewindPoint < last ? rewindPoint : last
+        const s = Math.min(chunkPrefill.cap, stopAt - prefillPos)
         // Pooled chunks await a readback per MoE layer; unpooled ones resolve
         // immediately. One await covers both.
         await chunkPrefill.record(promptIds, prefillPos, s)
@@ -4085,6 +4115,15 @@ export function buildDecodeEngine(
     // skipping readback removes the CPU syncs.
     for (; prefillPos < last; prefillPos++) {
       submitStep(promptIds[prefillPos], prefillPos, false)
+      // saveGdnCkpt's argument is a COUNT of absorbed tokens, and submitStep
+      // has just set gdnStatePos = prefillPos + 1. Passing prefillPos here
+      // labels the snapshot one SHORT, and restoring it replays that token
+      // into a recurrence that is not idempotent — fluent wrong output. That
+      // bug was written and reverted on 2026-08-19; the +1 is the whole fix.
+      if (prefillPos + 1 === rewindPoint) {
+        await device.queue.onSubmittedWorkDone()
+        saveGdnCkpt(prefillPos + 1)
+      }
       if ((prefillPos & 63) === 0) {
         // Same reason as the chunk loop: submitStep fires without a readback,
         // so on a spec that cannot chunk, the whole prompt queues up instantly

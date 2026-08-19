@@ -273,7 +273,9 @@ async function run(job: Job): Promise<void> {
     }))
     if (job.tools?.length) messages = withTools(dialect, messages, job.tools)
 
-    const promptIds = buildChatPromptFor(spec, messages as Parameters<typeof buildChatPromptFor>[1], tokenizer)
+    const split = { genStart: 0 }
+    const promptIds = buildChatPromptFor(
+      spec, messages as Parameters<typeof buildChatPromptFor>[1], tokenizer, split)
     if (poolOn && !poolTried) {
       // Once, on the first request after boot — a reload is the case the pool
       // exists for. Later requests ride the in-session absorbed record.
@@ -313,7 +315,7 @@ async function run(job: Job): Promise<void> {
       if (job.stop?.length) {
         for (const s of job.stop) if (s && out.endsWith(s)) { hit.stop = s; break }
       }
-    }, () => hit.stop !== null)
+    }, () => hit.stop !== null, undefined, split.genStart)
 
     await emit.flush()
     if (hit.stop) out = out.slice(0, out.length - hit.stop.length)

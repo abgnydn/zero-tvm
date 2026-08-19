@@ -213,3 +213,68 @@ describe('byte-level coverage', () => {
     expect(tok.decode(tok.encode(zwj))).toBe(zwj)
   })
 })
+
+describe('the generation-prompt split is token-identical to one encode', () => {
+  // buildChatPrompt encodes the history and the generation prompt separately so
+  // it can report the boundary index — the exact point the NEXT turn's prompt
+  // diverges, which the engine needs for its GDN rewind snapshot.
+  //
+  // That is only sound if no BPE merge crosses the boundary. It does not, and
+  // the reason is structural rather than lucky: the generation prompt opens with
+  // `<|im_start|>`, an ADDED token, and the byte-level pipeline splits on added
+  // tokens before merging. Asserted here against the real Qwen tokenizer rather
+  // than argued, because "the merge cannot cross this" is exactly the kind of
+  // claim this file exists to stop trusting.
+  const oneEncode = (
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+    thinking: boolean,
+  ) => {
+    let text = ''
+    for (const m of messages) text += `<|im_start|>${m.role}\n${m.content}<|im_end|>\n`
+    text += '<|im_start|>assistant\n'
+    if (!thinking) text += '<think>\n\n</think>\n\n'
+    return tok.encode(text)
+  }
+
+  const CASES: Array<[string, Array<{ role: 'system' | 'user' | 'assistant'; content: string }>]> = [
+    ['plain turn', [{ role: 'user', content: 'hi' }]],
+    ['multi-turn', [
+      { role: 'user', content: 'q1' }, { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'q2' },
+    ]],
+    // The adversarial ones: content ending in the characters a merge would want
+    // to pull across — a newline, a partial tag, whitespace.
+    ['history ends in a newline', [{ role: 'user', content: 'hi\n' }]],
+    ['history ends mid-word', [{ role: 'user', content: 'assistan' }]],
+    ['history ends with <', [{ role: 'user', content: 'a <' }]],
+    ['history ends with <|im_', [{ role: 'user', content: 'a <|im_' }]],
+    ['history ends in spaces', [{ role: 'user', content: 'a    ' }]],
+  ]
+
+  for (const [name, messages] of CASES) {
+    for (const thinking of [false, true]) {
+      test(`${name}${thinking ? '' : ' (non-thinking)'}`, () => {
+        const split = buildChatPrompt(messages, tok, thinking ? {} : { thinking: false })
+        expect(split).toEqual(oneEncode(messages, thinking))
+      })
+    }
+  }
+
+  test('reports the boundary, and it is where the generation prompt starts', () => {
+    const messages = [{ role: 'user' as const, content: 'hi' }]
+    const split = { genStart: -1 }
+    const ids = buildChatPrompt(messages, tok, { thinking: false, split })
+    expect(split.genStart).toBeGreaterThan(0)
+    // The boundary token IS <|im_start|> — asserted on the id, not on decoded
+    // text, because decode() drops special tokens and would hide a boundary
+    // that landed one token late.
+    const imStart = tok.encode('<|im_start|>')
+    expect(imStart).toHaveLength(1)
+    expect(ids[split.genStart]).toBe(imStart[0])
+    // The split is exactly the generation prompt: re-encoding it reproduces the
+    // tail, and the head is the history.
+    expect(ids.slice(split.genStart))
+      .toEqual(tok.encode('<|im_start|>assistant\n<think>\n\n</think>\n\n'))
+    expect(ids.slice(0, split.genStart)).toEqual(tok.encode('<|im_start|>user\nhi<|im_end|>\n'))
+  })
+})

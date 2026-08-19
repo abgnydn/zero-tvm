@@ -119,7 +119,12 @@ let saveTimer = null
 async function runJob(body, onDelta, isAborted) {
   let messages = normalize(body.messages)
   if (body.tools?.length) messages = S.withTools(dialect, messages, body.tools)
-  const promptIds = S.buildChatPromptFor(spec, messages, tokenizer)
+  // Where the trailing generation prompt starts. The next turn re-renders this
+  // turn's reply in its place, so this is exactly where that prompt diverges
+  // from what the engine absorbed — and where its GDN rewind snapshot has to
+  // sit. An agent loop is the surface that needs it most: many short turns.
+  const split = { genStart: 0 }
+  const promptIds = S.buildChatPromptFor(spec, messages, tokenizer, split)
 
   if (POOL && !poolTried) {
     poolTried = true
@@ -156,7 +161,8 @@ async function runJob(body, onDelta, isAborted) {
     }
     for (const st of stopStrs) if (st && out.endsWith(st)) { hit.stop = st; break }
   }, () => hit.stop !== null || (isAborted?.() ?? false),
-  (done, total) => { live = { phase: 'prefill', done, total, generated: 0, startedAt: tStart } })
+  (done, total) => { live = { phase: 'prefill', done, total, generated: 0, startedAt: tStart } },
+  split.genStart)
   if (hit.stop) out = out.slice(0, out.length - hit.stop.length)
   {
     const ttft = (tFirst || Date.now()) - tStart

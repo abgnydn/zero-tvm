@@ -266,3 +266,62 @@ describe('dropSnapshotsAbove — a rewind invalidates every snapshot above it', 
     expect(ring[slot]).toBe(646)
   })
 })
+
+// ── the rewind point a turn actually needs ──────────────────────────────────
+//
+// Hand-derived from the two facts the engine states about itself, not from
+// running it:
+//   1. buildChatPrompt reports `genStart`, the index where the trailing
+//      generation prompt begins. The NEXT turn re-renders this turn's reply in
+//      its place, so genStart is exactly where the two token sequences diverge:
+//      LCP == genStart.
+//   2. saveGdnCkpt's argument is a COUNT of absorbed tokens.
+//
+// This exists because both halves were got wrong on 2026-08-19 and neither was
+// visible: snapshots on the CHUNK_CAP grid land above the divergence (so reuse
+// silently falls to 0), and a snapshot labelled one short restores a state that
+// has absorbed one token too many (so the recurrence replays a token — fluent
+// wrong output, and a gate asserting `reused > 0` reports success).
+describe('the generation-prompt rewind point', () => {
+  // A conversation whose prompt is 500 tokens, with the generation prompt
+  // occupying the last 9 — so genStart is 491 and the next turn's LCP is 491.
+  const PROMPT = 500
+  const GEN_START = 491
+
+  it('a CHUNK_CAP grid alone never produces a usable slot for a short prompt', () => {
+    // One chunk covers the whole prompt, so the only boundary is at its end.
+    const ring = [PROMPT - 1, -1, -1, -1]
+    expect(rewindSlot(ring, GEN_START, PROMPT)).toBe(-1)
+  })
+
+  it('a snapshot AT the generation-prompt boundary is selected', () => {
+    const ring = [GEN_START, -1, -1, -1]
+    expect(rewindSlot(ring, GEN_START, PROMPT)).toBe(0)
+  })
+
+  it('and it is preferred over an earlier chunk boundary', () => {
+    // Both are usable; the higher one replays fewer tokens.
+    const ring = [256, GEN_START, -1, -1]
+    expect(rewindSlot(ring, GEN_START, PROMPT)).toBe(1)
+  })
+
+  it('a snapshot one PAST the boundary is refused, not silently used', () => {
+    // This is what a mislabelled snapshot looks like from rewindSlot's side
+    // when the label is too HIGH: correctly rejected.
+    expect(rewindSlot([GEN_START + 1, -1, -1, -1], GEN_START, PROMPT)).toBe(-1)
+  })
+
+  it('a snapshot labelled one SHORT is accepted — which is why the label matters', () => {
+    // rewindSlot cannot tell a correct label from one that is too LOW: both are
+    // <= the limit. It returns the slot, the caller sets gdnStatePos to the
+    // label and replays from there, and the state has already absorbed that
+    // token. Nothing downstream catches it, so the +1 belongs at the call site.
+    expect(rewindSlot([GEN_START - 1, -1, -1, -1], GEN_START, PROMPT)).toBe(0)
+  })
+
+  it('the boundary is below promptLen-1, so the limit never clips it', () => {
+    // A generation prompt is always at least one token, so genStart < len-1 and
+    // rewindSlot's own min(lcp, len-1) clamp is not what decides this case.
+    expect(GEN_START).toBeLessThan(PROMPT - 1)
+  })
+})

@@ -40,7 +40,7 @@ const capture = { encode: (t: string) => [t] as unknown as number[] }
 type TemplateMessages = Array<{ role: 'system' | 'user' | 'assistant'; content: string }>
 const render = (m: TemplateMessages | ToolChatMessage[],
                 generation: 'qwen3' | 'qwen35' | 'qwen38') =>
-  (buildChatPrompt(m as TemplateMessages, capture, { thinking: false, generation }) as unknown as string[])[0]
+  (buildChatPrompt(m as TemplateMessages, capture, { thinking: false, generation }) as unknown as string[]).join('')
 
 // ── vendor fixtures ─────────────────────────────────────────────────────────
 const THINK_IN_REPLY_QWEN3 = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n<|im_start|>user\nagain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
