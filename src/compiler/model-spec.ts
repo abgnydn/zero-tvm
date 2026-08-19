@@ -236,7 +236,16 @@ export interface ModelSpecBase {
    *  pinned byte-exact against that family's own tokenizer_config.json jinja.
    *  `template` is docs/PORTING.md's top blocker: 29 of 51 RED repos. */
   chatTemplateId:
-    | 'phi3' | 'chatml' | 'llama3' | 'deepseek'
+    // 'chatml' is the Qwen3-era rule; 'chatml-q35' is Qwen3.5 and later, which
+    // dropped the `loop.last or reasoning_content` gate on the past-turn
+    // <think> block so every assistant turn in the CURRENT tool round carries
+    // one; 'chatml-q38' keeps one on EVERY assistant turn (its condition starts
+    // `preserve_thinking is undefined`, which nothing defines). The same split
+    // decides the tool-call dialect and where the tools block sits, so this one
+    // field settles all three — see toolDialectFor in tool-calls.ts. Rendering a
+    // 3.6 conversation with the 3.0 rule costs nothing visible and breaks tool
+    // calling once a session is deep.
+    | 'phi3' | 'chatml' | 'chatml-q35' | 'chatml-q38' | 'llama3' | 'deepseek'
     // [INST] family — three spacings that differ across one vendor's own line.
     | 'mistral' | 'mistral-nemo' | 'ministral'
     // Tulu-3 shape. NOT 'olmoe': it renders through the same builder, but its
@@ -809,7 +818,7 @@ export const QWEN35_4B: ModelSpec = makeModelSpec({
   // mlc-chat-config stop_token_ids [151643, 151645] are stale Qwen3 ids that
   // map to ORDINARY BPE tokens in this vocab — do not use them.
   stops: [248046, 248044],
-  chatTemplateId: 'chatml',
+  chatTemplateId: 'chatml-q35',
   tokenizerKind: 'byteLevel',
   hfRepo: 'mlc-ai/Qwen3.5-4B-q4f16_1-MLC',
   manifestName: 'tensor-cache.json',  // MLC renamed ndarray-cache.json; tensor-cache-b16.json also exists — ignore it
@@ -912,7 +921,7 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
   // Same ids as Qwen3.5 — confirmed against THIS repo's tokenizer.json
   // added_tokens, not assumed from the shared 248320 vocab size.
   stops: [248046, 248044],   // <|im_end|>, <|endoftext|>
-  chatTemplateId: 'chatml',
+  chatTemplateId: 'chatml-q35',
   tokenizerKind: 'byteLevel',
   hfRepo: 'lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit',
   manifestName: 'model.safetensors.index.json',
@@ -1034,7 +1043,7 @@ export const QWEN3_8_27B_4BIT: ModelSpec = makeModelSpec({
   qkNorm: true,
   // Resolved from THIS repo's tokenizer.json added_tokens by name, not assumed.
   stops: [248046, 248044],
-  chatTemplateId: 'chatml',
+  chatTemplateId: 'chatml-q38',
   tokenizerKind: 'byteLevel',
   hfRepo: 'mlx-community/Qwen3.8-27B-4bit',
   manifestName: 'model.safetensors.index.json',
@@ -1067,7 +1076,7 @@ export const QWEN3_5_9B_MLX_4BIT: ModelSpec = makeModelSpec({
   qkNorm: true,
   // Resolved from THIS repo's tokenizer.json added_tokens by name, not assumed.
   stops: [248046, 248044],
-  chatTemplateId: 'chatml',
+  chatTemplateId: 'chatml-q35',
   tokenizerKind: 'byteLevel',
   hfRepo: 'lmstudio-community/Qwen3.5-9B-MLX-4bit',
   manifestName: 'model.safetensors.index.json',

@@ -63,10 +63,16 @@ export function buildChatPromptFor(
   // rather than a branch that is never taken — so the dispatch reads the raw
   // string until that union is widened with the ids below.
   const id: string = spec.chatTemplateId
-  if (id === 'chatml') {
-    // Qwen3 v1 chat is non-thinking: emit the template's explicit
-    // `enable_thinking is false` suffix so the model skips the <think> block.
-    return buildChatMLPrompt(messages, tokenizer, { thinking: false })
+  if (id === 'chatml' || id === 'chatml-q35' || id === 'chatml-q38') {
+    // Non-thinking: emit the template's explicit `enable_thinking is false`
+    // suffix so the model skips the <think> block on THIS turn. `generation`
+    // picks which past turns keep one — the two Qwen generations disagree, and
+    // rendering 3.6 with the 3.0 rule breaks tool calling at depth without
+    // changing anything visible.
+    return buildChatMLPrompt(messages, tokenizer, {
+      thinking: false,
+      generation: id === 'chatml-q38' ? 'qwen38' : id === 'chatml-q35' ? 'qwen35' : 'qwen3',
+    })
   }
   if (id === 'deepseek') {
     // Prose turns, not header tokens — see buildDeepSeekChatPrompt for the two

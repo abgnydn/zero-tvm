@@ -427,28 +427,81 @@ export async function loadByteLevelTokenizer(
 // "<think>\n\n</think>\n\n".
 // ============================================================
 
+/**
+ * Which ChatML generation's rule for the past-turn <think> block applies.
+ *   'qwen3'  — Qwen3-4B, Qwen3-30B-A3B: only a TRAILING assistant turn (their
+ *              extra `loop.last or reasoning_content` gate, and we carry no
+ *              reasoning_content).
+ *   'qwen35' — Qwen3.5-4B/9B, Qwen3.6-35B-A3B: every assistant turn in the
+ *              current round (`loop.index0 > ns.last_query_index`).
+ *   'qwen38' — Qwen3.8-27B: EVERY assistant turn. Its condition opens with
+ *              `preserve_thinking is undefined or ...`, and nothing defines
+ *              preserve_thinking, so the branch is always taken. Deliberate,
+ *              not a missing guard — and confirmed by rendering the template
+ *              through transformers three ways (undefined / false / true).
+ *
+ * Verified in each checkpoint's own tokenizer_config.json or
+ * chat_template.jinja; scripts/render-diff.py diffs our output against them.
+ */
+export type ChatMLGeneration = 'qwen3' | 'qwen35' | 'qwen38'
+
 /** MLC conv_template "qwen3" default system message. */
 export const QWEN3_DEFAULT_SYSTEM_MESSAGE = 'You are a helpful assistant.'
+
+/**
+ * Index of the last REAL user query — jinja's `ns.last_query_index`.
+ *
+ * The templates walk the messages backwards and stop at the first user turn
+ * that is not entirely a <tool_response> block, because a tool result rides in
+ * a user turn and is not a new question. Everything after that index is the
+ * CURRENT tool-calling round.
+ *
+ * Defaults to the last index when there is no real query, matching jinja's
+ * initial value — under which no turn satisfies `index > last_query_index` and
+ * no think block is emitted. (jinja raises there instead; a chat surface
+ * rendering a partial conversation should not.)
+ */
+function lastQueryIndex(messages: ReadonlyArray<{ role: string; content: string }>): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== 'user') continue
+    const c = messages[i].content.trim()
+    if (c.startsWith('<tool_response>') && c.endsWith('</tool_response>')) continue
+    return i
+  }
+  return messages.length - 1
+}
 
 export function buildChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   // Only encode() is needed, so the SPM Tokenizer shape (no stopIds) is
   // accepted too — the model-select factory routes either kind here.
   tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
-  opts?: { thinking?: boolean }
+  opts?: { thinking?: boolean; generation?: ChatMLGeneration },
 ): number[] {
+  // Which past assistant turns carry the empty <think> block. This was
+  // UNCONDITIONAL — every assistant turn got one — and that is not what any
+  // Qwen template does. Measured on Qwen3.6 at ~24k tokens: 286 spurious blocks
+  // through the history, 5,434 characters the model was never trained to see,
+  // and a tool-calling loop that read the right files, computed the right
+  // answer and then replied in prose instead of calling the tool. Both rules
+  // below are read off the checkpoints' own tokenizer_config.json.
+  const gen = opts?.generation ?? 'qwen3'
+  const q = lastQueryIndex(messages)
   let text = ''
-  for (const msg of messages) {
-    // Non-thinking mode: past assistant turns are re-rendered WITH the empty
-    // <think> block. The generation actually produced those tokens (the
-    // suffix below was part of the generation prompt the model continued
-    // from), so this is the faithful transcript — and it makes each turn's
-    // prompt an exact token-level extension of the previous turn's absorbed
-    // sequence, which is what the engine's cross-turn prefix reuse matches
-    // against (engine-core.ts computeReuseStart).
-    const content = opts?.thinking === false && msg.role === 'assistant'
-      ? `<think>\n\n</think>\n\n${msg.content}`
-      : msg.content
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    // The block belongs to the CURRENT round only. It is not gated on thinking
+    // mode: the templates emit it from the index rule alone, and `enable_thinking`
+    // reaches only the generation prompt below.
+    //
+    // Qwen3-era additionally requires `loop.last or reasoning_content`, and we
+    // carry no reasoning_content, so in practice a past turn there gets nothing
+    // — only a trailing assistant turn does. Qwen3.5 and later dropped that
+    // gate, which is why the two generations are separate ids.
+    const inRound = msg.role === 'assistant' && i > q
+    const think = msg.role === 'assistant' && (gen === 'qwen38'
+      || (inRound && (gen === 'qwen35' || i === messages.length - 1)))
+    const content = think ? `<think>\n\n</think>\n\n${msg.content}` : msg.content
     text += `<|im_start|>${msg.role}\n${content}<|im_end|>\n`
   }
   text += '<|im_start|>assistant\n'

@@ -425,6 +425,7 @@ export async function hostSurface() {
     parseToolCalls: tc.parseToolCalls,
     renderAssistantCalls: tc.renderAssistantCalls,
     foldToolResults: tc.foldToolResults,
+    toolDialectFor: tc.toolDialectFor,
     poolSave: pool.poolSave,
     poolTryRestore: pool.poolTryRestore,
   }

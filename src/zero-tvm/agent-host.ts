@@ -30,8 +30,8 @@ import { parseVariantFlags, type VariantFlags } from './variants.js'
 import { poolSave, poolTryRestore, type PoolConfig } from './kv-pool.js'
 import { specFromSearch, buildChatPromptFor, modelBranding } from './model-select.js'
 import {
-  withTools, parseToolCalls, renderAssistantCalls, foldToolResults,
-  type ToolDef, type ToolDialect, type ToolChatMessage,
+  withTools, parseToolCalls, renderAssistantCalls, foldToolResults, toolDialectFor,
+  type ToolDef, type ToolChatMessage,
 } from './tool-calls.js'
 
 /** One unit of work as scripts/agent-server.mjs relays it. */
@@ -70,24 +70,23 @@ el('model').textContent = `${brand.name} — ${brand.params}`
  *  under it, so every entry here is read off that checkpoint's own
  *  chat_template.jinja and pinned in tool-calls.ts against the vendor text:
  *
- *    chatml-xml   Qwen3.6-35B-A3B, Qwen3.8-27B — the template spells out
+ *    chatml-xml   Qwen3.5-4B, Qwen3.5-9B, Qwen3.6-35B-A3B, Qwen3.8-27B — the
+ *                 template spells out
  *                 `<tool_call><function=NAME><parameter=K>V</parameter>…`
- *    chatml-json  Qwen3-4B, Qwen3-30B-A3B, Qwen3.5 — a JSON object inside
- *                 <tool_call> tags
+ *    chatml-json  Qwen3-4B, Qwen3-30B-A3B — a JSON object inside <tool_call>
+ *
+ *  Qwen3.5 was listed on the json line here until 2026-08-19 and it is not: its
+ *  template ships the XML form, moves the tools block ahead of the system text,
+ *  and changes the past-turn <think> rule, all three together. That is why the
+ *  dialect is now derived from the chat template id rather than from a set of
+ *  name prefixes — the prefix set caught Qwen3.8 only after it shipped wrong,
+ *  and still missed both 3.5 builds.
  *
  *  A model whose template was never read must NOT be guessed at: the wrong
  *  dialect renders tool blocks the model cannot follow and parses calls it
  *  never made, which reads as "the model is bad at tools" rather than as a
- *  wiring bug. Qwen3.8 landed exactly in that trap — an id-prefix test for
- *  'qwen36' sent it to chatml-json while its template demands XML.
+ *  wiring bug.
  */
-const XML_DIALECT_SPECS = new Set(['qwen36', 'qwen3-8-27b'])
-function dialectFor(id: string): ToolDialect {
-  if (id === 'llama3') return 'llama3'
-  return [...XML_DIALECT_SPECS].some((p) => spec.id.startsWith(p))
-    ? 'chatml-xml' : 'chatml-json'
-}
-
 // No top-level await: the build targets es2020 (vite.config.ts), where it is a
 // hard error. Everything below the boot lives inside main(), started at the
 // bottom of the file — the same shape chat.ts uses.
@@ -164,7 +163,7 @@ async function main(): Promise<void> {
     throw new Error(boot.reason)
   }
   const { engine, tokenizer } = boot
-  const dialect = dialectFor(spec.chatTemplateId)
+  const dialect = toolDialectFor(spec.chatTemplateId)
 
   // KV POOL (paging Phase 1): a saved prefix survives reload/crash/restart and
   // restores in ~0.4s where re-prefill costs the whole prompt. ?pool=0 opts

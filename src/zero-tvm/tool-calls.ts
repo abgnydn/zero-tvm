@@ -82,6 +82,26 @@ export interface ToolDef {
 export type ToolDialect = 'chatml-json' | 'chatml-xml' | 'llama3'
 
 /**
+ * Which dialect a spec's checkpoint speaks, from its chat template id.
+ *
+ * This used to be a prefix match on spec.id, written out separately in the
+ * native host and the browser host: `['qwen36', 'qwen3-8-27b'].some(...)`. It
+ * was wrong for BOTH Qwen3.5 builds — qwen35-4b and qwen3-5-9b-mlx-4bit ship
+ * the XML call format and the tools-block-first ordering, and got served the
+ * Qwen3-era JSON dialect, which reads as "this model is bad at tools".
+ *
+ * Keying off chatTemplateId works because the split is the same one: every
+ * checkpoint that moved to the XML call format also moved the tools block ahead
+ * of the system text and changed the past-turn <think> rule. Verified across
+ * six checkpoints' own templates (scripts/render-diff.py).
+ */
+export function toolDialectFor(chatTemplateId: string): ToolDialect {
+  if (chatTemplateId === 'chatml-q35' || chatTemplateId === 'chatml-q38') return 'chatml-xml'
+  if (chatTemplateId === 'llama3') return 'llama3'
+  return 'chatml-json'
+}
+
+/**
  * One call. The render side needs only `name` + `arguments`; the parse side
  * fills the other two.
  */

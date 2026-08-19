@@ -29,6 +29,8 @@ Needs Metal, so it runs in your shell:
 from __future__ import annotations
 
 import argparse
+import pathlib
+import sys
 
 from mlx_lm import load, generate
 
@@ -46,64 +48,13 @@ p.add_argument("--thinking", action="store_true",
                help="render WITH the thinking block (default: match our engine, which does not)")
 a = p.parse_args()
 
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "attempt_completion",
-        "description": "Report the final answer and finish the task",
-        "parameters": {"type": "object", "properties": {"result": {"type": "string"}},
-                       "required": ["result"]}}},
-    {"type": "function", "function": {
-        "name": "read_file", "description": "Read one file by path",
-        "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
-                       "required": ["path"]}}},
-]
+# The conversation lives in toolcall_case.py — scripts/render-diff.py needs the
+# same one, and a second copy would drift.
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import toolcall_case as case  # noqa: E402
 
-SYSTEM = ("You are a coding agent. Call exactly one tool per step. Use what each tool "
-          "returns. When you know the answer, call attempt_completion. "
-          "Never read a file you have already read.")
+TOOLS, SYSTEM = case.TOOLS, case.SYSTEM
 
-
-def padding(target: int):
-    """Inert prior conversation — must not contain or hint at the answer, or this
-    measures retrieval instead of whether the tool format survives length."""
-    msgs, approx, i = [], 0, 0
-    while approx < target:
-        q = f"Step {i}: summarise what changed in release 2.{i % 9}.{i % 5}."
-        ans = (f"Release 2.{i % 9}.{i % 5} adjusted logging thresholds, renamed two internal "
-               "helpers, and left public behaviour unchanged. No configuration keys moved, and "
-               "the deployment procedure is identical to the previous release. Nothing here "
-               "affects pipeline capacity or the dimension constants used elsewhere.")
-        msgs += [{"role": "user", "content": q}, {"role": "assistant", "content": ans}]
-        approx += (len(q) + len(ans)) // 4
-        i += 1
-    return msgs
-
-
-# NB: `arguments` is a DICT, not a JSON string. The Qwen template does
-# `tool_call.arguments | items`, which raises "Can only get item pairs from a
-# mapping" on a string — the OpenAI wire format uses a string here and the
-# jinja does not.
-# The state our engine reaches right before it fails: three files read, the
-# arithmetic available. The only correct next move is attempt_completion("84").
-TAIL = [
-    {"role": "user", "content": "What number does capacity() return? Read only the files you "
-                                "need, then call attempt_completion with just the number."},
-    {"role": "assistant", "content": "", "tool_calls": [
-        {"id": "c1", "type": "function",
-         "function": {"name": "read_file", "arguments": {"path": "src/pipeline.ts"}}}]},
-    {"role": "tool", "tool_call_id": "c1",
-     "content": 'import { WIDTH } from "./dims.ts"\nimport { scale } from "./scale.ts"\n'
-                "export function capacity() { return scale(WIDTH) }"},
-    {"role": "assistant", "content": "", "tool_calls": [
-        {"id": "c2", "type": "function",
-         "function": {"name": "read_file", "arguments": {"path": "src/dims.ts"}}}]},
-    {"role": "tool", "tool_call_id": "c2", "content": "export const WIDTH = 12"},
-    {"role": "assistant", "content": "", "tool_calls": [
-        {"id": "c3", "type": "function",
-         "function": {"name": "read_file", "arguments": {"path": "src/scale.ts"}}}]},
-    {"role": "tool", "tool_call_id": "c3",
-     "content": "export const FACTOR = 7\nexport function scale(n: number) { return n * FACTOR }"},
-]
 
 model, tokenizer = load(a.model)
 print(f"{a.model}\n")
@@ -113,14 +64,14 @@ print(f"{a.model}\n")
 # reading it would have caught the thinking mismatch on the first run instead of
 # the third. Ours ends: '<|im_start|>assistant\n<think>\n\n</think>\n\n'
 _probe = tokenizer.apply_chat_template(
-    [{"role": "system", "content": SYSTEM}] + TAIL, tools=TOOLS,
+    case.conversation(0), tools=TOOLS,
     add_generation_prompt=True, enable_thinking=a.thinking)
 print(f"  thinking={a.thinking} · rendered prompt ends: "
       f"{tokenizer.decode(_probe[-14:])!r}\n")
 print(f"  {'depth':>8} {'prompt tok':>11} {'gen':>6}     called?     how it ENDED")
 
 for d in [int(x) for x in a.depths.split(",")]:
-    msgs = [{"role": "system", "content": SYSTEM}] + padding(d) + TAIL
+    msgs = case.conversation(d)
     prompt = tokenizer.apply_chat_template(
         msgs, tools=TOOLS, add_generation_prompt=True, enable_thinking=a.thinking)
     ntok = len(prompt)
