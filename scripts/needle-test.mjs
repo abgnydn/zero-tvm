@@ -18,9 +18,13 @@
 // Deliberately NOT a tool loop: no tool schema, no multi-step, nothing that can
 // fail for a second reason. A wrong answer here is retrieval or nothing.
 //
-//   npm run station                                  # other shell, load a model
-//   node scripts/needle-test.mjs                     # default sweep
-//   DEPTHS=0,4000,16000 node scripts/needle-test.mjs
+//   npm run station                                  # other shell
+//   node scripts/needle-test.mjs qwen38              # loads it, then sweeps
+//   node scripts/needle-test.mjs                     # whatever is resident
+//   DEPTHS=0,4000,16000 node scripts/needle-test.mjs qwen38
+//
+// ALWAYS name the model. The first row of output states which one answered, and
+// it is the only thing that makes the sweep mean anything.
 import http from 'node:http'
 
 const post = (port, path, body) => new Promise((res, rej) => {
@@ -61,13 +65,30 @@ function padding(target) {
 }
 
 const DEPTHS = (process.env.DEPTHS ?? '0,2000,8000,16000,24000').split(',').map(Number)
+const WANT = process.argv[2] ?? process.env.MODEL ?? null
 
-const state = await get(8017, '/api/state').catch((e) => {
+let state = await get(8017, '/api/state').catch((e) => {
   if (e.code === 'ECONNREFUSED') { console.error('no station on 127.0.0.1:8017 — start it with: npm run station\n'); process.exit(1) }
   throw e
 })
+// Load the model ourselves when asked. Reading whatever happens to be resident
+// is how a sweep gets run against the wrong model and read as a result: the
+// first version of this printed a clean pass for a model that was not the one
+// under investigation, because the station still held the previous one.
+if (WANT) {
+  await post(8017, '/api/load', { param: WANT, ctx: 32768, pool: 0 })
+  for (let i = 0; i < 200; i++) {
+    await new Promise((r) => setTimeout(r, 2000))
+    state = await get(8017, '/api/state')
+    if (state.phase === 'ready') break
+    if (state.phase === 'failed') { console.error(`${WANT}: ${state.failure}`); process.exit(1) }
+  }
+}
 if (state.phase !== 'ready') { console.error(`station is "${state.phase}", not ready — load a model first`); process.exit(1) }
 const h = await get(8019, '/health')
+if (WANT && !h.hosting.includes(WANT.replace(/[^a-z0-9]/gi, '').slice(0, 6))) {
+  console.log(`  (asked for ${WANT}, station reports ${h.hosting})`)
+}
 console.log(`${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse}`)
 console.log(`needle "${NEEDLE}" at position ~0, asked at the end\n`)
 console.log(`  ${'depth'.padStart(7)}  ${'prompt tok'.padStart(10)}  found?  answer`)
