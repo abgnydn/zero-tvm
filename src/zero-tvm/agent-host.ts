@@ -25,7 +25,7 @@
  */
 
 import { bootEngine } from './loading-ui.js'
-import { buildDecodeEngine, allocKVPages } from './engine-core.js'
+import { buildDecodeEngine, allocKVFor } from './engine-core.js'
 import { parseVariantFlags, type VariantFlags } from './variants.js'
 import { poolSave, poolTryRestore, type PoolConfig } from './kv-pool.js'
 import { specFromSearch, buildChatPromptFor, modelBranding } from './model-select.js'
@@ -155,7 +155,7 @@ async function main(): Promise<void> {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
       })
-      return buildDecodeEngine(device, weights, allocKVPages(device, sp), { spec: sp, variants: flags })
+      return buildDecodeEngine(device, weights, allocKVFor(device, sp, flags), { spec: sp, variants: flags })
     },
   })
   if (!boot.ok) {

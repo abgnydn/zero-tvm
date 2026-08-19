@@ -17,7 +17,7 @@
 import { loadWeights, formatEta, LoadedWeights } from './weight-loader.js'
 import { Tokenizer } from './tokenizer.js'
 import { loadTokenizerFor, buildChatPromptFor } from './model-select.js'
-import { allocKVPages, buildDecodeEngine, type DecodeEngine } from './engine-core.js'
+import { allocKVFor, buildDecodeEngine, type DecodeEngine } from './engine-core.js'
 import { SCALAR_VARIANTS } from './variants.js'
 import { PHI3, type ModelSpec } from '../compiler/compiler.js'
 
@@ -285,8 +285,6 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     setProgress(96, 'Compiling shaders...')
     engine = opts.buildEngine({ device, weights, sgSizeOk, spec })
   } else {
-    log(`Allocating KV cache (${spec.layers} layers × ${spec.maxPages} pages)`)
-    const kvPages = allocKVPages(device, spec)
     setProgress(96, 'Compiling shaders...')
     log('Compiling WGSL kernels (10 roles)')
     // A MoE spec has no scalar path — moe_router_topk and the grid-z expert
@@ -296,6 +294,12 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     const variants = spec.moe && sgSizeOk
       ? { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled' as const }
       : undefined
+    // Allocated AFTER the variants are chosen, because the cache layout has to
+    // match them: allocKVFor reads int8KV from the flags. Allocating first and
+    // deciding later is how four surfaces ended up running an f16 cache while
+    // their own flags said int8.
+    log(`Allocating KV cache (${spec.layers} layers × ${spec.maxPages} pages)`)
+    const kvPages = allocKVFor(device, spec, variants ?? SCALAR_VARIANTS)
     engine = buildDecodeEngine(device, weights, kvPages, { spec, variants })
   }
 

@@ -243,7 +243,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       // different machines that resolve different variants agree for a while
       // and then fork, which reads as a split bug and is not one.
       ;(window as unknown as Record<string, unknown>).__variants = { ...flags, fused }
-      const kv = engineMod.allocKVPages(device, s)
+      const kv = engineMod.allocKVFor(device, s, flags)
       return engineMod.buildDecodeEngine(device, weights, kv, {
         variants: flags, fused, spec: s, layerRange: stageRange ?? undefined,
         ...(poolSlots ? { expertPool: poolSlots } : {}),
@@ -371,7 +371,7 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
         sgSizeOk,
       })
       ;(window as unknown as Record<string, unknown>).__variants = { ...flags, fused: false }
-      return engineMod.buildDecodeEngine(device, weights, engineMod.allocKVPages(device, s), {
+      return engineMod.buildDecodeEngine(device, weights, engineMod.allocKVFor(device, s, flags), {
         variants: flags, fused: false, spec: s, layerRange: range,
       })
     },

@@ -38,6 +38,9 @@ try {
   }
   const logs = []
   let sawChunks = 0
+  // PER ARM. Summing across arms let two single-chunk runs total 2 and satisfy
+  // a >= 2 check that exists precisely to reject a single chunk.
+  let maxArmChunks = 0
   page.on('console', (m) => {
     const t = m.text()
     if (t.includes('chunked prefill')) logs.push(t)
@@ -46,7 +49,7 @@ try {
     // PASS at 4 and 8 tokens for exactly that reason while the engine was
     // broken at every length that actually chunked.
     const m2 = /prefill: .*?(\d+) chunks? of/.exec(t)
-    if (m2) sawChunks += Number(m2[1])
+    if (m2) { sawChunks += Number(m2[1]); maxArmChunks = Math.max(maxArmChunks, Number(m2[1])) }
   })
 
   for (const [label, v] of [['scalar', {}], ['shipped', { subgroups: true, matmul: 'tiled', splitK: 8 }]]) {
@@ -76,9 +79,9 @@ try {
   // So a single chunk no longer counts as having tested chunking. Two is the
   // minimum that crosses a boundary; the size of each chunk matters
   // independently, which is what CAP is for.
-  check('chunking actually ran', sawChunks >= 2,
-    sawChunks >= 2 ? `${sawChunks} chunks recorded (${IDS.length} tokens)`
-      : sawChunks === 1
+  check('chunking actually ran', maxArmChunks >= 2,
+    maxArmChunks >= 2 ? `${maxArmChunks} chunks in one arm, ${sawChunks} total (${IDS.length} tokens)`
+      : maxArmChunks === 1
         ? `ONE chunk — crosses no boundary, so this proves nothing about chunking. `
           + `Raise PROMPT above the cap (or lower CAP): PROMPT=${IDS.length} needs ~${IDS.length * 2} to split.`
         : 'ZERO chunks — this run proves nothing, raise PROMPT')

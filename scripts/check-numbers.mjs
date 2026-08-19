@@ -141,8 +141,16 @@ try {
   const h = await res.json()
   const last = h.last
   if (last && last.prefillTokPerSec) {
-    const hit = [...ceilings.values()].find((c) => h.hosting && h.hosting.includes(String(c.param || '').slice(0, 5)))
-      ?? [...ceilings.values()][0]
+    // Match on the spec ID, which /health reports verbatim. The first version
+    // matched on the PARAM's first five characters — and Phi-3's param is the
+    // empty string, so `hosting.includes('')` was true for everything and every
+    // model was bounded by Phi-3's ceiling. It read qwen38's decode as 1.1% of
+    // ceiling when the truth was 6.7%.
+    const hit = ceilings.get(h.hosting)
+    if (!hit) {
+      console.log(`\nlive engine: ${h.hosting} is not in the roster — cannot bound it`)
+      throw new Error('unmatched')
+    }
     console.log('\nlive engine:')
     const overP = last.prefillTokPerSec > hit.p * 1.25
     const overD = last.decodeTokPerSec > hit.d * 1.25

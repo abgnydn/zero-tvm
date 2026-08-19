@@ -128,6 +128,56 @@ export function allocKVPages(device: GPUDevice, spec: ModelSpec = PHI3): GPUBuff
 // the cost of one extra dispatch per layer (quantize). Opt-in (?kv8=1 on the
 // chat page) — validate output parity against the f16 baseline on your target
 // hardware.
+/**
+ * The KV cache the FLAGS ask for. Use this instead of picking an allocator by
+ * hand.
+ *
+ * int8KV was expressed twice — once as VariantFlags.int8KV (parsed from ?kv8,
+ * DEFAULT ON) and once as DecodeEngineOptions.int8KV — and the engine read only
+ * the option. Threading the two together was a hand-written step at every
+ * construction site, and four of the five got it wrong: the agent host, both
+ * room paths and the validate boot allocated an f16 cache while their own flags
+ * reported int8.
+ *
+ * That was silent and it mattered three ways. `?kv8=0` was a NO-OP on those
+ * surfaces, so a bisection could "clear" int8 KV as a cause on a surface that
+ * never ran it. They ran different attention kernels from the chat page for the
+ * same model (`splitK = int8Mode ? 0 : R.splitK`), so a number measured on one
+ * describes kernels the other does not execute. And they allocated twice the KV
+ * the entrance publishes.
+ */
+/**
+ * Does this engine run an int8 KV cache? The ONE place that decides.
+ *
+ * Extracted because a test that re-implements this decision cannot see it
+ * change — which happened: the first test for this pairing asserted a local
+ * copy of the branch, and the mutation gate showed it stayed green when the
+ * engine was reverted to the buggy version.
+ *
+ * The explicit option wins when given; otherwise the VARIANT flag decides,
+ * which is the fix for four surfaces that parsed ?kv8 and then never threaded
+ * it, silently running f16 while reporting int8. MLA is excluded either way —
+ * it caches a latent rather than per-head K/V and has no int8 path.
+ */
+export function resolveInt8Mode(
+  opts: { int8KV?: boolean },
+  variants: { int8KV?: boolean },
+  spec: { mla?: unknown },
+): boolean {
+  if (spec.mla) return false
+  return opts.int8KV ?? variants.int8KV ?? false
+}
+
+export function allocKVFor(
+  device: GPUDevice,
+  spec: ModelSpec,
+  flags: { int8KV?: boolean },
+): GPUBuffer[] | { pages: GPUBuffer[]; scales: GPUBuffer[] } {
+  // MLA caches a latent rather than per-head K/V and has no int8 path;
+  // buildDecodeEngine throws for it, so it must keep the f16 allocator.
+  return resolveInt8Mode({}, flags, spec) ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
+}
+
 export function allocKVPagesInt8(device: GPUDevice, spec: ModelSpec = PHI3): { pages: GPUBuffer[]; scales: GPUBuffer[] } {
   const bytesPerPage = spec.kvI8PageWords * 4       // Phi-3: 96 KB
   const scalesPerPage = spec.kvScalesPerPage        // Phi-3: 1024 f16 per page
@@ -510,7 +560,7 @@ export function buildDecodeEngine(
 ): DecodeEngine {
   const variants = opts.variants ?? SCALAR_VARIANTS
   const fused = opts.fused ?? false
-  const int8Mode = opts.int8KV ?? false
+  const int8Mode = resolveInt8Mode(opts, variants, opts.spec ?? PHI3)
   const S = opts.spec ?? PHI3
   const kvPages = Array.isArray(kv) ? kv : kv.pages
   const kvScales = Array.isArray(kv) ? undefined : kv.scales
