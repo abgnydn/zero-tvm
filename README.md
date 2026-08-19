@@ -1,12 +1,40 @@
-<img alt="Zero-TVM — LLMs up to a 35B sparse MoE in the browser on hand-written WGSL kernels (zerotvm.com)" src="docs/hero.png" />
+<div align="center">
+
+<a href="https://zerotvm.com"><img src="docs/banner.png" alt="Zero-TVM — LLM inference in the browser, on hand-written WGSL" width="100%" /></a>
+
+<p align="center">
+  <a href="https://zerotvm.com"><img src="https://img.shields.io/badge/TRY_IT-zerotvm.com-E8955A?style=for-the-badge&labelColor=0B1020" alt="Live: zerotvm.com" /></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/abgnydn/zero-tvm/ci.yml?branch=main&style=for-the-badge&label=CI&labelColor=0B1020" alt="CI status" /></a>
+  <a href="./BENCH.md"><img src="https://img.shields.io/badge/benchmarks-vs_WebLLM_%2B_LM_Studio-1E293B?style=for-the-badge&labelColor=0B1020" alt="Benchmarks" /></a>
+  <a href="./docs/COMPAT.md"><img src="https://img.shields.io/badge/compatibility-matrix-1E293B?style=for-the-badge&labelColor=0B1020" alt="Compatibility matrix" /></a>
+  <a href="https://doi.org/10.5281/zenodo.20838918"><img src="https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20838918-059669?style=for-the-badge&labelColor=0B1020" alt="DOI" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-059669?style=for-the-badge&labelColor=0B1020" alt="License: MIT" /></a>
+</p>
+
+<p align="center">
+  <a href="https://zerotvm.com"><strong>Try it →</strong></a> ·
+  <a href="https://zerotvm.com/docs"><strong>Docs</strong></a> ·
+  <a href="./BENCH.md"><strong>Benchmarks</strong></a> ·
+  <a href="./CHANGELOG.md"><strong>Changelog</strong></a>
+</p>
+
+<p align="center"><sub>
+  <a href="#try-it">Try it</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#the-kernels">The kernels</a> ·
+  <a href="#how-its-validated">How it's validated</a> ·
+  <a href="#adding-a-model">Adding a model</a> ·
+  <a href="#the-repository-as-an-argument">Architecture</a> ·
+  <a href="#measured-against-lm-studio">vs LM Studio</a> ·
+  <a href="#where-everything-lives">Where things live</a>
+</sub></p>
+
+</div>
 
 # Zero-TVM
-
-[![CI](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml/badge.svg)](https://github.com/abgnydn/zero-tvm/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Live](https://img.shields.io/badge/live-zerotvm.com-6ea8ff)](https://zerotvm.com)
-[![Bench](https://img.shields.io/badge/bench-vs%20WebLLM%20%2B%20LM%20Studio-orange)](./BENCH.md)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20838918.svg)](https://doi.org/10.5281/zenodo.20838918)
 
 **[zerotvm.com](https://zerotvm.com)** — pick a model, it runs in your tab.
 

@@ -24,6 +24,14 @@ p.add_argument("--out", required=True)
 p.add_argument("--prompt", default="What is the capital of France?")
 p.add_argument("--prompt-ids", default=None, help="comma-separated ids; overrides --prompt")
 p.add_argument("--tokens", type=int, default=24)
+p.add_argument("--depth", type=int, default=0,
+               help="pad the prompt to roughly this many tokens before the question. "
+                    "The whole roster is verified at ~20 tokens and NONE at depth, which "
+                    "is how a model that is correct short and broken past 8k passes its "
+                    "gate. Forwards in chunks, because materialising logits for every "
+                    "position at 16k is ~24 GB.")
+p.add_argument("--chunk", type=int, default=512,
+               help="tokens per reference forward pass when --depth is set")
 args = p.parse_args()
 
 model, tokenizer = load(args.model)
@@ -51,20 +59,83 @@ else:
     msgs = [{"role": "user", "content": args.prompt}]
     ids = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False)
 
-x = mx.array([ids])
-logits = model(x)[0, -1, :].astype(mx.float32)
+def forward_final(seq):
+    """Final-position logits for a sequence of any length.
+
+    model(x) returns logits for EVERY position — at 16k tokens over a 248k
+    vocabulary that is ~24 GB and the process dies. So a long sequence is fed
+    through a prompt cache in chunks and only the last chunk's last position is
+    kept, which is the same arithmetic the engine does and the only part being
+    compared.
+    """
+    if len(seq) <= args.chunk:
+        return model(mx.array([seq]))[0, -1, :].astype(mx.float32)
+    try:
+        from mlx_lm.models.cache import make_prompt_cache
+    except ImportError as e:      # the module moved between mlx_lm versions
+        raise SystemExit(
+            "--depth needs mlx_lm's prompt cache and this build does not expose it "
+            f"at mlx_lm.models.cache ({e}). Without a cache the forward is quadratic "
+            "in memory and will OOM; refusing rather than pretending."
+        )
+    cache = make_prompt_cache(model)
+    out = None
+    for i in range(0, len(seq), args.chunk):
+        out = model(mx.array([seq[i:i + args.chunk]]), cache=cache)
+        mx.eval(out)
+    return out[0, -1, :].astype(mx.float32)
+
+
+if args.depth:
+    # Inert filler: it must not contain or hint at the answer, or this measures
+    # retrieval instead of fidelity. Same shape the agentic eval uses.
+    pad = []
+    approx, i = 0, 0
+    while approx < args.depth:
+        q = f"Step {i}: summarise what changed in release 2.{i % 9}.{i % 5}."
+        a = (f"Release 2.{i % 9}.{i % 5} adjusted logging thresholds, renamed two internal "
+             "helpers, and left public behaviour unchanged. No configuration keys moved.")
+        pad += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+        approx += (len(q) + len(a)) // 4
+        i += 1
+    msgs = pad + [{"role": "user", "content": args.prompt}]
+    ids = tokenizer.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False)
+    print(f"depth {args.depth}: {len(ids)} prompt ids, forwarding in chunks of {args.chunk}")
+
+logits = forward_final(ids)
 mx.eval(logits)
 
 # Greedy continuation, KV-less re-forward each step (slow, exact, simple).
 greedy = []
-cur = list(ids)
-for _ in range(args.tokens):
-    out = model(mx.array([cur]))[0, -1, :]
-    nxt = int(mx.argmax(out).item())
-    greedy.append(nxt)
-    cur.append(nxt)
-    if nxt in (getattr(tokenizer, "eos_token_id", None),):
-        break
+# Greedy continuation. The short path re-forwards the whole sequence per token —
+# slow, exact, simple, and it was fine while prompts were one sentence. At depth
+# it is 24 full forwards of a 16k sequence, so a cache is built ONCE from the
+# prompt and each new token is fed alone. Same arithmetic, linear instead of
+# quadratic.
+if args.depth:
+    from mlx_lm.models.cache import make_prompt_cache
+    cache = make_prompt_cache(model)
+    out = None
+    for i in range(0, len(ids), args.chunk):
+        out = model(mx.array([ids[i:i + args.chunk]]), cache=cache)
+        mx.eval(out)
+    nxt = int(mx.argmax(out[0, -1, :]).item())
+    for _ in range(args.tokens):
+        greedy.append(nxt)
+        if nxt == getattr(tokenizer, "eos_token_id", None):
+            break
+        out = model(mx.array([[nxt]]), cache=cache)
+        mx.eval(out)
+        nxt = int(mx.argmax(out[0, -1, :]).item())
+else:
+    cur = list(ids)
+    for _ in range(args.tokens):
+        out = forward_final(cur)
+        nxt = int(mx.argmax(out).item())
+        greedy.append(nxt)
+        cur.append(nxt)
+        if nxt in (getattr(tokenizer, "eos_token_id", None),):
+            break
 
 lf = logits.tolist()
 order = sorted(range(len(lf)), key=lambda i: -lf[i])
@@ -78,6 +149,7 @@ out.mkdir(parents=True, exist_ok=True)
     "top16": [[i, lf[i]] for i in order[:16]],
     "greedy": greedy,
     "greedy_text": tokenizer.decode(greedy),
+    "depth": args.depth,
 }, indent=1))
 print(f"prompt {len(ids)} ids; argmax {order[0]} ({tokenizer.decode([order[0]])!r})")
 print(f"greedy: {tokenizer.decode(greedy)!r}")
