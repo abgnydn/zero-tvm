@@ -56,7 +56,9 @@ Open **[zerotvm.com](https://zerotvm.com)** and pick a model. Weights stream
 from HuggingFace once, then cache in your browser (OPFS); nothing ever leaves
 your machine. The shipped models — sizes, RAM requirements, `?model=` flags —
 are defined in
-[`src/zero-tvm/model-registry.ts`](src/zero-tvm/model-registry.ts). The site's model cards render from that table.
+[`src/zero-tvm/model-registry.ts`](src/zero-tvm/model-registry.ts) — the site's
+model cards render from that table, so what you see on the entrance and what the
+engine allocates cannot disagree.
 
 ## Quick start
 
@@ -75,9 +77,13 @@ them at `/local-weights/` so nothing re-downloads.
 
 Every shader is hand-written WGSL in
 [`src/compiler/shaders/`](src/compiler/shaders/), plus one small readable
-generator for the int4/int3 matmul family. There is no compiler and no autotuner. For the other side of the
-argument, [`src/tvm-shaders/`](https://github.com/abgnydn/zero-tvm/tree/main/src/tvm-shaders) browses the TVM-generated
-kernels WebLLM ships, captured live from a running session.
+generator for the int4/int3 matmul family. There is no compiler and no
+autotuner.
+
+For the other side of the argument,
+[`src/tvm-shaders/`](https://github.com/abgnydn/zero-tvm/tree/main/src/tvm-shaders)
+holds the TVM-generated kernels WebLLM ships, captured live from a running
+session.
 
 ## How it's validated
 
@@ -103,18 +109,27 @@ Models whose blocks the kernel set already covers are added mechanically:
 npm run add-model -- mlx-community/Qwen3-4B-4bit --param qwen3mlx
 ```
 
-One command probes the checkpoint (10-20 MB, nearly all of it tokenizer.json,
-which is fetched whole — the safetensors headers really are ranged reads), checks
-it against the constraint matrix, generates the `ModelSpec`, registers it on
-every surface (landing cards, switcher, `?model=` URL), and compiles every
-kernel under the new dims. If the model needs a kernel that doesn't exist, the
-same command says exactly which one — [docs/COMPAT.md](docs/COMPAT.md) is the
-full support matrix. `scripts/validate-model.mjs` checks **fidelity**: that the
-engine computes what `mlx_lm` computes on the same checkpoint, by diffing logits
-and greedy decode. That is not a quality claim and cannot be one — it runs
-against the SAME quantized weights, so a checkpoint quantized into gibberish
-passes it. [docs/QUALITY.md](docs/QUALITY.md) demonstrates exactly that and
-holds the tools that do measure quality.
+That one command probes the checkpoint, checks it against the constraint
+matrix, generates the `ModelSpec`, registers it on every surface — landing card,
+switcher, `?model=` flag — and compiles every kernel under the new dimensions.
+If the model needs a kernel that does not exist, it says which one;
+[docs/COMPAT.md](docs/COMPAT.md) is the full support matrix.
+
+The probe downloads 10–20 MB, nearly all of it `tokenizer.json`. The safetensors
+headers really are ranged reads.
+
+Then verify it numerically:
+
+```bash
+node scripts/validate-model.mjs qwen3mlx --ref /tmp/ref-qwen3mlx
+```
+
+This checks **fidelity** — that the engine computes what `mlx_lm` computes on
+the same checkpoint — by diffing logits and greedy decode. It is not a quality
+claim and cannot be one: it runs against the *same quantized weights*, so a
+checkpoint quantized into gibberish passes it.
+[docs/QUALITY.md](docs/QUALITY.md) demonstrates precisely that, and holds the
+tools that do measure quality.
 
 ## The repository as an argument
 
@@ -144,16 +159,24 @@ comparison harness lives in `src/webllm-bench/` and is run from a shell.
 src/
   zero-tvm/             THE RESULT
     engine-core.ts        THE decode engine: buildDecodeEngine,
-                          allocKVPages/allocKVPagesInt8, the 32-layer decode
-                          loop. No DOM. Parameterized by mode: unfused
-                          reference path (validate, 9 dispatches/layer) or
-                          fused QKV+RoPE+KV-append (chat, 7/layer; 8 with int8
-                          KV), plus two generate styles — blocking
-                          generate/forwardLogits and the pipelined readback
-                          ring (generatePipelined). Driven by BOTH chat.ts
-                          and validate.ts.
+                          allocKVPages/allocKVPagesInt8, the decode loop. No
+                          DOM. Spec-parameterized — layer count, head shape and
+                          block kinds all come from model-spec.ts, so one loop
+                          serves a 1B dense model and a 64-layer hybrid MoE.
+                          Two generate styles: blocking generate/forwardLogits,
+                          and the pipelined readback ring (generatePipelined).
+                          FIVE call sites drive it — the chat page, the
+                          entrance's in-place chat, validate, the room host,
+                          and the agent host.
     chat.ts               thin chat page: DOM state, boot wiring
                           (via loading-ui's bootEngine), streaming render.
+    chat-flow.ts          the turn loop itself — history, prompt building,
+                          streaming, cancellation — shared by the chat page
+                          and the entrance.
+    model-registry.ts     the single source for ?model= flags, landing cards,
+                          the switcher, and every figure they display.
+    tool-calls.ts         three tool-call dialects, pinned byte-exact against
+                          each checkpoint's own jinja.
     variants.ts           URL-flag A/B harness (?sg/?matmul=/
                           ?kv8=0 …) and variant→pipeline resolution.
     markdown.ts           minimal streaming Markdown renderer.
@@ -162,9 +185,15 @@ src/
     spec-sim.ts           CPU-side prompt-lookup speculative-decoding
                           acceptance simulator. Used to falsify a speed-up
                           experiment before building shaders.
-    tokenizer.ts          BPE tokenizer from scratch
-    weight-loader.ts      direct HuggingFace Phi-3-MLC fetch,
-                          OPFS cache, layer-ordered streaming
+    tokenizer.ts          Phi-3's SentencePiece-style tokenizer, from scratch
+    tokenizer-bpe.ts      byte-level BPE for every Qwen and Llama build, plus
+                          the chat templates — including the three ChatML
+                          generations, which disagree about whitespace and
+                          about which past turns keep a <think> block
+    weight-loader.ts      MLC layout: HuggingFace fetch, OPFS cache,
+                          layer-ordered streaming
+    weight-loader-mlx.ts  MLX layout: byte-RANGE reads out of multi-GB
+                          safetensors shards. Most of the roster loads here.
     validate.ts           multi-prompt forward-pass smoke test
     loading-ui.ts         shared progress-bar UI + bootEngine
                           flow used by both chat and validate
@@ -294,6 +323,8 @@ plausible number first, and BENCH.md records what they looked like.
 | Engine documentation (per-model commands, flags, gotchas) | [CLAUDE.md](CLAUDE.md) |
 | Shipped model list (the source of truth) | [`src/zero-tvm/model-registry.ts`](src/zero-tvm/model-registry.ts) |
 | Reference docs + diagrams | [docs](https://zerotvm.com/docs) |
+| How this project verifies itself | [docs/VERIFICATION.md](docs/VERIFICATION.md) |
+| Support matrix (what a new model needs) | [docs/COMPAT.md](docs/COMPAT.md) |
 | Release history | [CHANGELOG.md](CHANGELOG.md) |
 
 ## License
