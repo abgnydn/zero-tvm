@@ -4180,7 +4180,12 @@ export function buildDecodeEngine(
     // expensive failure mode here, and it is invisible without this line: say
     // WHERE the agreement ended, so a caller can tell "the client changed an
     // earlier turn" from "the recurrent state is not where reuse needs it".
-    if (startPos === 0 && preAbsorbed > 0) {
+    // ...but say nothing when reuse was TURNED OFF. Under ?reuse=0 the decline
+    // is the instruction, not a fault, and the branch below reports it as
+    // "lcp == absorbed and state is aligned, but reuseStart still declined" —
+    // which reads as the engine refusing a reuse it should have taken. That
+    // line appeared in a bisection arm whose whole purpose was disabling reuse.
+    if (startPos === 0 && preAbsorbed > 0 && (opts.prefixReuse ?? true)) {
       const why = !preValid ? 'the absorbed record was invalidated (a gap in submitted positions)'
         : preLcp === 0 ? 'the new prompt diverges at token 0 — a different conversation, or the system prompt changed'
         : preLcp < preAbsorbed

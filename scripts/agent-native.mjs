@@ -210,6 +210,15 @@ async function runJob(body, onDelta, isAborted) {
       promptTokens: promptIds.length,
       genTokens: ids.length,
       ttftMs: ttft,
+      // NOT TRUSTWORTHY — do not publish either rate until the split is fixed.
+      // Observed 2026-08-19 on qwen38: 15,446 prompt tokens with ttft 4.06s
+      // ("3803 tok/s prefill") and 45 generated at "1.3 tok/s". The total is
+      // right; the split is not. 3803 tok/s on a 27.8B dense model implies
+      // ~211 TFLOP/s and this machine peaks near 13, while 1.3 tok/s decode is
+      // ~10x below the model's own bandwidth roofline. Swapping them puts both
+      // where physics allows, so tFirst is being taken before prefill has
+      // actually finished and the prefill time is being charged to decode.
+      // The panel shows these; BENCH.md must not, and neither must a model card.
       prefillTokPerSec: ttft > 0 ? +(promptIds.length / (ttft / 1000)).toFixed(1) : 0,
       newTokens: pf ? promptIds.length - pf.reused : null,
       decodeTokPerSec: decodeMs > 0 && ids.length > 1 ? +((ids.length - 1) / (decodeMs / 1000)).toFixed(1) : 0,
