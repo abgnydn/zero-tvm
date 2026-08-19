@@ -541,7 +541,16 @@ those were caught by reading a diff.
 
 **The test that matters is the one that FAILS on the old code.** Write it, run
 it against the bug, watch it fail, then fix. A test written after the fix and
-never seen red proves nothing.
+never seen red proves nothing. `node scripts/mutation-gate.mjs` re-checks that
+for eight bugs that actually shipped — a suite can lose its teeth in a refactor
+and still look green.
+
+**`docs/VERIFICATION.md` is the doctrine**, derived from the twelve defects found
+on 2026-08-19. The short version: scale is part of the claim (four gates asserted
+the right property at a size where it could not fail); assert the OUTPUT, not a
+metric the engine reports about itself; test at the definition rather than next
+to it; derive rather than author; and fixtures must be able to tell a right
+implementation from the wrong one.
 
 The GPU suites are NOT in the hook — they need hardware CI and the agent
 sandbox do not have. They are the gate for anything touching WGSL or the
