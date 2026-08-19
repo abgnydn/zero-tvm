@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img"
+     aria-label="Zero-TVM — LLM inference in the browser, on hand-written WGSL">
+  <!--
+    Authored, not captured. The entrance mascot is drawn per frame by
+    src/mascot.ts through a WebGPU pipeline, so there is no file to point a
+    README at; scripts/capture-mascot.mjs renders one but needs a GPU. This is
+    the fallback that ships from any machine.
+
+    Palette is public/tokens.css verbatim, so the README and the site are
+    recognisably the same project. Self-contained: no external refs, no fonts
+    beyond generic families, no script — GitHub sanitises SVG and drops all
+    three.
+
+    The ring motif is the entrance's stage marking (public/entrance/ring.svg):
+    a circle in plan, squashed by an ellipse transform so its ticks foreshorten
+    like a floor does.
+  -->
+  <defs>
+    <radialGradient id="glow" cx="76%" cy="50%" r="42%">
+      <stop offset="0%" stop-color="#f0a860" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#f0a860" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f0a860"/>
+      <stop offset="100%" stop-color="#f0a860" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="400" fill="#05070d"/>
+  <rect width="1280" height="400" fill="url(#glow)"/>
+
+  <!-- stage: concentric rings in perspective, the entrance's floor marking -->
+  <g transform="translate(975 210)" opacity="0.55">
+    <g transform="scale(1 0.34)">
+      <circle r="168" fill="none" stroke="#1c2434" stroke-width="2"/>
+      <circle r="126" fill="none" stroke="#1c2434" stroke-width="2"/>
+      <circle r="84"  fill="none" stroke="#2a3446" stroke-width="2"/>
+      <circle r="42"  fill="none" stroke="#f0a860" stroke-width="2" stroke-opacity="0.5"/>
+    </g>
+    <!-- ticks, at the cardinal points of the squashed ring -->
+    <g stroke="#f0a860" stroke-opacity="0.45" stroke-width="2">
+      <line x1="-168" y1="0" x2="-148" y2="0"/>
+      <line x1="148"  y1="0" x2="168"  y2="0"/>
+      <line x1="0" y1="-57" x2="0" y2="-47"/>
+      <line x1="0" y1="47"  x2="0" y2="57"/>
+    </g>
+  </g>
+
+  <!-- a token streaming out of the stage: the thing the engine actually does -->
+  <g opacity="0.9">
+    <circle cx="975" cy="150" r="7" fill="#f0a860"/>
+    <circle cx="1042" cy="150" r="5" fill="#f0a860" fill-opacity="0.6"/>
+    <circle cx="1098" cy="150" r="4" fill="#f0a860" fill-opacity="0.35"/>
+    <circle cx="1146" cy="150" r="3" fill="#f0a860" fill-opacity="0.18"/>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="96" y="176" font-size="82" font-weight="600" fill="#edf0f6" letter-spacing="-1">zero<tspan fill="#f0a860">-</tspan>tvm</text>
+    <rect x="96" y="206" width="286" height="3" fill="url(#rule)"/>
+    <text x="96" y="264" font-size="26" fill="#a9b3c6">LLM inference in the browser,</text>
+    <text x="96" y="302" font-size="26" fill="#a9b3c6">on hand-written WGSL.</text>
+    <text x="96" y="352" font-size="18" fill="#5e6a7e">no TVM · no ONNX · no WASM runtime · zerotvm.com</text>
+  </g>
+</svg>

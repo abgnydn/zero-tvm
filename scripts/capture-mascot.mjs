@@ -15,6 +15,12 @@
 //                     in the page so it uses the site's own fonts and palette
 //                     rather than an approximation of them
 //
+// docs/banner.svg is the committed FALLBACK the README points at, authored by
+// hand from public/tokens.css so it ships from any machine. Point the README at
+// banner.png only once this has actually been run — the README referenced a
+// banner.png that did not exist for about an hour, and rendered a broken image
+// on the repo's front page.
+//
 //   node scripts/capture-mascot.mjs                 # default model's palette
 //   MODEL=qwen36q3 node scripts/capture-mascot.mjs
 import { mkdirSync, writeFileSync } from 'node:fs'

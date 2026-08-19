@@ -1,6 +1,6 @@
 <div align="center">
 
-<a href="https://zerotvm.com"><img src="docs/banner.png" alt="Zero-TVM — LLM inference in the browser, on hand-written WGSL" width="100%" /></a>
+<a href="https://zerotvm.com"><img src="docs/banner.svg" alt="Zero-TVM — LLM inference in the browser, on hand-written WGSL" width="100%" /></a>
 
 <p align="center">
   <a href="https://zerotvm.com"><img src="https://img.shields.io/badge/TRY_IT-zerotvm.com-E8955A?style=for-the-badge&labelColor=0B1020" alt="Live: zerotvm.com" /></a>
