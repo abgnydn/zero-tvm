@@ -78,5 +78,58 @@ def tail(wire: bool = False):
     return out
 
 
+# ── the agentic eval's TURN ONE ──────────────────────────────────────────────
+# A different shape from the tail above and the one that actually fails: six
+# tools instead of two, and NO tool history — the model has taken no action yet.
+# qwen38 fails on this first call, inventing `mcp__tools__repo_search`, so the
+# 3-reads-done tail was never the failing state for it. Verified byte-identical
+# to the checkpoint's own template at depth 0 and 24000.
+EVAL_TOOLS = [
+    {"type": "function", "function": {"name": "list_files",
+     "description": "List every file in the workspace",
+     "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {"name": "read_file",
+     "description": "Read one file by path",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "search",
+     "description": "Search file contents for a string",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "write_file",
+     "description": "Write content to a file",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "run_command",
+     "description": "Run a shell command in the workspace",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "attempt_completion",
+     "description": "Report the final answer and finish the task",
+     "parameters": {"type": "object", "properties": {"result": {"type": "string"}}, "required": ["result"]}}},
+]
+
+EVAL_TASK = ("What number does capacity() return? Read only the files you need, "
+             "then call attempt_completion with just the number. Do not guess.")
+
+
+def eval_padding(target: int):
+    """The eval's own filler — a different divisor and different prose from
+    padding() above, so it must not be shared with it."""
+    msgs, approx, i = [], 0, 0
+    import math
+    while approx < target:
+        q = f"Step {i}: summarise what changed in release 2.{i % 9}.{i % 5}."
+        a = (f"Release 2.{i % 9}.{i % 5} adjusted logging thresholds, renamed two internal "
+             "helpers, and left public behaviour unchanged. No configuration keys moved, and the "
+             "deployment procedure is identical to the previous release. Nothing here affects "
+             "pipeline capacity or the dimension constants used elsewhere in the service.")
+        msgs += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+        approx += math.ceil((len(q) + len(a)) / 3.6)
+        i += 1
+    return msgs
+
+
+def eval_turn1(depth: int):
+    return [{"role": "system", "content": SYSTEM}] + eval_padding(depth) + \
+           [{"role": "user", "content": EVAL_TASK}]
+
+
 def conversation(depth: int, wire: bool = False):
     return [{"role": "system", "content": SYSTEM}] + padding(depth) + tail(wire)

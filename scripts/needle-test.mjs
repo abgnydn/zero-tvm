@@ -86,9 +86,7 @@ if (WANT) {
 }
 if (state.phase !== 'ready') { console.error(`station is "${state.phase}", not ready — load a model first`); process.exit(1) }
 const h = await get(8019, '/health')
-if (WANT && !h.hosting.includes(WANT.replace(/[^a-z0-9]/gi, '').slice(0, 6))) {
-  console.log(`  (asked for ${WANT}, station reports ${h.hosting})`)
-}
+
 console.log(`${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse}`)
 console.log(`needle "${NEEDLE}" at position ~0, asked at the end\n`)
 console.log(`  ${'depth'.padStart(7)}  ${'prompt tok'.padStart(10)}  found?  answer`)

@@ -44,6 +44,10 @@ p.add_argument("--max-tokens", type=int, default=700)
 # thinking on, so the first two runs of this script compared a thinking model
 # against a non-thinking engine and the rows were meaningless. --thinking runs
 # the other arm deliberately.
+p.add_argument("--case", choices=("tail", "eval-turn1"), default="tail",
+               help="tail: three files already read, the state our engine gave prose on. "
+                    "eval-turn1: the agentic eval's FIRST call — six tools, no history — "
+                    "which is where qwen38 actually fails, inventing a tool name.")
 p.add_argument("--thinking", action="store_true",
                help="render WITH the thinking block (default: match our engine, which does not)")
 a = p.parse_args()
@@ -68,15 +72,22 @@ _probe = tokenizer.apply_chat_template(
     add_generation_prompt=True, enable_thinking=a.thinking)
 print(f"  thinking={a.thinking} · rendered prompt ends: "
       f"{tokenizer.decode(_probe[-14:])!r}\n")
+print(f"  case: {a.case}")
 print(f"  {'depth':>8} {'prompt tok':>11} {'gen':>6}     called?     how it ENDED")
 
 for d in [int(x) for x in a.depths.split(",")]:
-    msgs = case.conversation(d)
+    msgs = case.eval_turn1(d) if a.case == "eval-turn1" else case.conversation(d)
+    tools = case.EVAL_TOOLS if a.case == "eval-turn1" else TOOLS
     prompt = tokenizer.apply_chat_template(
-        msgs, tools=TOOLS, add_generation_prompt=True, enable_thinking=a.thinking)
+        msgs, tools=tools, add_generation_prompt=True, enable_thinking=a.thinking)
     ntok = len(prompt)
     out = generate(model, tokenizer, prompt=prompt, max_tokens=a.max_tokens, verbose=False)
     called = "<tool_call>" in out or "attempt_completion" in out
+    # A tool name that is not on offer is its own outcome, not a pass: qwen38
+    # emits well-formed <tool_call> blocks naming mcp__tools__* functions that
+    # appear nowhere in the prompt, which "did it call something?" scores as YES.
+    names = {t["function"]["name"] for t in tools}
+    invented = "mcp__" in out or ("<function=" in out and not any(f"<function={n}>" in out for n in names))
     # Qwen3.6's own template invites reasoning BEFORE the call ("you may provide
     # optional reasoning ... BEFORE the function call, but NOT after"), so the
     # call is the LAST thing generated, not the first. Two consequences the
@@ -86,7 +97,8 @@ for d in [int(x) for x in a.depths.split(",")]:
     gen = len(tokenizer.encode(out))
     cap = "CUT" if gen >= a.max_tokens - 1 else "   "
     tail = out.strip().replace("\n", " ")[-90:]
-    print(f"  {d:>8} {ntok:>11} {gen:>6}{cap}  {'YES' if called else 'NO ':<10}  …{tail!r}")
+    verdict = "INVENTED" if invented else ("YES" if called else "NO")
+    print(f"  {d:>8} {ntok:>11} {gen:>6}{cap}  {verdict:<10}  …{tail!r}")
 
 print("""
   Reading this — depth 0 is the CONTROL and must be YES. Our engine emits the
