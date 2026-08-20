@@ -7,7 +7,7 @@ asserted. That is a property of how the gates were written, not of how carefully
 anyone was working, so it will recur unless the gates change shape.
 
 This is not a style guide. Every rule below is derived from a specific defect
-that shipped here.
+that shipped here, or from one the assistant made while fixing them.
 
 ---
 
@@ -23,7 +23,91 @@ something" asserts nothing here.
 
 ---
 
-## The five rules
+## Rule 0 — something that looks like a check is not a check
+
+**Every defect found here has been something occupying the position of a
+verification without performing one.**
+
+That is the whole diagnosis. The five rules below are its prescriptions, and
+they are worth less than this sentence, because the sentence generalises to
+gates nobody has written yet.
+
+The evidence is unusually good, because it comes from two independent sources
+that produced the *same* taxonomy: the twelve defects that shipped in this
+codebase, and roughly twenty mistakes the assistant made while fixing them in a
+single day. Two different authors, two different kinds of work, one shape.
+
+Four families. Every instance from both sources is one of them.
+
+### 1. Right assertion, wrong inputs
+
+The check is correct and runs where the defect cannot appear.
+
+| | instance |
+|---|---|
+| out-of-domain scale | `chunk-prefill-test` asserts chunked ≡ per-token — at 150 tokens, which is ONE chunk. The defect needs sixteen. |
+| non-discriminating fixture | every ChatML fixture ended with a real user query, the one shape where the right and wrong `<think>` rules render identically |
+| unreached subject | `renderToolResults` was correct and tested; nothing called it |
+
+**A test asserts P(x) for the x it happened to use, and nothing states the
+domain.** Green means "not here", not "not anywhere".
+
+### 2. Right inputs, wrong subject
+
+Something adjacent to the claim gets asserted instead of the claim.
+
+| | instance |
+|---|---|
+| restated copy | a test that re-implemented the formula it was checking, and stayed green when the real one was mutated — then the same mistake again, on a different function, within the hour |
+| proxy metric | the e2e gate asserted `reused > 0`, which a snapshot mislabelled by one token also satisfies while corrupting a recurrence |
+| lying instrument | a refused HTTP request scored as "the model answered with prose"; a facts checker reporting "0 errors" from a mode that executes nothing |
+
+**A restatement, a downstream number, or the tool itself — none of them is the
+subject.**
+
+### 3. Produced but never compared
+
+The value exists, is displayed, and nothing checks it against what it claims.
+
+| | instance |
+|---|---|
+| unasserted value | the eval PRINTED the engine's flags in its banner and never compared them to the flags it had requested |
+| silent fallback | `hosting.includes('')` is true for everything, so every model was bounded by Phi-3's ceiling; `MODEL=qwen30b` rendered the default character |
+| duplicated rule | `int8KV` expressed in variants AND options — four surfaces ran f16 while their own flags said int8 |
+| authored derivation | the tool dialect prefix-matched on the model's NAME, wrong for both Qwen3.5 builds |
+
+**Producing a value and validating it are different acts, and the first
+reliably masquerades as the second.** A fallback is the sharpest case: it
+converts a question into a confident wrong answer.
+
+### 4. The conclusion outran the evidence
+
+| | instance |
+|---|---|
+| undated claim | throughput measured before int8 became the default; a planning doc still calling the old figure "today" |
+| hypothesis as evidence | a rewind-ring fix wrong on all three of its premises; M-RoPE, attention-over-distance and int8 quantisation each proposed as the root cause and each wrong, at one GPU run apiece |
+
+**A measurement is a function of a configuration, and publishing the value
+discards the domain.** A plausible mechanism is not evidence. Bisection is.
+
+### Using it
+
+Four questions, asked of any gate before trusting it:
+
+1. **Domain** — at what size and shape does this run, and at what size and shape
+   does the thing ship? If they differ, say by how much.
+2. **Subject** — does it assert the thing, or a copy of it, a number downstream
+   of it, or the tool that measures it?
+3. **Comparison** — is the value compared against something, or only produced?
+   Anything printed and not compared is decoration.
+4. **Conditions** — under what configuration was this true, and is that still
+   the configuration?
+
+A gate that cannot answer all four is a gate whose green is uninformative.
+
+---
+
+## The five rules — the prescriptions
 
 ### 1. Scale is part of the claim
 

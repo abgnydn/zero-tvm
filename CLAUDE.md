@@ -545,12 +545,18 @@ never seen red proves nothing. `node scripts/mutation-gate.mjs` re-checks that
 for eight bugs that actually shipped — a suite can lose its teeth in a refactor
 and still look green.
 
-**`docs/VERIFICATION.md` is the doctrine**, derived from the twelve defects found
-on 2026-08-19. The short version: scale is part of the claim (four gates asserted
-the right property at a size where it could not fail); assert the OUTPUT, not a
-metric the engine reports about itself; test at the definition rather than next
-to it; derive rather than author; and fixtures must be able to tell a right
-implementation from the wrong one.
+**`docs/VERIFICATION.md` is the doctrine.** Its top rule, and the only line
+worth memorising: **something that looks like a check is not a check.** Every
+defect found here — and every mistake made while fixing them — has been
+something occupying the position of a verification without performing one. Four
+families: right assertion on the wrong inputs; right inputs on the wrong
+subject; a value produced but never compared; a conclusion that outran its
+evidence.
+
+Four questions to ask of any gate before trusting its green: at what **scale**
+does it run versus ship; does it assert the **subject** or a copy/metric/the
+tool; is the value **compared** or only produced; under what **configuration**
+was it true, and is that still the configuration?
 
 The GPU suites are NOT in the hook — they need hardware CI and the agent
 sandbox do not have. They are the gate for anything touching WGSL or the
