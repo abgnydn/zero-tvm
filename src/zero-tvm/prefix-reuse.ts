@@ -100,7 +100,8 @@ export function rewindSlot(ckptPos: readonly number[], lcp: number, promptLen: n
  * two rewinds whose points are NOT monotonically increasing, so a client that
  * rewrites the same trailing block every turn never triggers it — the case the
  * ring was verified against. A randomized 12-turn simulation hit it in 2,929
- * of 20,000 conversations at CHUNK_CAP 1024; the failure is one turn restoring
+ * of 20,000 conversations at CHUNK_CAP 1024 — a domain that no longer covers a
+ * spec quarantined below that (qwen38 runs 256); the failure is one turn restoring
  * an earlier turn's recurrent state onto the current KV cache, which is fluent
  * wrong output rather than a crash.
  */

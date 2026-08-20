@@ -7,6 +7,67 @@ from `0.1.0`.
 
 ## [Unreleased]
 
+### 2026-08-20 — qwen38's chunked prefill quarantined at 256; the chunking gate ran at six tokens
+
+On qwen38, chunked prefill and the per-token path disagree at long context. The
+contract chunked prefill is held to is empirical TOKEN identity — it has never
+been bit-equal to per-token — and at ~16k that fails: correct per-token and at
+cap 256, invents tool names at the shipped cap of 1024, generic greeting at
+4096. Cleared at a depth that fails: the model (`mlx_lm` correct at every depth
+tried), the prompt (byte-identical to the vendor jinja), int8 KV, cross-turn
+reuse, retrieval. `gdn_recur`'s workgroup barriers are correct, including the
+one before the staging buffers are reused. Those runs were made by hand against
+a loaded station and their OUTPUTS are not committed. The harness that re-runs
+the identity check at depth is `scripts/chunk-prefill-test.mjs` with an explicit
+PROMPT and CAP (the invocation is recorded on the `maxChunkCap` field);
+`chunk-cap-sweep.mjs` sweeps the same caps but measures tok/s and compares no
+output, so it does not reproduce the correctness column.
+
+**The mechanism is not found.** `ModelSpec.maxChunkCap` bounds the damage where
+the bisection put the threshold — 256 for qwen38, the largest cap TESTED
+correct, not a proven ceiling (512 was never swept for correctness at this
+depth — BENCH.md has it at 931.3 tok/s in the throughput sweep — so the
+threshold is somewhere in (256, 1024]; 24k is untested under the quarantine). It
+clamps the DEFAULT only: an explicit cap is honoured, because the sweep that
+found the threshold has to be able to cross it. `resolveChunkCap` derives that
+default — a pooled MoE build lowers it again downstream — and was extracted so a
+test can assert the real function rather than a copy; the mutation gate
+reinstates the pre-quarantine expression.
+
+Not free, though qwen38's own cost is UNMEASURED: the closest comparable sweep
+is llama32 at 4k (844.7 vs 972.1 tok/s, ~13% between those caps) and llama32 is
+not clamped. The GDN rewind ring's lookback drops from ~4k tokens to ~1k; what
+that ring buys was measured on an unquarantined qwen36q3 session, so that cost
+is unmeasured too. E5 survives the clamp (256 satisfies `CHUNK_CAP % 64 === 0`,
+and qwen38's d/qDim/ffn/gdnVDim are all multiples of 64).
+
+Why nothing saw it: `gdn_chunk_chain` asserted chunk-vs-stepwise bit identity at
+SIX tokens against a shipped cap of 1024 and stayed green throughout. It is now
+parameterized by scale with a 1024 arm — which still does NOT reach the failing
+configuration: it runs qwen35 dims through `int4_matmul_batched_dyn`, while cap
+1024 is reached by default only where the subgroup-matrix feature exists, which
+is exactly when the engine picks E5. `skip()` also returns `pass: true`, so a
+machine without 32-lane subgroups reports PASS while running nothing.
+
+Recorded, not fixed: the chunk-GEMM `dimsOK` guard omits `gdnProjRows`, and
+among the shipped hybrids qwen38 is the only one whose value is not a multiple
+of 64 (16480 = 64x257 + 32; the other four are 12352 = 64x193). E5 tiles N by 32
+and guards the ragged column, so this is a lead, not a diagnosis.
+
+Also: `chunkCap`'s documented default disagreed with the code in SIX places
+across four files — three inside `engine-core.ts`, plus `src/lib/index.ts`,
+`CLAUDE.md` and `tests/kernels/compile-qwen35.mjs`; all six now agree.
+`scripts/chunk-prefill-test.mjs` (which contradicts itself),
+`scripts/gemm-bench.mjs`, `docs/PAGING_PLAN.md`, `docs.html` and
+`hf-space/README.md` still say 64, and `scripts/chunk-cap-sweep.mjs` still
+frames 256 as the shipped cap; none are touched. BENCH.md's cap-1024 token
+identity result and its "pinned bit-exactly" note are scoped rather than
+retracted, and THREE stale qwen35 suite counts are deleted rather than
+incremented (`CLAUDE.md`'s and both of `BENCH.md`'s round-A ones);
+`docs/PAGING_PLAN.md` still carries two and is left for follow-up.
+`scripts/mutation-gate.mjs` is NOT concurrency-safe — it mutates
+`src/` in place, so two runs in one worktree each see a false red baseline.
+
 ### 2026-08-19 — the agentic loop at depth: three prompt bugs, none of them a kernel
 
 qwen36q3 through the station at ~24k tokens of history read all three files it

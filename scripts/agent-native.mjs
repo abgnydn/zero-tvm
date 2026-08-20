@@ -63,7 +63,8 @@ const REUSE = flag('reuse') !== '0'
 // token-identical to per-token, not bit-equal, so a divergence that appears
 // only with it on is a real finding rather than rounding.
 const CHUNK = flag('chunk') !== '0'
-// Chunk capacity in tokens (default 1024 with the matrix unit, 64 without).
+// Chunk capacity in tokens (default 1024 with the matrix unit, 64 without,
+// then clamped by the spec's maxChunkCap — qwen38 is quarantined at 256).
 // Exposed because varying it is the FAST way to test chunk-boundary defects:
 // both arms stay on the chunked path, so a 16k prompt costs seconds either way,
 // while the number of boundaries changes 16x. The per-token arm answers the
@@ -95,7 +96,8 @@ console.log(KV8
 if (EXPERTS) console.log(`[native] expert pool ${EXPERTS} slots/layer — saves RAM, but prefill runs PER TOKEN (no chunking)`)
 if (!REUSE) console.log('[native] cross-turn prefix reuse OFF (--reuse 0) — every turn re-prefills from zero')
 if (!CHUNK) console.log('[native] chunked prefill OFF (--chunk 0) — prompt runs token by token, much slower')
-if (CAP) console.log(`[native] chunk cap ${CAP} tokens (default is 1024 with the matrix unit)`)
+if (CAP) console.log(`[native] chunk cap ${CAP} tokens (default is 1024 with the matrix unit, `
+  + 'or the spec\'s maxChunkCap where it has one)')
 const { engine, tokenizer, spec, variants, info } = await createEngineRaw({
   model: param,
   ...(CTX ? { ctx: CTX } : {}),

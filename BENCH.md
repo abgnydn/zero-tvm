@@ -874,7 +874,8 @@ path untouched (`recordForward` unchanged; same 340 dispatches/token).
 `bench/results.json` untouched.
 
 1. **Chunked GDN prefill (Qwen3.5, `?chunk=0` opts out).** Prompt tokens
-   before the last run in chunks of ≤64: every projection (fused GDN
+   before the last run in chunks of ≤CHUNK_CAP (64 at the time of this round;
+   1024 on the matrix-unit path since 2026-08-15): every projection (fused GDN
    in_proj, out_proj, c_attn, o_proj, gate_up, down) becomes ONE
    `int4_matmul_batched_dyn` dispatch — the m=4 register block looping over
    runtime-M row blocks, unpacking each weight word once per 4 batch rows
@@ -888,8 +889,11 @@ path untouched (`recordForward` unchanged; same 340 dispatches/token).
    decode kernel, pinned in tests). FFN runs batched gate_up → `silu_mul` →
    batched down. ~394 dispatches per 64-token chunk ≈ **6.2/token vs 340**.
    Chunked-vs-per-token equality is pinned bit-exactly (f32 recurrent state
-   included) by `gdn_chunk_chain` in `tests/kernels/compile-qwen35.mjs`
-   (suite now 19/19). Requires sg32; falls back per-token otherwise.
+   included) by `gdn_chunk_chain` in `tests/kernels/compile-qwen35.mjs`.
+   Requires sg32; falls back per-token otherwise. **Scope, added 2026-08-20:**
+   that gate ran at SIX tokens against a shipped cap of 1024, so "pinned" meant
+   pinned at six. A 1024 arm exists now, still on qwen35 dims through
+   `batched_dyn` rather than the qwen38/E5 pair that actually fails.
 
    | Qwen3.5 prefill, 816-token prompt (median of 3) | prefill tok/s | TTFT |
    |---|---:|---:|
@@ -956,9 +960,9 @@ asserted with `?chunk=0`; with chunking on, the absorbed prefix was built
 by the batched-matmul kernels whose reduction order differs from the
 per-token GEMV, and the diff measures that variant numerics instead —
 max|Δ| 0.019 / mean 0.0023 on the 248k-logit vector, the same class as the
-sg-vs-scalar differences). Suites: kernels 28/28 + 21/21 + **19/19** (6 new
-chunked-prefill tests, incl. bit-exact chunk-vs-stepwise with f32 state),
-unit 287, e2e **13/13** (2 new multi-turn tests asserting turn-2 coherence
+sg-vs-scalar differences). Suites: kernels (6 new chunked-prefill tests, incl.
+bit-exact chunk-vs-stepwise with f32 state), unit, e2e (2 new multi-turn tests
+asserting turn-2 coherence
 AND that reuse actually engaged, per model family). Decode sanity after
 the round: 51.2 tok/s on a quick 2×64-token check (headline protocol
 unchanged — decode dispatches untouched).
@@ -2391,3 +2395,10 @@ Monotonic at 4k — the tile finally has rows to amortize. Token identity at
 1024 vs 256 held on all three chunk families (llama32, qwen35, qwen30b —
 2,600-token prompts, 64 generated, zero divergence). Non-sgmat machines stay
 at 64: unmeasured there. createEngineRaw exposes chunkCap for re-sweeps.
+
+**SUPERSEDED IN SCOPE 2026-08-20.** Read that identity result with its domain:
+three specs, 2,600-token prompts. qwen38 shipped later and breaks it — at ~16k
+it is correct per-token and at cap 256, and invents tool names at 1024. The
+mechanism is unfound; `ModelSpec.maxChunkCap` quarantines that spec at 256, so
+this table's 1024 column no longer describes what qwen38 runs. Nothing here is
+retracted for the three specs it was measured on.

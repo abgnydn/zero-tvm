@@ -308,6 +308,39 @@ export interface ModelSpecBase {
    * name from this — the loader has no other prefix knowledge.
    */
   mlxPrefix?: string
+  /**
+   * Ceiling on the prefill CHUNK_CAP for this spec, in tokens.
+   *
+   * Not a tuning knob — a QUARANTINE. Chunked prefill has never been bit-equal
+   * to the per-token path; the contract it is held to is empirical TOKEN
+   * IDENTITY, measured at specific caps. On qwen38 that fails: at ~16k the
+   * model answers correctly per-token and at cap 256, invents tool names at
+   * the shipped cap of 1024, and degrades to a generic greeting at 4096. The
+   * mechanism is not found yet (gdn_recur's barriers are correct, the prompt is
+   * byte-identical to the vendor jinja, int8 KV and cross-turn reuse are both
+   * cleared), so this bounds the damage where the bisection put the threshold
+   * rather than pretending to fix it.
+   *
+   * 256 is the largest cap TESTED correct, not a proven ceiling: 512 was never
+   * swept FOR CORRECTNESS at this depth (BENCH.md has it at 931.3 tok/s in the
+   * throughput sweep), so the threshold is somewhere in (256, 1024]. Nor is 24k retested
+   * under the quarantine — scripts/agentic-eval.mjs records qwen38 inventing
+   * mcp__tools__list_directory nine times at PAD=24000. Under a monotonic
+   * model, 256 is less wrong, not proven right.
+   *
+   * Delete this field from a spec only when a gate at the shipped cap is green
+   * FOR THAT SPEC. Today that is not runnable: compile-qwen35.mjs binds
+   * `const Q = QWEN35_4B` at module scope, so `gdn_chunk_chain_scale` cannot be
+   * pointed at qwen38 — parameterizing the suite by spec is the prerequisite
+   * (CLAUDE.md, Known gaps). The other half does run today, but only with the
+   * depth and cap spelled out: at the default PROMPT=150 the quarantined cap of
+   * 256 makes the prompt ONE chunk, and chunk-prefill-test refuses that outright
+   * ("crosses no boundary, so this proves nothing about chunking"), so the
+   * default invocation fails rather than passing for the wrong reason:
+   *
+   *   PROMPT=16000 CAP=1024 node scripts/chunk-prefill-test.mjs qwen38
+   */
+  maxChunkCap?: number
 }
 
 export interface ModelSpec extends ModelSpecBase {
@@ -1053,6 +1086,9 @@ export const QWEN3_8_27B_4BIT: ModelSpec = makeModelSpec({
   gdn: { kHeads: 16, vHeads: 48, headK: 128, headV: 128, convK: 4 },
   attnGate: true,
   partialRotaryFactor: 0.25,
+  // Quarantine, not tuning — see maxChunkCap. Bisected 2026-08-19: correct
+  // per-token and at 256, wrong at 1024, worse at 4096.
+  maxChunkCap: 256,
   paramNaming: mlxParamNaming("language_model."),
 })
 

@@ -111,7 +111,7 @@ opt-in) — see BENCH.md's Qwen sections for the measured WebLLM gap.
 node scripts/download-weights.mjs --model qwen3   # ~2.3 GB → .weights-local/
 npm run dev                                       # then zero-tvm.html?model=qwen3
                                                   #  or validate.html?model=qwen3
-npm run test:kernels:qwen                         # 21/21 compile + numerics (needs a GPU)
+npm run test:kernels:qwen                         # compile + numerics (needs a GPU)
 npm run test:e2e                                  # includes tests/e2e/qwen.test.ts —
                                                   # skips loudly if the mirror isn't primed
 BENCH_QUERY="?model=qwen3" npm run bench          # same-session A/B vs WebLLM's
@@ -130,7 +130,7 @@ kernels read regions via 256-aligned bind offsets — 340 dispatches/token),
 and the blocking `generate()` is **incremental** (a `gdnStatePos` tracker
 reuses the non-idempotent recurrent state when it matches `startPos`
 instead of replaying the prompt). Prompt PREFILL on the chat page is
-**chunked** (perf round A): tokens run in chunks of ≤64 — every projection
+**chunked** (perf round A): tokens run in chunks of ≤`CHUNK_CAP` — every projection
 one `int4_matmul_batched_dyn` dispatch (runtime M), rope/kv_append/conv/
 gates/norm batched, ONE `gdn_recur` dispatch per layer per chunk, causal
 `attention_prefill` for the 8 attention layers; `?chunk=0` opts out
@@ -165,8 +165,9 @@ at or below the divergence instead of prefilling from zero (~0.19-0.24 GB of
 VRAM). They are taken at chunk boundaries AND, since 2026-08-19, every 64 tokens
 on the per-token path — without that, any build that cannot chunk (a pooled MoE,
 a hybrid without subgroups, `?chunk=0`) kept an empty ring and got no reuse at
-all. Lookback is 4 x CHUNK_CAP, so ~4k tokens
-where the matrix unit gives cap 1024 and only ~256 on a browser without it. Agent clients that
+all. Lookback is 4 x CHUNK_CAP, so ~4k tokens where the matrix unit gives cap
+1024, ~1k on a spec quarantined to 256 (qwen38 — see below), and only ~256 on a
+browser without the matrix unit. Agent clients that
 rewrite a trailing metadata block every turn hit this constantly: measured
 392.50s → 12.76s. WebLLM A/B
 needs `@mlc-ai/web-llm` ≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84
@@ -176,7 +177,7 @@ prebuilt libs).
 node scripts/download-weights.mjs --model qwen35  # ~2.6 GB → .weights-local/
 npm run dev                                       # then zero-tvm.html?model=qwen35
                                                   #  or validate.html?model=qwen35
-npm run test:kernels:qwen35                       # 19/19 GDN + chunked-prefill kernels vs CPU reference
+npm run test:kernels:qwen35                       # GDN + chunked-prefill kernels vs CPU reference
 npm run test:e2e                                  # includes tests/e2e/qwen35.test.ts —
                                                   # skips loudly if the mirror isn't primed
 BENCH_QUERY="?model=qwen35" npm run bench         # same-session A/B vs WebLLM's
@@ -227,12 +228,17 @@ npm run test:kernels:real     # kernels vs mlx_lm's own modules on real weights
 
 ## Chunk-prefill GEMM (`chunkGemm`)
 
-The chunk path picks a GEMM: `sgmat` (E1 on Metal's matrix unit, the default
-where the device has `chromium-experimental-subgroup-matrix`) → `tiled` →
-`matvec`. `e5` is the same unit at a 64(M)x32(N) tile with a swizzled B —
-18-22% over E1 in isolation, **13-15% on real prefill** (BENCH.md, "Sweep
-round 3" and "E5 in the engine"). Opt-in until it passes token identity on an
-MLC-symmetric and a hybrid spec; neither checkpoint is on this disk.
+The chunk path picks a GEMM: **`e5` is the default since 2026-08-13** where the
+device has `chromium-experimental-subgroup-matrix`, degrading to `sgmat` (E1 on
+the same unit) when the cap does not tile by 64, else `matvec`. (`tiled` exists
+but is unreachable by default — nothing sets `chunkTiled`, and `wantGemm` never
+resolves to it on its own; it is an explicit `chunkGemm:'tiled'` only.) E5 is
+that unit at a 64(M)x32(N) tile with a swizzled B — 18-22% over E1 in isolation,
+**13-15% on real prefill** (BENCH.md, "Sweep round 3" and "E5 in the engine").
+It cleared the opt-in bar it was written under — token identity vs per-token
+prefill on llama32, qwen3mlx and qwen35 (both MLC-symmetric and hybrid GDN).
+`engine-core.ts` is the authority on the ladder; this paragraph said "opt-in"
+for a week after that stopped being true.
 
 An EXPLICIT `chunkGemm` that cannot run now **throws** instead of falling back.
 Silent substitution is how a kernel A/B measures the same code twice.
@@ -573,6 +579,35 @@ because it would read as coverage.
 
 ## Known gaps
 
+- **qwen38 chunked prefill corrupts at long context.** At ~16k the model is
+  correct per-token and at cap 256, invents tool names at the shipped cap of
+  1024, and loses the task at 4096. Cleared at a failing depth: the model
+  (mlx_lm), the prompt (byte-identical to the vendor jinja), int8 KV, cross-turn
+  reuse, retrieval. `gdn_recur`'s workgroup barriers are correct. The mechanism
+  is NOT found; `ModelSpec.maxChunkCap` quarantines the spec at 256, which cuts
+  the rewind ring's lookback to ~1k and costs prefill throughput — how much on
+  qwen38 is UNMEASURED; the nearest sweep (llama32 at 4k, which is not clamped)
+  reads ~13% between those caps. 512 was never swept FOR CORRECTNESS at this
+  depth, so the threshold is somewhere in (256, 1024], and 24k is untested under the
+  quarantine.
+- **The scale gates still do not reach that configuration.**
+  `gdn_chunk_chain_scale` runs at 1024 but on qwen35's dims through
+  `int4_matmul_batched_dyn`, and the kernel harness never requests the
+  subgroup-matrix feature. Cap 1024 is reached by DEFAULT only where that
+  feature exists, which is exactly when the engine picks E5 — so the arm and the
+  configuration that fails never coincide. `attention_prefill`
+  is still 5 tokens against a shipped 1024 and `validate-model` ~20 against 32k.
+  Closing this needs the suite parameterized by spec plus a matrix-unit arm.
+- **CI runs one of the kernel suites, and a running one can still report PASS
+  for tests it did not execute.** `test:kernels:qwen35` — where the new scale
+  arm lives — runs only in a human's shell. When it does run, `skip()` returns
+  `pass: true`, so a machine without 32-lane subgroups reports PASS per test
+  while running nothing; read the detail strings, not the count. With no adapter
+  at all it exits 1, which is correct and was briefly documented here as exit 0
+  — a claim taken from a review without being run. UNRUN is not a pass, and
+  neither is an unverified claim about what UNRUN does.
+- **`scripts/mutation-gate.mjs` is not concurrency-safe.** It mutates `src/` in
+  place, so two runs in one worktree each see a false red baseline.
 - **No ESLint.** Fixed 2026-08-10: ci.yml calls `npm run typecheck` directly
   and the misleading `lint` alias is gone. An actual ESLint config is still a
   future addition — `biome` is the house choice per the global setup.

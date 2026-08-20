@@ -31,6 +31,14 @@ const arg = process.argv[2]
  *  that silently passes, which is the failure this file exists to prevent. */
 const MUTATIONS = [
   {
+    id: 'chunk-quarantine',
+    defect: "the per-spec chunk-cap ceiling ignored, so qwen38 defaults to 1024 again",
+    shipped: 'invented tool names at ~16k, correct at cap 256 and per-token',
+    file: 'src/zero-tvm/engine-core.ts',
+    find: '  return Math.min(sgmatAvail ? 1024 : 64, spec.maxChunkCap ?? Infinity)',
+    replace: '  return sgmatAvail ? 1024 : 64',
+  },
+  {
     id: 'think-block',
     defect: 'the empty <think> block back on EVERY past assistant turn',
     shipped: 'rendered a prompt no Qwen template produces; 286 spurious blocks at 24k',
