@@ -290,7 +290,11 @@ const check = (name, detail, pass) => results.push({ name, detail, pass })
 }
 
 if (!existsSync(CKPT)) {
-  console.log(`SKIP  mlx repack — no checkpoint at ${CKPT}`)
+  // Routed through `check` so the summary can SEE it. It used to print straight
+  // to stdout, so the tally below counted one skip while two were displayed —
+  // a summary that undercounts the very thing it was just changed to report.
+  // Caught by a reviewer noticing the two numbers disagreed on screen.
+  check('mlx repack', `no checkpoint at ${CKPT}`, null)
   console.log('      huggingface-cli download lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit '
     + `--local-dir ${CKPT}`)
 } else {
@@ -488,5 +492,21 @@ for (const r of results) {
   if (r.pass === false) failed++
   console.log(`${tag}  ${r.name.padEnd(28)} ${r.detail}`)
 }
-console.log(`\n${failed === 0 ? 'mlx repack correct' : `${failed} repack check(s) FAILED`}`)
+// "correct" for ZERO checks is the lie this repo exists to stop telling. With
+// no checkpoint on disk every case skips, `failed` is 0, and this printed "mlx
+// repack correct" and exited 0 — while lefthook.yml names this suite as a gate
+// and release-check.mjs labels it `needs: 'gpu'`. A reader, and a script, both
+// read that as a pass.
+//
+// Exit 0 stays: a 20 GB checkpoint being absent is a legitimate skip, and
+// failing CI over it would train people to ignore the exit code. What changes
+// is that the SUMMARY says what happened. UNRUN is not a pass — but it is not a
+// failure either, and the honest word for it is SKIPPED.
+// A SKIP is not a check. `results.length` counts them, so counting it would
+// reproduce the same lie one level down.
+const ran = results.filter((r) => r.pass !== null).length
+const skipped = results.length - ran
+console.log(`\n${failed > 0 ? `${failed} repack check(s) FAILED`
+  : ran === 0 ? `SKIPPED — 0 checks ran (${skipped} skipped); this suite verified NOTHING`
+  : `mlx repack correct — ${ran} check(s) ran, ${skipped} skipped`}`)
 process.exit(failed === 0 ? 0 : 1)
