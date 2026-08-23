@@ -37,6 +37,7 @@ import {
   addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
 import { specForParam } from './model-registry.js'
+import { ENGINE_GPU_FEATURES } from './variants.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
 import { fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
 import { serveStage } from './pipeline-peer.js'
@@ -229,7 +230,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   // scalar validation path.
   const boot = await loadingUi.bootEngine({
     spec,
-    optionalFeatures: ['subgroups' as GPUFeatureName],
+    optionalFeatures: ENGINE_GPU_FEATURES,
     probeSubgroups: true,
     layerRange: stageRange ?? undefined,
     ...(poolSlots ? { expertPool: poolSlots } : {}),
@@ -362,7 +363,7 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
 
   const boot = await loadingUi.bootEngine({
     spec,
-    optionalFeatures: ['subgroups' as GPUFeatureName],
+    optionalFeatures: ENGINE_GPU_FEATURES,
     probeSubgroups: true,
     layerRange: range,
     buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {

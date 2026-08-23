@@ -196,10 +196,24 @@ const readJson = (req) => new Promise((resolve, reject) => {
   req.on('end', () => { try { resolve(b ? JSON.parse(b) : {}) } catch (e) { reject(e) } })
 })
 
+// See agent-server.mjs for why `*` was wrong here: a wildcard lets any page
+// the user has open read this server's endpoints from the browser, and this one
+// proxies /v1 to the engine.
+const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/
+
 createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
-  res.setHeader('access-control-allow-origin', '*')
-  res.setHeader('access-control-allow-headers', 'content-type, authorization')
+  const origin = req.headers.origin
+  if (origin !== undefined) {
+    if (!LOCAL_ORIGIN.test(origin)) {
+      res.writeHead(403, { 'content-type': 'text/plain' })
+        .end(`origin ${origin} is not allowed; this server serves localhost pages only\n`)
+      return
+    }
+    res.setHeader('access-control-allow-origin', origin)
+    res.setHeader('vary', 'origin')
+    res.setHeader('access-control-allow-headers', 'content-type, authorization')
+  }
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return }
 
   // The UI.

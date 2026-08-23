@@ -91,6 +91,51 @@ export interface VariantFlags {
 }
 
 /** Everything scalar / off — the reference path validate.ts runs on. */
+/**
+ * The GPU features EVERY inference surface must request.
+ *
+ * This was an `optionalFeatures` parameter of bootEngine, and the six callers
+ * asked for six different things — so the repo shipped six engines and said it
+ * shipped one:
+ *
+ *   chat-flow    subgroups + subgroup-matrix (+ timestamp-query)  -> cap 1024, E5
+ *   share host   subgroups only                                   -> cap 64, batched_dyn
+ *   share stage  subgroups only                                   -> cap 64, batched_dyn
+ *   agent-host   subgroups + subgroup-matrix                      -> cap 1024, E5
+ *   validate     NOTHING                                          -> scalar everything
+ *   lib          subgroups + subgroup-matrix                      -> cap 1024, E5
+ *
+ * Three live consequences. share.ts says "the two hosting surfaces cannot
+ * drift" and "same engine composition as chat.ts" while running a different
+ * prefill GEMM at a different chunk cap. That the cap can change TOKENS at long
+ * context is recorded in scripts/chunk-prefill-test.mjs — qwen38 at 16k emits a
+ * tool name that was never offered where per-token on the same prompt does not,
+ * and it worsens with chunk size. The CHUNK_CAP docstring below says tokens are
+ * identical at every cap, which is true for the three specs it was measured on
+ * and is why the qwen38 result is recorded separately. validate.html,
+ * whose copy says it checks that the live chat path generalises, shares
+ * approximately no kernels with it, and — because the MoE probe needs a
+ * `subgroups` feature it never requested — refuses every MoE model at 3%. And
+ * timestamp-query is suspected of serialising Metal command execution, so
+ * requesting it on one path and not another makes those two paths'
+ * measurements incomparable.
+ *
+ * Adding a feature here adds it everywhere, which is the point. Each is still
+ * requested only if the adapter has it (bootEngine filters).
+ */
+export const ENGINE_GPU_FEATURES: GPUFeatureName[] = [
+  'subgroups' as GPUFeatureName,
+  // The matrix unit. Gates sgmat/E5 and, through sgmatAvail, CHUNK_CAP 1024.
+  'chromium-experimental-subgroup-matrix' as GPUFeatureName,
+]
+
+/** Profiling only. Kept OUT of the shared list: it is suspected of serialising
+ *  Metal command execution, so a surface that requests it is not measuring the
+ *  same machine as one that does not. Opt in per run, never by default. */
+export const PROFILE_GPU_FEATURES: GPUFeatureName[] = [
+  'timestamp-query' as GPUFeatureName,
+]
+
 export const SCALAR_VARIANTS: VariantFlags = {
   subgroups: false,
   sgAttn: false,
@@ -222,13 +267,21 @@ export function resolveMatmul(
     if (wide === 'vec4h' && variant !== 'scalar' && P.int4MatmulTiledVec4hAffine && P.int4MatmulF32TiledVec4hAffine) {
       return { pipeline: P.int4MatmulTiledVec4hAffine, pipelineF32: P.int4MatmulF32TiledVec4hAffine, rowsPerWG: 4, label: 'tiled_vec4h_affine' }
     }
-    if (wide === 'vec4h' && P.int4MatmulSgVec4hAffine && P.int4MatmulF32SgVec4hAffine) {
+    // `variant !== 'scalar'` on the sg rungs too. Without it ?matmul=scalar
+    // could not reach scalar on ANY MLX checkpoint: the tiled rungs honoured it
+    // and these two did not, so a subgroup-capable device — the chat page's
+    // default — answered with sg_vec4h_affine or sg_affine. That silently
+    // disabled the one bisection lever aimed at kernel wrongness, on exactly
+    // the models most likely to need it (llama32, qwen3mlx, qwen35mlx, qwen36,
+    // qwen38). ?sg=0 still worked, but by never compiling the pipeline rather
+    // than by resolving, which is a different question.
+    if (wide === 'vec4h' && variant !== 'scalar' && P.int4MatmulSgVec4hAffine && P.int4MatmulF32SgVec4hAffine) {
       return { pipeline: P.int4MatmulSgVec4hAffine, pipelineF32: P.int4MatmulF32SgVec4hAffine, rowsPerWG: 1, label: 'sg_vec4h_affine' }
     }
     if (variant !== 'scalar' && P.int4MatmulTiledAffine && P.int4MatmulF32TiledAffine) {
       return { pipeline: P.int4MatmulTiledAffine, pipelineF32: P.int4MatmulF32TiledAffine, rowsPerWG: 4, label: 'tiled_affine' }
     }
-    if (P.int4MatmulSgAffine && P.int4MatmulF32SgAffine) {
+    if (variant !== 'scalar' && P.int4MatmulSgAffine && P.int4MatmulF32SgAffine) {
       return { pipeline: P.int4MatmulSgAffine, pipelineF32: P.int4MatmulF32SgAffine, rowsPerWG: 1, label: 'sg_affine' }
     }
     return { pipeline: P.int4MatmulAffine, pipelineF32: P.int4MatmulF32Affine, rowsPerWG: 1, label: 'scalar_affine' }

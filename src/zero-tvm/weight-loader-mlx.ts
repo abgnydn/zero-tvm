@@ -335,11 +335,39 @@ export async function assembleMlx(
     }
 
     let data: Uint8Array<ArrayBuffer>
+    // A cache entry of the wrong size is a stale or torn write, and its bytes
+    // are believable — this is slab-source.ts's rule applied to the buffer
+    // path, which did not have it.
+    //
+    // The specific way it bit: cacheWrite is fire-and-forget, and opfsWrite
+    // creates the directory entry BEFORE writing. Close the tab mid-download
+    // and OPFS keeps zero-length entries. `cached` is then a 0-byte
+    // ArrayBuffer, which is TRUTHY, so the else-branch never re-fetches it —
+    // the entry is permanent. A zero-SIZE buffer is legal per the WebGPU spec —
+    // createBuffer has no size > 0 rule and zero-fills every allocation — but a
+    // bind group entry whose bound range has zero size is not: createBindGroup
+    // rejects it, the encoder is invalidated, and WebGPU discards the whole
+    // submit. The model then emits fluent text from a buffer the submit never
+    // wrote. No throw, no console line, and (before this commit) no
+    // uncapturederror listener in any shipped build input. The MLC loader never
+    // had this hole: it sizes from rec.nbytes in the manifest and RangeErrors
+    // on a short shard.
+    const want = planBytes(plan,
+      (r: string) => { const l = locate(r); return l.end - l.begin },
+      (r: string) => locate(r).info.dtype)
     const cached = await hooks.cacheRead?.(key)
-    if (cached) {
+    if (cached && cached.byteLength === want) {
       data = new Uint8Array(cached) as Uint8Array<ArrayBuffer>
     } else {
+      if (cached) {
+        console.warn(`[weights] ${key}: cached ${cached.byteLength} B, expected ${want} B — `
+          + 'torn or stale entry, refetching and overwriting')
+      }
       data = await buildPlan(plan, locate, src)
+      if (data.byteLength !== want) {
+        throw new Error(`assembleMlx: ${key} built ${data.byteLength} B, expected ${want} B — `
+          + 'the plan and the checkpoint disagree; refusing to upload a buffer of the wrong size')
+      }
       hooks.cacheWrite?.(key, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))
     }
 

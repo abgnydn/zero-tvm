@@ -26,7 +26,7 @@
 
 import { bootEngine } from './loading-ui.js'
 import { buildDecodeEngine, allocKVFor } from './engine-core.js'
-import { parseVariantFlags, type VariantFlags } from './variants.js'
+import { parseVariantFlags, ENGINE_GPU_FEATURES, type VariantFlags } from './variants.js'
 import { poolSave, poolTryRestore, type PoolConfig } from './kv-pool.js'
 import { specFromSearch, buildChatPromptFor, modelBranding } from './model-select.js'
 import {
@@ -50,8 +50,27 @@ interface Job {
   stop: string[] | null
 }
 
-const SERVER = new URL(location.href).searchParams.get('server')
-  ?? 'http://127.0.0.1:8017'
+/** `?server=` is operator convenience for a non-default port, NOT a way to
+ *  point this page at an arbitrary host. agent-host.html is a production build
+ *  input and public/_headers sets no CSP, so an unvalidated value here means a
+ *  link can aim the page — and the consent dialog still says "127.0.0.1:8017"
+ *  while it does. Localhost only; anything else falls back to the default. */
+const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])$/
+const DEFAULT_SERVER = 'http://127.0.0.1:8017'
+const SERVER = ((): string => {
+  const raw = new URL(location.href).searchParams.get('server')
+  if (!raw) return DEFAULT_SERVER
+  try {
+    const u = new URL(raw)
+    // Scheme AND host. `javascript://localhost/x` and `ftp://localhost/x` both
+    // pass a hostname-only check — the first yields origin "null".
+    if ((u.protocol === 'http:' || u.protocol === 'https:') && LOCAL_HOST.test(u.hostname)) return u.origin
+    console.warn(`[agent-host] ignoring ?server=${raw} — not a localhost origin`)
+  } catch {
+    console.warn(`[agent-host] ignoring ?server=${raw} — not a URL`)
+  }
+  return DEFAULT_SERVER
+})()
 
 const el = (id: string) => document.getElementById(id)!
 const setStatus = (t: string, cls = '') => { const s = el('status'); s.textContent = t; s.className = cls }
@@ -144,7 +163,7 @@ async function main(): Promise<void> {
   await confirmBoot()
   const boot = await bootEngine({
     spec,
-    optionalFeatures: ['subgroups', 'chromium-experimental-subgroup-matrix' as GPUFeatureName],
+    optionalFeatures: ENGINE_GPU_FEATURES,
     probeSubgroups: true,
     // The default boot is the SCALAR composition — no subgroups, no chunked
     // prefill. This surface exists for agents, where prefill dominates, so it

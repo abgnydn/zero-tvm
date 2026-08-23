@@ -115,13 +115,49 @@ function dispatch(job) {
   vlog(`-> tab  job ${job.id.slice(0, 8)} (${job.request.messages.length} messages)`)
 }
 
+// Origins allowed to reach this server. `*` was wrong, and binding 127.0.0.1
+// does not save it: EventSource is a SIMPLE CORS GET, so any page the user has
+// open could `new EventSource('http://127.0.0.1:8017/agent/jobs')`, EVICT the
+// real host tab (the handler below ends the previous host on connect), and
+// then receive every job — i.e. every prompt Claude Code or pi sends, file
+// contents included. The threat is a page in the user's browser, not a remote
+// socket, and same-origin policy does not cover a wildcard.
+//
+// Localhost origins only, any port: the dev server moves (5173, 4173, 8017)
+// and pinning one would break `npm run dev`.
+const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/
+function applyCors(req, res) {
+  const origin = req.headers.origin
+  // No Origin header is NOT proof of a native client: a no-cors GET — <img src>,
+  // <script src>, fetch(mode:'no-cors') — omits it too. Such a request cannot
+  // READ the response, but /agent/jobs EVICTS the current host on connect, so a
+  // drive-by page could still knock the real tab off the server without ever
+  // seeing a byte. Browsers always send Sec-Fetch-Site and a page cannot forge
+  // it; a native client sends neither header, which is the case we allow.
+  const site = req.headers['sec-fetch-site']
+  if (origin === undefined) {
+    if (site === undefined) return true          // curl / pi / a native client
+    if (site === 'same-origin' || site === 'same-site' || site === 'none') return true
+    res.writeHead(403, { 'content-type': 'text/plain' })
+      .end(`cross-site request (sec-fetch-site: ${site}) is not allowed\n`)
+    return false
+  }
+  if (!LOCAL_ORIGIN.test(origin)) {
+    res.writeHead(403, { 'content-type': 'text/plain' })
+      .end(`origin ${origin} is not allowed; this server serves localhost pages only\n`)
+    return false
+  }
+  res.setHeader('access-control-allow-origin', origin)
+  res.setHeader('vary', 'origin')
+  res.setHeader('access-control-allow-headers', 'content-type, authorization')
+  return true
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`)
   const path = url.pathname
 
-  // CORS so the vite-served page on :5173 can reach this on :8017.
-  res.setHeader('access-control-allow-origin', '*')
-  res.setHeader('access-control-allow-headers', 'content-type, authorization')
+  if (!applyCors(req, res)) return
   if (req.method === 'OPTIONS') { res.writeHead(204).end(); return }
 
   // ---- the browser host ---------------------------------------------------

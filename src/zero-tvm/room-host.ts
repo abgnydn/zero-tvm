@@ -192,13 +192,23 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
     if (!next) return
     generating = true
     const { guest, req } = next
-    const preview = req.messages.at(-1)?.content.slice(0, 80) ?? ''
-    const st = ui.row(guest, preview)
-    // One engine, one owner: if the host's own chat is mid-reply, this guest
-    // waits — visibly — instead of interleaving into the same KV cache.
-    if (opts.lock?.held()) st('waiting — the host is chatting…')
-    await opts.lock?.acquire()
+    // The preview slice and the lock acquisition are inside the try; the
+    // `generating` flag above is reset by the finally either way. It was not:
+    // the preview sat outside, so a guest sending
+    // {"type":"chat","id":1,"messages":[{}]} threw on `.content.slice` and
+    // wedged the host permanently — every later request from every guest
+    // queued forever, with `void pump()` swallowing the rejection and no error
+    // reaching anyone. onGuestMessage only validates Array.isArray(messages).
+    let st: (s: string) => void = () => {}
+    let tok: number | undefined
     try {
+      const last = req.messages.at(-1)?.content
+      const preview = typeof last === 'string' ? last.slice(0, 80) : ''
+      st = ui.row(guest, preview)
+      // One engine, one owner: if the host's own chat is mid-reply, this guest
+      // waits — visibly — instead of interleaving into the same KV cache.
+      if (opts.lock?.held()) st('waiting — the host is chatting…')
+      tok = await opts.lock?.acquire()
       const promptIds = encode(req.messages)
       // The per-reply cap is the KV room the prompt leaves behind, not a
       // magic constant — same rule as chat.ts.
@@ -228,7 +238,13 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
       send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
       st('error')
     } finally {
-      opts.lock?.release()
+      // ONLY if we actually took it. `tok` is undefined when the throw happened
+      // above the acquire (ui.row can), and release(undefined) skips the token
+      // check — so an unconditional release here hands the engine to a queued
+      // waiter while the real holder still believes it holds. That is the exact
+      // two-holder interleave this whole change removes, reintroduced by the
+      // change itself; caught by a review that ran it rather than read it.
+      if (tok !== undefined) opts.lock?.release(tok)
       generating = false
       ui.onBusy?.(false)
       void pump()
