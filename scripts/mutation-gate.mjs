@@ -37,6 +37,7 @@ const arg = process.argv[2]
 const MUTATIONS = [
   {
     id: 'chunk-quarantine',
+    expect: 'chunk-cap-quarantine.test.ts',
     defect: "the per-spec chunk-cap ceiling ignored, so qwen38 defaults to 1024 again",
     shipped: 'invented tool names at ~16k, correct at cap 256 and per-token',
     file: 'src/zero-tvm/engine-core.ts',
