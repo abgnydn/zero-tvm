@@ -7,6 +7,165 @@ from `0.1.0`.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-25
+
+### 2026-08-24 — main had been red for six days behind a green local suite
+
+`scripts/native/shims.mjs` imports `webgpu` for dawn.node. The package was in
+neither `package.json` nor `package-lock.json` — it existed only as an unsaved
+`npm i --no-save webgpu`. So `npm ci` never installed it, and
+`tests/unit/native-opfs-shim.test.ts` failed with three `ERR_MODULE_NOT_FOUND`
+on every CI run from `959b9ed` onward, the commit that added the test, whose own
+run failed on 2026-08-17. On any machine carrying the unsaved install the same
+test passed. The check ran, and reported green exactly where the package
+happened to be present.
+
+Declaring it fixes it: on a clean `npm ci`, typecheck, `test:unit` and build all
+exit 0; hiding `node_modules/webgpu` reproduces CI's failure exactly. npm's
+script-blocking default is harmless here — `webgpu@0.4.0` ships its Dawn
+binaries in `dist/`.
+
+Not changed: which package the native path uses. `@kmamal/gpu` is already a
+devDependency and closer than it looks — same `enable-dawn-features` array,
+and it spreads the same globals onto its export rather than exposing a `globals`
+object — but switching changes which Dawn build the native host loads, which
+moves measurement conditions.
+
+Note for anyone reading the suites: they do not share a provider.
+`test:kernels`, `:qwen`, `:qwen35`, `:spec` and `:real` take their adapter from
+`@kmamal/gpu` via `tests/kernels/gpu.mjs` and need no install. `test:kernels:mlx`
+uses neither — `mlx-repack.mjs` is byte-exact repack arithmetic off the
+safetensors shards, "No GPU, no tolerance". `test:kernels:sgmat` runs
+`gemm-sweep-native.mjs`, which goes through the same `shims.mjs` as the native
+host and so does need the `webgpu` package — `npm ci` now provides it.
+
+### 2026-08-24 — the release checklist dropped a row it could not run
+
+`release-check.mjs` tags each check PASS, FAIL, UNRUN or MISSING. MISSING — set
+when a check's `cwd` does not exist — was pushed into `results` and referenced
+nowhere after: not printed, not tallied, not listed. With no sibling
+`sites-shared` checkout the `facts registry` row simply vanished, the run
+reported one fewer check than it holds, and it still exited 0. UNRUN was loud by
+design; MISSING was silent.
+
+It surfaced by producing a wrong published number — a draft of this release note
+said the checklist "names twelve rows", read off a run where the row had been
+swallowed. MISSING now prints with the path it wanted, gets its own summary
+line, and the tally states the total so a short list shows up as arithmetic.
+`tests/unit/release-check-accounting.test.ts` asserts that every status the
+script can assign appears in its reporting half.
+
+### 2026-08-24 — a mutation the gate could not check, from a merge git could not see
+
+Two branches, each green alone. One added the `chunk-quarantine` mutation; the
+other added `expect` — the test file that must be among the failures, not merely
+THAT the suite went red — and filled it in for the nine entries on its own side.
+Neither could know about the other's line and the textual merge was clean.
+Merged, `MUTATIONS` held ten entries with exactly one missing `expect`, and
+`!run.failed.includes(undefined)` is always true, so the gate reported
+`WRONG CHECK — expected undefined` and main went red on the very job the second
+branch had added.
+
+The coverage was never wrong; `chunk-cap-quarantine.test.ts` is exactly the file
+that fired. Naming it gives `10/10 mutations without holes` — established, not
+restored: no earlier commit could have printed that line.
+
+The gate's own config was the one thing the gate did not gate, so
+`tests/unit/mutation-gate-config.test.ts` now asserts that every mutation names
+an `expect` and that the file exists. Seen red before it was trusted. It reads
+`mutation-gate.mjs` as text and never imports it — that file runs at module
+scope and ends in `process.exit`, so importing it from a test would rewrite
+`src/` mid-suite and kill the runner.
+
+Left alone: the message printed for a missing `expect` still talks about a test
+named "undefined". Its wording deserves its own change.
+
+### 2026-08-23 — the gates this repo believed it had
+
+CI ran typecheck, unit, build and the lavapipe kernel job, and stopped. The
+mutation gate and the release checklist both existed, both were good, and
+nothing forced either. Measured at ~40s, so the gate runs on every PR;
+`release-check.mjs --list` runs beside it as a report, not a gate, so the
+GPU-only checks stay visible in the log rather than in someone's memory.
+
+The mutation gate proved only that the suite went red SOMEWHERE. A mutation
+caught by a downstream test is a hole reporting green: the check whose name
+claims that defect never fired. Each mutation now names the file that must be
+among the failures, `WRONG CHECK` is reported distinctly from `NOT CAUGHT` and
+counted as a hole, and an unreadable vitest report exits 2 rather than falling
+back to the weaker claim. Every value was derived by running the gate and
+reading which files failed.
+
+Nothing asked whether a new spec is dispositioned everywhere. Five test files
+already iterate `SHIPPED_MODELS`, each checking one property well;
+`tests/unit/registry-disposition.test.ts` asks the other question — can a
+twelfth spec land with no branding, a chat template nothing renders, or
+dimensions the ingest checker would have refused, and still go green? It could.
+`toolDialectFor` returns `chatml-json` for any id it does not recognise and
+`modelBranding` returns Phi-3's card for any id it does not know; both are
+silent fall-throughs, and a first draft of the test asserted tautologies over
+them.
+
+`test:kernels:mlx` printed "mlx repack correct" having run almost nothing. Its
+summary now names what happened. Two siblings with the same shape,
+`needle-test.mjs` and `agentic-eval.mjs`, are NOT fixed.
+
+### 2026-08-23 — a damaged weight cache produced fluent text from a buffer nothing wrote
+
+`weight-loader-mlx` sized a GPU buffer from the length of whatever file it found
+in OPFS. `cacheWrite` is fire-and-forget and `opfsWrite` creates the entry
+before writing, so a tab closed mid-download leaves a zero-length file — which
+is truthy, so the refetch branch never ran and the entry was permanent. A
+zero-SIZE buffer is legal and zero-filled; what is illegal is a bind group entry
+with a zero-size range, which invalidates the encoder and makes WebGPU discard
+the submit. Generation then continued on a buffer submit never wrote. No throw,
+no console line, no badge. No gate could reach it — every harness starts from a
+clean or complete cache — and the guard was already written in the slab path,
+while the MLC loader sizes from the manifest and raises on a short shard. The
+silent path served 8 of the 11 shipped specs.
+
+The cache read now checks against `planBytes()` — defined in `mlx-weights.ts`
+and already called 166 lines above the read, in the function that reports the
+download size — and refetches on a mismatch. `loading-ui` gains an
+`uncapturederror` listener; no shipped build input had one. `opfsDirFor` folds
+in an optional `weightsRevision`, set on `qwen36q3`, because a directory keyed
+by `spec.id` alone is a name rather than a fact about bytes. That costs every
+warm client of the 35B MoE one re-download, and the stale directory is not
+swept: the sweep matches `zero-tvm-weights-` with a dash while MLX directories
+use a dot, so no MLX weight directory has ever been swept.
+
+Also in this pass: `room-host` set `generating = true` outside its `try`, so
+`{"type":"chat","messages":[{}]}` from any guest wedged the host permanently on
+both hosting surfaces; `engine-lock.release()` took no argument and checked
+nothing, so a double release with two waiters granted the lock to two holders —
+the exact interleave the file exists to prevent, and the first fix of it
+reintroduced the bug, found by a reviewer who ran it rather than read it. The
+lock had never had a test despite being pure and synchronous.
+
+`agent-server` and `station` both sent `access-control-allow-origin: *` with no
+auth; `EventSource` is a simple CORS GET, so a cross-origin page could read the
+job stream. Chrome 142's Local Network Access narrows the realistic reach, and
+the wildcard was still wrong. A second hole survived the first fix: a no-cors
+GET sends no `Origin` at all and still reached the handler that evicts the host
+tab. `Sec-Fetch-Site` cannot be forged by a page, so a cross-site request is
+refused while a native client passes. `?server=` now validates scheme and host.
+
+`?matmul=scalar` could not reach scalar on any MLX checkpoint — the affine
+ladder's two `sg` rungs did not consult `variant` — which is the one bisection
+lever aimed at silent kernel wrongness, dead on the models most likely to have
+it. The test that should have caught it hand-typed 40 of the interface's 94
+fields and asserted the negation of shipped behaviour.
+
+`optionalFeatures` was a parameter of `bootEngine` and six callers invented four
+lists, producing three engine compositions: `share.ts` claimed the two hosting
+surfaces "cannot drift" while running a different prefill GEMM at a different
+chunk cap, `validate.ts` requested nothing so `validate.html` refused every MoE
+model, and `timestamp-query` — suspected of serialising Metal command execution
+— was requested on the chat page and not the native path, so BENCH.md compares
+numbers taken under different conditions. `ENGINE_GPU_FEATURES` and
+`PROFILE_GPU_FEATURES` now live in `variants.ts`; `?profile=1` is the only way
+to opt into the timer.
+
 ### 2026-08-20 — qwen38's chunked prefill quarantined at 256; the chunking gate ran at six tokens
 
 On qwen38, chunked prefill and the per-token path disagree at long context. The
@@ -564,5 +723,6 @@ attention + page-table read combined).
   to the same model size.
 - [kernelfusion.dev](https://kernelfusion.dev) — research umbrella.
 
+[0.3.0]: https://github.com/abgnydn/zero-tvm/releases/tag/v0.3.0
 [0.2.0]: https://github.com/abgnydn/zero-tvm/releases/tag/v0.2.0
 [0.1.0]: https://github.com/abgnydn/zero-tvm/releases/tag/v0.1.0
