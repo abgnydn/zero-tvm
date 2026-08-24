@@ -100,8 +100,10 @@ export interface CreateEngineOptions {
    *  epsilon the chunked prefill leaves in KV flipped thin-margin argmaxes
    *  hundreds of tokens later — which was then reported as a pooling bug. */
   chunkedPrefill?: boolean
-  /** Chunk capacity in tokens (DecodeEngineOptions.chunkCap; default 256 with
-   *  the matrix unit, 64 without). Exposed for the CHUNK_CAP sweep. */
+  /** Chunk capacity in tokens (DecodeEngineOptions.chunkCap; default 1024 with
+   *  the matrix unit, 64 without, then clamped by the spec's `maxChunkCap`).
+   *  Exposed for the CHUNK_CAP sweep, which must be able to cross that clamp,
+   *  so an explicit value here is honoured above it. */
   chunkCap?: number
   /** Cross-turn prefix reuse on/off (DecodeEngineOptions.prefixReuse — the
    *  chat page's ?reuse=0). The native host had no way to turn it off, so

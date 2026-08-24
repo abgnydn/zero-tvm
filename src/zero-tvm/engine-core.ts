@@ -168,6 +168,47 @@ export function resolveInt8Mode(
   return opts.int8KV ?? variants.int8KV ?? false
 }
 
+/**
+ * How many prompt tokens go in one prefill chunk. The one place a DEFAULT cap
+ * is derived — but not the last word on the shipped one: a pooled MoE build is
+ * clamped again to 16 downstream (`const C = pooling ? ...`), and the chunk loop
+ * slices by THAT. Downstream only ever lowers the cap.
+ *
+ * Extracted for the same reason resolveInt8Mode was the day before: a test that
+ * restates a branch cannot see the branch change. That happened twice in one
+ * day on two different functions — resolveInt8Mode here, and the KV figure in
+ * landing.ts, whose first test copied the formula out of it. This extraction is
+ * preventive rather than a third incident. The mutation gate reinstates the
+ * pre-quarantine version of this function and the unit test must go red.
+ *
+ * `maxChunkCap` is a per-spec QUARANTINE, not tuning. Chunked prefill has never
+ * been bit-equal to per-token; what it is held to is empirical TOKEN IDENTITY,
+ * and on qwen38 that fails at ~16k (correct per-token and at 256, invents tool
+ * names at 1024, loses the task at 4096). It clamps the DEFAULT only — an
+ * explicit cap is honoured as asked, because the sweep that located the
+ * threshold has to be able to cross it, and silently clamping a diagnostic is
+ * how an A/B ends up measuring the same code twice.
+ *
+ * It is not free. The cap sweep CLOSEST to this configuration (BENCH.md,
+ * llama32, 4,096-token prompt, medians of 3 — there are two earlier ones at 800
+ * tokens) reads 844.7 tok/s at 256 against 972.1 at 1024, so the clamp costs
+ * about 13% of prefill on THAT spec at THAT length; qwen38's own cost is
+ * unmeasured. It also cuts the GDN rewind ring's lookback, 4 x CHUNK_CAP, from
+ * ~4k tokens to ~1k. What that ring buys was measured on a different spec — a
+ * qwen36q3 agent session, 392.50s cold to 12.76s (CHANGELOG) and 26.30s on the
+ * turns after (BENCH.md) —
+ * and qwen36q3 is not quarantined, so its lookback is untouched. qwen38's reuse
+ * cost under the clamp is unmeasured too.
+ */
+export function resolveChunkCap(
+  opts: { chunkCap?: number },
+  spec: { maxChunkCap?: number },
+  sgmatAvail: boolean,
+): number {
+  if (opts.chunkCap != null) return opts.chunkCap
+  return Math.min(sgmatAvail ? 1024 : 64, spec.maxChunkCap ?? Infinity)
+}
+
 export function allocKVFor(
   device: GPUDevice,
   spec: ModelSpec,
@@ -451,8 +492,9 @@ export interface DecodeEngineOptions {
   /**
    * Chunked GDN prefill (hybrid specs; default true; ?chunk=0 disables).
    * Requires the subgroups pipelines (int4_matmul_batched_dyn). Prompt
-   * tokens before the last are processed in chunks of up to 64: batched
-   * projections + one gdn_recur dispatch per layer per chunk.
+   * tokens before the last are processed in chunks of up to CHUNK_CAP
+   * (resolveChunkCap): batched projections + one gdn_recur dispatch per layer
+   * per chunk.
    */
   chunkedPrefill?: boolean
   /** Pooled engines only: chunk the prefill through the per-layer union cut.
@@ -461,17 +503,23 @@ export interface DecodeEngineOptions {
    *  far ran on battery and is void. Opt in with ?chunk=1 until the AC pair
    *  exists. Unpooled chunking is unaffected (measured, default on). */
   pooledChunkedPrefill?: boolean
-  /** Chunk capacity in tokens (default 64). See the CHUNK_CAP note in
-   *  buildChunkPrefill; sweep results in BENCH.md. */
+  /** Chunk capacity in tokens. Default 1024 with the subgroup-matrix unit and
+   *  64 without, then clamped by the spec's `maxChunkCap` if it has one; an
+   *  EXPLICIT value here is honoured above that clamp. resolveChunkCap derives
+   *  the default; a pooled MoE build lowers it again downstream. Sweep results
+   *  in BENCH.md. */
   chunkCap?: number
   /** Use the tiled batched GEMM for chunk projections (default false — see
    *  the tiledOK note in buildChunkPrefill: correct, but not yet measured
    *  faster on a quiet machine). */
   chunkTiled?: boolean
-  /** Chunk GEMM selection: 'sgmat' (E1 on the matrix unit, needs the
-   *  experimental feature), 'e5' (same unit, 64x32 tile + swizzled B — 20%
-   *  faster in isolation at M=256, opt-in pending an in-engine A/B), 'tiled',
-   *  'matvec'. Default: sgmat when its pipelines exist, else matvec. */
+  /** Chunk GEMM selection: 'e5' (the matrix unit at a 64x32 tile with a
+   *  swizzled B), 'sgmat' (E1 on the same unit), 'tiled', 'matvec'. Both
+   *  matrix-unit kernels need the experimental subgroup-matrix feature.
+   *  Default: E5 since 2026-08-13 where its pipelines exist and the cap tiles
+   *  by 64, else sgmat, else matvec — see the ladder in buildChunkPrefill,
+   *  which is the authority. This comment said "opt-in pending an in-engine
+   *  A/B" for nine days after that A/B promoted it. */
   chunkGemm?: 'sgmat' | 'e5' | 'tiled' | 'matvec'
   /** Capture the router's expert choice per layer per token, for
    *  scripts/moe-trace.mjs. Costs one small buffer copy per MoE layer and one
@@ -3342,11 +3390,12 @@ export function buildDecodeEngine(
   // GEMM: the matvec cannot exploit M beyond its 4-row block (the 2026-08-11
   // sweep was flat), but the matrix-unit GEMM scales with M — measured
   // 3.26s / 2.80s / 2.70s at cap 64/256/512 on qwen3mlx's 800-token prompt,
-  // tokens identical at every cap. 256 is the default where sgmat runs
-  // (512's extra 3.6% is inside thermal noise and doubles the activation
-  // buffers); 64 remains the default for the FMA kernels it was tuned on.
-  // Both matrix-unit kernels get the 256 cap; asking for 'e5' must not silently
-  // drop the engine to the 64 the non-subgroup fallback uses.
+  // tokens identical at every cap. That measurement set the default at 256;
+  // the 4k-prompt sweep later raised it to 1024 (see the CHUNK_CAP note below),
+  // and a spec may now clamp it back down via maxChunkCap. 64 remains the
+  // default for the FMA kernels it was tuned on. Both matrix-unit kernels get
+  // the matrix-unit cap; asking for 'e5' must not silently drop the engine to
+  // the 64 the non-subgroup fallback uses.
   const sgmatAvail = (AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat) != null
     && ['sgmat', 'e5'].includes(opts.chunkGemm ?? 'sgmat')
   // 1024 since 2026-08-15: the cap was chosen at an 800-token prompt, where
@@ -3358,7 +3407,21 @@ export function buildDecodeEngine(
   // workspace is C-linear — worst buffer ~38 MB at 1024 — with no C×context
   // term. The non-matrix-unit fallback stays at 64: the sweep ran on E5, and
   // that path was never measured at these caps.
-  const CHUNK_CAP = opts.chunkCap ?? (sgmatAvail ? 1024 : 64)
+  //
+  // Read the token-identity claim above with its DOMAIN attached: three specs,
+  // 2,600-token prompts, and qwen38 did not exist yet. It fails at ~16k, where
+  // cap 1024 invents tool names that cap 256 and the per-token path get right.
+  // A spec may therefore carry `maxChunkCap` — a quarantine that clamps the
+  // DEFAULT here. An explicit chunkCap is still honoured exactly as asked,
+  // because the sweep that found the threshold has to be able to cross it and
+  // silently clamping a diagnostic is how an A/B measures the same code twice;
+  // it warns instead.
+  if (opts.chunkCap != null && opts.chunkCap > (S.maxChunkCap ?? Infinity)) {
+    console.warn(`[chunk] cap ${opts.chunkCap} is above ${S.id}'s maxChunkCap ${S.maxChunkCap}. `
+      + 'Honouring it because it was asked for explicitly, but chunked prefill is KNOWN to corrupt '
+      + 'this spec above that cap at long context — treat the output as suspect.')
+  }
+  const CHUNK_CAP = resolveChunkCap(opts, S, sgmatAvail)
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
   interface ChunkPrefill {
@@ -3399,11 +3462,27 @@ export function buildDecodeEngine(
     // the clean-ish runs read parity with batched_dyn, not a win — at M<=64
     // Apple's L2 apparently covers most of the matvec's activation re-reads.
     // It becomes the default when a quiet-machine A/B says so, not before.
+    // NOT a complete list of the N dimensions this GEMM runs. On a hybrid it
+    // also runs the fused GDN input projection at N = gdnProjRows, which this
+    // does not look at. Among the shipped HYBRIDS, qwen38 is the only one whose
+    // gdnProjRows is not a multiple of 64 (16480 = 64*257 + 32; qwen35, qwen36,
+    // qwen36q3 and qwen35mlx are all 12352 = 64*193). Scope that to hybrids:
+    // makeModelSpec derives gdnProjRows for every spec, so the embedding build
+    // also reports a non-multiple (8224) while running no GDN at all.
+    //
+    // This is NOT known to be a defect and is deliberately not being "fixed" on
+    // a guess. E5 tiles N by 32, 16480 % 32 === 0, and int4_matmul.gen.ts
+    // guards the ragged column with `if (n2 < N)` — three reasons to expect it
+    // is fine. It is written down only because it is the one CHUNK-GEMM
+    // dimension whose 64-divisibility differs between qwen38 and the four other
+    // shipped hybrids. They also differ in d, ffn, gdnVHeads and layer count,
+    // so this is a lead, not a difference.
     const dimsOK = CHUNK_CAP % 32 === 0
       && [S.d, S.qDim, S.ffn, ...(hybrid ? [S.gdnVDim] : [])].every((k) => k % 64 === 0)
-    // GEMM ladder: sgmat (the matrix unit) > tiled-v2 > matvec. sgmat is
-    // 'auto' when its pipelines exist — the device advertised the feature —
-    // and holds the SAME bar every chunk kernel holds: chunked prefill was
+    // GEMM ladder: e5 > sgmat > matvec (tiled-v2 only on an explicit
+    // chunkGemm:'tiled'). E5 and sgmat are both 'auto' when their pipelines
+    // exist — the device advertised the feature — and each holds the SAME bar
+    // every chunk kernel holds: chunked prefill was
     // never bit-equal to per-token (that is why checkReuse needs ?chunk=0);
     // the gate is empirical token identity in chunk-prefill-test.mjs, and
     // sgmat passes it on every chunking spec before it may default here.

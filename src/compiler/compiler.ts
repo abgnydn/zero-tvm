@@ -115,8 +115,10 @@ export interface Pipelines {
   int4MatmulSgMatAffine: GPUComputePipeline | null
   /** E5 — the same matrix unit at a 64(M)x32(N) tile with a swizzled B.
    *  Measured 18-22% over E1 at M=256 on every chunk shape (BENCH.md, "Sweep
-   *  round 3"). Opt-in via chunkGemm:'e5' until an in-engine A/B promotes it;
-   *  isolated-kernel TF is not prefill tok/s. */
+   *  round 3"). THE DEFAULT since 2026-08-13 where this pipeline exists and the
+   *  cap tiles by 64 — it cleared the in-engine A/B bar this comment was written
+   *  under (token identity on llama32, qwen3mlx and qwen35). engine-core.ts's
+   *  GEMM ladder is the authority; isolated-kernel TF is not prefill tok/s. */
   int4MatmulSgE5: GPUComputePipeline | null
   int4MatmulSgE5Affine: GPUComputePipeline | null
   // vec4-load variants — default ON since 2026-07-25 (+7.1% with the qkv

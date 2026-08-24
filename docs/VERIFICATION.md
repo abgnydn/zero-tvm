@@ -117,8 +117,8 @@ actually diverge, and must **refuse to pass** at a size where they cannot.
 | gate | asserted | ran at | shipped at |
 |---|---|---|---|
 | `chunk-prefill-test` | chunked ≡ per-token | 150 tokens = **1 chunk** | 16+ chunks |
-| `gdn_chunk_chain` | chunk ≡ stepwise, bit-exact | **6 tokens** | `CHUNK_CAP` 1024 |
-| `attention_prefill` | chunk ≡ per-token, bit-exact | **5 tokens** | 1024 |
+| `gdn_chunk_chain` | chunk ≡ stepwise, bit-exact | **6 tokens**; a 1024 arm now exists but on qwen35 dims through `batched_dyn`, not the qwen38/E5 pair that fails | `CHUNK_CAP` 1024, or 256 where a spec is quarantined |
+| `attention_prefill` | chunk ≡ per-token, bit-exact | **5 tokens** | `CHUNK_CAP` 1024, or 256 where a spec is quarantined |
 | `validate-model` | logits ≡ mlx_lm | **~20 tokens** | 32k context |
 
 All four were green while chunked prefill was corrupting output at 16k. The
@@ -186,7 +186,7 @@ real templates.
 
 | mechanism | what it enforces |
 |---|---|
-| `scripts/mutation-gate.mjs` | reinstates 8 shipped bugs, asserts the suite goes red. A green suite looks the same whether it is checking something or not. |
+| `scripts/mutation-gate.mjs` | reinstates every bug in its table, asserts the suite goes red. A green suite looks the same whether it is checking something or not. **Not concurrency-safe** — it mutates `src/` in place, so two of these in one worktree each see a false red baseline. |
 | `scripts/render-diff.py` | our rendered prompt vs the checkpoint's own jinja — `--shapes` for awkward inputs, `--plain` for chat, `--depth` for length |
 | `scripts/depth-bisect.mjs` | turns off one length-dependent subsystem at a time |
 | `scripts/needle-test.mjs` | can the model still see the start of its context from the end |

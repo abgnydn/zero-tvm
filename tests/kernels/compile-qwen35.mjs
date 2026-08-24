@@ -891,9 +891,11 @@ async function testMatmulBatchedDyn(device) {
 async function testMatmulBatchedDynAffine(device) {
   if (!HAS_SG32) return skip('int4_matmul_batched_dyn_affine')
   const r = rng(37)
-  // Engine-scale: CHUNK_CAP is 64 and a chunk's M is whatever is left, so M=31
-  // with CAP=64 is the shape a real prefill actually dispatches. The first
-  // version of this test used M=6/CAP=8 and passed while the engine diverged.
+  // Engine-scale: a chunk's M is whatever is left, so M=31 with CAP=64 is a
+  // shape a real prefill dispatches — on the NON-matrix-unit path, where 64 is
+  // the cap. Where the matrix unit exists the cap is 1024 (or a spec's
+  // maxChunkCap), and this test does not cover those Ms. The first version used
+  // M=6/CAP=8 and passed while the engine diverged.
   const K = Q.d, N = 256, M = 31, CAP = 64
   const KP = K / 8, SPR = K / 64             // group 64, not 32
   const weights = Uint32Array.from(arr(N * KP, () => (r() * 0xffffffff) >>> 0))
@@ -1019,12 +1021,39 @@ function makeTiledTest(affine) {
 const testMatmulTiledM = makeTiledTest(false)
 const testMatmulTiledMAffine = makeTiledTest(true)
 
-// ── full chunked GDN chain — ONE chunk of 6 vs 6 single-token chunks (must be
-// BIT-EXACT, f32 state included) and vs the sequential CPU reference ─────────
-async function testGdnChunkChain(device) {
-  if (!HAS_SG32) return skip('gdn_chunk_chain')
+// ── full chunked GDN chain — the SAME tokens under DIFFERENT chunkings must
+// agree BIT-EXACTLY (f32 state included); the 6-token arm also checks the
+// sequential CPU reference ──────────────────────────────────────────────────
+//
+// SCALE IS PART OF THE CLAIM (docs/VERIFICATION.md rule 1). This asserted
+// chunk-vs-stepwise equality at SIX tokens while the engine shipped CHUNK_CAP
+// 1024, and stayed green through the entire qwen38 investigation — where
+// chunked prefill degrades MONOTONICALLY WITH CHUNK SIZE: per-token and cap
+// 256 answer correctly, cap 1024 invents tool names, cap 4096 loses the task.
+// Six tokens cannot see any of that. The scale arm runs the shipped cap.
+async function testGdnChunkChain(device, opts = {}) {
+  const {
+    S = 6,
+    chunkings = [[6], [1, 1, 1, 1, 1, 1]],
+    cpuRef = true,
+    label = 'gdn_chunk_chain 6 tok',
+  } = opts
+  if (!HAS_SG32) return skip(label)
+  // Two arms with the same chunk shape compare one kernel against itself. Refuse
+  // rather than pass: an arm that cannot tell the answers apart is exactly what
+  // docs/VERIFICATION.md rule 5 is about.
+  if (chunkings.length < 2 || new Set(chunkings.map((c) => c.length)).size < 2) {
+    return { name: label, pass: false, detail: 'arms do not differ in chunking — cannot detect a chunk-size defect' }
+  }
+  for (const c of chunkings) {
+    const n = c.reduce((x, y) => x + y, 0)
+    if (n !== S) return { name: label, pass: false, detail: `chunking ${c.join('+')} covers ${n} tokens, not S=${S}` }
+  }
   const r = rng(36)
-  const d = Q.d, S = 6, CAP = 8, STRIDE = Q.gdnProjRows
+  // CAP is the buffer capacity, deliberately >= the largest chunk: the 6-token
+  // arm has always run CAP 8 against a 6-token chunk, which is part of what it
+  // checks.
+  const d = Q.d, CAP = Math.max(8, ...chunkings.flat()), STRIDE = Q.gdnProjRows
   const w = {
     qkv: randInt4(r, Q.gdnQkvDim, d),
     z: randInt4(r, Q.gdnVDim, d),
@@ -1039,14 +1068,17 @@ async function testGdnChunkChain(device) {
   const xs = arr(S, () => arr(d, () => toF16(r() * 2 - 1)))
 
   const refState = { history: [], recur: new Float64Array(Q.gdnVHeads * Q.gdnStatePerHead) }
-  const refOuts = refGdnBlock(xs, {
+  // The CPU reference is O(S · gdnProjRows · d) of plain-JS int4 MACs — ~32
+  // billion at S=1024 — so the scale arm skips it. What is load-bearing there
+  // is chunking-vs-chunking bit identity, which needs no reference at all.
+  const refOuts = cpuRef ? refGdnBlock(xs, {
     qkvW: w.qkv.weights, qkvS: w.qkv.scales,
     zW: w.z.weights, zS: w.z.scales,
     aW: w.a.weights, aS: w.a.scales,
     bW: w.b.weights, bS: w.b.scales,
     outW: w.out.weights, outS: w.out.scales,
     convW, gamma, aLog, dtBias,
-  }, Q, refState)
+  }, Q, refState) : null
 
   // Packed projection (loader layout).
   const KP = d / 8, SPR = d / 32
@@ -1126,19 +1158,35 @@ async function testGdnChunkChain(device) {
     return { outs, state }
   }
 
-  const chunked = await runChain([S])
-  const stepwise = await runChain([1, 1, 1, 1, 1, 1])
-  let outBits = 0
-  for (let i = 0; i < chunked.outs.length; i++) if (chunked.outs[i] !== stepwise.outs[i]) outBits++
-  let stateBits = 0
-  for (let i = 0; i < chunked.state.length; i++) if (chunked.state[i] !== stepwise.state[i]) stateBits++
+  const arms = []
+  for (const c of chunkings) arms.push({ c, r: await runChain(c) })
+  const chunked = arms[0].r
+  // A diverged fixture makes every bit comparison "differ" and reads as a kernel
+  // failure when the recurrence is what blew up. Name which one it is rather
+  // than reporting a number the run did not earn.
+  if (!chunked.state.every((v) => Number.isFinite(v))) {
+    return {
+      name: label,
+      pass: false,
+      detail: `FIXTURE: arm ${arms[0].c.length}x produced non-finite f32 state over ${S} steps — the bit comparison below would be meaningless`,
+    }
+  }
+  let outBits = 0, stateBits = 0, worst = ''
+  for (let a = 1; a < arms.length; a++) {
+    let ob = 0, sb = 0
+    for (let i = 0; i < chunked.outs.length; i++) if (chunked.outs[i] !== arms[a].r.outs[i]) ob++
+    for (let i = 0; i < chunked.state.length; i++) if (chunked.state[i] !== arms[a].r.state[i]) sb++
+    if (ob + sb > 0 && !worst) worst = `${arms[0].c.length}x vs ${arms[a].c.length}x`
+    outBits += ob
+    stateBits += sb
+  }
   // vs CPU: mixed tolerance — |Δ| < max(2e-2, 2e-2·|ref|). Six recurrence
   // steps amplify f16 input rounding on near-zero outputs, so a pure
   // relative metric over-penalizes; the BIT-EXACT chunk-vs-stepwise check
   // above (same kernels, f32 state included) is the load-bearing equality,
   // and the per-token semantics vs CPU are pinned by gdn_block.
   let cpuWorst = 0
-  for (let t = 0; t < S; t++) {
+  for (let t = 0; cpuRef && t < S; t++) {
     for (let i = 0; i < d; i++) {
       const got = f16BitsToF32(chunked.outs[t * d + i])
       const ref = refOuts[t][i]
@@ -1147,15 +1195,19 @@ async function testGdnChunkChain(device) {
     }
   }
   const refStateF32 = Float32Array.from(refState.recur)
-  const stateErr = maxRelDiff(chunked.state, refStateF32, 1e-2)
+  const stateErr = cpuRef ? maxRelDiff(chunked.state, refStateF32, 1e-2) : 0
   // State tolerance 5e-3 (vs gdn_recur_seq's 1e-3): here the recurrence
   // inputs passed through the f16 projection + conv stages, adding their
   // rounding to the drift a direct-input recurrence doesn't see.
   const pass = outBits === 0 && stateBits === 0 && cpuWorst < 1 && stateErr < 5e-3
+  const shape = chunkings.map((c) => (c.length === 1 ? `${c[0]}` : `${c.length}x${c[0]}`)).join(' vs ')
   return {
-    name: 'gdn_chunk_chain 6 tok',
+    name: label,
     pass,
-    detail: `chunk-vs-stepwise: ${outBits} out / ${stateBits} f32-state bit diffs; vs CPU: out ${cpuWorst.toFixed(3)}×tol, state rel ${stateErr.toExponential(2)}`,
+    detail: `${S} tok, ${shape}: ${outBits} out / ${stateBits} f32-state bit diffs${worst ? ` (first at ${worst})` : ''}`
+      + (cpuRef
+        ? `; vs CPU: out ${cpuWorst.toFixed(3)}×tol, state rel ${stateErr.toExponential(2)}`
+        : '; CPU reference skipped at this scale'),
   }
 }
 
@@ -1432,6 +1484,36 @@ const TESTS = [
   { label: 'matmul_tiled_m', fn: testMatmulTiledM },
   { label: 'matmul_tiled_m_affine', fn: testMatmulTiledMAffine },
   { label: 'gdn_chunk_chain', fn: testGdnChunkChain },
+  // Raises the SCALE, and does not yet reach the failing configuration. Read
+  // the domain before reading the result:
+  //
+  //   covers      chunk-size dependence in the GDN chain kernels at 1024, the
+  //               cap the engine ships on the matrix-unit path. 1024, 256 and
+  //               64 are all real caps (256 is qwen38's quarantine).
+  //   DOES NOT    the spec — this file is `const Q = QWEN35_4B` (line 65), one
+  //               of the specs that does NOT corrupt.
+  //   DOES NOT    the GEMM — the projection here is int4_matmul_batched_dyn,
+  //               and tests/kernels/gpu.mjs never requests
+  //               chromium-experimental-subgroup-matrix. But cap 1024 is only
+  //               reached when that feature EXISTS, which is exactly when the
+  //               engine picks E5. So the shipped 1024 path always runs E5 and
+  //               this arm always runs batched_dyn.
+  //   NOT A PASS  skip() returns pass:true, so on an adapter without 32-lane
+  //               subgroups this reports PASS while running nothing. UNRUN is
+  //               not a pass (docs/VERIFICATION.md) — read the detail string.
+  //
+  // So a green run here does NOT clear qwen38. Closing the gap needs this file
+  // parameterized by spec and a matrix-unit arm; both are follow-ups, and until
+  // then this catches the chunk-size class only where the kernels are shared.
+  {
+    label: 'gdn_chunk_chain_scale',
+    fn: (d) => testGdnChunkChain(d, {
+      S: 1024,
+      chunkings: [[1024], Array(4).fill(256), Array(16).fill(64)],
+      cpuRef: false,
+      label: 'gdn_chunk_chain 1024 tok',
+    }),
+  },
   { label: 'attention_prefill', fn: testAttentionPrefill },
   { label: 'silu_mul', fn: testSiluMul },
 ]
