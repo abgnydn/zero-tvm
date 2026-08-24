@@ -216,6 +216,27 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     log(`ERROR: GPU device lost (${info.reason}): ${info.message}`)
     opts.onDeviceLost?.(info)
   })
+  // The other half of "fail loudly", and the one this repo did not have: WebGPU
+  // validation errors do NOT throw. A rejected bind group invalidates its
+  // encoder, the driver discards the whole submit, and generation continues on
+  // a buffer that submit never wrote. That is the failure mode
+  // docs/VERIFICATION.md opens with, and no shipped build input listened for it
+  // — src/compiler/test-chain.ts had one, but it is a dev-only page excluded
+  // from the build. The harnesses under scripts/ and tests/kernels/ use
+  // pushErrorScope; the product used neither.
+  //
+  // Deliberately NOT a badge on every error: a single validation error is
+  // usually fatal to correctness but the page may look fine, so it goes to the
+  // log and the badge, once, and does not spam. Reload is the fix.
+  let reportedGpuError = false
+  device.addEventListener('uncapturederror', (ev) => {
+    const e = (ev as GPUUncapturedErrorEvent).error
+    log(`ERROR: WebGPU ${e.constructor.name}: ${e.message}`)
+    if (reportedGpuError) return
+    reportedGpuError = true
+    setBadge('GPU error', 'error')
+    setProgress(0, `WebGPU rejected work: ${e.message.slice(0, 160)} — output is not trustworthy; reload`)
+  })
 
   let sgSizeOk = false
   // MoE specs force the probe: moe_router_topk and the expert matmul are

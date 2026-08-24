@@ -23,6 +23,7 @@
 import { Tokenizer } from './tokenizer.js'
 import { specFromSearch, modelBranding, buildChatPromptFor } from './model-select.js'
 import { type DecodeEngine } from './engine-core.js'
+import { ENGINE_GPU_FEATURES } from './variants.js'
 import {
   bootEngine,
   hideProgress,
@@ -298,7 +299,11 @@ async function main(): Promise<void> {
   // byte counter the chat page uses, so the user can see how much download
   // is left on first run.
   setStatus('Booting engine...')
-  const boot = await bootEngine({ spec: SPEC })
+  // Requested NOTHING until 2026-08-23, so this page ran scalar shaders, f16
+  // KV and per-token prefill — sharing approximately no kernels with the chat
+  // path it exists to check. Worse, the MoE probe needs a `subgroups` feature
+  // that was never asked for, so validate.html refused every MoE model at 3%.
+  const boot = await bootEngine({ spec: SPEC, optionalFeatures: ENGINE_GPU_FEATURES, probeSubgroups: true })
   if (!boot.ok) {
     setStatus(boot.reason)
     return

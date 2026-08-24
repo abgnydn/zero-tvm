@@ -26,6 +26,7 @@
  */
 
 import { SHIPPED_MODELS, modelBranding } from '../zero-tvm/model-registry.js'
+import { ENGINE_GPU_FEATURES, PROFILE_GPU_FEATURES } from '../zero-tvm/variants.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
 import type { ChatMessage } from '../zero-tvm/model-select.js'
 
@@ -270,19 +271,22 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   report({ stage: 'gpu', message: 'Requesting GPU access' })
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
   if (!adapter) throw new Error('No GPU adapter found')
+  // ONE list, shared with every browser surface (variants.ts). This path used
+  // to enumerate the same two features by hand, which is how the six callers
+  // drifted apart in the first place. Each is still requested only if the
+  // adapter has it — a missing feature degrades the ladder, it does not throw.
   const features: GPUFeatureName[] = ['shader-f16' as GPUFeatureName]
-  if (adapter.features.has('subgroups')) features.push('subgroups' as GPUFeatureName)
-  // The matrix unit (experimental Chrome/Dawn). compile() creates the sgmat
-  // GEMM only when the device carries it; absent, the ladder degrades.
-  if (adapter.features.has('chromium-experimental-subgroup-matrix')) {
-    features.push('chromium-experimental-subgroup-matrix' as GPUFeatureName)
+  for (const f of ENGINE_GPU_FEATURES) {
+    if (adapter.features.has(f)) features.push(f)
   }
   // Enables engine.profileStep() (per-kernel timings) — OPT-IN via
   // ZTVM_PROFILE=1 / ?profile=1, never default: requesting timestamp-query on
   // the device is suspected of serializing Metal command execution.
   const wantProfile = typeof process !== 'undefined' && process.env?.ZTVM_PROFILE === '1'
-  if (wantProfile && adapter.features.has('timestamp-query')) {
-    features.push('timestamp-query' as GPUFeatureName)
+  if (wantProfile) {
+    for (const f of PROFILE_GPU_FEATURES) {
+      if (adapter.features.has(f)) features.push(f)
+    }
   }
   // Lift the storage-binding/buffer ceilings to whatever the adapter offers
   // (always valid per spec). The default 128 MiB maxStorageBufferBindingSize

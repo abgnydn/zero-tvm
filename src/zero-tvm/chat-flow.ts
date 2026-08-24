@@ -26,7 +26,7 @@ import {
   buildDecodeEngine,
   type DecodeEngine,
 } from './engine-core.js'
-import { parseVariantFlags } from './variants.js'
+import { parseVariantFlags, ENGINE_GPU_FEATURES, PROFILE_GPU_FEATURES } from './variants.js'
 import { bootEngine, setBadge, log as bootLog, type BootResult } from './loading-ui.js'
 import type { Tokenizer } from './tokenizer.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
@@ -101,8 +101,12 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
     // Chrome). compile() creates the sgmat GEMM only on such devices, and the
     // chunk path prefers it — gated by token-identity on every chunking spec
     // (chunk-prefill-test.mjs), the same empirical bar chunking itself holds.
-    optionalFeatures: ['subgroups' as GPUFeatureName, 'timestamp-query' as GPUFeatureName,
-      'chromium-experimental-subgroup-matrix' as GPUFeatureName],
+    // timestamp-query was requested here UNCONDITIONALLY while lib/index.ts
+    // gated it behind a flag for serialising Metal command execution — so every
+    // browser number was taken with it and every native number without, and
+    // they were compared. ?profile=1 now opts in, on this path only.
+    optionalFeatures: [...ENGINE_GPU_FEATURES,
+      ...(new URLSearchParams(location.search).get('profile') === '1' ? PROFILE_GPU_FEATURES : [])],
     probeSubgroups: true,
     onDeviceLost: opts.onDeviceLost,
     buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
@@ -496,7 +500,8 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     setBusy(true); stopRequested = false
     // One engine, one owner: wait out a room guest's generation if the host
     // is serving one. Released in the shared epilogue below.
-    await opts.lock?.acquire()
+    const tok = await opts.lock?.acquire()
+    try {
     // Resuming an earlier reply stops being meaningful once a new turn is
     // under way — retire the button but keep the "this was cut short" text.
     $('messages')?.querySelectorAll('.truncation-btn').forEach((b) => b.remove())
@@ -512,9 +517,6 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
       setBadge('Context full', 'error')
       updateCtxHint(promptIds.length)
       log(msg)
-      opts.lock?.release()
-      setBusy(false); stopRequested = false
-      updateSendEnabled()
       return
     }
     // Commit the (empty) assistant turn before decoding so the resume path has
@@ -526,10 +528,15 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     entry.content = r.text
     entry.ids = r.ids
     persist()
-    opts.lock?.release()
-    setBusy(false); stopRequested = false
-    updateSendEnabled()
-    if (finePointer) inp?.focus()
+    } finally {
+      // ONE epilogue for every exit — the early return, the happy path, and a
+      // throw anywhere in between. Previously each path released by hand and a
+      // throw released nothing.
+      opts.lock?.release(tok)
+      setBusy(false); stopRequested = false
+      updateSendEnabled()
+      if (finePointer) inp?.focus()
+    }
   }
 
   /**
@@ -556,19 +563,22 @@ export function wireChatSurface(opts: ChatSurfaceOptions): void {
     // stale button is no longer about the last thing the model said.
     if (history[history.length - 1] !== entry) return
     setBusy(true); stopRequested = false
-    await opts.lock?.acquire()
-    const contSplit = { genStart: 0 }
-    const promptIds = buildChatPromptFor(SPEC, history.slice(0, -1), tokenizer, contSplit)
-      .concat(entry.ids)
-    const r = await runGeneration(ai, promptIds, entry.ids, () => { void continueTurn(entry, ai) },
-      contSplit.genStart)
-    entry.content = r.text
-    entry.ids = r.ids
-    persist()
-    opts.lock?.release()
-    setBusy(false); stopRequested = false
-    updateSendEnabled()
-    if (finePointer) inp?.focus()
+    const tok = await opts.lock?.acquire()
+    try {
+      const contSplit = { genStart: 0 }
+      const promptIds = buildChatPromptFor(SPEC, history.slice(0, -1), tokenizer, contSplit)
+        .concat(entry.ids)
+      const r = await runGeneration(ai, promptIds, entry.ids, () => { void continueTurn(entry, ai) },
+        contSplit.genStart)
+      entry.content = r.text
+      entry.ids = r.ids
+      persist()
+    } finally {
+      opts.lock?.release(tok)
+      setBusy(false); stopRequested = false
+      updateSendEnabled()
+      if (finePointer) inp?.focus()
+    }
   }
 
   // ── Slash commands ── handled locally, never sent to the model. The

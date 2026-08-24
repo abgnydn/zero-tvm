@@ -256,6 +256,21 @@ export interface ModelSpecBase {
     | 'olmo2' | 'falcon3'
   tokenizerKind: 'spm' | 'byteLevel'  // which tokenizer pipeline tokenizer.json needs
   hfRepo: string           // HuggingFace repo with the MLC q4f16_1 layout
+  /**
+   * Bump to invalidate every client's cached weights for this spec.
+   *
+   * The OPFS weight directory is keyed by `spec.id` alone, which is a name, not
+   * a fact about bytes. Re-upload a checkpoint under the same repo — which is
+   * routine for the builds converted in this repo — and every warm client keeps
+   * serving the old tensors forever. The size guard in weight-loader-mlx only
+   * catches a TORN entry; a clean reconvert of the same shape is invisible to
+   * it, which is precisely the case this field covers.
+   *
+   * Absent means "never reconverted": the directory keeps its historical name
+   * so existing caches are not orphaned for no reason. Set it, and bump it, on
+   * any spec whose checkpoint this repo controls.
+   */
+  weightsRevision?: string
   /** Weight-manifest filename in the repo. Older MLC repos ship
    *  ndarray-cache.json (the default); repos built with newer MLC ship the
    *  renamed tensor-cache.json (Qwen3.5). */
@@ -1048,6 +1063,9 @@ export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
   ...QWEN36_35B_A3B,
   id: 'qwen36-35b-a3b-q3',
   hfRepo: 'abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp',
+  // OUR upload, produced by scripts/convert-q3-experts.py — the one shipped
+  // checkpoint that can change under a fixed name. Bump on every reconvert.
+  weightsRevision: 'r1',
   moe: { ...QWEN36_35B_A3B.moe!, bits: 3 },
 })
 

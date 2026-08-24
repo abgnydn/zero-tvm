@@ -150,8 +150,20 @@ export function quantLabel(spec: ModelSpec): string {
   return spec.moe?.bits === 3 ? `3-bit experts, 4-bit elsewhere · ${fmt}` : `4-bit · ${fmt}`
 }
 
+/** OPFS weight directory for a spec.
+ *
+ *  Phi-3 keeps the bare directory name it shipped with, so no existing cache is
+ *  orphaned. `weightsRevision`, when a spec sets it, is part of the path: a
+ *  reconverted checkpoint under an unchanged repo name lands in a NEW directory
+ *  rather than being read as the old one. Without that, re-uploading a build
+ *  silently serves every warm client stale tensors — the loader's size check
+ *  cannot see it, because a clean reconvert has the same byte count. */
 export function opfsDirFor(spec: ModelSpec): string {
-  return spec.id === PHI3.id ? WEIGHTS_OPFS_DIR : `${WEIGHTS_OPFS_DIR}.${spec.id}`
+  const rev = spec.weightsRevision ? `.${spec.weightsRevision}` : ''
+  // Phi-3 keeps the bare historical name, but it must still honour a revision if
+  // one is ever set — dropping it there would be a silent no-op on the one spec
+  // whose directory nothing else distinguishes.
+  return spec.id === PHI3.id ? `${WEIGHTS_OPFS_DIR}${rev}` : `${WEIGHTS_OPFS_DIR}.${spec.id}${rev}`
 }
 
 export interface ModelBrand {
