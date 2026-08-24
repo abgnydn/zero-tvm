@@ -38,6 +38,39 @@ jobs:
       # e2e tests use Puppeteer + WebGPU which Ubuntu runners don't expose;
       # run locally with `npm run test:e2e`.
 
+  gates:
+    name: mutation gate · release checklist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+      # A green suite looks the same whether it is checking something or not.
+      # This reinstates each bug that actually shipped and asserts the suite goes
+      # red — and, since 2026-08-22, that the test whose NAME claims the defect
+      # is AMONG the failures. Membership, not exclusivity: other tests may fire
+      # too and that is accepted. What it catches is a defect covered ONLY
+      # incidentally, where the named check never fires at all and could be
+      # deleted tomorrow unnoticed.
+      #
+      # It was written months before this job existed and ran only when someone
+      # remembered. FreeToken's tests/README.md names the failure mode: "a gate
+      # nobody trips rots silently" — and FreeToken then does not run its own
+      # gates in CI, so its 17/17 score is a fact about one afternoon rather
+      # than a property of the repo. ~40s here; if it outgrows the PR budget,
+      # move it to `schedule:` rather than deleting it. (The ~40s was measured on
+      # the author's machine, not on this runner.)
+      - run: node scripts/mutation-gate.mjs
+      # Prints the checklist INCLUDING what this runner cannot run. UNRUN is not
+      # a pass, so the GPU-only gates stay visible in every PR log instead of
+      # being remembered. Exits 0 — it is a report, not a gate.
+      - run: node scripts/release-check.mjs --list
+
   kernels:
     name: kernel correctness (lavapipe)
     runs-on: ubuntu-latest

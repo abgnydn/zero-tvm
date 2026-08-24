@@ -1,4 +1,5 @@
-node_modules/
+node_modules
+.mutation-gate-report.json
 dist/
 dist-lib/
 .claude/
@@ -24,3 +25,4 @@ docs/gpuweb-6338-comment.md
 # which went stale the day it was written.
 docs/reddit-webgpu-moe-draft.md
 .station.json
+.repowise/
