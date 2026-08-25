@@ -13,8 +13,8 @@ authors:
 license: MIT
 repository-code: "https://github.com/abgnydn/zero-tvm"
 url: "https://zerotvm.com"
-version: 0.2.0
-date-released: "2026-06-25"
+version: 0.3.0
+date-released: "2026-08-25"
 keywords:
   - webgpu
   - wgsl

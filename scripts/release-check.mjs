@@ -68,7 +68,15 @@ if (LIST_ONLY) {
 const results = []
 for (const c of CHECKS) {
   if (c.needs !== 'none') { results.push({ ...c, status: 'UNRUN' }); continue }
-  if (c.cwd && !existsSync(c.cwd)) { results.push({ ...c, status: 'MISSING' }); continue }
+  if (c.cwd && !existsSync(c.cwd)) {
+    // Printed AND counted. It used to be pushed and then referenced nowhere:
+    // not in the loop's output, not in the summary's three tallies, not in the
+    // failure list. The row simply vanished and the run still exited 0, so the
+    // checklist under-reported its own length — which is how a release note came
+    // to claim twelve rows for a thirteen-row list.
+    console.log(`  ${pad(c.name, W)}  MISSING — ${c.cwd} is not there`)
+    results.push({ ...c, status: 'MISSING' }); continue
+  }
   process.stdout.write(`  ${pad(c.name, W)}  … `)
   const r = spawnSync(c.cmd[0], c.cmd.slice(1), { cwd: c.cwd ?? ROOT, encoding: 'utf8' })
   const ok = r.status === 0
@@ -84,7 +92,15 @@ for (const f of failed) {
 }
 
 const unrun = results.filter((r) => r.status === 'UNRUN')
-console.log(`\n${results.filter((r) => r.status === 'PASS').length} passed · ${failed.length} failed · ${unrun.length} NOT RUN HERE\n`)
+const missing = results.filter((r) => r.status === 'MISSING')
+const tally = `${results.filter((r) => r.status === 'PASS').length} passed · ${failed.length} failed`
+  + ` · ${unrun.length} NOT RUN HERE${missing.length ? ` · ${missing.length} MISSING` : ''}`
+console.log(`\n${tally}  (of ${CHECKS.length})\n`)
+if (missing.length) {
+  console.log('  These could not run at all — a path they need is absent. Not passes:')
+  for (const m of missing) console.log(`    ${pad(m.name, W)}  needs ${m.cwd}`)
+  console.log('')
+}
 if (unrun.length) {
   console.log('  These need a GPU and a checkpoint. They are NOT passes — run them:')
   for (const u of unrun) console.log(`    ${pad(u.name, W)}  ${u.cmd.join(' ')}`)
