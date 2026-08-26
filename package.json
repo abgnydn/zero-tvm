@@ -27,6 +27,7 @@
     "dist-lib"
   ],
   "scripts": {
+    "evals": "node scripts/evals.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "build:lib": "vite build --config vite.lib.config.ts && tsc --emitDeclarationOnly --outDir dist-lib/types",
