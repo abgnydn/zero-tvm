@@ -110,7 +110,13 @@ export async function startHarness(): Promise<void> {
     // Default puppeteer protocolTimeout is 180s. The first cold run downloads
     // ~2 GB of weights and a single waitForFunction poll can straddle the
     // download → bump to 10 min so the very first run isn't fragile.
-    protocolTimeout: 10 * 60 * 1000,
+    //
+    // Ten minutes is NOT enough for a fidelity-at-depth run: one
+    // page.evaluate does the whole prefill, so 20k tokens at qwen38's
+    // quarantined cap of 256 is 80 chunks inside a single protocol call and
+    // it times out with the engine working correctly. ZTVM_PROTOCOL_MIN
+    // raises it for those runs; the default is unchanged.
+    protocolTimeout: Number(process.env.ZTVM_PROTOCOL_MIN ?? 10) * 60 * 1000,
   })
 }
 
@@ -136,7 +142,14 @@ export async function newPage(path: string): Promise<Page> {
     console.error(`[pageerror] ${err.message}\n${err.stack}`)
   })
   page.on('console', (m) => {
-    if (m.type() === 'error') console.error(`[console.error] ${m.text()}`)
+    if (m.type() === 'error') { console.error(`[console.error] ${m.text()}`); return }
+    // model-smoke.html's say() reports every phase through console.log('[T]',
+    // ...). Dropping non-error messages made a long run indistinguishable from
+    // a hung one: a 20k-token fidelity-at-depth prefill sat for 40 minutes with
+    // the page narrating each step and nothing reaching the terminal. Forward
+    // the page's own progress markers; ZTVM_PAGE_LOG=1 forwards everything.
+    const t = m.text()
+    if (process.env.ZTVM_PAGE_LOG === '1' || t.startsWith('[T]')) console.log(`[page] ${t}`)
   })
   await page.goto(`${BASE}${path}`, { waitUntil: 'domcontentloaded', timeout: 30_000 })
   // The download gate's #start-btn appears either statically (compiler-chat,
