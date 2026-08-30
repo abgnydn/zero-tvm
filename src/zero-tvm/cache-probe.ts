@@ -48,7 +48,17 @@ async function mirrorHasModel(spec: ModelSpec): Promise<boolean> {
   }
 }
 
-export async function isModelCached(spec: ModelSpec): Promise<boolean> {
+/**
+ * `range` — ask about ONE PIPELINE STAGE instead of the whole model. A helper
+ * device only ever holds its own layers, so the whole-model question is always
+ * answered "no" for it: a phone that had already downloaded its stage was
+ * shown the full download gate again on every visit, quoting the whole
+ * checkpoint's size (real device, 2026-08-29).
+ */
+export async function isModelCached(
+  spec: ModelSpec,
+  range?: { start: number; end: number },
+): Promise<boolean> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return false
   try {
     const root = await navigator.storage.getDirectory()
@@ -57,7 +67,7 @@ export async function isModelCached(spec: ModelSpec): Promise<boolean> {
       // The LAST plan, not the first: it is written last, so its presence means
       // the download FINISHED rather than started. A half-cached model that
       // reported cached would skip the gate and then stall on a fetch.
-      const plans = planModel(spec)
+      const plans = planModel(spec, range)
       const last = plans[plans.length - 1]
       await dir.getFileHandle(planKey(last.plan, last.layer))
     } else {
