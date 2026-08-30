@@ -33,6 +33,10 @@
        composer too. Before landing.css, which carries the panel chrome. -->
   <link rel="stylesheet" href="/chat-ui.css">
   <link rel="stylesheet" href="/landing.css">
+  <!-- swarm.css: the SWARM section below the entrance. Its own file rather
+       than more of landing.css, so the section can be worked on without
+       touching the stylesheet the character screen lives in. -->
+  <link rel="stylesheet" href="/swarm.css">
 
   <script type="application/ld+json">
   {
@@ -74,6 +78,7 @@
     <a href="/" class="nav-logo">zero<span>-tvm</span></a>
     <div class="nav-links">
       <a href="#models">Models</a>
+      <a href="#swarm">Swarm</a>
       <!-- "Rooms" pointed at share.html's bare host page (a floating modal
            over black). Hosting lives in the entrance now — enter a character,
            then ⟁ Room. share.html remains the GUEST surface links point at,
@@ -96,14 +101,90 @@
 <section id="models">
   <!-- The game entrance. Full-viewport character select — landing.ts renders
        the whole screen (splash, stage, roster, sheet) into this root. Every
-       figure and number still comes from the registry; the scroll below keeps
-       the essay and the kernel window for the reader who wants the why. -->
+       figure and number still comes from the registry; the scroll below is the
+       swarm section, and docs.html carries the rest of the why. -->
   <div id="model-browser" class="cs-root"></div>
 </section>
 
-<!-- The page IS the character select now — nav above, footer below,
-     nothing between. The essay, the kernel window and the deep copy left
-     with the 2026-08-15 entrance redesign; docs.html carries the why. -->
+<!-- Below the entrance: the one thing the character screen cannot say, since
+     it sells one model in one tab. The prose and the plain share.html link are
+     static so they survive a browser with no JavaScript; src/landing-swarm.ts
+     replaces #swarm-builder with the link builder. -->
+<section id="swarm">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="eyebrow"><span class="pulse" aria-hidden="true"></span>Swarm</span>
+      <h2>A model bigger than the machine in front of you</h2>
+      <p>
+        A transformer is a stack of layers run in order, and nothing requires
+        one machine to hold all of them. Cut the stack into ranges: this laptop
+        loads the first layers, another machine loads the next, and each token
+        travels the chain as a single hidden state hopping from one browser to
+        the next over a peer-to-peer connection. Whoever holds the link just
+        chats, and never learns the model was assembled out of parts.
+      </p>
+    </div>
+
+    <div class="band sw-band">
+      <div>
+        <h3>Split by layer</h3>
+        <p>
+          Each machine downloads only the layers it holds, and keeps the
+          attention cache for those layers alone. The one that starts the model
+          carries the embedding; the one that ends it carries the output head.
+        </p>
+      </div>
+      <div>
+        <h3>Tokens hop</h3>
+        <p>
+          What crosses between machines is the bare residual — one hand-off per
+          token, on its own data channel so it never queues behind a reply
+          being streamed to a guest.
+        </p>
+      </div>
+      <div>
+        <h3>Guests just talk</h3>
+        <p>
+          A guest opens the room link and types. No WebGPU, no download, nothing
+          runs on their machine; the conversation lives in their tab and the
+          machines serving it are stateless between requests.
+        </p>
+      </div>
+      <div>
+        <h3>Weights spread</h3>
+        <p>
+          A guest can copy the cached weights straight from the machine serving
+          it, over a second channel, instead of fetching them again — and then
+          serve the same room itself.
+        </p>
+      </div>
+    </div>
+
+    <div id="swarm-builder" class="sw-builder">
+      <p class="note">
+        The link builder needs JavaScript. Without it: <a href="share.html">share.html</a>
+        is the room surface — open it as
+        <code>share.html?model=&lt;model&gt;&amp;layers=0-k</code> on the first
+        machine, then <code>share.html?model=&lt;model&gt;&amp;layers=k-N#&lt;room&gt;</code>
+        on the next, and <code>share.html#&lt;room&gt;</code> for anyone who
+        only wants to chat.
+      </p>
+    </div>
+
+    <p class="note sw-reach">
+      <b>What this needs.</b> The machines connect directly to each other; the
+      relay only passes connection details, and prompts and tokens never touch
+      it. There is no TURN relay in the connection config, so machines on the
+      same network, or behind ordinary home routers, find each other — a
+      corporate or hotel network usually will not let them. Splitting also
+      needs an MLX checkpoint: the MLC builds fetch whole shards, so skipping
+      layers would save no download, and only the models the builder lists can
+      be cut. Every serving tab should stay awake — share.html has a switch for
+      that, and a machine whose tab is asleep serves nobody.
+    </p>
+  </div>
+</section>
+
 
 <footer>
   <div class="wrap">
@@ -120,6 +201,7 @@
         <ul>
           <li><a href="zero-tvm.html">Chat</a></li>
           <li><a href="share.html">Host a room</a></li>
+          <li><a href="#swarm">Split a model across machines</a></li>
           <li><a href="docs.html">Docs</a></li>
           <li><a href="docs.html#vs-webllm">Proof</a></li>
           <li><a href="validate.html">Validate</a></li>
@@ -142,6 +224,7 @@
 </footer>
 
 <script type="module" src="/src/landing.ts"></script>
+<script type="module" src="/src/landing-swarm.ts"></script>
 
 </body>
 </html>

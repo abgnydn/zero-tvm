@@ -41,6 +41,10 @@ import { ENGINE_GPU_FEATURES } from './variants.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
 import { fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
 import { serveStage } from './pipeline-peer.js'
+// The URL grammar lives in room-url.ts — shared with the entrance's swarm
+// link builder, so a URL that page hands out is routed by the same three-way
+// branch that reads it here.
+import { roomIdFrom, stageRangeFrom, roleFor } from './room-url.js'
 // The host loop, the wire protocol, and the signaling constants live in
 // room-host.ts — shared with the landing entrance's in-place room
 // (landing-room.ts), so the two hosting surfaces cannot drift.
@@ -53,31 +57,21 @@ const { base: SIGNAL_BASE, override: SIG_OVERRIDE } = signalEnv()
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement
 
-function roomIdFrom(hash: string): string | null {
-  const id = hash.replace(/^#/, '')
-  return /^[A-Za-z0-9_-]{16,64}$/.test(id) ? id : null
-}
-
-// URL grammar, three cases:
-//   ?model=X              host a NEW room
-//   #<room>               join as a guest (the link you hand out)
-//   ?model=X#<room>       serve an EXISTING room from this device too
-// The third is what turns a room into a swarm: a guest that copied the
-// weights adds ?model= to the link it already has and starts serving.
-/** `?layers=0-20` — this device holds that slice of the model, nothing else. */
-function stageRangeFrom(search: string): { start: number; end: number } | null {
-  const m = /^(\d+)-(\d+)$/.exec(new URLSearchParams(search).get('layers') ?? '')
-  return m ? { start: Number(m[1]), end: Number(m[2]) } : null
-}
-
+// URL grammar, four cases (room-url.ts):
+//   ?model=X                    host a NEW room
+//   ?model=X&layers=0-k         host a new room holding the first layers
+//   ?model=X&layers=k-N#<room>  join that room holding the rest
+//   #<room>                     join as a guest (the link you hand out)
+// `?model=X#<room>` also serves an EXISTING room from this device — that is
+// what turns a room into a swarm: a guest that copied the weights adds
+// ?model= to the link it already has and starts serving.
 const room = roomIdFrom(location.hash)
-const wantsToHost = new URLSearchParams(location.search).has('model')
 const stage = stageRangeFrom(location.search)
-// A stage that does not start the model cannot serve chat — it has no
-// embedding and no tokenizer role — so it JOINS someone else's room and
-// offers its layers there. Everything else follows the earlier grammar.
-if (room && stage && stage.start > 0) void runHelper(room, stage)
-else if (room && !wantsToHost) void runGuest(room)
+// The assertions hold by roleFor's own definition: it returns 'helper' only
+// when both parses succeeded and 'guest' only when the room did.
+const role = roleFor(location.search, location.hash)
+if (role === 'helper') void runHelper(room!, stage!)
+else if (role === 'guest') void runGuest(room!)
 else void runHost(room, stage)
 
 /**
