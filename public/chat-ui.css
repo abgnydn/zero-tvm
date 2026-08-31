@@ -521,3 +521,20 @@
       .msg.ai .cursor { animation: none; }
       .thinking span { animation: none; opacity: 0.6; }
     }
+
+    /* ─── PHONE ───
+       This surface is what share.html's GUEST role is, and it was measured on
+       a real iPhone (2026-08-29): send/stop and the scroll FAB are 34px
+       against a 44px touch floor, and the composer hint rendered at 10.2px
+       with a 9.3px key cap. Floors only — nothing here applies above 480px,
+       so the desktop chat is untouched. */
+    @media (max-width: 480px) {
+      .composer-wrap { padding: 0.6rem 0.75rem 0.75rem; }
+      /* The textarea is the biggest tap target on the page and was 35px.
+         min-height, not padding alone: autoGrow writes an inline height. */
+      .composer textarea { padding: 0.6rem 0; min-height: 44px; }
+      .composer-btn { width: 44px; height: 44px; }
+      .scroll-fab { width: 44px; height: 44px; }
+      .composer-hint { font-size: 14px; }
+      .composer-hint kbd { font-size: 13px; }
+    }

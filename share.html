@@ -46,8 +46,19 @@
                     white-space: pre-wrap; margin-top: .5rem; font-family: var(--mono); }
     #loading-error { color: var(--danger); font-size: .8rem; margin-top: .5rem; }
     /* Consent gate — shown by share.ts before the first weight byte, and only
-       when the model is not already cached on this device. */
-    #share-gate { border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+       when the model is not already cached on this device.
+       inset/margin: the `* { margin: 0 }` reset at the top of this block
+       cancels the UA's centering margin, so the dialog rendered jammed into
+       the top-left corner of every phone (measured at 360x640 and 390x844:
+       top = 0, left = 0). max-height/overflow-y restate what Chrome's UA
+       sheet already gives a <dialog> — measured, #share-gate-go stayed
+       reachable down to a 280px-tall viewport even without them — but they
+       are the property this layout depends on and a longer body would be the
+       first thing to break, so they are declared rather than inherited. Same
+       four the chat page's #start-dialog carries. */
+    #share-gate { position: fixed; inset: 0; margin: auto;
+                  max-height: calc(100dvh - 2rem); overflow-y: auto;
+                  border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
                   color: var(--text); width: calc(100vw - 2rem); max-width: 30rem; padding: 1.5rem 1.6rem; font: inherit; }
     #share-gate::backdrop { background: rgba(8,8,10,.82); backdrop-filter: blur(10px); }
     #share-gate h2 { font-size: 1.05rem; font-weight: 600; margin-bottom: .7rem; }
@@ -85,6 +96,52 @@
                          font-weight: 600; padding: .5rem 1rem; margin-top: .6rem; }
     #local-copy button:disabled { opacity: .5; cursor: default; }
     .hidden { display: none !important; }
+
+    /* ─── PHONE ───
+       Measured on a real iPhone (2026-08-29) while it served one stage of a
+       split 27B: every caption on this page rendered between 10.2px and
+       12.6px, the header's back link broke across two lines and read as two
+       controls, and the room link was a sliver of input beside Copy. 14px is
+       a FLOOR here, not a redesign — the desktop rules above are untouched,
+       and this block cannot apply above 480px. */
+    @media (max-width: 480px) {
+      .top { padding: .6rem .75rem; }
+      /* nowrap because at 360px "← zerotvm.com" broke across two lines and
+         read as two controls; inline-flex so the link is a 44px touch target
+         rather than a 22px one. */
+      .top a.back { font-size: 14px; white-space: nowrap;
+                    display: inline-flex; align-items: center; min-height: 44px; }
+      .top h1 { font-size: 15px; min-width: 0; }
+      .badge { font-size: 14px; padding: 5px 10px; }
+
+      .wrap { padding: 1rem .75rem 3rem; }
+      #progress-status { font-size: 15px; }
+      #progress-detail { font-size: 14px; }
+      /* Bigger type in the same box shows fewer lines — give it back. */
+      #progress-log { font-size: 14px; max-height: 11rem; }
+      #loading-error { font-size: 14px; }
+      #loading-error-top { font-size: 14px; }
+      section.card h2 { font-size: 14px; }
+      .hint { font-size: 14px; }
+      #req-log li { font-size: 14px; }
+      label.opt { font-size: 14px; }
+      /* The label is tappable too, but the box is what a thumb aims at. */
+      label.opt input { width: 22px; height: 22px; flex: none; }
+
+      /* Side by side leaves the URL unreadable and Copy under the 44px touch
+         floor; stacked, both are full width. */
+      .linkrow { flex-direction: column; align-items: stretch; }
+      .linkrow input { font-size: 14px; min-height: 44px; }
+      .linkrow button { min-height: 44px; font-size: 15px; }
+
+      #share-gate { width: calc(100vw - 1.5rem); padding: 1.25rem 1.1rem; }
+      #share-gate p { font-size: 14px; }
+      #share-gate p.fine { font-size: 14px; }
+      #share-gate .acts { flex-wrap: wrap; }
+      #share-gate .acts a { font-size: 14px; display: inline-flex; align-items: center; min-height: 44px; }
+      #share-gate .acts button { min-height: 44px; }
+      #local-copy button { min-height: 44px; }
+    }
   </style>
 </head>
 <body>

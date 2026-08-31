@@ -178,6 +178,25 @@ export async function buildPlan(
   return data
 }
 
+/**
+ * How often the loader should report buffer progress, given how many buffers
+ * this load plans. Lives beside planModel because the plan COUNT is what it
+ * has to scale with.
+ *
+ * loadWeights reported every 25th buffer, a constant chosen for the whole
+ * model (1127 plans on the 27B). A PIPELINE STAGE plans a fraction of that —
+ * one layer of the 27B is 18 — so the only report that ever fired was the
+ * final one, after the download had finished. That is what an iPhone serving
+ * one stage of a split 27B showed for minutes at a time (2026-08-29): a
+ * progress bar stuck at 10% and no way to tell working from dead.
+ *
+ * ~40 reports whatever the size: enough to look alive on the smallest stage,
+ * few enough that a 1127-buffer load does not spend its time on strings.
+ */
+export function progressEvery(total: number): number {
+  return Math.max(1, Math.ceil(total / 40))
+}
+
 /** Total GPU bytes the model will occupy, before fetching anything. */
 export function modelBytes(spec: ModelSpec, locate: (record: string) => RecordLoc): number {
   const src = (r: string) => { const l = locate(r); return l.end - l.begin }

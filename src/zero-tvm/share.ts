@@ -140,25 +140,65 @@ function wireKeepAwake(): void {
 async function confirmDownload(
   spec: ModelSpec,
   brand: { name: string; sizeLabel: string; ramNote?: string },
+  role: {
+    /** 'helper' joins someone else's room and offers layers; 'host' opens one. */
+    kind: 'host' | 'helper'
+    /** Set when THIS device holds ONE STAGE — either half of a split. */
+    stage?: { start: number; end: number }
+  },
 ): Promise<void> {
   const { isModelCached } = await import('./cache-probe.js')
-  const cached = await isModelCached(spec)
+  const { stage } = role
+  const cached = await isModelCached(spec, stage)
   // Cached used to mean no dialog at all — so a returning visitor who clicked
   // "Rooms" in the nav was serving a room to anyone with the link the moment
   // the page finished loading. The download question disappears when the
   // weights are local; the HOSTING question never does.
 
+  // WHAT THIS DEVICE FETCHES — one sentence, both roles, because both can be
+  // a stage. The gate used to quote brand.sizeLabel unconditionally: the
+  // iPhone that held one layer of the 27B was asked to approve "~14.1 GB" for
+  // a slice worth a fraction of that (real device, 2026-08-29). A stage's
+  // exact bytes are not knowable here — they come from the safetensors
+  // headers, read after consent — so this states the RANGE and leaves the
+  // size to the progress panel. It does not guess a number.
+  const weightsLine = cached
+    ? (stage
+        ? `Layers ${stage.start}-${stage.end} are already cached on this device.`
+        : 'The weights are already cached on this device.')
+    : (stage
+        ? `Layers ${stage.start}-${stage.end} of ${spec.layers} download once — a slice of the `
+          + `full ${brand.sizeLabel}, not all of it — and are cached locally; the progress panel `
+          + 'below shows the real size as it arrives.'
+        : `The weights download once (${brand.sizeLabel}) and are cached locally; every later visit starts from disk.`)
+  // brand.ramNote is a whole-checkpoint figure ("needs ~20 GB free RAM") and
+  // is false for a stage. Nothing replaces it: a per-stage number would have
+  // to be invented.
+  const ramLine = !stage && brand.ramNote ? `<p class="warn">${brand.ramNote}</p>` : ''
+
   const dlg = document.createElement('dialog')
   dlg.id = 'share-gate'
-  dlg.innerHTML = `
+  dlg.innerHTML = role.kind === 'helper' && stage
+    ? `
+    <h2>Serve ${brand.name} layers ${stage.start}-${stage.end} from this tab</h2>
+    <p>
+      This device holds ONE STAGE of the model — layers ${stage.start} to
+      ${stage.end} of ${spec.layers}, not the whole checkpoint. ${weightsLine}
+    </p>
+    <p class="fine">The machine that starts the model sends this stage a hidden
+      state for every token and gets one back. It keeps the room and the
+      conversation; this tab holds only its layers.</p>
+    <div class="acts">
+      <a href="/">Not now</a>
+      <button type="button" id="share-gate-go" autofocus>${cached ? 'Serve these layers →' : 'Download the layers &amp; serve →'}</button>
+    </div>`
+    : `
     <h2>Host ${brand.name} from this tab</h2>
     <p>
       Hosting runs the model on THIS machine and serves it to whoever opens
-      your room link. ${cached
-        ? 'The weights are already cached on this device.'
-        : `The weights download once (${brand.sizeLabel}) and are cached locally; every later visit starts from disk.`}
+      your room link. ${weightsLine}
     </p>
-    ${brand.ramNote ? `<p class="warn">${brand.ramNote}</p>` : ''}
+    ${ramLine}
     <p class="fine">Guests' prompts run on your GPU. You see every request as it arrives.</p>
     <div class="acts">
       <a href="/">Not now</a>
@@ -212,8 +252,9 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
 
   wireKeepAwake()
 
-  // Consent BEFORE the first byte, not after.
-  await confirmDownload(spec, brand)
+  // Consent BEFORE the first byte, not after. A host with ?layers=0-k holds a
+  // stage too — it fetches that slice, not the whole checkpoint.
+  await confirmDownload(spec, brand, { kind: 'host', ...(stageRange ? { stage: stageRange } : {}) })
 
   // ?pool= — the same memory-build knob as the chat page, so the entrance's
   // "Enter & open a room" fallback link carries the chosen build honestly.
@@ -343,6 +384,20 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
   // (The keep-awake card is deliberately a SEPARATE section, so removing this
   // one does not take the toggle with it.)
   $('share-link').closest('section')?.remove()
+  // The same refusal the host path does, and for the same reason: without it
+  // the consent dialog asks a browser that can never boot the engine to
+  // approve a download. It matters more here than there — a helper link is
+  // something you paste to a phone, and every iOS browser is WebKit, so
+  // anything before Safari 26 lands on this branch.
+  if (!('gpu' in navigator)) {
+    const top = $('loading-error-top')
+    top.style.display = 'block'
+    top.textContent = 'Serving a stage needs WebGPU with shader-f16 — Chrome and Edge ship it; Safari from 26. '
+      + 'This browser can still JOIN the room as a guest: open the link without the ?layers= part.'
+    $('badge').className = 'badge error'
+    $('badge-text').textContent = 'No WebGPU'
+    return
+  }
   wireKeepAwake()
   const [{ specFromSearch, modelBranding }, loadingUi, variantsMod, engineMod] = await Promise.all([
     import('./model-select.js'),
@@ -354,12 +409,18 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
   const brand = modelBranding(spec)
   $('page-title').textContent = `Serving ${brand.name} layers ${range.start}-${range.end}`
   const stats = $('room-stats')
-  stats.textContent = `loading layers ${range.start}-${range.end} of ${spec.layers}…`
+  // "loading layers X-Y…" set HERE, before the gate, was the only thing an
+  // iPhone helper ever showed for the whole download (2026-08-29): it is
+  // written once and never again until the chain pairs, so it reads as
+  // "loading" whether the tab is working, finished, or dead. It now states
+  // only what is true at each point, and the progress panel carries the rest.
+  stats.textContent = `layers ${range.start}-${range.end} of ${spec.layers} — not started yet`
 
   // Consent BEFORE the first byte — same gate as the host. A helper link in
   // a chat message used to boot the download and enrol the GPU in a
   // stranger's room with no click at all (lens 2026-08-17).
-  await confirmDownload(spec, brand)
+  await confirmDownload(spec, brand, { kind: 'helper', stage: range })
+  stats.textContent = `loading layers ${range.start}-${range.end} of ${spec.layers}…`
 
   const boot = await loadingUi.bootEngine({
     spec,
@@ -384,6 +445,11 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
     const top = $('loading-error-top'); top.style.display = 'block'; top.textContent = boot.reason
     $('loading-error').textContent = boot.reason; return
   }
+  // Loaded and idle is a real state, and the page used to have no word for it:
+  // the line above still read "loading layers 2-6 of 48…" long after the badge
+  // said Ready, which on a phone is indistinguishable from a stall.
+  stats.textContent = `layers ${range.start}-${range.end} of ${spec.layers} loaded — `
+    + 'looking for the machine that starts the model'
 
   const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
   const pc = new RTCPeerConnection(ICE)

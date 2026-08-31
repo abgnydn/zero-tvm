@@ -12,7 +12,7 @@
  */
 
 import { PHI3, type ModelSpec } from '../compiler/model-spec.js'
-import { openMlxCheckpoint, assembleMlx, planModel, type MlxSource } from './weight-loader-mlx.js'
+import { openMlxCheckpoint, assembleMlx, planModel, progressEvery, type MlxSource } from './weight-loader-mlx.js'
 import {
   fetchSlabSource, opfsSlabSource, type SlabDirectory, type SlabSource,
 } from './slab-source.js'
@@ -650,8 +650,11 @@ export async function loadWeights(
       cacheWrite: mirrorBase ? undefined
         : (key, data) => { pendingWrites.push(opfsWrite(opfs, key, data)) },
       onBuffer: (done, n, bytes) => {
-        // Every 25th, so a 947-buffer load does not spend its time on strings.
-        if (done % 25 !== 0 && done !== n) return
+        // Sampled, so a 1127-buffer load does not spend its time on strings —
+        // but the STEP scales with the plan count (progressEvery says why a
+        // fixed every-25th left a pipeline stage silent for its whole
+        // download).
+        if (done % progressEvery(n) !== 0 && done !== n) return
         const el = (performance.now() - t0) / 1000
         // Buffers stand in for shards here — same progress semantics, different
         // unit, because a plan is what this loader actually completes.

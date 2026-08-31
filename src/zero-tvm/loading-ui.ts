@@ -277,14 +277,30 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
 
   setBadge('Downloading...', 'loading')
   let weights: LoadedWeights
+  // The loader's setup steps — OPFS open, cache stores, safetensors header
+  // reads — all run BEFORE the first buffer, and on a phone over a real link
+  // that is minutes. They spoke only to #progress-log, a 10px monospace box
+  // nobody reads on a handset, so the page a real iPhone showed for all of it
+  // was "Loading model weights..." above a bar at 10% (2026-08-29). Mirror the
+  // loader's own line into the status, holding the bar where the last
+  // byte-level report left it.
+  let dlPct = 10
   try {
-    weights = await loadWeights(device, (m) => log(m), (s) => {
+    weights = await loadWeights(device, (m) => { log(m); setProgress(dlPct, m) }, (s) => {
       // Real byte-level progress from the loader's own stats.
       const frac = s.totalBytes > 0 ? Math.min(1, s.bytesLoaded / s.totalBytes) : 0
       const pct = Math.round(frac * 100)
+      dlPct = 10 + frac * 80
       setProgress(
-        10 + frac * 80,
-        `Downloading weights — shard ${s.shardsLoaded} / ${s.totalShards}`,
+        dlPct,
+        // A stage says which layers it is fetching. "weights" on a helper
+        // reads as the whole checkpoint, which is the thing that alarmed a
+        // phone owner holding one layer; and on the MLX path the unit really
+        // is a buffer, not a shard (see loadWeights' own note).
+        opts.layerRange
+          ? `Downloading layers ${opts.layerRange.start}-${opts.layerRange.end}`
+            + ` — buffer ${s.shardsLoaded} / ${s.totalShards}`
+          : `Downloading weights — shard ${s.shardsLoaded} / ${s.totalShards}`,
         `${formatBytes(s.bytesLoaded)} / ${formatBytes(s.totalBytes)} · ` +
           `${s.mbPerSec.toFixed(0)} MB/s` +
           (s.etaSec > 0 ? ` · ~${formatEta(s.etaSec)} left` : ''),
