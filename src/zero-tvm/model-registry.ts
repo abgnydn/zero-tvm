@@ -92,6 +92,19 @@ export function specWithCtx(base: ModelSpec, ctx: number): ModelSpec {
   return makeModelSpec({ ...base, maxPages: pages })
 }
 
+/**
+ * Can this model be split across machines?
+ *
+ * loadWeights refuses a layerRange on anything but an MLX checkpoint — the MLC
+ * path fetches whole shards, so skipping layers would save no download — and an
+ * embedding model has no chat surface to serve into a room. Derived here, next
+ * to the table the entrance renders from, so the swarm link builder cannot hand
+ * someone a `?layers=` URL that throws at boot.
+ */
+export function canSplitAcrossDevices(spec: ModelSpec): boolean {
+  return spec.weightFormat === 'mlx-safetensors' && !spec.embeddingOnly
+}
+
 /** Root OPFS directory the weight cache lives under. */
 export const WEIGHTS_OPFS_DIR = 'zero-tvm-weights'
 

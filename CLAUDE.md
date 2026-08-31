@@ -19,11 +19,14 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
 
 - `index.html` — the ENTRANCE: a full-screen character-select screen
   (`src/landing.ts` renders splash, stage, roster, sheet, deeds into
-  `#model-browser`), nav above and footer below, nothing else. ENTER mounts
+  `#model-browser`), then a SWARM section below it. ENTER mounts
   the chat IN PLACE (`landing-chat.ts`) rather than navigating; the ⟁ Room
   tool hosts from there (`landing-room.ts` over `room-host.ts`). The hero,
   kernel window and carousel left with the 2026-08-15 redesign; docs.html
-  carries the why.
+  carries the why. The swarm section (`src/landing-swarm.ts`, `public/swarm.css`)
+  explains the layer split and builds the host/helper/guest URLs from
+  `room-url.ts` — the same grammar share.ts routes on, so a link the entrance
+  hands out cannot be read as another role.
 - `zero-tvm.html` — the hand-written chat surface
 - `docs.html`, `validate.html` — docs and the validation harness
 - `share.html` — host a model for other devices; `agent-host.html` — the
