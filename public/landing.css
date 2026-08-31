@@ -735,7 +735,10 @@ footer li a:hover { color: var(--accent); }
 /* ARMED: a cached character's circle runs a rotating highlight — the same
    OPFS truth as the READY tag, drawn as ceremony. Conic light clipped by the
    very ring mask. */
-#models .mb-art[data-armed] .mb-pedestal::before {
+/* data-swarm-armed rides the same rule: in swarm mode every machine's link is
+   writable, which is the same "ready to summon" state, drawn the same way. */
+#models .mb-art[data-armed] .mb-pedestal::before,
+#models .mb-art[data-swarm-armed] .mb-pedestal::before {
   content: ''; position: absolute; inset: 0;
   background: conic-gradient(from 0deg,
     transparent 0deg, transparent 290deg,
@@ -774,6 +777,7 @@ footer li a:hover { color: var(--accent); }
 
 @media (prefers-reduced-motion: reduce) {
   .cs-aura i, #models .mb-art[data-armed] .mb-pedestal::before,
+  #models .mb-art[data-swarm-armed] .mb-pedestal::before,
   #models .mb-variant[aria-selected="true"] { animation: none; }
   .cs-aura i { opacity: 0.35; transform: translateY(-8vh); }
 }
@@ -1439,4 +1443,195 @@ footer li a:hover { color: var(--accent); }
   #models .cs-summoning .mb-pedestal::after,
   #models .cs-thinking .mb-pedestal::after { animation: none; }
   .cs-guest-mascot { animation: none; }
+}
+
+
+/* ══ SWARM MODE ════════════════════════════════════════════════════════════
+   The second stage-mode, parallel to cs-chatting. It was a documentation
+   section stacked under the scene; splitting a model across machines is a
+   thing you do to the character you are looking at, so it happens on the same
+   stage, in the same chrome.
+
+   Nothing below invents a colour, a face or an easing. The rows are the
+   sheet's own (.mb-row-label, .mb-variant, .mb-abilities), the link fields are
+   the room strip's, the buttons are .cs-chat-tool, the entrance transition is
+   cs-wipe + rowIn, and the ring arcs light on ringFlash and arm on armedSpin
+   — every one of them already here. */
+
+/* The doorway. The amber line says a model may not fit this machine; this is
+   the only control on the scene that answers it, so it lives IN the sentence
+   rather than beneath it. */
+#models .mb-ram-split {
+  font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em;
+  text-transform: uppercase; white-space: nowrap; cursor: pointer;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 78%, #fff);
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent);
+  border-radius: 3px; padding: 2px 8px; margin-left: 2px;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+#models .mb-ram-split:hover {
+  color: #fff; border-color: var(--cs-accent, var(--accent));
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 24%, transparent);
+}
+
+/* ── the sheet becomes the builder ─────────────────────────────────────── */
+/* The stat rows stay in the DOM and step aside — landing.ts keeps repainting
+   them, and leaving the mode has to give the sheet back exactly. */
+#models .cs-swarm .mb-panel > :not(.sw-row) { display: none; }
+/* Four machines of role rows are taller than the stage, and the scene's grid
+   grows to its tallest item — the character floated off the bottom of the
+   screen and the roster went with it. Chat mode already solved this: pin the
+   chamber to the viewport (the nav is sticky IN FLOW, 60px + border) and let
+   the panel that grew scroll inside it. Same height, same reason.
+
+   Column layout ONLY. Under 900px the scene is a single stack — plate, stage,
+   roster, sheet, enter — with no flexible cell to give the leftover height to,
+   and pinning it there crushed every row into the same 800px (caught in the
+   browser, at 390x844). The phone scrolls the page, as it already did. */
+@media (min-width: 901px) {
+  #models .cs-root.cs-swarm {
+    height: calc(100dvh - 61px);
+    min-height: 0;
+    padding-top: 22px;
+  }
+  #models .cs-swarm .mb-info {
+    align-self: stretch; min-height: 0; overflow-y: auto;
+    /* The panel's rune corners sit at -5px; without the padding the scroll box
+       clips them off. */
+    padding: 34px 7px 7px;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+    /* The cut edge reads as a rendering fault otherwise. Same breath of dark
+       the scene already puts at its top and bottom (.cs-root::before/::after),
+       at the scale of a panel. */
+    -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 26px, #000 calc(100% - 22px), transparent 100%);
+    mask-image: linear-gradient(180deg, transparent 0, #000 26px, #000 calc(100% - 22px), transparent 100%);
+  }
+}
+/* The realm's own two corner statements and the swarm's two reach lines are
+   the same register in the same place — only one pair at a time. */
+#models .cs-swarm .cs-corner { display: none; }
+/* The room path under ENTER hosts the WHOLE model from this tab — beside a
+   builder that cuts it into stages, two ⟁ lines meaning different things. */
+#models .cs-swarm .mb-cta-room { display: none; }
+/* Deeds are things that happened on this device; the note row carries the
+   reach caveat instead while the mode is open. */
+#models .cs-swarm .cs-deeds { display: none; }
+
+/* The rows animate in on the sheet's own stagger. nth-child cannot count them
+   (the hidden stat rows come first), so the step is carried as --i and the
+   keyframe and the 0.05s rhythm are the ones already here. */
+#models .cs-swarm .mb-panel.cs-in > .sw-row {
+  animation: rowIn 0.4s ease both;
+  animation-delay: calc(var(--i, 0) * 0.05s);
+}
+
+#models .sw-room {
+  width: 100%; padding: 6px 9px;
+  font-family: var(--mono); font-size: 0.66rem; color: var(--text);
+  background: #0a101ccc; border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 30%, var(--border));
+}
+#models .sw-room::placeholder { color: var(--dim); }
+#models .sw-hint { margin: 6px 0 0; font-size: 0.68rem; line-height: 1.45; color: var(--dim); }
+
+#models .sw-stops { display: grid; gap: 10px; }
+#models .sw-stop {
+  border-left: 2px solid #ffffff1c; padding: 1px 0 2px 10px;
+}
+/* The guest link is the one that gets handed to other people — the only row
+   here whose keyline earns the accent. */
+#models .sw-stop[data-role="guest"] {
+  border-left-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 65%, transparent);
+}
+#models .sw-stop-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 4px 10px; flex-wrap: wrap;
+}
+#models .sw-stop-head b {
+  font-size: 0.78rem; font-weight: 600; letter-spacing: 0.02em;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 55%, var(--text));
+}
+#models .sw-stop-head span {
+  font-family: var(--mono); font-size: 0.56rem; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--dim);
+}
+#models .sw-linkrow { display: flex; gap: 5px; align-items: center; margin-top: 7px; }
+#models .sw-linkrow input {
+  flex: 1 1 auto; min-width: 0; padding: 5px 8px;
+  font-family: var(--mono); font-size: 0.62rem; color: var(--text);
+  background: #0a101ccc; border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 26%, var(--border));
+}
+#models .sw-linkrow input:disabled { color: var(--dim); background: transparent; }
+#models .sw-note { margin: 6px 0 0; font-size: 0.7rem; line-height: 1.45; color: var(--dim); }
+
+#models .sw-exit {
+  align-self: start; margin-top: 14px;
+  font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em;
+  text-transform: uppercase; cursor: pointer;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 65%, var(--dim));
+  background: transparent; padding: 4px 9px;
+  border: 1px solid transparent; border-radius: 3px;
+  transition: color 0.15s, border-color 0.15s;
+}
+#models .sw-exit:hover {
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff);
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent);
+}
+
+/* ── the roster states the limit ───────────────────────────────────────── */
+/* Only an MLX checkpoint can be cut. The old section expressed that by
+   offering a shorter list, which read as an arbitrary one; the rail dims the
+   characters that cannot instead, next to the ones that can. */
+#models .cs-swarm .mb-dot:not([data-splittable]) { opacity: 0.38; filter: grayscale(0.6); }
+
+/* ── the summoning ring counts the machines ────────────────────────────── */
+/* One arc per machine, laid over the same ring.svg the pedestal already
+   wears. The arc box is the ring's own 600x240, bottom-aligned, so the conic
+   gradient's centre and the ring's centre are the same point. */
+#models .cs-swarm .mb-pedestal::after { opacity: 0.28; animation: none; }
+#models .sw-arc {
+  position: absolute; left: 0; right: 0; bottom: 0; aspect-ratio: 600 / 240;
+  pointer-events: none;
+  background: conic-gradient(from 0deg at 50% 50%,
+    transparent var(--a0),
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff) var(--a0),
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff) var(--a1),
+    transparent var(--a1));
+  -webkit-mask: url('/entrance/ring.svg') center / 100% 100% no-repeat;
+  mask: url('/entrance/ring.svg') center / 100% 100% no-repeat;
+  opacity: 0.13;
+  transition: opacity 0.35s ease;
+}
+/* Lit = that machine has a URL to open. ringFlash is the selection flash the
+   stage already runs; here it fires once, as the arc comes on. */
+#models .sw-arc[data-lit] { opacity: 0.95; animation: ringFlash 0.7s ease-out; }
+
+/* ── the reach caveat, in the corner-line register ─────────────────────── */
+#models .sw-reach-note { display: none; }
+#models .cs-swarm .sw-reach-note {
+  display: block; grid-area: note; z-index: 1; justify-self: center;
+  text-align: center; max-width: 92ch; padding: 2px 0;
+  font-family: var(--mono); font-size: 0.58rem; letter-spacing: 0.12em;
+  line-height: 1.7; text-transform: uppercase;
+  /* Full --dim, not the corners' 70% wash: the corners are flavour and this
+     is the sentence that decides whether an evening is wasted. */
+  color: var(--dim);
+}
+#models .cs-swarm .sw-reach-note span { display: block; }
+
+@media (max-width: 900px) {
+  #models .cs-swarm .sw-reach-note { letter-spacing: 0.08em; max-width: none; }
+}
+@media (max-width: 560px) {
+  /* A URL field with two buttons beside it is unreadable at this width; the
+     buttons take their own line, the same fix the old panel made. */
+  #models .sw-linkrow { flex-wrap: wrap; }
+  #models .sw-linkrow input { flex: 1 0 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #models .cs-swarm .mb-panel.cs-in > .sw-row,
+  #models .sw-arc[data-lit] { animation: none; }
+  #models .sw-arc { transition: none; }
 }

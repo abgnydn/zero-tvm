@@ -19,14 +19,19 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
 
 - `index.html` — the ENTRANCE: a full-screen character-select screen
   (`src/landing.ts` renders splash, stage, roster, sheet, deeds into
-  `#model-browser`), then a SWARM section below it. ENTER mounts
+  `#model-browser`). ENTER mounts
   the chat IN PLACE (`landing-chat.ts`) rather than navigating; the ⟁ Room
   tool hosts from there (`landing-room.ts` over `room-host.ts`). The hero,
   kernel window and carousel left with the 2026-08-15 redesign; docs.html
-  carries the why. The swarm section (`src/landing-swarm.ts`, `public/swarm.css`)
-  explains the layer split and builds the host/helper/guest URLs from
-  `room-url.ts` — the same grammar share.ts routes on, so a link the entrance
-  hands out cannot be read as another role.
+  carries the why. The screen has TWO stage-modes, both classes on `.cs-root`:
+  `cs-chatting` and `cs-swarm`. The swarm (`src/landing-swarm.ts`) opens from
+  the ⟁ control on the sheet's amber RAM line — the doorway from "this model
+  does not fit" to its answer — turns the stat sheet into the host/helper/guest
+  link builder and the summoning ring into one arc per machine, and builds
+  every URL from `room-url.ts`, the same grammar share.ts routes on, so a link
+  the entrance hands out cannot be read as another role. `index.html`'s
+  `#swarm` section and `public/swarm.css` are the NO-JS FALLBACK for that mode
+  and nothing else — landing.ts hides the section once the scene renders.
 - `zero-tvm.html` — the hand-written chat surface
 - `docs.html`, `validate.html` — docs and the validation harness
 - `share.html` — host a model for other devices; `agent-host.html` — the

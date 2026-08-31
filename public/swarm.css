@@ -1,20 +1,23 @@
-/* SWARM — the section below the entrance (index.html #swarm, built by
-   src/landing-swarm.ts).
+/* SWARM — the NO-JS FALLBACK only (index.html #swarm).
 
-   No new palette and no new type: every colour, radius and face here is a
-   token from tokens.css, and the components are landing.css's own — .wrap,
-   .sec-head, .band, .mb-panel, .mb-row-label, .mb-variant, .cs-chat-tool,
-   .note. What is defined below is only the parts that do not exist yet: the
-   link rows, and the .band cells as plain divs rather than links.
+   The swarm is a mode of the character-select scene now, not a section under
+   it: landing.ts appends the ⟁ doorway to the sheet's RAM line and mounts the
+   builder inside the sheet, and everything that mode needs lives in
+   landing.css beside the scene it belongs to. The first thing landing.ts does
+   once the scene has rendered is hide #swarm.
 
-   Its own file rather than more of landing.css so this section can be worked
+   What is left here dresses the section a browser with no JavaScript still
+   gets: the prose, the four explainer cards, the plain share.html link and the
+   full reach paragraph. No component below is used by the scene.
+
+   Its own file rather than more of landing.css so the fallback can be worked
    on without touching the stylesheet the character screen lives in. */
 
 #swarm { border-top: 1px solid var(--border); }
 
-/* The nav is the only pointer to this section from the top of the page, and
+/* The nav is the only pointer to the swarm from the top of the page, and
    landing.css hides every nav link but Docs under 720px — because the ones it
-   hides cost gigabytes to follow. This one costs a scroll, so it stays. Same
+   hides cost gigabytes to follow. This one costs a tap, so it stays. Same
    specificity as that rule, later in the cascade; the entrance's own layout is
    deliberately not touched, since it already fills the viewport exactly at
    1440x900 and one more line under ENTER took it past. */
@@ -28,50 +31,7 @@
    a real mechanism, not filler. */
 .sw-band > div { background: var(--surface); padding: 22px; }
 
-/* ── the link builder ──────────────────────────────────────────────── */
 .sw-builder { margin-top: 28px; }
-.sw-panel { padding: 20px 22px 18px; }
-
-/* Step headings sit further from the row above them than a plain label does —
-   they separate three things you do in order, not three properties of one. */
-.sw-panel .sw-step { margin-top: 26px; color: var(--accent); }
-
-.sw-room {
-  width: 100%; font-family: var(--mono); font-size: var(--step--1);
-  padding: 9px 11px; border-radius: var(--rad-s);
-  border: 1px solid var(--border-hi); background: var(--bg); color: var(--text);
-}
-.sw-room::placeholder { color: var(--dim); }
-.sw-hint { color: var(--muted); font-size: var(--step--1); margin: 8px 0 0; }
-
-.sw-stops { display: grid; gap: 14px; }
-.sw-stop {
-  border: 1px solid var(--border); border-left: 2px solid var(--border-hi);
-  border-radius: var(--rad-s); background: var(--surface); padding: 12px 14px;
-}
-/* The guest link is the one that gets handed to other people — the only row
-   here whose keyline earns the accent. */
-.sw-stop[data-role="guest"] { border-left-color: var(--accent); }
-
-.sw-stop-head {
-  display: flex; align-items: baseline; justify-content: space-between;
-  gap: 10px; flex-wrap: wrap;
-}
-.sw-stop-head b { font-weight: 500; }
-.sw-stop-head span {
-  font-family: var(--mono); font-size: var(--step--1); color: var(--dim);
-  text-transform: uppercase; letter-spacing: 0.08em;
-}
-
-.sw-linkrow { display: flex; gap: 6px; align-items: center; margin-top: 10px; }
-.sw-linkrow input {
-  flex: 1 1 auto; min-width: 0;
-  font-family: var(--mono); font-size: var(--step--1);
-  padding: 8px 10px; border-radius: var(--rad-s);
-  border: 1px solid var(--border); background: var(--bg); color: var(--text);
-}
-.sw-linkrow input:disabled { color: var(--dim); background: transparent; }
-.sw-note { color: var(--muted); font-size: var(--step--1); margin: 8px 0 0; }
 
 .sw-reach { max-width: 76ch; margin-top: 28px; }
 .sw-reach b { color: var(--text); font-weight: 500; }
@@ -79,14 +39,4 @@
 #swarm code {
   font-family: var(--mono); font-size: 0.92em;
   color: var(--accent); overflow-wrap: anywhere;
-}
-
-/* Phones: the link row's three items do not fit side by side at 390px, and a
-   URL is long enough that shrinking the field to fit the buttons leaves it
-   unreadable. The buttons drop to their own line instead. */
-@media (max-width: 560px) {
-  .sw-panel { padding: 16px 14px 14px; }
-  .sw-linkrow { flex-wrap: wrap; }
-  .sw-linkrow input { flex: 1 0 100%; }
-  .sw-stop-head span { letter-spacing: 0.05em; }
 }

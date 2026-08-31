@@ -17,11 +17,12 @@
  * The mascot and the cached badge are additive; both fail to silence.
  */
 
-import { SHIPPED_MODELS, kvBytesPerTokenShown as kvBytesPerToken, modelBranding, quantLabel, specWithCtx } from './zero-tvm/model-registry.js'
+import { SHIPPED_MODELS, canSplitAcrossDevices, kvBytesPerTokenShown as kvBytesPerToken, modelBranding, quantLabel, specWithCtx } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
 import { FEATS, feats } from './feats.js'
+import type { SwarmHandle } from './landing-swarm.js'
 
 interface Variant { param: string; spec: ModelSpec; label: string }
 interface Group { name: string; params: string; variants: Variant[] }
@@ -194,6 +195,15 @@ function render(): void {
       </div>
     </aside>
     ${'gpu' in navigator ? '<div class="cs-deeds" role="list" aria-label="Deeds"></div>' : ''}
+    <!-- The reach caveat, in the realm's corner-line register rather than as a
+         paragraph of prose: two mono lines that only show in swarm mode. NOT
+         aria-hidden like the decorative corners — this is the one thing a
+         reader has to know before they spend an evening on it. The full prose
+         stays in the #swarm fallback for a browser with no JavaScript. -->
+    <div class="sw-reach-note" role="note">
+      <span>Reach · STUN only, no TURN — same network or an ordinary home router; corporate and hotel usually will not</span>
+      <span>Splitting needs an MLX checkpoint · every serving tab has to stay awake</span>
+    </div>
     <div class="cs-roster-head" aria-hidden="true">Roster</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter">
@@ -210,6 +220,11 @@ function render(): void {
     ${'gpu' in navigator ? '' :
       '<p class="note cs-note">This browser has no WebGPU — the chat needs Chrome, Edge, or another WebGPU-enabled browser.</p>'}
   `
+  // The scene rendered, so the static #swarm section below it has done its
+  // job: it is the no-JS fallback and nothing else. Hidden HERE rather than in
+  // the markup, so a browser that never reaches this line still gets the prose
+  // and the plain share.html link.
+  document.getElementById('swarm')?.setAttribute('hidden', '')
   {
     const splash = host.querySelector<HTMLElement>('.cs-splash')!
     const still2 = matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -238,6 +253,9 @@ function render(): void {
    *  shows is whichever build is chosen here, priced in KV bytes. */
   let xi = 0
   let mascot: MascotHandle | null = null
+  /** The swarm stage-mode, when it is on. Non-null exactly while the root
+   *  carries `cs-swarm` — the second mode this screen has, after cs-chatting. */
+  let swarm: SwarmHandle | null = null
   // Denominator counts the shared expert only where one EXISTS — qwen30b has
   // none, and a blanket +1 understated its residency fraction.
   const poolFracOf = (spec: ModelSpec, slots: number): number =>
@@ -462,7 +480,20 @@ function render(): void {
       ? `long context allocates ~${kvPrice(v.spec, cx.tokens, INT8_KV)} at boot, on top of the weights`
       : ''
     ram.textContent = [baseNote, ctxNote, b.qualityNote].filter(Boolean).join(' — ')
-    ram.hidden = !(baseNote || ctxNote || b.qualityNote)
+    // THE DOORWAY. This amber line is the page's only statement that a model
+    // may not fit the machine reading it, and until now nothing on the scene
+    // connected it to the one thing that answers it. The control sits IN the
+    // sentence, on the models the registry says can actually be cut — offering
+    // it on an MLC checkpoint would hand out a ?layers= URL that throws at boot.
+    const splittable = canSplitAcrossDevices(v.spec)
+    if (splittable) {
+      const door = document.createElement('button')
+      door.type = 'button'
+      door.className = 'mb-ram-split'
+      door.textContent = '⟁ split across machines'
+      ram.append(' ', door)
+    }
+    ram.hidden = !(baseNote || ctxNote || b.qualityNote || splittable)
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
@@ -473,6 +504,11 @@ function render(): void {
       d.toggleAttribute('data-cached', grp.variants.some((x) => CACHED.has(x.spec.id)))
       // Save slot: a conversation stored on this device continues on enter.
       d.toggleAttribute('data-save', grp.variants.some((x) => hasSave(x.spec.id)))
+      // Who can be split. The old section hid the answer inside a filtered
+      // picker, so the MLX-only rule read as an arbitrary short list; in swarm
+      // mode the rail dims the characters that cannot, which states the limit
+      // on the roster where the reader is already looking.
+      d.toggleAttribute('data-splittable', grp.variants.some((x) => canSplitAcrossDevices(x.spec)))
     }
     const cached = el<HTMLElement>('.mb-cached')
     cached.hidden = !CACHED.has(v.spec.id)
@@ -483,6 +519,12 @@ function render(): void {
     // Full and they grow.
     mascot?.setSpec(specWithCtx(v.spec, cx.tokens), CACHED.has(v.spec.id),
       mode ? poolFracOf(v.spec, mode.slots) : 0)
+
+    // In swarm mode the character on stage IS the model being split, so a
+    // repaint has to re-point the links at it. refresh() is a no-op when the
+    // model has not changed — the cache probe repaints, and it must not wipe a
+    // room link somebody just pasted.
+    swarm?.refresh(v.spec, v.param)
   }
 
   /** DEEDS: things that happened on this device — lit runes, earned names.
@@ -517,17 +559,72 @@ function render(): void {
     }
   }
 
+  /** Leave swarm mode. The sheet's own rows are still in the DOM underneath —
+   *  the mode hides them rather than replacing them — so a repaint restores
+   *  the stat sheet exactly. */
+  function exitSwarm(): void {
+    swarm?.destroy()
+    swarm = null
+    root.classList.remove('cs-swarm')
+    paint()
+    selectFx()
+  }
+
+  /**
+   * Enter swarm mode on the character currently on stage. Imported on demand
+   * for the same reason the chat is: the entrance must render before either
+   * module is fetched, and neither is needed to look at a roster.
+   *
+   * The transition is the SELECTION transition — cs-wipe plus the sheet's
+   * row-stagger — because that is what this is: a second thing you can choose
+   * about the character you are already looking at.
+   */
+  async function enterSwarm(): Promise<void> {
+    const panel = root.querySelector<HTMLElement>('.mb-panel')
+    if (!panel || swarm) return
+    const { mountSwarm } = await import('./landing-swarm.js')
+    const v = GROUPS[gi].variants[vi]
+    swarm = mountSwarm({
+      root,
+      panel,
+      spec: v.spec,
+      param: v.param,
+      onExit: exitSwarm,
+    })
+    root.classList.add('cs-swarm')
+    const live = root.querySelector<HTMLElement>('.cs-live')
+    if (live) live.textContent = `${GROUPS[gi].name} — split across machines`
+    selectFx()
+  }
+
   function go(nextG: number): void {
     gi = (nextG + GROUPS.length) % GROUPS.length
     vi = 0
     mi = 0
     xi = 0
+    if (swarm) {
+      // Qwen3-4B ships an MLC build and an MLX one under one name, and only
+      // the MLX one can be cut — land on the build the mode is about rather
+      // than on variants[0] and then hand out links for a different one.
+      const k = GROUPS[gi].variants.findIndex((x) => canSplitAcrossDevices(x.spec))
+      if (k < 0) {
+        // Nothing to split here. Say so, and give the sheet back.
+        const live = root.querySelector<HTMLElement>('.cs-live')
+        if (live) live.textContent = `${GROUPS[gi].name} cannot be split — it is not an MLX checkpoint`
+        exitSwarm()
+        return
+      }
+      vi = k
+    }
     paint()
     selectFx()
   }
 
   host.addEventListener('click', (e) => {
     const t = e.target as HTMLElement
+    // The RAM line's doorway. First, because it lives inside the sheet and
+    // every other branch below would otherwise have to know about it.
+    if (t.closest('.mb-ram-split')) { void enterSwarm(); return }
     const arrow = t.closest<HTMLElement>('.mb-arrow')
     if (arrow) { go(gi + Number(arrow.dataset.dir)); return }
     const dot = t.closest<HTMLElement>('.mb-dot')
@@ -540,16 +637,25 @@ function render(): void {
     if (modeBtn) { mi = Number(modeBtn.dataset.m); paint(); refocus(`.mb-mode[data-m="${mi}"]`); return }
     const ctxBtn = t.closest<HTMLElement>('.mb-ctx')
     if (ctxBtn) { xi = Number(ctxBtn.dataset.x); paint(); refocus(`.mb-ctx[data-x="${xi}"]`); return }
+    // data-v guards the branch: the swarm mode's machine-count chips wear
+    // .mb-variant for the chip styling but carry no data-v, and Number(undefined)
+    // is NaN — which would index the variant list out of existence.
     const variant = t.closest<HTMLElement>('.mb-variant')
-    if (variant) { vi = Number(variant.dataset.v); mi = 0; xi = 0; paint(); refocus(`.mb-variant[data-v="${vi}"]`) }
+    if (variant && variant.dataset.v !== undefined) {
+      vi = Number(variant.dataset.v); mi = 0; xi = 0; paint(); refocus(`.mb-variant[data-v="${vi}"]`)
+    }
   })
   host.tabIndex = 0
   host.setAttribute('role', 'application')
   host.setAttribute('aria-label', 'Character select — Up and Down arrows change model, Enter opens the chat')
   host.addEventListener('keydown', (e) => {
     // In chat mode the keyboard belongs to the composer — arrows must not
-    // switch characters under a conversation.
+    // switch characters under a conversation. Nor under a text field: the
+    // swarm sheet has one, and typing a room link into it moved the roster.
     if (root.classList.contains('cs-chatting')) return
+    const tag = (e.target as HTMLElement).tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return
+    if (e.key === 'Escape' && swarm) { e.preventDefault(); exitSwarm(); return }
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); go(gi + 1) }
     else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); go(gi - 1) }
     else if (e.key === 'Enter' && (e.target as HTMLElement).tagName !== 'BUTTON' && (e.target as HTMLElement).tagName !== 'A') {
@@ -620,6 +726,10 @@ function render(): void {
     if (!('gpu' in navigator)) return  // navigate — the fallback page explains what is missing
     const href = (e.currentTarget as HTMLAnchorElement).href
     e.preventDefault()
+    // ENTER is still on screen in swarm mode — it is the "run it here instead"
+    // path. Chat mode owns the same sheet and the same stage, so the swarm has
+    // to hand both back before the panel mounts.
+    if (swarm) exitSwarm()
     if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
       root.querySelector<HTMLElement>('.cs-engage')?.classList.add('cs-go')
     }
@@ -646,6 +756,31 @@ function render(): void {
   // The room path is the same summoning with the room strip already open on
   // its CONSENT step — discoverable from the select screen, never auto-armed.
   root.querySelector<HTMLAnchorElement>('.mb-cta-room')?.addEventListener('click', (e) => engage(e, true))
+
+  // "Swarm" in the nav and the footer pointed at the section below. That
+  // section is the no-JS fallback now, so with JS the same href opens the
+  // stage mode instead — and a browser that never runs this still scrolls to
+  // the prose, which is the whole point of leaving the href alone.
+  for (const link of document.querySelectorAll<HTMLAnchorElement>('a[href="#swarm"]')) {
+    link.addEventListener('click', (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+      e.preventDefault()
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+      if (swarm) return
+      // The character on stage may be one that cannot be cut — walk to the
+      // first that can rather than opening a mode with nothing in it.
+      if (!canSplitAcrossDevices(GROUPS[gi].variants[vi].spec)) {
+        const g = GROUPS.findIndex((x) => x.variants.some((y) => canSplitAcrossDevices(y.spec)))
+        if (g < 0) return
+        gi = g
+        vi = GROUPS[g].variants.findIndex((x) => canSplitAcrossDevices(x.spec))
+        mi = 0
+        xi = 0
+        paint()
+      }
+      void enterSwarm()
+    })
+  }
 
   // Idle: 18 s without input and the realm starts breathing on its own; 50 s
   // and the character falls ASLEEP — heavy lids, slow breath, dim ring — but
