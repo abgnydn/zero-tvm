@@ -18,6 +18,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
+# launchd runs with a minimal PATH that has no node — the 2026-08-28 run died
+# in one second with "node: No such file or directory", exit 127. The mise shim
+# dir is the stable answer: it survives node version bumps, because the shim
+# delegates to mise, which resolves the version this project asks for.
+export PATH="$HOME/.local/share/mise/shims:$PATH"
+
 STAMP=$(date +%Y%m%d-%H%M)
 OUT=".evals/nightly-fidelity-$STAMP.log"
 REF=".evals/ref-qwen38-16k"
