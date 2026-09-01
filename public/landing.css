@@ -349,6 +349,11 @@ footer li a:hover { color: var(--accent); }
    every value is the registry row. */
 #models { padding: 0; }
 #models .cs-root {
+  /* THE CHARACTER'S HEIGHT, declared once. The canvas asks for it, the art box
+     is capped to it, and the floor ring is a share of that box — so the three
+     cannot disagree. Every stage-mode below re-declares this ONE property
+     rather than setting a canvas height of its own. */
+  --cs-char-h: min(54dvh, 500px);
   position: relative;
   min-height: 100dvh;
   display: grid;
@@ -433,22 +438,34 @@ footer li a:hover { color: var(--accent); }
 }
 
 /* The stage. */
-#models .mb-stage { grid-area: stage; display: flex; align-items: stretch; gap: 4px; min-height: 0; position: relative; z-index: 1; }
+#models .mb-stage { grid-area: stage; display: flex; align-items: stretch; gap: 4px; min-height: 0; position: relative; z-index: 1;
+  /* The stage row is 1fr, so it takes whatever the viewport leaves — but the
+     canvas stops growing at --cs-char-h. Above ~926px of viewport height (where
+     the 500px half of min(54dvh,500px) starts to bind) the two came apart: at
+     1512x982 the row was 520.39 tall against a 500px canvas, at 1920x1080 it was
+     618.39. Everything the floor ring is measured from is that box, so the ring
+     grew past the character again (149.05 -> 176.92 -> 210.25 tall) and its
+     bottom:2% anchor drifted to 47px below the feet — the exact defect the
+     height-driven ring was written to fix, reappearing above the cap.
+     min(char, 100%) is the whole rule: the row still clamps the stage when the
+     viewport is SHORT (1512x860 stays 398.39), --cs-char-h clamps it when the
+     viewport is TALL, and the canvas fills what is left in both directions. */
+  align-self: center; max-height: min(var(--cs-char-h), 100%); }
 #models .mb-art { flex: 1; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
 /* max-height matters as much as height here. The canvas asked for
    min(54dvh,500px) = 464px inside a 398px .mb-art, so it overflowed 33px
    past the bottom. The floor ring is anchored to .mb-art's bottom, so it
    landed 41px above the character's feet and cut through the torso.
    Capping the canvas to its container puts the feet back on the ring. */
-#models .mb-mascot { height: min(54dvh, 500px); max-height: 100%; max-width: 100%; position: relative; z-index: 2; }
+#models .mb-mascot { height: var(--cs-char-h); max-height: 100%; max-width: 100%; position: relative; z-index: 2; }
 #models .mb-pedestal {
   position: absolute; left: 50%; bottom: 2%; transform: translateX(-50%);
   /* Sized off the character, not the container. The ring took 86% of the
      art box's WIDTH while the character's size follows its HEIGHT, so in chat
      mode — where the stage folds to a 110px familiar over a wide panel — the
      floor ring stayed 311px across and swamped the figure standing on it.
-     Height is now a share of the art box (the canvas fills it exactly, since
-     .mb-mascot is capped at max-height:100%) and the width follows through
+     Height is now a share of the art box — which the max-height above holds
+     to the canvas at every viewport height — and the width follows through
      aspect-ratio, so one rule holds at every size. The entrance is unchanged:
      0.34 x 438 = 149 tall, 395 wide, against the 150 x 397 it had before. */
   width: auto; height: 34%; aspect-ratio: 2.65; max-width: 86%;
@@ -648,7 +665,18 @@ footer li a:hover { color: var(--accent); }
 @keyframes csSplashOut { 0%, 78% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
 
 @media (prefers-reduced-motion: reduce) {
-  .cs-fog i, .cs-dust, #models .mb-pedestal::after { animation: none; }
+  /* !important, not more specificity. Both halves of this rule were losing a
+     specificity fight to rules further down the file and had been for as long
+     as they have existed: `.cs-fog i` (0,1,1) loses to `.cs-fog i:nth-child(1)`
+     (0,2,1), and `#models .mb-pedestal::after` (1,1,1) loses to
+     `#models .mb-art.cs-in .mb-pedestal::after` (1,2,1) — and .cs-in is applied
+     unconditionally by selectFx(), so that is the resting state, not a
+     transition. Measured with document.getAnimations() under reduce: fogA
+     (46s), fogB (58s) and ringPulse (5s) all running, on / and — since it
+     adopted the scene — on /share.html too. A reduced-motion guard that any
+     later rule can outrank is not a guard; the reader's OS setting is not one
+     more author opinion to be ranked against the rest. */
+  .cs-fog i, .cs-dust, #models .mb-pedestal::after { animation: none !important; }
 }
 
 /* Phones: stage first, roster as a strip, sheet, enter. */
@@ -663,8 +691,12 @@ footer li a:hover { color: var(--accent); }
     grid-template-areas: 'plate' 'stage' 'enter' 'roster' 'sheet' 'note';
     padding: calc(var(--nav-h, 64px) + 8px) 14px 18px;
     gap: 8px;
+    --cs-char-h: min(36dvh, 300px);
   }
-  #models .mb-mascot { height: min(36dvh, 300px); }
+  /* The phone grid sizes the stage row from its content, so there is nothing
+     for the desktop clamp to hold back and no definite row for its 100% to
+     resolve against. */
+  #models .mb-stage { align-self: stretch; max-height: none; }
   #models .cs-roster-head { display: none; }
   #models .mb-roster {
     flex-direction: row; overflow-x: auto; overflow-y: hidden; margin-top: 0;
@@ -1325,8 +1357,9 @@ footer li a:hover { color: var(--accent); }
     grid-template-columns: 1fr;
     grid-template-rows: auto auto 1fr;
     grid-template-areas: 'plate' 'stage' 'chat';
+    --cs-char-h: 110px;
   }
-  #models .cs-chatting .mb-mascot { height: 110px; -webkit-box-reflect: none; }
+  #models .cs-chatting .mb-mascot { -webkit-box-reflect: none; }
   #models .cs-chatting .cs-lore { display: none; }
   #models .cs-chatting .mb-plate { padding-bottom: 4px; }
   #models .cs-chatting .mb-name { font-size: 1.3rem; }
@@ -1533,6 +1566,58 @@ footer li a:hover { color: var(--accent); }
   color: var(--dim); margin-left: auto; flex: none; }
 .cs-tool-live { border-color: var(--cs-accent, var(--accent)) !important;
   color: color-mix(in srgb, var(--cs-accent, var(--accent)) 80%, #fff) !important; }
+
+/* ⟁ Room is a TOGGLE, and the only way back out of the strip. It looked
+   exactly like the buttons beside it in both states, which is why an open
+   strip read as a dead end rather than as something you had opened. */
+#room-btn[aria-expanded='true'] {
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 80%, #fff);
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 50%, transparent);
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 12%, transparent);
+}
+
+/* PHONES: the strip is a sheet OVER the conversation, not a block above it.
+   In flow it is bigger than the panel it sits in — at 360x740 it asked for
+   333.48px of a 416.91px panel, which left .chat-main 0px tall (37.69px at
+   390x844) and pushed the composer out of the panel's bottom edge. The plan
+   block is only ~150px of that; hiding it entirely still left 74.66px of
+   conversation, so shrinking the plan was never going to be the fix.
+   ⟁ Open a room (?chat=1&room=1) lands here with the strip already open, so
+   that was the first thing a phone saw of a room.
+
+   The panel becomes a grid whose body row holds the conversation and the strip
+   in the SAME cell. The strip covers the messages — which is what you are
+   looking past while you set a room up — and the head and the composer, the
+   two things you need to leave or to type, stay in their own rows at full
+   size. Closing the strip returns the whole body row to the conversation with
+   no reflow of anything else. */
+@media (max-width: 900px) {
+  #models .cs-chat {
+    display: grid;
+    /* minmax(0, …), not 1fr: an auto column is max-content, and the nowrap
+       composer-hint made every row 437.8px wide inside a 332px panel. */
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-areas: 'head' 'boot' 'body' 'composer';
+  }
+  #models .cs-chat > .cs-chat-head { grid-area: head; }
+  #models .cs-chat > .cs-boot { grid-area: boot; }
+  #models .cs-chat > .chat-main { grid-area: body; }
+  #models .cs-chat > .composer-wrap { grid-area: composer; }
+  #models .cs-chat > .cs-room {
+    grid-area: body; z-index: 4; overflow-y: auto;
+    /* start + max-height, not stretch: a strip shorter than the body row —
+       share.html's weight-copy offer is two elements — covers only its own
+       height, and only the entrance's full room strip takes the whole cell
+       and scrolls inside it. */
+    align-self: start; max-height: 100%;
+    /* Opaque: it is over the conversation now, and the panel's own background
+       is a gradient the messages would read through. */
+    background: linear-gradient(180deg, #0c1220, #090e18);
+    box-shadow: 0 14px 28px #0009;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+  }
+}
 
 /* Guests on stage: small familiars on the ring's edge. */
 .cs-guest-mascot { position: absolute; width: 90px; height: 90px; z-index: 1;
