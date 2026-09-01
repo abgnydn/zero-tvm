@@ -31,11 +31,21 @@
 //                              Phi-3 back on stage and undo that.
 //
 //   `model` key PRESENT but    "what does an unrecognised ?model= mean" — a
-//   unresolvable               COMPATIBILITY question, and every pre-registry
+//   NOT ON THE ROSTER          COMPATIBILITY question, and every pre-registry
 //   (`?model=bogus`,           URL depends on the fall-through. zero-tvm.html
-//    `?model=`,                already answers Phi-3, so the entrance must
-//    `?model=embed`)           too. THIS is where the two surfaces may not
-//                              disagree.
+//    `?model=`, and also       already answers Phi-3, so the entrance must
+//    `?model=embed`)           too, and the two surfaces may not disagree for
+//                              any value that resolves to a ROSTERED spec.
+//
+// `?model=embed` is in that list for a different reason and the difference
+// matters. It is not unresolvable: `specForParam('embed')` returns the
+// embedding spec, and /zero-tvm.html boots it. The ENTRANCE shows Phi-3 for
+// it, so the two surfaces genuinely DO disagree there — deliberately. A
+// character-select screen for conversation cannot put on stage a model that
+// returns a vector and does not speak, so the roster excludes it and the
+// entrance falls back rather than promoting whichever model leads the roster
+// this month. Anyone "fixing that inconsistency" deletes the exclusion; the
+// test below pins the disagreement so they cannot do it quietly.
 //
 // The split is therefore on PRESENCE of the key, never on whether its value
 // resolves. Both halves are pinned below; collapsing them into one rule breaks
@@ -104,19 +114,33 @@ describe('a ?model= that is PRESENT is the registry\'s question', () => {
   })
 
   it('boots Phi-3 for an unresolvable ?model=, exactly like /zero-tvm.html', () => {
-    // The three measured URLs, plus the two shipped specs the roster does not
-    // carry. ?model=embed names a REAL registry entry — an embedding model,
-    // which returns a vector and does not speak — so the entrance cannot put
-    // it on stage; it must land on the registry's fallback and not on the
-    // roster's lead.
+    // The measured URLs. `specForParam` cannot name a spec for any of these,
+    // so both surfaces take the registry's fallback and agree.
     for (const s of [
       '?model=not-a-model&chat=1',
       '?model=&chat=1',
       '?model=not-a-model',
-      '?model=embed',
-      '?model=embed&chat=1',
     ]) {
+      expect(specForParam(new URLSearchParams(s).get('model')).id, s).toBe(PHI3.id)
       expect(specOf(entranceIntent(s, '')).id, s).toBe(PHI3.id)
+    }
+  })
+
+  it('DISAGREES with /zero-tvm.html on ?model=embed, and that is the point', () => {
+    // `embed` RESOLVES — it is a real registry entry, and /zero-tvm.html boots
+    // it. The entrance does not, because a character-select screen for
+    // conversation cannot put on stage a model that returns a vector and does
+    // not speak; the roster excludes it (buildGroups skips embeddingOnly) and
+    // the entrance takes the registry's own fallback rather than the roster's
+    // lead. Both halves are asserted so that "fixing the inconsistency" —
+    // answering specForParam here like the other surfaces do — fails loudly
+    // instead of quietly deleting the exclusion.
+    expect(specForParam('embed').id).toBe('qwen3-embedding-0-6b-4bit-dwq')
+    expect(specForParam('embed').embeddingOnly).toBe(true)
+    expect(onRoster('qwen3-embedding-0-6b-4bit-dwq')).toBe(false)
+    for (const s of ['?model=embed', '?model=embed&chat=1']) {
+      expect(specOf(entranceIntent(s, '')).id, s).toBe(PHI3.id)
+      expect(specOf(entranceIntent(s, '')).id, s).not.toBe(specForParam('embed').id)
     }
   })
 })
