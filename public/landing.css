@@ -179,7 +179,14 @@ section { padding: 72px 0; }
 @media (max-width: 780px) {
   .mb-slide { grid-template-columns: 1fr; text-align: center; min-height: 0; }
   .mb-stats { justify-items: center; }
-  .mb-variants, .mb-info { justify-content: center; align-items: center; }
+  /* .mb-info was in this rule too, from the old .mb-slide carousel. On a flex
+     COLUMN, align-items:center makes the sheet shrink-to-fit instead of filling
+     its track — so any row whose min-content is wider than a phone column (the
+     room log's nowrap request lines) sized the whole panel to itself and it
+     hung off both edges of the screen, measured at 390x844. The entrance never
+     showed it because its own rows all fit; it is still the wrong behaviour for
+     a card in a single-column stack. */
+  .mb-variants { justify-content: center; align-items: center; }
 }
 .mb-art { position: relative; padding-bottom: 66px; }
 .mb-mascot { display: block; width: 100%; height: 320px; position: relative; z-index: 1; }
@@ -1126,21 +1133,24 @@ footer li a:hover { color: var(--accent); }
 .cs-chat-tool:hover { color: var(--text); border-color: var(--muted); }
 .cs-chat-tool:disabled { opacity: 0.4; cursor: not-allowed; }
 
-/* Live badge — written by loading-ui.ts (Summoning → % → Ready). */
-.cs-chat .badge {
+/* Live badge — written by loading-ui.ts (Summoning → % → Ready). Scoped to the
+   HEAD rather than to .cs-chat: the badge has only ever lived in this row, and
+   share.html's host and helper wear the same row inside the stat sheet, where
+   there is no conversation panel to hang it off. */
+.cs-chat-head .badge {
   flex: none; display: inline-flex; align-items: center; gap: 6px;
   font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.1em; text-transform: uppercase;
   padding: 4px 9px; border: 1px solid #ffffff1c; border-radius: 999px; color: var(--dim);
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-.cs-chat .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
-.cs-chat .badge.loading { color: #fbbf24; border-color: #fbbf2440; }
-.cs-chat .badge.loading .dot { background: #fbbf24; animation: csBadgePulse 1.4s infinite; }
-.cs-chat .badge.ready { color: var(--cs-accent, var(--accent));
+.cs-chat-head .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.cs-chat-head .badge.loading { color: #fbbf24; border-color: #fbbf2440; }
+.cs-chat-head .badge.loading .dot { background: #fbbf24; animation: csBadgePulse 1.4s infinite; }
+.cs-chat-head .badge.ready { color: var(--cs-accent, var(--accent));
   border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent); }
-.cs-chat .badge.ready .dot { background: var(--cs-accent, var(--accent)); }
-.cs-chat .badge.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
-.cs-chat .badge.error .dot { background: var(--err); }
+.cs-chat-head .badge.ready .dot { background: var(--cs-accent, var(--accent)); }
+.cs-chat-head .badge.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.cs-chat-head .badge.error .dot { background: var(--err); }
 @keyframes csBadgePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
 /* The rite card: download + compile progress, then it folds away. */
