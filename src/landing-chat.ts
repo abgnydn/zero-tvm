@@ -56,15 +56,32 @@ const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
 const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>'
 
-function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, buildLabel: string): string {
+export function panelMarkup(
+  spec: ModelSpec,
+  brand: ReturnType<typeof modelBranding>,
+  buildLabel: string,
+  layerRange?: { start: number; end: number },
+): string {
   const sigil = LANE_SIGIL[laneOf(spec)] ?? ''
   const size = brand.params.split(/[\s·]/)[0]
+  // WHAT THIS TAB IS ABOUT TO FETCH. A stage holds part of the checkpoint, so
+  // the checkpoint's own figures are not its figures — the same bug share.ts's
+  // download gate already fixed once, where "the iPhone that held one layer of
+  // the 27B was asked to approve '~14.1 GB' for a slice worth a fraction of
+  // that (real device, 2026-08-29)". Same resolution here: state the RANGE and
+  // invent no per-stage byte figure, since the real size is not knowable until
+  // the safetensors headers are read. The progress panel shows it as it lands.
+  const detail = layerRange
+    ? `layers ${layerRange.start}–${layerRange.end} of ${spec.layers} · cached after first load`
+    : `${brand.sizeLabel} · cached after first load — next visit starts in seconds`
   // The one note a visitor cannot undo by waiting: RAM for the full build,
   // the build's own caveat for a chosen one (picking less memory IS the
-  // answer to the RAM warning).
+  // answer to the RAM warning). brand.ramNote is a whole-checkpoint number and
+  // is false for a stage; nothing replaces it, because a per-stage figure would
+  // have to be guessed. A chosen memory build is still this tab's build.
   const note = buildLabel !== brand.params
     ? `Build: ${buildLabel}`
-    : (brand.ramNote ?? '')
+    : (layerRange ? '' : (brand.ramNote ?? ''))
   return `
     <div class="cs-chat-head">
       <span class="cs-chat-sigil" aria-hidden="true">${sigil}</span>
@@ -80,7 +97,7 @@ function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, b
       <div class="cs-boot-title" id="loading-title">Summoning ${brand.name}</div>
       <div class="cs-boot-status" id="progress-status" aria-live="polite">Preparing…</div>
       <div class="cs-boot-track"><i id="progress-bar"></i></div>
-      <div class="cs-boot-detail" id="progress-detail">${brand.sizeLabel} · cached after first load — next visit starts in seconds</div>
+      <div class="cs-boot-detail" id="progress-detail">${detail}</div>
       ${note ? `<div class="cs-boot-note">${note}</div>` : ''}
       <details class="cs-boot-log"><summary>Rite log</summary><pre id="progress-log"></pre></details>
       <div class="cs-boot-error" id="loading-error"></div>
@@ -147,7 +164,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   panel.className = 'cs-chat'
   panel.setAttribute('role', 'region')
   panel.setAttribute('aria-label', `Chat with ${brand.name}`)
-  panel.innerHTML = panelMarkup(spec, brand, buildLabel)
+  panel.innerHTML = panelMarkup(spec, brand, buildLabel, opts.layerRange)
   root.appendChild(panel)
   root.classList.add('cs-chatting')
   // ENTER just display:none'd itself — without a new focus target the whole
@@ -229,7 +246,12 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   if (lane === 'dense' || lane === 'hybrid' || lane === 'moe') recordFeat(`lane-${lane}`)
   if (opts.poolSlots) recordFeat('pooled')
   if (opts.ctxTokens) recordFeat('long-ctx')
-  {
+  // Heavyweight is "boot a ≥10 GB footprint", and both terms of that sum are
+  // WHOLE-MODEL: poolLabel/sizeLabel is the whole checkpoint's download and
+  // kvBytesPerToken counts every layer's KV. A stage booted neither, so it is
+  // not awarded one — the deed would be the same false figure as the boot card
+  // used to print, only stored.
+  if (!opts.layerRange) {
     const w = /([\d.]+)\s*GB/.exec(opts.poolLabel || brand.sizeLabel)
     const gb = (w ? parseFloat(w[1]) : 0) + (spec.maxContext * spec.kvBytesPerToken) / 2 ** 30
     if (gb >= 10) recordFeat('heavy')

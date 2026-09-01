@@ -414,6 +414,42 @@ async function confirmDownload(
   })
 }
 
+/* CONSENT:BEGIN — one paragraph, two files: src/landing-room.ts (the entrance's
+   ⟁ Room tool) and src/zero-tvm/share.ts (share.html's host role). They cannot
+   share one import: share.html's guest needs no WebGPU and downloads nothing,
+   while landing-room.ts reaches model-select → weight-loader. So this block is
+   kept BYTE-IDENTICAL in both files and tests/unit/stage-honesty.test.ts
+   compares them. Edit both. */
+/**
+ * What opening a room actually commits this machine to.
+ *
+ * The whole-model paragraph was written when a serving tab could only hold the
+ * whole model, and all three of its promises are false under a split: a stage's
+ * tab does not run the reply (room-chain.ts's stepAll runs this tab's layers and
+ * then awaits every downstream stage on OTHER machines), and a guest copying
+ * weights from a stage host gets one layer range rather than a model it can run
+ * (loadWeights writes only that range into the model's OPFS dir, and
+ * peer-weights.ts streams that dir as it stands). So the copy branches.
+ */
+export function roomConsentCopy(
+  name: string,
+  stage: { start: number; end: number } | null,
+  layers: number,
+): string {
+  if (stage) {
+    return `Open a room and whoever has the link chats with <b>${name}</b>, split across the `
+      + `machines in this room. This tab holds layers ${stage.start}–${stage.end} of ${layers}: `
+      + 'every guest token runs its share on your GPU and the rest on the other machines. '
+      + 'Every request is listed here as it arrives. Weights copied from this tab are those '
+      + 'layers only, not a model that runs on its own. Keep this tab in the foreground while serving.'
+  }
+  return `Open a room and whoever has the link chats with <b>${name}</b> running on `
+    + 'THIS machine. Their prompts run on your GPU; every request is listed here as it '
+    + "arrives. Guests can also copy the model's cached weights from this machine to "
+    + 'run it locally. Keep this tab in the foreground while serving.'
+}
+/* CONSENT:END */
+
 async function runHost(existingRoom: string | null, stageRange: { start: number; end: number } | null): Promise<void> {
   // The registry spec is enough to paint the character (name, lane, lore,
   // accent) and it needs no WebGPU — so the scene is on screen before the
@@ -437,10 +473,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
         <div class="mb-row-label sw-row" style="--i:1">Room</div>
         <div class="cs-room sw-row" style="--i:2">
           <div class="cs-room-consent">
-            <p>Open a room and whoever has the link chats with <b>${brand.name}</b> running on
-            THIS machine. Their prompts run on your GPU; every request is listed here as it
-            arrives. Guests can also copy the model's cached weights from this machine to
-            run it locally. Keep this tab in the foreground while serving.</p>
+            <p>${roomConsentCopy(brand.name, stageRange, baseSpec.layers)}</p>
             <p id="gate-weights"></p>
             <p class="mb-ram" id="gate-ram"></p>
             <button type="button" class="cs-chat-tool" id="share-gate-go" disabled>Checking this device…</button>
@@ -973,8 +1006,13 @@ async function runGuest(roomId: string): Promise<void> {
     $('guest-sigil').innerHTML = LANE_SIGIL[laneOf(spec)] ?? ''
     paintCharacter(root, spec, msg.name, msg.params)
     $('welcome-title').textContent = `Speak with ${msg.name}`
-    $('welcome-lore').textContent = `${loreOf(spec)} It runs on the machine that opened this room; `
-      + 'this page holds only the conversation.'
+    // "It runs on the machine that opened this room" was written before a room
+    // could be split. Under a split the reply is assembled across every machine
+    // in the chain, and this page cannot tell which it is: room-host.ts's info
+    // frame carries name/params/tag/param/specId/ctx and no stage or chain
+    // field. Rather than invent one, the sentence is true either way.
+    $('welcome-lore').textContent = `${loreOf(spec)} It runs on the machine that opened this room, `
+      + 'and on any machine it has split the model across; this page holds only the conversation.'
     selectFx(root)
     void mountFigure(root, spec, false).then((m) => { mascot = m })
   }
@@ -984,9 +1022,15 @@ async function runGuest(roomId: string): Promise<void> {
       reveal(msg)
       // The host's advertised rate is deliberately not shown: a guest cannot
       // act on it, and the one thing a guest DOES need to know about this room
-      // is whose machine the words land on.
+      // is whose machine the words land on. Under a split that is more than one
+      // machine — so the exposure is stated once, and not overstated: the host
+      // renders the chat template and tokenizes, so it holds the TEXT; a machine
+      // holding a later stage never does (pipeline-peer.ts hands it a residual
+      // and it hands one back). Both clauses are true either way, which they
+      // have to be — the info frame carries no stage or chain field.
       setStatus(`${msg.params}${msg.ctx ? ` · ${msg.ctx.toLocaleString()}-token context` : ''}`
-        + ' · runs on the host machine — the host can read what you send; this page holds only the conversation.')
+        + ' · the host machine can read what you send; machines it splits the model with see only'
+        + ' the numbers passing between layers, not your text. This page holds only the conversation.')
       setBadge('Ready', 'ready')
       $('welcome').classList.remove('cs-wait')
       inp.disabled = false
@@ -1120,7 +1164,15 @@ async function runGuest(roomId: string): Promise<void> {
     const gb = (inv.bytes / 1e9).toFixed(2)
     panel.classList.remove('hidden')
     panel.hidden = false
-    status.textContent = `The host has ${gb} GB cached. Copying it here lets this device run ${spec.id} on its own GPU.`
+    // What the host has cached is its OPFS directory AS IT STANDS — the whole
+    // model if it holds the whole model, one layer range if it is a stage of a
+    // split (loadWeights writes only that range; peer-weights.ts streams the
+    // dir). The info frame carries no stage field, so this page cannot tell the
+    // two apart and must not promise the second one runs on its own GPU. What
+    // it CAN say without qualification is that the copy saves the download.
+    status.textContent = `The host has ${gb} GB cached — copying it saves this device the download. `
+      + `If that is the whole of ${spec.id} this device can then run it on its own GPU; if the host `
+      + "is holding one stage of a split model, it is that stage's layers."
     btn.textContent = `Copy ${gb} GB to this device`
     btn.addEventListener('click', () => {
       btn.disabled = true
@@ -1142,7 +1194,13 @@ async function runGuest(roomId: string): Promise<void> {
             origin: '', path: '/share.html', room: roomId,
             model: param, ctx: ctx ?? null, sig: SIG_OVERRIDE,
           })
+          // Both links boot the WHOLE model on this device, so both assume the
+          // host was holding the whole model. It may have been holding one stage
+          // of a split, and nothing on the wire says which — so the condition is
+          // stated rather than hidden behind a link that would simply fail.
           status.innerHTML = `Done — ${(res.bytes / 1e9).toFixed(2)} GB in ${secs}s. `
+            + 'Both links below need the whole model on this device; if the host was holding '
+            + "one stage of a split, what arrived is that stage's layers.<br>"
             + `<a href="/zero-tvm.html?model=${p}">Open the chat on this device →</a><br>`
             + `<a href="${serve}">…or serve this room from here too →</a>`
           btn.remove()
