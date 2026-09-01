@@ -105,6 +105,16 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
   const html = `
     <div class="mb-row-label sw-row" style="--i:0">Split across</div>
     <div class="mb-variants sw-splits sw-row" style="--i:1" role="tablist" aria-label="How many machines"></div>
+    <!-- Context is per-ROOM, not per-machine: every stage sizes its KV cache
+         from it (room-url.ts's ctxFor), and two stages on different numbers
+         hold different slot counts for the same conversation — the room then
+         dies mid-generation rather than at boot. So it is set once, here, and
+         written into every serving link. -->
+    <label class="sw-ctx sw-row" style="--i:1">
+      <span>Context</span>
+      <input class="sw-ctx-in" type="number" min="256" step="256" aria-label="Context window in tokens">
+      <span class="sw-ctx-unit">tokens · sizes the KV cache on every machine</span>
+    </label>
     <div class="mb-row-label sw-row" style="--i:2">The start</div>
     <div class="sw-stops sw-host sw-row" style="--i:3"></div>
     <div class="mb-row-label sw-row" style="--i:4">Room link from it</div>
@@ -182,7 +192,19 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
     const who = stop.role === 'guest' ? 'Anyone else' : `${ordinal(index)} machine`
     // A guest holds no layers at all, so the range slot is simply absent —
     // "no layers" read as a fault rather than as the point of the row.
-    const tag = stop.range ? `${stop.role} · layers ${stop.range.start}–${stop.range.end}` : stop.role
+    // The END of each stage except the last is an INPUT. An even split is the
+    // wrong default for real hardware: the session this came from put 63 layers
+    // on a laptop and one on a phone, because a phone cannot hold a sixteenth
+    // of a 27B. The last serving stage has no editable end — it always runs to
+    // the final layer, or the chain would never complete.
+    const editable = stop.range != null && index < machineCount() - 1
+    const tag = stop.range
+      ? (editable
+          ? `${stop.role} · layers ${stop.range.start}–<input class="sw-cut" type="number" `
+            + `min="${stop.range.start + 1}" max="${spec.layers}" value="${stop.range.end}" `
+            + `data-cut="${index}" aria-label="last layer on the ${ordinal(index)} machine">`
+          : `${stop.role} · layers ${stop.range.start}–${stop.range.end}`)
+      : stop.role
     const head = `<div class="sw-stop-head"><b>${who}</b><span>${tag}</span></div>`
     // Every helper carries the same sentence — printing it three times was the
     // documentation tell. It is stated once, on the first one.
@@ -208,9 +230,27 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
       ${body}</div>`
   }
 
+  /** Serving stages = machines; the guest is not one of them. */
+  function machineCount(): number { return SPLITS[si].n }
+
+  /** Interior cut points. null = an even split; set once the operator drags a
+   *  boundary. Reset whenever the machine count changes, because the old cuts
+   *  describe a different number of stages. */
+  let cuts: number[] | null = null
+
+  /** Context for the whole room. Starts at the spec's own default; the field
+   *  lets it come down for a machine that cannot afford the KV. */
+  let ctx: number = spec.maxContext
+
   function paint(): void {
+    const ctxIn = o.panel.querySelector<HTMLInputElement>('.sw-ctx-in')
+    if (ctxIn && document.activeElement !== ctxIn) {
+      ctxIn.max = String(spec.maxContext)
+      ctxIn.value = String(ctx)
+    }
     const machines = SPLITS[si].n
     const stops = swarmUrls({
+      cuts,
       origin: location.origin,
       param,
       layers: spec.layers,
@@ -221,7 +261,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
       // and a compiled default that moved between them would give the stages
       // differently sized KV caches for the same conversation (room-url.ts's
       // ctxFor). A number in the link cannot drift; a default can.
-      ctx: spec.maxContext,
+      ctx,
     })
     el('.sw-host').innerHTML = stopRow(stops[0], 0, true)
     el('.sw-rest').innerHTML = stops.slice(1)
@@ -235,11 +275,23 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
     lightArcs(stops)
   }
 
+  /** A boundary moved. Read every visible cut so one edit cannot desync the
+   *  rest, then let clampBounds inside swarmUrls make it legal. */
+  function onCutChange(): void {
+    const inputs = [...o.panel.querySelectorAll<HTMLInputElement>(String.raw`.sw-cut`)]
+    if (!inputs.length) return
+    cuts = inputs.map((i) => Number(i.value))
+    paint()
+  }
+
   const onClick = (e: Event): void => {
     const t = e.target as HTMLElement
     const split = t.closest<HTMLElement>('.sw-split')
     if (split) {
       si = Number(split.dataset.i)
+      // Old cuts describe a different number of stages; carrying them over
+      // would silently produce ranges that do not tile the model.
+      cuts = null
       for (const b of o.panel.querySelectorAll<HTMLElement>('.sw-split')) {
         b.setAttribute('aria-selected', String(Number(b.dataset.i) === si))
       }
@@ -262,6 +314,20 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
   }
   o.panel.addEventListener('click', onClick)
   roomInput.addEventListener('input', paint)
+  // 'change', not 'input': repainting on every keystroke would steal the
+  // caret mid-number and clamp a half-typed value.
+  o.panel.addEventListener('change', (e) => {
+    const t = e.target as HTMLElement
+    if (t.classList.contains('sw-cut')) { onCutChange(); return }
+    if (t.classList.contains('sw-ctx-in')) {
+      // Clamp to the spec's own ceiling: a link asking for more than the KV
+      // allocator will grant is a promise the stages cannot keep.
+      const want = Number((t as HTMLInputElement).value)
+      ctx = Math.min(Math.max(Number.isFinite(want) ? want : spec.maxContext, 256), spec.maxContext)
+      ;(t as HTMLInputElement).value = String(ctx)
+      paint()
+    }
+  })
 
   drawArcs(SPLITS[si].n)
   paint()

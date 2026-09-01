@@ -95,6 +95,27 @@ export function splitBounds(layers: number, machines: number): number[] {
   return Array.from({ length: n + 1 }, (_, i) => Math.round((i * layers) / n))
 }
 
+/** Clamp a set of interior cut points into a legal ascending split.
+ *
+ *  An EVEN split is the wrong default for real hardware and was never what a
+ *  working swarm looked like: the session this feature came from put 63 layers
+ *  on a laptop and ONE on a phone, because a phone cannot hold a sixteenth of
+ *  a 27B. So the builder lets each boundary move, and this keeps the result
+ *  well-formed — ascending, inside the model, and never an empty stage, which
+ *  `offerStage` would refuse as `layers a-a is not a range`. */
+export function clampBounds(layers: number, cuts: readonly number[]): number[] {
+  const n = cuts.length + 1                       // stages, not cut points
+  const out: number[] = [0]
+  for (let i = 0; i < cuts.length; i++) {
+    // Leave room for every stage still to come, and for this one to be >= 1.
+    const lo = out[i] + 1
+    const hi = layers - (n - 1 - i)
+    out.push(Math.min(Math.max(Math.round(cuts[i]), lo), Math.max(lo, hi)))
+  }
+  out.push(layers)
+  return out
+}
+
 export interface SwarmStop {
   role: RoomRole
   /** Layers this machine holds; absent for a guest, which holds none. */
@@ -172,8 +193,14 @@ export function swarmUrls(o: {
   /** `?ctx=` for the serving links, so every stage sizes the same KV cache
    *  (ctxFor). Omit to let each machine use its build's default. */
   ctx?: number | null
+  /** Interior cut points, when the operator has moved them. Omit for an even
+   *  split. Clamped by clampBounds, so a caller cannot produce an empty or
+   *  descending stage. */
+  cuts?: readonly number[] | null
 }): SwarmStop[] {
-  const bounds = splitBounds(o.layers, o.machines)
+  const bounds = o.cuts && o.cuts.length === o.machines - 1
+    ? clampBounds(o.layers, o.cuts)
+    : splitBounds(o.layers, o.machines)
   const at = (i: number): { start: number; end: number } => ({ start: bounds[i], end: bounds[i + 1] })
   const serve = (r: { start: number; end: number }, room: string | null): string =>
     roomLink({ origin: o.origin, path: '/share.html', room, model: o.param, layers: r, ctx: o.ctx })

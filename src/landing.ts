@@ -207,8 +207,17 @@ function render(): void {
     <div class="cs-roster-head" aria-hidden="true">Roster</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter">
-      <a class="mb-cta btn btn-primary">Enter chat ▸</a>
-      <a class="mb-cta-room">⟁ Enter &amp; open a room — serve this model to other machines</a>
+      <!-- TWO verbs, equal weight. Serving a room works on EVERY model — only
+           splitting one across machines needs an MLX checkpoint, and 8 of the
+           11 shipped specs are MLX. Hiding the room behind a line of grey text
+           under the button, below the fold, buried the most shareable thing
+           the project does; the split doorway on the RAM line made it worse by
+           framing the swarm as a consolation for not having enough memory. -->
+      <div class="cs-verbs">
+        <a class="mb-cta btn btn-primary">Enter chat ▸</a>
+        <a class="mb-cta-room btn btn-room">⟁ Open a room</a>
+      </div>
+      <p class="cs-verbs-note">A room serves this model to other machines. <span class="cs-verbs-split"></span></p>
     </div>
     <div class="cs-live" aria-live="polite"></div>
     <div class="cs-wipe" aria-hidden="true"></div>
@@ -485,15 +494,24 @@ function render(): void {
     // connected it to the one thing that answers it. The control sits IN the
     // sentence, on the models the registry says can actually be cut — offering
     // it on an MLC checkpoint would hand out a ?layers= URL that throws at boot.
+    // The RAM line states a fact and stops there. It used to carry the only
+    // door to the swarm, which put a primary action inside a caveat, on a
+    // sheet that is itself below the fold on the larger characters.
     const splittable = canSplitAcrossDevices(v.spec)
+    ram.hidden = !(baseNote || ctxNote || b.qualityNote)
+
+    // The split offer lives with the room verb, where it reads as a capability
+    // rather than a fallback. Absent on the three MLC specs, whose loader
+    // refuses a layerRange.
+    const splitNote = el<HTMLElement>('.cs-verbs-split')
+    splitNote.replaceChildren()
     if (splittable) {
-      const door = document.createElement('button')
-      door.type = 'button'
-      door.className = 'mb-ram-split'
-      door.textContent = '⟁ split across machines'
-      ram.append(' ', door)
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'cs-verbs-split-btn'
+      b.textContent = 'Too big for one machine? Split it ▸'
+      splitNote.append(b)
     }
-    ram.hidden = !(baseNote || ctxNote || b.qualityNote || splittable)
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
@@ -624,7 +642,7 @@ function render(): void {
     const t = e.target as HTMLElement
     // The RAM line's doorway. First, because it lives inside the sheet and
     // every other branch below would otherwise have to know about it.
-    if (t.closest('.mb-ram-split')) { void enterSwarm(); return }
+    if (t.closest('.cs-verbs-split-btn')) { void enterSwarm(); return }
     const arrow = t.closest<HTMLElement>('.mb-arrow')
     if (arrow) { go(gi + Number(arrow.dataset.dir)); return }
     const dot = t.closest<HTMLElement>('.mb-dot')

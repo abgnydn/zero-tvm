@@ -37,22 +37,32 @@ import { QWEN3_5_9B_MLX_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_8_27B_4BIT } from '../compiler/model-spec.ts'
 // ADD-MODEL:IMPORTS
 
-/** URL `?model=` value for each spec; Phi-3 is the no-flag default. */
+/** URL `?model=` value for each spec.
+ *
+ *  ORDER IS THE ROSTER ORDER, and the entrance opens on the first entry
+ *  (`GROUPS[0]`). It used to be the order specs were added, which put Phi-3 —
+ *  the oldest and least capable thing here — on stage as the first thing any
+ *  visitor saw. Strongest first now, descending.
+ *
+ *  This does NOT change the no-flag default: `specForParam` matches on `param`,
+ *  and an empty or unknown value still boots Phi-3, so every pre-registry URL
+ *  keeps its exact behaviour. */
 export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> = [
-  { param: '', spec: PHI3 },
-  { param: 'qwen3', spec: QWEN3_4B },
-  { param: 'qwen35', spec: QWEN35_4B },
+  { param: 'qwen38', spec: QWEN3_8_27B_4BIT },
   // The 35B MoE ships twice: 3-bit experts first (the build most machines can
   // actually run — ~20 GB free RAM), full 4-bit for the boxes that can.
   { param: 'qwen36q3', spec: QWEN36_35B_A3B_Q3 },
   { param: 'qwen36', spec: QWEN36_35B_A3B },
-  { param: 'qwen3mlx', spec: QWEN3_4B_MLX },
-  { param: 'llama32', spec: LLAMA_3_2_1B_INSTRUCT_4BIT },
   { param: 'qwen30b', spec: QWEN3_30B_A3B_4BIT },
-  // Not a chat model: ?model=embed serves forwardEmbedding, not generation.
-  { param: 'embed', spec: QWEN3_EMBEDDING_06B },
   { param: 'qwen35mlx', spec: QWEN3_5_9B_MLX_4BIT },
-  { param: 'qwen38', spec: QWEN3_8_27B_4BIT },
+  { param: 'qwen35', spec: QWEN35_4B },
+  { param: 'qwen3mlx', spec: QWEN3_4B_MLX },
+  { param: 'qwen3', spec: QWEN3_4B },
+  { param: '', spec: PHI3 },
+  { param: 'llama32', spec: LLAMA_3_2_1B_INSTRUCT_4BIT },
+  // Not a chat model: ?model=embed serves forwardEmbedding, not generation.
+  // Last on purpose — it answers nothing a visitor typed.
+  { param: 'embed', spec: QWEN3_EMBEDDING_06B },
   // ADD-MODEL:MODELS
 ]
 

@@ -347,10 +347,16 @@ footer li a:hover { color: var(--accent); }
   display: grid;
   grid-template-columns: minmax(270px, 350px) 1fr minmax(250px, 320px);
   grid-template-rows: auto 1fr auto auto;
+  /* The sheet spans the same three rows as the roster. It used to hold row 2
+     alone while the roster ran rows 1-3, so the left rail was roughly a third
+     the height of the right one and no amount of align-self could change it —
+     it was already filling the single row it had. The plate now sits over the
+     stage column only, which centres the character's name on the character
+     rather than on the character plus the sheet. */
   grid-template-areas:
-    'plate plate  roster'
+    'sheet plate  roster'
     'sheet stage  roster'
-    'enter enter  roster'
+    'sheet enter  roster'
     'note  note   note';
   gap: 10px 24px;
   padding: calc(var(--nav-h, 64px) + 14px) 30px 24px;
@@ -464,8 +470,15 @@ footer li a:hover { color: var(--accent); }
 #models .mb-stats { display: block; margin: 12px 0 2px; }
 #models .mb-stats > div {
   display: flex; justify-content: space-between; align-items: baseline;
+  gap: 14px;
   padding: 6px 2px; border-bottom: 1px solid #ffffff0d;
 }
+/* The label never wraps and never steals width from the value; the value takes
+   the rest. Without this the label could wrap first and push a long value
+   ("3-bit experts, 4-bit elsewhere · MLX affine · group 64") into a four-line
+   ragged block while the row still had room. */
+#models .mb-stats dt { flex: 0 0 auto; white-space: nowrap; }
+#models .mb-stats dd { flex: 1 1 auto; min-width: 0; text-align: right; }
 #models .mb-stats dt {
   font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.12em; color: var(--dim);
 }
@@ -499,7 +512,13 @@ footer li a:hover { color: var(--accent); }
 }
 #models .mb-dot {
   width: 100%; height: auto; min-height: 64px; padding: 7px 10px;
-  display: flex; flex-direction: row; align-items: center; gap: 11px;
+  /* justify-content is NOT inherited-safe here: the base .mb-dot (the older
+     carousel thumb) sets `center`, and this rule replaces display, direction,
+     align-items and gap but used to leave that standing — so every card
+     centred its own contents and the portraits sat at a different x per card,
+     indented by however short the model name was. */
+  display: flex; flex-direction: row; justify-content: flex-start;
+  align-items: center; gap: 11px;
   text-align: left; border-radius: 4px; cursor: pointer;
   border: 1px solid #ffffff14;
   background: linear-gradient(180deg, #ffffff08, transparent 60%), #0a0f1acc;
@@ -596,7 +615,12 @@ footer li a:hover { color: var(--accent); }
 @media (max-width: 900px) {
   #models .cs-root {
     grid-template-columns: 1fr;
-    grid-template-areas: 'plate' 'stage' 'roster' 'sheet' 'enter' 'note';
+    /* The two verbs follow the character directly. They used to sit fifth,
+       after the roster and the whole stat sheet, which put the primary action
+       — and the room, the most shareable thing here — several hundred pixels
+       below the fold on every phone. Specs are reference material and can
+       wait; the thing you came to do should not. */
+    grid-template-areas: 'plate' 'stage' 'enter' 'roster' 'sheet' 'note';
     padding: calc(var(--nav-h, 64px) + 8px) 14px 18px;
     gap: 8px;
   }
@@ -606,7 +630,12 @@ footer li a:hover { color: var(--accent); }
     flex-direction: row; overflow-x: auto; overflow-y: hidden; margin-top: 0;
     border-left: 0; border-top: 1px solid #ffffff12; padding: 10px 2px 4px;
   }
-  #models .mb-dot { width: auto; min-width: 168px; flex: 0 0 auto; }
+  /* A swipe strip, not a wrapped grid. The base .mb-dots sets flex-wrap:wrap,
+     which silently defeated the overflow-x:auto above it: cards wrapped onto
+     new lines at their own content widths, so the roster read as a ragged
+     stack rather than a row you scroll. Fixed width so every card matches. */
+  #models .mb-roster { flex-wrap: nowrap; scroll-snap-type: x proximity; }
+  #models .mb-dot { width: 196px; min-width: 196px; flex: 0 0 196px; scroll-snap-align: start; }
   #models .cs-enter .mb-cta { min-width: 0; width: 100%; }
 }
 
@@ -898,7 +927,12 @@ footer li a:hover { color: var(--accent); }
 #models .cs-root {
   --cs-gutter: 24px;
   max-width: 1720px; margin: 0 auto;
-  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr) minmax(260px, 310px);
+  /* The sheet was capped at 340px while a 1440+ screen left its margin empty,
+     so long values wrapped four deep — "3-bit experts, 4-bit elsewhere · MLX
+     affine · group 64" broke across four lines beside blank space. The stage
+     still takes what is left (1fr), so the character does not shrink; the caps
+     only stop the rails stretching absurdly on an ultrawide. */
+  grid-template-columns: minmax(300px, 430px) minmax(0, 1fr) minmax(268px, 340px);
   gap: 8px var(--cs-gutter);
   padding: calc(var(--nav-h, 64px) + 12px) max(28px, 4vw) 22px;
 }
@@ -921,6 +955,15 @@ footer li a:hover { color: var(--accent); }
 /* Chips wrap on the same 8px rhythm. */
 #models .mb-variants, #models .mb-modes { gap: 8px; }
 @media (max-width: 900px) {
+  /* This block re-declares .cs-root AFTER the stacking query at the top of the
+     file, so its three desktop columns won a specificity tie and pinned every
+     stacked row to 280px on a phone — the roster then wrapped its 168px cards
+     into a ragged column instead of scrolling sideways. Restore the single
+     column here, next to the rule that broke it. */
+  #models .cs-root {
+    grid-template-columns: 1fr;
+    padding: calc(var(--nav-h, 64px) + 8px) 14px 18px;
+  }
   #models .cs-enter { grid-column: 1; justify-self: stretch; }
   #models .mb-info { padding-top: 0; }
   #models .mb-roster { margin-top: 0; }
@@ -1461,18 +1504,30 @@ footer li a:hover { color: var(--accent); }
 /* The doorway. The amber line says a model may not fit this machine; this is
    the only control on the scene that answers it, so it lives IN the sentence
    rather than beneath it. */
-#models .mb-ram-split {
-  font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em;
-  text-transform: uppercase; white-space: nowrap; cursor: pointer;
-  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 78%, #fff);
-  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent);
-  border-radius: 3px; padding: 2px 8px; margin-left: 2px;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
+/* The two verbs sit together and carry the same weight. Room is offered for
+   every model; only the split offer below is conditional. */
+#models .cs-verbs { display: flex; gap: 10px; align-items: stretch; justify-content: center; flex-wrap: wrap; }
+#models .btn-room {
+  background: transparent; color: var(--cs-accent, var(--accent));
+  border: 1px solid var(--cs-accent, var(--accent));
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 20px; border-radius: 4px; font-weight: 600; letter-spacing: .02em;
+  min-height: 44px; cursor: pointer; transition: background .15s, box-shadow .15s;
 }
-#models .mb-ram-split:hover {
-  color: #fff; border-color: var(--cs-accent, var(--accent));
-  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 24%, transparent);
+#models .btn-room:hover { background: color-mix(in srgb, var(--cs-accent, var(--accent)) 14%, transparent); }
+#models .cs-verbs-note {
+  margin: 9px 0 0; text-align: center; font-size: 12.5px; color: var(--muted);
+  display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; align-items: baseline;
+}
+#models .cs-verbs-split-btn {
+  background: none; border: 0; padding: 0; cursor: pointer; font: inherit;
+  color: var(--cs-accent, var(--accent)); text-decoration: underline;
+  text-underline-offset: 3px; text-decoration-color: #ffffff30;
+}
+#models .cs-verbs-split-btn:hover { text-decoration-color: currentColor; }
+@media (max-width: 900px) {
+  #models .cs-verbs { flex-direction: column; }
+  #models .cs-verbs .mb-cta, #models .cs-verbs .btn-room { width: 100%; }
 }
 
 /* ── the sheet becomes the builder ─────────────────────────────────────── */
@@ -1490,6 +1545,26 @@ footer li a:hover { color: var(--accent); }
    and pinning it there crushed every row into the same 800px (caught in the
    browser, at 390x844). The phone scrolls the page, as it already did. */
 @media (min-width: 901px) {
+  /* The scene is one screen. The roster already scrolled inside itself, but
+     the sheet did not — so on a character with many rows (the 35B carries
+     variants, stats, abilities, context AND a memory build) the left column
+     grew past the fold and dragged the page with it, while the right column
+     ended short. Both rails are bounded now and scroll internally, so the two
+     columns end on the same line and the stage stays put. */
+  #models .cs-root {
+    height: calc(100dvh - 61px);
+    min-height: 0;
+  }
+  #models .cs-root .mb-info { align-self: stretch; min-height: 0; }
+  /* The GLASS BOX is what the eye reads as the column, and it was content-sized
+     — so on a short character it stopped a third of the way down while the
+     roster ran the full height, and the scene looked lopsided. Stretching
+     .mb-info alone did nothing visible, because the border lives on .mb-panel.
+     The panel now fills the rail and scrolls inside itself. */
+  #models .cs-root .mb-panel {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+  }
   #models .cs-root.cs-swarm {
     height: calc(100dvh - 61px);
     min-height: 0;
