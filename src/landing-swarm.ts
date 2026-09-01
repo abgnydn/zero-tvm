@@ -156,7 +156,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
     <div class="mb-row-label sw-row" style="--i:0">Split across</div>
     <div class="mb-variants sw-splits sw-row" style="--i:1" role="tablist" aria-label="How many machines"></div>
     <!-- Context is per-ROOM, not per-machine: every stage sizes its KV cache
-         from it (room-url.ts's ctxFor), and two stages on different numbers
+         from it (room-url.ts's ctxFrom), and two stages on different numbers
          hold different slot counts for the same conversation — the room then
          dies mid-generation rather than at boot. So it is set once, here, and
          written into every serving link. -->
@@ -290,7 +290,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
       // default. Two machines in one swarm can be on two deploys of the site,
       // and a compiled default that moved between them would give the stages
       // differently sized KV caches for the same conversation (room-url.ts's
-      // ctxFor). A number in the link cannot drift; a default can.
+      // ctxFrom). A number in the link cannot drift; a default can.
       ctx,
     })
     // The room strip needs the WHOLE split, not just this machine's slice —

@@ -764,7 +764,7 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
   // iPhone helper ever showed for the whole download (2026-08-29): it reads as
   // "loading" whether the tab is working, finished, or dead. Every line below
   // states only what is true at that point, and the rite card carries the rest.
-  // The context is the host's, adopted from the link (ctxFor) — printed because
+  // The context is the host's, adopted from the link (ctxFrom) — printed because
   // a stage silently sizing its KV cache off its own default is exactly the
   // failure that rule prevents, and an unprinted number cannot be checked
   // against the host's.
@@ -1189,7 +1189,7 @@ async function runGuest(roomId: string): Promise<void> {
           // can serve the SAME room instead of only consuming it. Built by
           // roomLink so the query lands BEFORE the fragment, and carrying the
           // host's ctx so this machine runs the room's context rather than
-          // its own compiled default (ctxFor).
+          // its own compiled default (ctxFrom).
           const serve = roomLink({
             origin: '', path: '/share.html', room: roomId,
             model: param, ctx: ctx ?? null, sig: SIG_OVERRIDE,

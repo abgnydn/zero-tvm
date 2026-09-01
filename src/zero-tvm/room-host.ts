@@ -138,7 +138,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
   // fragment — roomLink writes them in that order, which is the whole reason
   // it exists. ctx is this host's EFFECTIVE maxContext (spec was already
   // rebuilt through specWithCtx), so a stage opening this link reproduces the
-  // host's spec instead of falling back to its own default (see ctxFor).
+  // host's spec instead of falling back to its own default (see ctxFrom).
   const helperLink = roomLink({
     origin: location.origin, path, room: roomId, sig: sigOverride,
     model: param, ctx: spec.maxContext,
