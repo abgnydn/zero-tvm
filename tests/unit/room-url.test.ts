@@ -14,7 +14,7 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  ctxFor, ctxFrom, roleFor, roomIdFrom, roomLink, splitBounds, stageRangeFrom, swarmUrls,
+  ctxFrom, roleFor, roomIdFrom, roomLink, splitBounds, stageRangeFrom, swarmUrls,
 } from '../../src/zero-tvm/room-url.ts'
 import { SHIPPED_MODELS, canSplitAcrossDevices, modelBranding } from '../../src/zero-tvm/model-registry.ts'
 
@@ -189,19 +189,25 @@ describe('ctxFrom', () => {
   })
 })
 
-describe('ctxFor — the link beats this device default', () => {
-  it('adopts the link value, not the local one', () => {
-    // The failure this prevents: the host runs 8192 and the helper falls back
-    // to its build's 32768, so the two stages allocate different numbers of KV
-    // slots for the same conversation and the room dies mid-generation.
-    expect(ctxFor('?model=qwen35&ctx=8192', 32768)).toBe(8192)
+describe('an absent ?ctx= stays absent', () => {
+  it('is never turned into a number by this module', () => {
+    // There used to be a `ctxFor(search, ownDefault)` here that answered an
+    // absent key with the caller's own default, and a number always reads
+    // downstream as "re-size me". specFromSearch handed it the spec's own
+    // maxContext, which then went back through specWithCtx's
+    // floor(maxSeq/pageSize) ceiling — a no-op on ten of eleven shipped specs
+    // and a silent SHRINK on Phi-3, whose 257 KV pages hold 4112 tokens
+    // against a 4096-token window. Every plain page load of the default model
+    // lost the 257th page. ctxFor is gone; nothing here may reintroduce a
+    // reader that cannot say ABSENT.
+    expect(ctxFrom('?model=qwen35')).toBeNull()
+    expect(ctxFrom('?model=qwen35&ctx=8192')).toBe(8192)
   })
 
-  it('falls back only when the link says nothing', () => {
-    expect(ctxFor('', 32768)).toBe(32768)
-    expect(ctxFor('?model=qwen35', 32768)).toBe(32768)
-    expect(ctxFor('?model=qwen35&ctx=junk', 32768)).toBe(32768)
-  })
+  // Which ctx wins — the link's, over this device's compiled default — is a
+  // property of the CALLER now, and is tested on the shipped function in
+  // tests/unit/ctx-override.test.ts. It is not restated here against a
+  // hand-rolled `?? ownDefault`, which is the shape that hid the shrink.
 })
 
 describe('roomLink', () => {
@@ -288,5 +294,70 @@ describe('swarmUrls carries ctx to every SERVING machine', () => {
   it('omitting ctx writes no ?ctx= at all — each machine keeps its own default', () => {
     const stops = swarmUrls({ origin: ORIGIN, param: 'qwen3mlx', layers: 36, machines: 2, room: ROOM })
     for (const s of stops) expect(ctxFrom(new URL(s.url!).search)).toBeNull()
+  })
+})
+
+// ── the room id is validated INSIDE the builder ─────────────────────────────
+//
+// roomLink concatenated `#${p.room}` raw while every other field went through
+// URLSearchParams, and its contract never said the caller had to validate the
+// id. That held only by caller discipline: share.ts and landing-swarm.ts both
+// run their id through roomIdFrom first, and landing-room.ts never passes
+// `existingRoom`, so its id is hostRoom's own crypto.getRandomValues.
+//
+// `existingRoom` IS a supported hostRoom option, and "join an existing room
+// from the entrance" is the obvious next feature — while landing-room.ts's
+// paintSplit already writes swarmUrls' output into
+// `<input readonly value="${st.url}">`. The day those two meet, an unvalidated
+// id is an attribute-injection sink, and this site ships no CSP
+// (public/_headers sets COOP/COEP only), so nothing would mitigate it. These
+// pin the guarantee to the function rather than to caller discipline.
+describe('roomLink validates the room id itself', () => {
+  const BAD: [string, string][] = [
+    ['a quote closes the attribute', `${ROOM}" onfocus=alert(1) x="`],
+    ['an angle bracket opens a tag', `${ROOM}<img src=x onerror=alert(1)>`],
+    ['a space ends the attribute value', `${ROOM} onfocus=alert(1)`],
+    ['too short to be 128 bits', 'short'],
+    ['a whole link, not an id', `https://evil.example/#${ROOM}`],
+    ['a second fragment', `${ROOM}#${ROOM}`],
+    ['a query smuggled into the fragment', `${ROOM}?model=qwen3mlx`],
+  ]
+  for (const [why, bad] of BAD) {
+    it(`refuses ${why}`, () => {
+      expect(() => roomLink({ origin: ORIGIN, path: '/share.html', room: bad })).toThrow(/room id/i)
+    })
+  }
+
+  it('refuses through swarmUrls too — the sink paintSplit writes into', () => {
+    expect(() => swarmUrls({
+      origin: ORIGIN, param: 'qwen3mlx', layers: 36, machines: 3,
+      room: `${ROOM}" onfocus=alert(1) x="`,
+    })).toThrow(/room id/i)
+  })
+
+  // One pattern, not two. A second copy of a security regex is how they drift:
+  // roomIdFrom would go on refusing what roomLink had quietly started to allow.
+  it('accepts exactly what roomIdFrom accepts', () => {
+    const CANDIDATES = [
+      ROOM, 'A'.repeat(16), 'A'.repeat(64), '-_-_-_-_-_-_-_-_',
+      'A'.repeat(15), 'A'.repeat(65), '', 'has space here!!', 'aaaaaaaaaaaaaaaa.',
+      `${ROOM}"`, `${ROOM}<`, `${ROOM}%22`, 'aaaaaaaaaaaaaaaa/../..',
+    ]
+    for (const id of CANDIDATES) {
+      const parses = roomIdFrom(`#${id}`) !== null
+      let builds = true
+      try { roomLink({ origin: ORIGIN, path: '/share.html', room: id }) } catch { builds = false }
+      expect(builds, `roomIdFrom and roomLink disagree about ${JSON.stringify(id)}`).toBe(parses)
+    }
+  })
+
+  it('still writes the links the app actually asks for', () => {
+    // The two real sources of an id today: hostRoom's crypto bytes, and a
+    // string that already passed roomIdFrom. Neither may start throwing.
+    const bytes = new Uint8Array(16).fill(200)
+    const crypted = btoa(String.fromCharCode(...bytes))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(routeOf(roomLink({ origin: ORIGIN, path: '/share.html', room: crypted }))).toBe('guest')
+    expect(routeOf(roomLink({ origin: ORIGIN, path: '/share.html', room: null, model: 'qwen3mlx' }))).toBe('host')
   })
 })
