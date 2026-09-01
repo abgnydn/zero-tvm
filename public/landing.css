@@ -518,8 +518,19 @@ footer li a:hover { color: var(--accent); }
   padding: 2px 0 0 16px; height: 20px;
 }
 #models .mb-roster {
+  /* flex-wrap and min-height are BOTH resets, and the rail is broken without
+     either. The base .mb-dots (the old carousel strip) sets flex-wrap:wrap;
+     this rule turns the direction to column but used to leave the wrap
+     standing, so on a short window the tail of the roster wrapped into a
+     SECOND COLUMN, off the right edge of the rail, where .cs-root's
+     overflow:hidden ate it. At a 700px viewport that silently hid the last two
+     characters — the roster looked like it simply did not carry them.
+     min-height:0 is what lets overflow-y:auto do the job instead: a grid item
+     defaults to min-height:auto and will not shrink below its content, so the
+     rail grew past the track rather than scrolling inside it. */
   grid-area: roster; z-index: 1; margin: 26px 0 0; padding: 0 4px 4px 14px;
-  display: flex; flex-direction: column; gap: 8px; justify-content: flex-start;
+  display: flex; flex-direction: column; flex-wrap: nowrap; min-height: 0;
+  gap: 8px; justify-content: flex-start;
   overflow-y: auto; border-left: 1px solid #ffffff12;
   scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
 }
