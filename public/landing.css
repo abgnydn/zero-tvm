@@ -1466,6 +1466,21 @@ footer li a:hover { color: var(--accent); }
 
 /* ══ THE ROOM ══ Hosting from inside the game: the strip in the panel, and
    one small mascot per connected guest flanking the character. */
+/* The room's plan, before it opens. Reuses the entrance's chip styling —
+   these are the same kind of choice, in a smaller frame. */
+.cs-room-plan { margin: 0 0 10px; }
+.cs-room-plan .cs-build-row {
+  display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;
+}
+.cs-room-plan .cs-build-chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.cs-room-plan .cs-build-label {
+  flex: 0 0 74px; font-family: var(--mono); font-size: 0.58rem;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim);
+}
+.cs-room-plan .mb-variant { text-decoration: none; }
+.cs-plan-line { font-size: 0.7rem; line-height: 1.5; color: var(--dim); }
+.cs-plan-line b { color: var(--text); font-weight: 600; }
+
 /* The split, inside the room. Same register as the Split panel's stop rows,
    at the room strip's own scale. */
 .cs-room-split { margin: 10px 0 4px; }

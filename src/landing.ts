@@ -810,6 +810,20 @@ function render(): void {
     const mode = modes[mi] ?? modes[0]
     const cxs = ctxModesOf(v.spec)
     const cx = cxs[xi] ?? cxs[0]
+    // ?split=0,8,16&stage=0 — the room strip's way of changing the split. It
+    // only applies to the character the URL actually names, so walking the
+    // roster afterwards cannot carry a stale set of bounds onto a model with
+    // a different layer count.
+    let urlRange: { start: number; end: number } | undefined
+    let urlSplit: { bounds: number[]; index: number; ctx: number } | undefined
+    if (Q.get('model') === v.param) {
+      const raw = (Q.get('split') ?? '').split(',').map(Number).filter((n) => Number.isFinite(n))
+      const idx = Number(Q.get('stage') ?? 0)
+      if (raw.length >= 3 && idx >= 0 && idx < raw.length - 1 && raw[raw.length - 1] === v.spec.layers) {
+        urlRange = { start: raw[idx], end: raw[idx + 1] }
+        urlSplit = { bounds: raw, index: idx, ctx: cx.tokens }
+      }
+    }
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
       root,
       spec: v.spec,
@@ -817,7 +831,9 @@ function render(): void {
       poolSlots: mode?.slots ?? 0,
       poolLabel: mode && mode.slots ? mode.label : '',
       ctxTokens: cx.tokens !== v.spec.maxContext ? cx.tokens : 0,
-      openRoom,
+      openRoom: openRoom || urlSplit !== undefined,
+      layerRange: urlRange,
+      split: urlSplit,
       mascot,
     })).catch((err) => {
       // The panel could not even mount — fall back to the standalone page.

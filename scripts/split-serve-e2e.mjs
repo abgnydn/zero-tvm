@@ -34,6 +34,8 @@ const SIGNAL_PORT = 8791
 const MODEL = process.env.MODEL ?? 'llama32'
 const spec = specForParam(MODEL)
 const STAGES = Number(process.env.STAGES ?? 2)
+/** PHONE=1 — run the guest tab as an emulated iPhone (see the guest block). */
+const PHONE = process.env.PHONE === '1'
 // With STAGES=2 the cut stays wherever SPLIT says, so the two-stage run keeps
 // its old shape; beyond that the layers are divided evenly.
 const BOUNDS = STAGES === 2
@@ -64,6 +66,27 @@ const launch = (userDataDir) => puppeteer.launch({
   protocolTimeout: 15 * 60 * 1000,
 })
 
+/**
+ * Every serving role asks before it downloads anything — #share-gate-go, the
+ * same button share-e2e.mjs clicks. This script never did, and since it wipes
+ * its profiles on the way out (line ~195) the weights are always cold, so the
+ * gate always waits: stage 0 sat on "Checking this device…" until the 10
+ * minute timeout. The run has been failing here rather than in anything it
+ * was written to test.
+ *
+ * The button starts disabled while the device is probed, so wait for it to be
+ * enabled rather than merely present.
+ */
+async function passGate(page, who) {
+  await page.waitForSelector('#share-gate-go', { visible: true, timeout: 60_000 })
+  await page.waitForFunction(() => {
+    const b = document.getElementById('share-gate-go')
+    return !!b && !b.disabled
+  }, { timeout: 60_000, polling: 200 })
+  await page.click('#share-gate-go')
+  console.log(`${who}: download confirmed`)
+}
+
 let failed = false
 /** browsers[0] hosts; the rest are helper stages. */
 const browsers = []
@@ -90,6 +113,7 @@ try {
   const stage0 = await b0.newPage()
   stage0.on('pageerror', (e) => console.error(`[stage 0] ${e.message}`))
   await stage0.goto(`${BASE}/share.html?model=${MODEL}&layers=0-${BOUNDS[1]}&sig=${SIGNAL_PORT}`, { waitUntil: 'domcontentloaded' })
+  await passGate(stage0, 'stage 0')
   await stage0.waitForFunction(() => window.__shareReady === true, { timeout: 10 * 60_000, polling: 1000 })
   await stage0.click('#awake')
   const link = await stage0.evaluate(() => window.__shareLink)
@@ -105,6 +129,7 @@ try {
     pg.on('pageerror', (e) => console.error(`[stage ${i}] ${e.message}`))
     await pg.goto(`${BASE}/share.html?model=${MODEL}&layers=${BOUNDS[i]}-${BOUNDS[i + 1]}&sig=${SIGNAL_PORT}#${roomId}`,
       { waitUntil: 'domcontentloaded' })
+    await passGate(pg, `stage ${i}`)
     await pg.waitForFunction(() => window.__helperReady === true, { timeout: 10 * 60_000, polling: 1000 })
     await pg.click('#awake')
     console.log(`stage ${i} up (layers ${BOUNDS[i]}-${BOUNDS[i + 1]})`)
@@ -114,7 +139,25 @@ try {
   check('chain assembled', true, await stage0.$eval('#room-stats', (el) => el.textContent ?? ''))
 
   // ── a guest asks the N-machine model a question ──
+  //
+  // PHONE=1 emulates the guest as an iPhone: viewport, touch, and the mobile
+  // user agent, on the real Chrome engine. That is the honest scope of it —
+  // it exercises the guest's LAYOUT and the WebRTC path from a phone-shaped
+  // client. It does NOT reproduce a phone's GPU, and it cannot: the guest
+  // role is the one that needs no WebGPU and downloads nothing, which is
+  // exactly why it is the role worth emulating. Whether a given phone can
+  // HOLD a stage is a question about maxBufferSize and free RAM on the
+  // device, and only the device can answer it.
   const guest = await b0.newPage()
+  if (PHONE) {
+    await guest.emulate({
+      name: 'iPhone 15 Pro',
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15'
+        + ' (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+      viewport: { width: 393, height: 852, deviceScaleFactor: 3,
+                  isMobile: true, hasTouch: true, isLandscape: false },
+    })
+  }
   guest.on('pageerror', (e) => console.error(`[guest] ${e.message}`))
   await guest.goto(link, { waitUntil: 'domcontentloaded' })
   await guest.waitForFunction(() => !document.getElementById('inp').disabled, { timeout: 90_000, polling: 200 })
@@ -126,6 +169,23 @@ try {
     const btn = document.getElementById('btn')
     return !!last && (last.textContent ?? '').length > 5 && !btn.hidden && !btn.disabled
   }, { timeout: 5 * 60_000, polling: 300 })
+
+  if (PHONE) {
+    // The thing that actually breaks a phone guest: a page wider than the
+    // screen, or a composer the keyboard would sit on top of. Both are
+    // measurable here even though the GPU is not.
+    const m = await guest.evaluate(() => ({
+      overflowX: document.documentElement.scrollWidth - window.innerWidth,
+      composerVisible: (() => {
+        const c = document.getElementById('inp')
+        if (!c) return false
+        const r = c.getBoundingClientRect()
+        return r.width > 0 && r.top < window.innerHeight
+      })(),
+    }))
+    check('phone guest: no sideways scroll', m.overflowX <= 0, `${m.overflowX}px overflow`)
+    check('phone guest: composer on screen', m.composerVisible, 'the input is reachable')
+  }
 
   const reply = await guest.$eval('.msg.ai:last-of-type', (el) => el.textContent ?? '')
   console.log(`reply: ${JSON.stringify(reply.slice(-90))}`)

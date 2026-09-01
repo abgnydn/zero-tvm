@@ -21,10 +21,10 @@ import type { DecodeEngine } from './zero-tvm/engine-core.js'
 import type { Tokenizer } from './zero-tvm/tokenizer.js'
 import type { MascotHandle } from './mascot.js'
 import { mountMascot } from './mascot.js'
-import { modelBranding } from './zero-tvm/model-registry.js'
+import { modelBranding, canSplitAcrossDevices } from './zero-tvm/model-registry.js'
 import { buildChatPromptFor } from './zero-tvm/model-select.js'
 import { hostRoom, type RoomHandle } from './zero-tvm/room-host.js'
-import { swarmUrls } from './zero-tvm/room-url.js'
+import { swarmUrls, splitBounds } from './zero-tvm/room-url.js'
 import { recordFeat } from './feats.js'
 
 export interface RoomToolOptions {
@@ -73,6 +73,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
       THIS machine. Their prompts run on your GPU; every request is listed here as it
       arrives. Guests can also copy the model's cached weights from this machine to
       run it locally. Keep this tab in the foreground while serving.</p>
+      <div class="cs-room-plan" id="room-plan"></div>
       <button type="button" class="cs-chat-tool" id="room-open">Open room →</button>
     </div>
     <div class="cs-room-live" hidden>
@@ -124,6 +125,50 @@ export function mountRoomTool(o: RoomToolOptions): void {
     strip.hidden = !strip.hidden
     btn.setAttribute('aria-expanded', String(!strip.hidden))
   })
+
+  /**
+   * What the room WILL be, before it is opened. The strip used to offer one
+   * button and no way to see or change anything about the room it was about
+   * to open — the split lived on the entrance sheet, which chat has covered by
+   * the time you get here. Each option is a link that re-enters holding that
+   * stage, the same ?split=/?stage= grammar the entrance reads.
+   */
+  function paintPlan(): void {
+    const box = $('#room-plan')
+    const layers = o.spec.layers
+    const ctx = o.split?.ctx ?? o.spec.maxContext
+    const here = o.split ? o.split.bounds.length - 1 : 1
+    const url = (machines: number): string => {
+      const q = new URLSearchParams()
+      q.set('model', o.param)
+      q.set('ctx', String(ctx))
+      if (machines > 1) {
+        q.set('split', splitBounds(layers, machines).join(','))
+        q.set('stage', '0')
+      }
+      q.set('chat', '1')
+      q.set('room', '1')
+      return `/?${q.toString()}`
+    }
+    // Splitting needs an MLX checkpoint; on an MLC one the only honest option
+    // is the whole model, so the row would be a single dead chip.
+    const counts = canSplitAcrossDevices(o.spec) ? [1, 2, 3, 4] : [1]
+    const chips = counts.map((n) => {
+      const label = n === 1 ? 'This machine only' : `${n} machines`
+      return n === here
+        ? `<span class="mb-variant" role="tab" aria-selected="true">${label}</span>`
+        : `<a class="mb-variant" role="tab" aria-selected="false" href="${url(n)}">${label}</a>`
+    }).join('')
+    const mine = o.split
+      ? `layers ${o.split.bounds[o.split.index]}–${o.split.bounds[o.split.index + 1]} of ${layers}`
+      : `all ${layers} layers`
+    box.innerHTML = `
+      <div class="cs-build-row"><span class="cs-build-label">Machines</span>
+        <div class="cs-build-chips">${chips}</div></div>
+      <div class="cs-plan-line">This tab holds <b>${mine}</b> · ${ctx} token context${
+        counts.length > 1 ? ' · changing this reopens the room' : ''}</div>`
+  }
+  paintPlan()
 
   /**
    * The split, as it stands, inside the room. The Split panel could not write
