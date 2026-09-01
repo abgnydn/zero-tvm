@@ -436,7 +436,16 @@ footer li a:hover { color: var(--accent); }
 #models .mb-mascot { height: min(54dvh, 500px); max-height: 100%; max-width: 100%; position: relative; z-index: 2; }
 #models .mb-pedestal {
   position: absolute; left: 50%; bottom: 2%; transform: translateX(-50%);
-  width: min(560px, 86%); height: 150px; border-radius: 0; filter: none;
+  /* Sized off the character, not the container. The ring took 86% of the
+     art box's WIDTH while the character's size follows its HEIGHT, so in chat
+     mode — where the stage folds to a 110px familiar over a wide panel — the
+     floor ring stayed 311px across and swamped the figure standing on it.
+     Height is now a share of the art box (the canvas fills it exactly, since
+     .mb-mascot is capped at max-height:100%) and the width follows through
+     aspect-ratio, so one rule holds at every size. The entrance is unchanged:
+     0.34 x 438 = 149 tall, 395 wide, against the 150 x 397 it had before. */
+  width: auto; height: 34%; aspect-ratio: 2.65; max-width: 86%;
+  border-radius: 0; filter: none;
   background: radial-gradient(ellipse at center,
     color-mix(in srgb, var(--cs-accent, var(--accent)) 30%, transparent) 0%,
     color-mix(in srgb, var(--cs-accent, var(--accent)) 8%, transparent) 52%,
@@ -1308,7 +1317,6 @@ footer li a:hover { color: var(--accent); }
     grid-template-areas: 'plate' 'stage' 'chat';
   }
   #models .cs-chatting .mb-mascot { height: 110px; -webkit-box-reflect: none; }
-  #models .cs-chatting .mb-pedestal { height: 60px; }
   #models .cs-chatting .cs-lore { display: none; }
   #models .cs-chatting .mb-plate { padding-bottom: 4px; }
   #models .cs-chatting .mb-name { font-size: 1.3rem; }
