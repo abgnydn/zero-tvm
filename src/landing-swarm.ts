@@ -103,6 +103,11 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
   // children, so these rows are appended to the panel itself and the container
   // is only a handle for removing them again.
   const html = `
+    <!-- The way back comes FIRST. Splitting hides the whole sheet — the
+         quantisation picker, the stats, the context build chooser — so the
+         only route to those settings is out of this mode, and a control for
+         that is no use sitting under ten rows of stage config. -->
+    <button type="button" class="sw-exit sw-row" style="--i:0">&lsaquo; Back to the model sheet</button>
     <div class="mb-row-label sw-row" style="--i:0">Split across</div>
     <div class="mb-variants sw-splits sw-row" style="--i:1" role="tablist" aria-label="How many machines"></div>
     <!-- Context is per-ROOM, not per-machine: every stage sizes its KV cache
@@ -124,8 +129,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
     <div class="mb-row-label sw-row" style="--i:7">The rest</div>
     <div class="sw-stops sw-rest sw-row" style="--i:8"></div>
     <ul class="mb-abilities sw-row" style="--i:9">${PASSIVES.map((p) =>
-      `<li><b>${p.name}</b><span>${p.desc}</span></li>`).join('')}</ul>
-    <button type="button" class="sw-exit sw-row" style="--i:10">⟨ Back to one machine</button>`
+      `<li><b>${p.name}</b><span>${p.desc}</span></li>`).join('')}</ul>`
   rows.innerHTML = html
   const mine = [...rows.children] as HTMLElement[]
   for (const n of mine) o.panel.appendChild(n)

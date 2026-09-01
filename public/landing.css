@@ -420,7 +420,12 @@ footer li a:hover { color: var(--accent); }
 /* The stage. */
 #models .mb-stage { grid-area: stage; display: flex; align-items: stretch; gap: 4px; min-height: 0; position: relative; z-index: 1; }
 #models .mb-art { flex: 1; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
-#models .mb-mascot { height: min(54dvh, 500px); max-width: 100%; position: relative; z-index: 2; }
+/* max-height matters as much as height here. The canvas asked for
+   min(54dvh,500px) = 464px inside a 398px .mb-art, so it overflowed 33px
+   past the bottom. The floor ring is anchored to .mb-art's bottom, so it
+   landed 41px above the character's feet and cut through the torso.
+   Capping the canvas to its container puts the feet back on the ring. */
+#models .mb-mascot { height: min(54dvh, 500px); max-height: 100%; max-width: 100%; position: relative; z-index: 2; }
 #models .mb-pedestal {
   position: absolute; left: 50%; bottom: 2%; transform: translateX(-50%);
   width: min(560px, 86%); height: 150px; border-radius: 0; filter: none;
@@ -1642,7 +1647,7 @@ footer li a:hover { color: var(--accent); }
 #models .sw-note { margin: 6px 0 0; font-size: 0.7rem; line-height: 1.45; color: var(--dim); }
 
 #models .sw-exit {
-  align-self: start; margin-top: 14px;
+  align-self: start; margin: 0 0 2px;
   font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em;
   text-transform: uppercase; cursor: pointer;
   color: color-mix(in srgb, var(--cs-accent, var(--accent)) 65%, var(--dim));
