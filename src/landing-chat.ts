@@ -268,7 +268,13 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   // anyway threw on the first message. The guest chats; this tab serves, and
   // the room strip is its whole interface.
   if (opts.layerRange) {
-    root.classList.add('cs-serving')
+    // No marker class here. This carried `cs-serving` and nothing styled it —
+    // a class that styles nothing is a claim the CSS does not keep. Both
+    // obvious visuals were already spoken for: the armed ring is set from the
+    // OPFS probe and stays on for any cached model, and dimming is cs-asleep's
+    // vocabulary, which would say the opposite of the truth about a tab that
+    // is working. The state is stated where it can be checked instead — the
+    // welcome names the range, and the composer is gone.
     const w = panel.querySelector<HTMLElement>('#welcome')
     if (w) {
       w.innerHTML = `<div class="cs-welcome-title">Serving ${brand.name}</div>
