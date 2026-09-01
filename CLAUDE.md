@@ -304,6 +304,13 @@ room id is 128 random bits in the link fragment (never sent to the static host).
 The guest renders with `chat-ui.ts` + `public/chat-ui.css` — the same surface as
 the chat page, which is why the two cannot drift.
 
+`share.html` has **no stylesheet of its own**: it renders the ENTRANCE'S SCENE
+(`public/landing.css` — plate, summoning ring, `.mb-panel` sheet, `.cs-boot`,
+`.cs-room-consent`/`.cs-room-live`, `.sw-arc`, `.cs-chat`), one character on the
+stage, per role. It used to carry ~130 lines of inline CSS re-implementing that
+chrome as a parallel design language. Anything new on this page comes from a
+component the entrance already has, or it does not go on.
+
 A SECOND channel (`weights`) replicates the host's OPFS weight cache to the
 guest's device, so a second machine never re-downloads gigabytes the first one
 has: `peer-weights.ts` streams the model's OPFS **directory** (format-agnostic —

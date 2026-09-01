@@ -42,11 +42,10 @@
     }
 
     /* ─────────── Chat area ─────────── */
-    /* share.html's guest view is a flex column, not zero-tvm.html's auto/1fr/auto
-   grid — without flex:1 this collapsed to ~56px on an empty room and the
-   composer floated near the top of a blank page. Scoped: on zero-tvm.html the
-   grid row sizes it and #guest-view does not exist. */
-#guest-view .chat-main { flex: 1; min-height: 0; }
+    /* #guest-view was share.html's own flex column and needed flex:1 here or it
+       collapsed to ~56px on an empty room. That view is the entrance's .cs-chat
+       panel now, and landing.css's `.cs-chat .chat-main { flex: 1 }` — written
+       for the same reason — carries it. */
 .chat-main {
       overflow-y: auto;
       scroll-behavior: smooth;

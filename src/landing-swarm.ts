@@ -70,7 +70,10 @@ const SPLITS: ReadonlyArray<{ n: number; label: string }> = [
   { n: 4, label: 'Four machines' },
 ]
 
-const ROLE_NOTE: Record<SwarmStop['role'], string> = {
+/** What each role in a split actually does. Exported because share.html is
+ *  where those roles are LIVED — the helper stage the builder sent someone to
+ *  states its job with the same sentence the builder promised it would. */
+export const ROLE_NOTE: Record<SwarmStop['role'], string> = {
   host: 'Opens the room and holds the start of the model. It asks before it downloads anything.',
   helper: 'Joins that room holding its own range. It answers no chat of its own — it runs its layers and hands the residual back.',
   guest: 'The link to hand out. Chats with the assembled model; downloads nothing, needs no WebGPU.',
@@ -93,6 +96,42 @@ const ordinal = (i: number): string =>
  *  that the ring still reads as one circle, wide enough that two machines are
  *  two things. */
 const ARC_GAP = 9
+
+/**
+ * Draw N arcs on the summoning ring — one per machine, dark until that
+ * machine's link can be written. `arcs` is the caller's live array and is
+ * emptied first, so redrawing at a new count leaves nothing behind.
+ *
+ * Module-level and exported because share.html's helper stage draws its OWN
+ * single arc on the same ring: the builder promises a machine an arc and the
+ * page that machine lands on has to draw the same one.
+ */
+export function drawArcs(pedestal: HTMLElement | null, arcs: HTMLElement[], n: number): void {
+  for (const a of arcs.splice(0)) a.remove()
+  if (!pedestal) return
+  const step = 360 / n
+  for (let i = 0; i < n; i++) {
+    const a = document.createElement('i')
+    a.className = 'sw-arc'
+    a.style.setProperty('--a0', `${i * step + ARC_GAP / 2}deg`)
+    a.style.setProperty('--a1', `${(i + 1) * step - ARC_GAP / 2}deg`)
+    pedestal.appendChild(a)
+    arcs.push(a)
+  }
+}
+
+/** Light the arcs whose machine is ready — one boolean per arc, in order. The
+ *  circle runs the armed sweep once every machine is lit. */
+export function lightArcs(art: HTMLElement | null, arcs: HTMLElement[], on: readonly boolean[]): void {
+  let lit = 0
+  on.forEach((v, i) => {
+    if (v) lit++
+    // Retrigger ringFlash only on the transition — a repaint must not
+    // re-flash a circle that has been lit the whole time.
+    if (v !== arcs[i]?.hasAttribute('data-lit')) arcs[i]?.toggleAttribute('data-lit', v)
+  })
+  art?.toggleAttribute('data-swarm-armed', lit === on.length && lit > 0)
+}
 
 export function mountSwarm(o: SwarmOptions): SwarmHandle {
   let spec = o.spec
@@ -152,36 +191,11 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
   const art = o.root.querySelector<HTMLElement>('.mb-art')
   const arcs: HTMLElement[] = []
 
-  function drawArcs(n: number): void {
-    for (const a of arcs.splice(0)) a.remove()
-    if (!pedestal) return
-    const step = 360 / n
-    for (let i = 0; i < n; i++) {
-      const a = document.createElement('i')
-      a.className = 'sw-arc'
-      a.style.setProperty('--a0', `${i * step + ARC_GAP / 2}deg`)
-      a.style.setProperty('--a1', `${(i + 1) * step - ARC_GAP / 2}deg`)
-      pedestal.appendChild(a)
-      arcs.push(a)
-    }
-  }
-
   /** An arc lights when the machine it stands for has a URL to open. The first
    *  one always does; the rest wait on the room, which is exactly the thing
    *  the sequence is blocked on. */
-  function lightArcs(stops: SwarmStop[]): void {
-    const machines = stops.filter((s) => s.role !== 'guest')
-    let lit = 0
-    machines.forEach((s, i) => {
-      const on = s.url !== null
-      if (on) lit++
-      // Retrigger ringFlash only on the transition — a repaint must not
-      // re-flash a circle that has been lit the whole time.
-      if (on !== arcs[i]?.hasAttribute('data-lit')) arcs[i]?.toggleAttribute('data-lit', on)
-    })
-    // Every machine has its link: the circle runs the armed sweep, the same
-    // ceremony a cached character's ring runs.
-    art?.toggleAttribute('data-swarm-armed', lit === machines.length && lit > 0)
+  function lightStops(stops: SwarmStop[]): void {
+    lightArcs(art, arcs, stops.filter((s) => s.role !== 'guest').map((s) => s.url !== null))
   }
 
   // ── the links ───────────────────────────────────────────────────────
@@ -291,7 +305,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
     el('.sw-hint').textContent = pastedRoom()
       ? 'Room found — every link below joins it.'
       : 'Keep this page open. The links below cannot be written until that room exists.'
-    lightArcs(stops)
+    lightStops(stops)
   }
 
   /** A boundary moved. Read every visible cut so one edit cannot desync the
@@ -314,7 +328,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
       for (const b of o.panel.querySelectorAll<HTMLElement>('.sw-split')) {
         b.setAttribute('aria-selected', String(Number(b.dataset.i) === si))
       }
-      drawArcs(SPLITS[si].n)
+      drawArcs(pedestal, arcs, SPLITS[si].n)
       paint()
       // paint() re-creates the chips' siblings, not the chips — but the ring
       // redraw is the visible answer, and focus stays where it was.
@@ -353,7 +367,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
     }
   })
 
-  drawArcs(SPLITS[si].n)
+  drawArcs(pedestal, arcs, SPLITS[si].n)
   paint()
 
   return {
