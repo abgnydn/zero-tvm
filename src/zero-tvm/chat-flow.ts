@@ -83,6 +83,10 @@ export interface BootChatOptions {
    *  sampling ?temp=&topp=&minp=&seed=). Default: the page's own search. */
   search?: string
   onDeviceLost?: (info: GPUDeviceLostInfo) => void
+  /** Half-open [start, end) of layers this tab holds. Absent = the whole
+   *  model. Set when the entrance opens a room for ONE STAGE of a split, so
+   *  the first machine hosts in place instead of navigating to share.html. */
+  layerRange?: { start: number; end: number }
 }
 
 /** Boot the throughput engine with progress wired into the standard markup. */
@@ -92,6 +96,7 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
   const poolSlots = opts.poolSlots ?? 0
   return bootEngine({
     spec,
+    layerRange: opts.layerRange,
     // Memory mode: the loader allocates slot-sized expert stacks instead of
     // full ones — that allocation difference IS the saving.
     ...(poolSlots ? { expertPool: poolSlots } : {}),

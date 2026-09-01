@@ -42,6 +42,9 @@ export interface RoomToolOptions {
   /** Expert-pool slots the engine booted with (0 = full) — a pooled host
    *  must not advertise the full model's measured rate to guests. */
   poolSlots: number
+  /** This tab holds only these layers — the room serves a STAGE, and the
+   *  helper links it writes start where this one ends. */
+  stageRange?: { start: number; end: number }
 }
 
 export function mountRoomTool(o: RoomToolOptions): void {
@@ -125,6 +128,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
       // the pooled builds are slower and the guest sees the label as truth.
       brand: o.poolSlots ? { ...brand, rateLabel: '' } : brand,
       param: o.param,
+      stageRange: o.stageRange,
       engine: o.engine,
       tokenizer: o.tokenizer,
       lock: o.lock,

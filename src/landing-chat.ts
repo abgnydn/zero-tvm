@@ -42,6 +42,10 @@ export interface EnterChatOptions {
   openRoom?: boolean
   /** The stage mascot — already showing this character. */
   mascot: MascotHandle | null
+  /** Host ONE STAGE of a split here, [start, end). The swarm panel's first
+   *  machine is this machine, so it boots in place; only the other stages
+   *  need a URL. */
+  layerRange?: { start: number; end: number }
 }
 
 const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>'
@@ -175,6 +179,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   const boot = await bootChatEngine({
     spec,
     poolSlots: opts.poolSlots,
+    layerRange: opts.layerRange,
     search: location.search,
     onDeviceLost: (info) => {
       showBootError(`GPU device lost: ${info.message || info.reason}. Reload the page to recover.`)
@@ -248,6 +253,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     root, panel, spec, param: opts.param,
     engine: boot.engine, tokenizer: boot.tokenizer, mascot,
     lock, poolSlots: opts.poolSlots,
+    stageRange: opts.layerRange,
     openStrip: opts.openRoom === true,
   })).catch((e) => console.warn('[landing] room tool failed to mount:', e))
 

@@ -48,6 +48,10 @@ export interface SwarmOptions {
   /** The character on stage cannot be split any more (the roster moved to an
    *  MLC checkpoint) — the mode has nothing left to show. */
   onExit: () => void
+  /** Host the FIRST stage in this tab. The first machine is this machine, so
+   *  it has no business being a URL — the entrance boots the stage in place
+   *  and the room strip carries the link for the next one. */
+  onHostHere: (range: { start: number; end: number }, ctx: number) => void
 }
 
 export interface SwarmHandle {
@@ -229,7 +233,10 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
       <div class="sw-linkrow">
         <input readonly value="${stop.url}" aria-label="${who} — ${stop.role} link">
         <button type="button" class="cs-chat-tool sw-copy">Copy</button>
-        <a class="cs-chat-tool sw-open" href="${stop.url}" target="_blank" rel="noopener">Open ↗</a>
+        ${stop.role === 'host' && stop.range
+          ? `<button type="button" class="cs-chat-tool sw-here"
+                     data-start="${stop.range.start}" data-end="${stop.range.end}">Open here</button>`
+          : `<a class="cs-chat-tool sw-open" href="${stop.url}" target="_blank" rel="noopener">Open &#8599;</a>`}
       </div>
       ${body}</div>`
   }
@@ -312,6 +319,14 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
       void navigator.clipboard.writeText(input.value)
       copy.textContent = 'Copied'
       setTimeout(() => { copy.textContent = 'Copy' }, 1200)
+      return
+    }
+    const here = t.closest<HTMLElement>('.sw-here')
+    if (here) {
+      o.onHostHere(
+        { start: Number(here.dataset.start), end: Number(here.dataset.end) },
+        ctx,
+      )
       return
     }
     if (t.closest('.sw-exit')) o.onExit()

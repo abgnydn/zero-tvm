@@ -614,6 +614,25 @@ function render(): void {
       spec: v.spec,
       param: v.param,
       onExit: exitSwarm,
+      // The first machine is THIS machine. Sending it to share.html meant
+      // leaving the game for a second page to do the one thing this page is
+      // already set up to do; the other stages are other machines and still
+      // need a URL. Booting here also removes the paste-the-room-link step:
+      // the room strip writes the helper link once the stage is live.
+      onHostHere: (range, ctxTokens) => {
+        exitSwarm()
+        void import('./landing-chat.js').then(({ enterChat }) => enterChat({
+          root,
+          spec: v.spec,
+          param: v.param,
+          poolSlots: 0,
+          poolLabel: '',
+          ctxTokens: ctxTokens !== v.spec.maxContext ? ctxTokens : 0,
+          openRoom: true,
+          layerRange: range,
+          mascot,
+        })).catch((err) => console.error('[landing] hosting a stage here failed:', err))
+      },
     })
     root.classList.add('cs-swarm')
     const live = root.querySelector<HTMLElement>('.cs-live')
