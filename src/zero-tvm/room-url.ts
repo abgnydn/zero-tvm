@@ -48,6 +48,19 @@ export function stageRangeFrom(search: string): { start: number; end: number } |
 }
 
 /**
+ * The smallest context a link may ask for.
+ *
+ * 256 is the figure `landing-swarm.ts`'s context field has clamped to since it
+ * was written (`min="256" step="256"`, and a `Math.max(…, 256)` behind it).
+ * Anything under it is a window no conversation fits in, and the cost of
+ * honouring one is a multi-gigabyte download for an engine that cannot answer.
+ * That file still writes its own literal; this is the copy the URL side reads,
+ * and it is the one every surface inherits, because every surface reads
+ * `?ctx=` through ctxFrom.
+ */
+export const MIN_CTX = 256
+
+/**
  * `?ctx=N` — the KV budget the room runs at, in tokens. THE ONE READER of that
  * key; every surface that sizes a KV cache from a URL comes through here.
  *
@@ -76,10 +89,25 @@ export function stageRangeFrom(search: string): { start: number; end: number } |
  * asking for the one you already have, and no signature that cannot say
  * "absent" can keep those apart. ctxFor was deleted with that fix rather than
  * left exported and tested with no caller.
+ *
+ * A BUDGET IS A WHOLE NUMBER OF TOKENS, AND AT LEAST MIN_CTX OF THEM. The
+ * guard was `n > 0`, which admits fractions and sub-page values, and every
+ * surface then honoured them: `share.html?model=qwen38&ctx=0.5` rendered
+ * "Context | 16 tokens" and `zero-tvm.html?model=qwen38&ctx=0.5` rendered
+ * "0K CONTEXT" — both about to fetch 14.1 GB of weights for a window that
+ * cannot hold a prompt, let alone a conversation. (specWithCtx's floor is ONE
+ * PAGE, so 0.5 does not error anywhere; it quietly builds a 16-token cache.)
+ * The swarm's own context field has clamped to >= 256 since it was written;
+ * the URL reader, which is where the same number arrives from a link, did not.
+ * It does now, so every surface inherits the floor from one place.
+ *
+ * REFUSED, not clamped: a malformed budget is NO budget, and the caller's own
+ * compiled default is a better answer than a number this module invented. It
+ * is the same rule the entrance applies to a malformed `?split=`.
  */
 export function ctxFrom(search: string): number | null {
   const n = Number(new URLSearchParams(search).get('ctx'))
-  return Number.isFinite(n) && n > 0 ? n : null
+  return Number.isInteger(n) && n >= MIN_CTX ? n : null
 }
 
 export type RoomRole = 'host' | 'helper' | 'guest'

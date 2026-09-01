@@ -18,6 +18,11 @@
  */
 
 import { SHIPPED_MODELS, canSplitAcrossDevices, kvBytesPerTokenShown as kvBytesPerToken, modelBranding, quantLabel, specForParam, specWithCtx } from './zero-tvm/model-registry.js'
+// `?ctx=` is read HERE by the one reader every other surface uses. The
+// entrance used to run its own `Number(Q.get('ctx'))`, which is how it came to
+// disagree with share.html and zero-tvm.html about the same link — see the
+// note on the ctx picker below.
+import { ctxFrom } from './zero-tvm/room-url.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
@@ -45,12 +50,31 @@ interface CtxMode { name: string; tokens: number }
 /** Context builds, derived from the spec: the compiled default (a ~1 GiB KV
  *  budget choice, not a limit), a middle step, and the checkpoint's own
  *  trained window. One entry when the default already IS the trained window
- *  (Phi-3) — then the row does not render. */
-function ctxModesOf(spec: ModelSpec): CtxMode[] {
+ *  (Phi-3) — then the row does not render.
+ *
+ *  `linked` is a window a LINK named that this list does not enumerate.
+ *  Without it the entrance honoured `?ctx=` only on an exact match to one of
+ *  the three, and every other value fell back to the spec default in silence —
+ *  while `landing-room.ts` writes room chips carrying any ctx in
+ *  [256, maxContext] and hands the SAME `?ctx=` to the other machines. Two
+ *  tabs then run different KV budgets for one conversation and neither prints
+ *  the number: the failure ctxFrom's own docstring exists to prevent, arriving
+ *  through the one surface that was not reading ctxFrom.
+ *
+ *  The value is passed through `specWithCtx` first, so the chip quotes the
+ *  window that is actually ALLOCATED — KV pages round up, so `?ctx=5000` on a
+ *  16-token page is a 5008-token cache — and the CTA writes that number back
+ *  into the link. Appended last, never sorted in: `go()` resets the picker to
+ *  index 0 and index 0 has to stay the compiled default. */
+function ctxModesOf(spec: ModelSpec, linked?: number | null): CtxMode[] {
   const out: CtxMode[] = [{ name: 'Standard', tokens: spec.maxContext }]
   const long = Math.min(spec.maxContext * 4, spec.maxSeq)
   if (long > spec.maxContext) out.push({ name: 'Long', tokens: long })
   if (spec.maxSeq > long) out.push({ name: 'Full', tokens: spec.maxSeq })
+  if (linked != null) {
+    const t = specWithCtx(spec, linked).maxContext
+    if (!out.some((c) => c.tokens === t)) out.push({ name: 'From the link', tokens: t })
+  }
   return out
 }
 
@@ -255,6 +279,144 @@ export function entranceIntent(search: string, hash: string): EntranceIntent {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// WHAT WAS CHOSEN, AND WHAT THAT COSTS — pure, so the suite can hold it
+// ─────────────────────────────────────────────────────────────────────────
+
+/** A choice on the select screen. Four indices, and only together do they
+ *  mean anything: character, quantisation, memory build, context build. */
+export interface Selection { gi: number; vi: number; mi: number; xi: number }
+
+/**
+ * Everything that follows from a Selection: what boots, and what the page is
+ * allowed to SAY about it.
+ *
+ * ONE resolver, and the boot takes its answer BY VALUE. That is the whole
+ * repair for a gate that read "This link asks to run Llama-3.2-1B … ~528 MB
+ * KV", then booted Qwen3.6-35B-A3B — 16.4 GB, ~20 GB of free RAM — because
+ * the roster had moved behind it and the boot re-read the live selection at
+ * click time. The sentence and the boot are two views of one BootPlan now, so
+ * there is no live state left for them to disagree about.
+ */
+export interface BootPlan {
+  spec: ModelSpec
+  /** `?model=` value. `''` is the DEFAULT model, not "unset". */
+  param: string
+  name: string
+  sizeLabel: string
+  ramNote: string
+  /** Expert slots for a pooled MoE build; 0 is the full model. */
+  poolSlots: number
+  poolLabel: string
+  /** The window this plan boots at, in tokens — post-clamp, the number that
+   *  is actually allocated. */
+  ctxTokens: number
+  /** `?model=&pool=&ctx=` for this plan: the CTA's href, the room verb's
+   *  href, and the page a failed in-place mount falls back to. */
+  query: string
+}
+
+/** The plan a Selection resolves to. `linkedCtx` is the window the URL named
+ *  (see ctxModesOf) or null. */
+export function bootPlanFor(sel: Selection, linkedCtx: number | null): BootPlan {
+  const v = GROUPS[sel.gi].variants[sel.vi]
+  const b = modelBranding(v.spec)
+  const modes = b.poolModes ?? []
+  const mode = modes[sel.mi] ?? modes[0]
+  const ctxs = ctxModesOf(v.spec, linkedCtx)
+  const cx = ctxs[sel.xi] ?? ctxs[0]
+  const qs: string[] = []
+  if (v.param) qs.push(`model=${v.param}`)
+  if (mode && mode.slots) qs.push(`pool=${mode.slots}`)
+  if (cx.tokens !== v.spec.maxContext) qs.push(`ctx=${cx.tokens}`)
+  return {
+    spec: v.spec,
+    param: v.param,
+    name: b.name,
+    sizeLabel: b.sizeLabel,
+    ramNote: b.ramNote ?? '',
+    poolSlots: mode?.slots ?? 0,
+    poolLabel: mode && mode.slots ? mode.label : '',
+    ctxTokens: cx.tokens,
+    query: qs.length ? `?${qs.join('&')}` : '',
+  }
+}
+
+/** Every word the consent gate says, derived from the plan it will boot and
+ *  from nothing else. Same voice as confirmDownload() in share.ts. */
+export function gateCopy(plan: BootPlan, o: {
+  room: boolean
+  cached: boolean
+  /** The layers this device would fetch, when the link named a stage — then
+   *  the download is a SLICE, and quoting the whole checkpoint's size for it
+   *  is the figure that once promised a phone 14.1 GB for a fraction of it. */
+  stage: { start: number; end: number } | null
+  int8: boolean
+}): { title: string; what: string; cost: string; go: string } {
+  const s = o.stage
+  const weights = o.cached
+    ? (s ? `Layers ${s.start}–${s.end} are already cached on this device.`
+      : 'The weights are already cached on this device.')
+    : (s ? `Layers ${s.start}–${s.end} of ${plan.spec.layers} download once — a slice of `
+        + `the full ${plan.sizeLabel}, not all of it — and are cached locally.`
+      : `The weights download once (${plan.sizeLabel}) and are cached locally; every later `
+        + 'visit starts from disk.')
+  return {
+    title: `Run ${plan.name} on this machine?`,
+    what: `This link asks to run ${plan.name} on this machine. ${weights} Nothing has downloaded yet.`,
+    // The second half of the price: the KV cache is allocated EAGERLY at boot,
+    // and ?ctx= moves it. ramNote is a whole-checkpoint figure and is false
+    // for a stage, so a stage does not carry it.
+    cost: [
+      `${ctxLabel(plan.ctxTokens)} context · ~${kvPrice(plan.spec, plan.ctxTokens, o.int8)} allocated at boot`,
+      s ? '' : plan.ramNote,
+    ].filter(Boolean).join(' — '),
+    go: o.room
+      ? (o.cached ? 'Enter & open a room →' : 'Download & open a room →')
+      : (o.cached ? 'Enter chat →' : 'Download & enter →'),
+  }
+}
+
+/** What a keypress on the scene means. */
+export type SceneKey = 'ignore' | 'prev' | 'next' | 'enter' | 'exit-swarm'
+
+/**
+ * THE SCENE'S KEYBOARD, as a decision rather than as a listener body.
+ *
+ * `display:none` HIDES PIXELS; IT IS NOT A CONTROL. The consent gate moved
+ * the verbs out of view and left this handler alone, and this handler
+ * synthesises a click on `.mb-cta` for Enter. `#model-browser` has
+ * `tabIndex = 0`, so any click on the scene focuses it — including the click
+ * that dismisses the splash — and one Enter afterwards started a 14.1 GB
+ * download with the gate still on screen and `?chat=1` still in the address
+ * bar (so the `⟨ Roster` escape the last round fixed came back on that path
+ * too). Arrows were worse: they are what a visitor presses to scroll a
+ * full-screen scene, and they walked the roster behind a dialog that had
+ * already been read.
+ *
+ * `gated` is checked FIRST and refuses everything. The gate is a real
+ * `<dialog>` opened with `showModal()`, so the document behind it is inert
+ * and no pointer can reach the roster either — but the dialog is a DESCENDANT
+ * of `#model-browser`, so keystrokes aimed at its own buttons still bubble
+ * through this listener. Escape belongs to the dialog's `cancel` event, which
+ * is the decline path.
+ */
+export function keyIntent(key: string, targetTag: string, s: {
+  chatting: boolean; gated: boolean; swarm: boolean
+}): SceneKey {
+  if (s.gated) return 'ignore'
+  // In chat mode the keyboard belongs to the composer — arrows must not
+  // switch characters under a conversation. Nor under a text field: the swarm
+  // sheet has one, and typing a room link into it moved the roster.
+  if (s.chatting) return 'ignore'
+  if (targetTag === 'INPUT' || targetTag === 'TEXTAREA') return 'ignore'
+  if (key === 'Escape') return s.swarm ? 'exit-swarm' : 'ignore'
+  if (key === 'ArrowRight' || key === 'ArrowDown') return 'next'
+  if (key === 'ArrowLeft' || key === 'ArrowUp') return 'prev'
+  if (key === 'Enter' && targetTag !== 'BUTTON' && targetTag !== 'A') return 'enter'
+  return 'ignore'
+}
+
 /** Class sigils — one per architecture lane, same circuit-rune language as
  *  the /entrance assets. currentColor, so they sit in the accent for free. */
 const STAT_ICON: Record<string, string> = {
@@ -388,12 +550,39 @@ function render(): void {
       <!-- A LINK IS NOT CONSENT. ?chat=1 used to click ENTER for you. This is
            the same question share.html's confirmDownload() asks, in the same
            voice, and it is asked EVEN WHEN THE WEIGHTS ARE CACHED — being
-           cached changes the wording, not whether anybody agreed. -->
-      <div class="cs-room-consent cs-url-gate" style="display:none;max-width:52ch;text-align:center">
-        <p id="cs-gate-what"></p>
-        <p class="cs-plan-line" id="cs-gate-cost"></p>
-        <button type="button" class="cs-chat-tool" id="cs-gate-go" disabled>Checking this device…</button>
-      </div>
+           cached changes the wording, not whether anybody agreed.
+
+           A REAL <dialog>, opened with showModal(). The first version was a
+           <div> that set display:none on the verbs, which hid pixels and
+           controlled nothing: the roster stayed clickable, the arrow keys
+           still walked it, Enter still synthesised a click on the hidden CTA,
+           and a screen reader was told none of it. showModal() makes the rest
+           of the document inert — roster, sheet and site nav — traps focus,
+           and gives Escape a meaning, which is what the three findings under
+           it were all consequences of. Styled inline because the entrance's
+           stylesheet is not this file's to edit; the palette is the same
+           token set the rest of the scene reads. -->
+      <dialog class="cs-room-consent cs-url-gate" role="dialog" aria-modal="true"
+              aria-labelledby="cs-gate-title" aria-describedby="cs-gate-what cs-gate-cost"
+              style="max-width:52ch;text-align:center;padding:20px 22px;border-radius:6px;
+                     color:var(--text);background:var(--surface-2);
+                     border:1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 34%, var(--border))">
+        <h2 id="cs-gate-title" style="margin:0 0 12px;font-family:var(--mono);font-size:0.62rem;
+            letter-spacing:0.14em;text-transform:uppercase;color:var(--dim);font-weight:600"></h2>
+        <!-- role=status so the probe's refinement ("already cached on this
+             device") is ANNOUNCED. The first wording is written before the
+             dialog opens, so aria-describedby carries it into the opening
+             announcement; without both, a blind visitor was asked to approve
+             a download whose size was never read out. -->
+        <div role="status">
+          <p id="cs-gate-what"></p>
+          <p class="cs-plan-line" id="cs-gate-cost"></p>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px">
+          <button type="button" class="cs-chat-tool" id="cs-gate-go" disabled>Checking this device…</button>
+          <button type="button" class="cs-chat-tool" id="cs-gate-no">Not now</button>
+        </div>
+      </dialog>
     </div>
     <div class="cs-live" aria-live="polite"></div>
     <div class="cs-wipe" aria-hidden="true"></div>
@@ -451,6 +640,21 @@ function render(): void {
    *  Context is a KV-memory dial, not a model property — the number the sheet
    *  shows is whichever build is chosen here, priced in KV bytes. */
   let xi = 0
+  /** The window the LINK asked for, through the one reader of `?ctx=` — which
+   *  refuses anything that is not an integer of at least 256 tokens, so a
+   *  `?ctx=0.5` cannot reach the picker at all. */
+  const LINKED_CTX = ctxFrom(location.search)
+  /** …and it applies only while the character the link NAMED is the one on
+   *  stage, the same rule the split follows: walking the roster must not
+   *  carry a stale window onto a model with a different trained length. */
+  const linkedFor = (param: string): number | null => (Q.get('model') === param ? LINKED_CTX : null)
+  /** The context builds offered for a slot, link included. */
+  const ctxsFor = (g: number, v2: number): CtxMode[] =>
+    ctxModesOf(GROUPS[g].variants[v2].spec, linkedFor(GROUPS[g].variants[v2].param))
+  /** THE ONE RESOLVER — see BootPlan. Every href, every sentence and the boot
+   *  itself come through here. */
+  const planFor = (sel: Selection): BootPlan =>
+    bootPlanFor(sel, linkedFor(GROUPS[sel.gi].variants[sel.vi].param))
   if (wanted !== null) {
     const spec0 = GROUPS[gi].variants[vi].spec
     const wp = Q.get('pool')
@@ -458,9 +662,13 @@ function render(): void {
       const j = (modelBranding(spec0).poolModes ?? []).findIndex((m) => String(m.slots) === wp)
       if (j >= 0) mi = j
     }
-    const wc = Number(Q.get('ctx'))
-    if (Number.isFinite(wc) && wc > 0) {
-      const j = ctxModesOf(spec0).findIndex((c) => c.tokens === wc)
+    if (LINKED_CTX !== null) {
+      // ctxModesOf appends the link's window when the three enumerated builds
+      // do not already carry it, so this findIndex hits for ANY in-range
+      // value now — it used to hit only on an exact match to one of three,
+      // and `?ctx=5000` silently booted at the spec default.
+      const t = specWithCtx(spec0, LINKED_CTX).maxContext
+      const j = ctxsFor(gi, vi).findIndex((c) => c.tokens === t)
       if (j >= 0) xi = j
     }
   }
@@ -468,6 +676,16 @@ function render(): void {
   /** The swarm stage-mode, when it is on. Non-null exactly while the root
    *  carries `cs-swarm` — the second mode this screen has, after cs-chatting. */
   let swarm: SwarmHandle | null = null
+  /**
+   * THE AGREEMENT ON SCREEN, or null when the gate is down.
+   *
+   * Non-null exactly while the consent dialog is open, and it holds the plan
+   * that was DESCRIBED — not a pointer at the live selection. Every other
+   * input path asks this variable first (keyIntent, the click delegate,
+   * engage), and the accept button boots `gate.plan`, so the thing that boots
+   * and the thing that was agreed to are the same object.
+   */
+  let gate: { plan: BootPlan; room: boolean } | null = null
   // Denominator counts the shared expert only where one EXISTS — qwen30b has
   // none, and a blanket +1 understated its residency fraction.
   const poolFracOf = (spec: ModelSpec, slots: number): number =>
@@ -549,18 +767,17 @@ function render(): void {
     // same numbers the registry row and the engine read.
     const modes = b.poolModes ?? []
     const mode = modes[mi] ?? modes[0]
-    const ctxs = ctxModesOf(v.spec)
+    const ctxs = ctxsFor(gi, vi)
     const cx = ctxs[xi] ?? ctxs[0]
     {
-      const qs: string[] = []
-      if (v.param) qs.push(`model=${v.param}`)
-      if (mode && mode.slots) qs.push(`pool=${mode.slots}`)
-      if (cx.tokens !== v.spec.maxContext) qs.push(`ctx=${cx.tokens}`)
-      el<HTMLAnchorElement>('.mb-cta').href = `zero-tvm.html${qs.length ? '?' + qs.join('&') : ''}`
+      // The SAME query the boot uses — one resolver, so a middle-click and an
+      // in-place ENTER cannot land on different builds.
+      const q2 = planFor({ gi, vi, mi, xi }).query
+      el<HTMLAnchorElement>('.mb-cta').href = `zero-tvm.html${q2}`
       // The room path carries the SAME build choices — share.html reads
       // ?pool= and ?ctx= too, so a modified click hosts the build that was
       // chosen, not silently the full model.
-      el<HTMLAnchorElement>('.mb-cta-room').href = `share.html${qs.length ? '?' + qs.join('&') : ''}`
+      el<HTMLAnchorElement>('.mb-cta-room').href = `share.html${q2}`
     }
 
     el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
@@ -884,6 +1101,13 @@ function render(): void {
 
   host.addEventListener('click', (e) => {
     const t = e.target as HTMLElement
+    // THE GATE IS MODAL, AND POINTER INPUT IS HALF OF WHAT THAT HAS TO MEAN.
+    // showModal() already makes the document behind the dialog inert, so a
+    // roster card cannot be clicked through it — but the dialog is a
+    // DESCENDANT of #model-browser, so its own clicks bubble here, and a
+    // future move of the markup would silently restore the bypass. The gate's
+    // two buttons carry their own listeners and do not need this delegate.
+    if (gate) return
     // The RAM line's doorway. First, because it lives inside the sheet and
     // every other branch below would otherwise have to know about it.
     if (t.closest('.cs-verbs-split-btn')) { void enterSwarm(); return }
@@ -911,18 +1135,19 @@ function render(): void {
   host.setAttribute('role', 'application')
   host.setAttribute('aria-label', 'Character select — Up and Down arrows change model, Enter opens the chat')
   host.addEventListener('keydown', (e) => {
-    // In chat mode the keyboard belongs to the composer — arrows must not
-    // switch characters under a conversation. Nor under a text field: the
-    // swarm sheet has one, and typing a room link into it moved the roster.
-    if (root.classList.contains('cs-chatting')) return
-    const tag = (e.target as HTMLElement).tagName
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return
-    if (e.key === 'Escape' && swarm) { e.preventDefault(); exitSwarm(); return }
-    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); go(gi + 1) }
-    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); go(gi - 1) }
-    else if (e.key === 'Enter' && (e.target as HTMLElement).tagName !== 'BUTTON' && (e.target as HTMLElement).tagName !== 'A') {
-      root.querySelector<HTMLAnchorElement>('.mb-cta')?.click()
-    }
+    // The rule is keyIntent()'s, not this listener's — it is unit-tested, and
+    // the bug it closes (Enter walking past an open consent gate) is only
+    // decidable headlessly because the decision left the listener body.
+    const act = keyIntent(e.key, (e.target as HTMLElement).tagName, {
+      chatting: root.classList.contains('cs-chatting'),
+      gated: gate !== null,
+      swarm: swarm !== null,
+    })
+    if (act === 'ignore') return
+    if (act === 'exit-swarm') { e.preventDefault(); exitSwarm(); return }
+    if (act === 'next') { e.preventDefault(); go(gi + 1); return }
+    if (act === 'prev') { e.preventDefault(); go(gi - 1); return }
+    root.querySelector<HTMLAnchorElement>('.mb-cta')?.click()
   })
   const art = el<HTMLElement>('.mb-art')
   art.addEventListener('mouseenter', () => mascot?.setHover(true))
@@ -982,12 +1207,17 @@ function render(): void {
   // (landing-chat.ts, imported only now because its chain touches WebGPU
   // globals). The href still points at zero-tvm.html?model=&pool= — that is
   // what modified clicks, middle-click, and browsers without WebGPU get.
-  const engage = (e: MouseEvent, openRoom: boolean): void => {
-    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
-    if (root.classList.contains('cs-chatting')) { e.preventDefault(); return }
-    if (!('gpu' in navigator)) return  // navigate — the fallback page explains what is missing
-    const href = (e.currentTarget as HTMLAnchorElement).href
-    e.preventDefault()
+  /**
+   * THE ONE BOOT PATH, and it takes a PLAN — never the live selection.
+   *
+   * A click on ENTER builds a plan from what is on stage at that instant; the
+   * consent dialog builds one when it OPENS and hands back the same object on
+   * accept. Neither can read `gi/vi/mi/xi` from in here, which is what let a
+   * gate describing Llama-3.2-1B boot Qwen3.6-35B-A3B: the accept used to
+   * synthesise a click on `.mb-cta`, and that click resolved the roster
+   * afresh, two ArrowDowns later.
+   */
+  function enter(plan: BootPlan, openRoom: boolean): void {
     // ENTER is still on screen in swarm mode — it is the "run it here instead"
     // path. Chat mode owns the same sheet and the same stage, so the swarm has
     // to hand both back before the panel mounts.
@@ -995,37 +1225,41 @@ function render(): void {
     if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
       root.querySelector<HTMLElement>('.cs-engage')?.classList.add('cs-go')
     }
-    const v = GROUPS[gi].variants[vi]
-    const modes = modelBranding(v.spec).poolModes ?? []
-    const mode = modes[mi] ?? modes[0]
-    const cxs = ctxModesOf(v.spec)
-    const cx = cxs[xi] ?? cxs[0]
     // ?split=0,8,16&stage=0 — the room strip's way of changing the split. It
     // only applies to the character the URL actually names, so walking the
     // roster afterwards cannot carry a stale set of bounds onto a model with
     // a different layer count.
-    // The URL's split, but only while the character it named is still the one
-    // on stage — walking the roster must not carry a stale set of bounds onto
-    // a model with a different layer count.
-    const st = intent.split && Q.get('model') === v.param ? intent.split : null
+    const st = intent.split && Q.get('model') === plan.param ? intent.split : null
     const urlRange = st ? { start: st.bounds[st.index], end: st.bounds[st.index + 1] } : undefined
-    const urlSplit = st ? { bounds: st.bounds, index: st.index, ctx: cx.tokens } : undefined
+    const urlSplit = st ? { bounds: st.bounds, index: st.index, ctx: plan.ctxTokens } : undefined
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
       root,
-      spec: v.spec,
-      param: v.param,
-      poolSlots: mode?.slots ?? 0,
-      poolLabel: mode && mode.slots ? mode.label : '',
-      ctxTokens: cx.tokens !== v.spec.maxContext ? cx.tokens : 0,
+      spec: plan.spec,
+      param: plan.param,
+      poolSlots: plan.poolSlots,
+      poolLabel: plan.poolLabel,
+      ctxTokens: plan.ctxTokens !== plan.spec.maxContext ? plan.ctxTokens : 0,
       openRoom: openRoom || urlSplit !== undefined,
       layerRange: urlRange,
       split: urlSplit,
       mascot,
     })).catch((err) => {
-      // The panel could not even mount — fall back to the standalone page.
+      // The panel could not even mount — fall back to the standalone page,
+      // on the SAME plan rather than on whatever the roster now reads.
       console.error('[landing] in-place chat failed, navigating:', err)
-      location.href = href
+      location.href = `zero-tvm.html${plan.query}`
     })
+  }
+
+  const engage = (e: MouseEvent, openRoom: boolean): void => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
+    if (root.classList.contains('cs-chatting')) { e.preventDefault(); return }
+    // The verbs are behind an open modal and cannot be clicked; a synthesised
+    // click still could, so the state is checked rather than assumed.
+    if (gate) { e.preventDefault(); return }
+    if (!('gpu' in navigator)) return  // navigate — the fallback page explains what is missing
+    e.preventDefault()
+    enter(planFor({ gi, vi, mi, xi }), openRoom)
   }
   root.querySelector<HTMLAnchorElement>('.mb-cta')?.addEventListener('click', (e) => engage(e, false))
   // The room path is the same summoning with the room strip already open on
@@ -1050,70 +1284,135 @@ function render(): void {
    * agreed. Clicking ENTER on this page is a click already and is not gated —
    * this is only the door a URL opens.
    */
+  /**
+   * WHY THE SELECTION IS CAPTURED HERE AND THE GATE DOES NOT REPAINT.
+   *
+   * Two designs answer "the gate named a model it will not boot": repaint the
+   * gate from paint() so its words track the roster, or capture the selection
+   * when the gate opens and boot from the capture. This is the capture, and
+   * the roster is FROZEN behind it — those two halves are one decision, not
+   * two.
+   *
+   * Repainting keeps the words in sync but not the READING. The visitor reads
+   * a sentence about 528 MB, presses ArrowDown twice to scroll a full-screen
+   * scene, and the sentence they have already read silently becomes a
+   * different sentence about 16.4 GB and ~20 GB of free RAM. Consent then
+   * means "whatever the text said at the instant of the click", which is the
+   * property that made `?chat=1` unsafe in the first place. It also cannot be
+   * made honest cheaply: the wording turns on an AWAITED cache probe, so
+   * every roster move needs a re-probe, and until one lands the dialog either
+   * shows the previous model's "already cached" clause or flickers its own
+   * button between "Enter chat" and "Download & enter".
+   *
+   * Capturing is only honest if changing your mind is POSSIBLE, which is why
+   * the dialog carries "Not now". A deliberate change of character while the
+   * gate is up is neither silently ignored nor silently obeyed — it cannot
+   * happen. Decline (or press Escape), the scene comes back, the
+   * act-without-a-click keys leave the address bar, and choosing another
+   * character and pressing ENTER is a click, which is consent on its own
+   * terms.
+   */
   async function openUrlGate(room: boolean): Promise<void> {
+    const dlg = el<HTMLDialogElement>('.cs-url-gate')
     const go = el<HTMLButtonElement>('#cs-gate-go')
+    const no = el<HTMLButtonElement>('#cs-gate-no')
     // `hidden` loses to `#models .cs-verbs { display: flex }`, so the verbs
-    // are moved by the property that actually wins.
-    const show = (sel: string, on: boolean): void => {
-      const n = root.querySelector<HTMLElement>(sel)
-      if (n) n.style.display = on ? '' : 'none'
+    // are moved by the property that actually wins. BOTH directions live in
+    // setGate, never in a handler's success path: the first version restored
+    // them only when the accept button was clicked, so a `?chat=1` link that
+    // was never accepted left "Enter chat" and "⟁ Open a room" gone from the
+    // page for good, and editing the address bar was the only way back into
+    // the site.
+    const setGate = (g: { plan: BootPlan; room: boolean } | null): void => {
+      gate = g
+      for (const sel of ['.cs-verbs', '.cs-verbs-note']) {
+        const n = root.querySelector<HTMLElement>(sel)
+        if (n) n.style.display = g ? 'none' : ''
+      }
+      if (g === null) {
+        // The link has been ANSWERED — either way — so take its verbs out of
+        // the address bar: "⟨ Roster" and /roster both reload, a reload keeps
+        // the query, and `?chat=1` then walks straight back into the gate.
+        history.replaceState(null, '', `${location.pathname}${urlAfterEnter(location.search)}${location.hash}`)
+      }
     }
-    const v = GROUPS[gi].variants[vi]
-    const b = modelBranding(v.spec)
-    const cxs = ctxModesOf(v.spec)
-    const cx = cxs[xi] ?? cxs[0]
+
+    const plan = planFor({ gi, vi, mi, xi })
     // The URL's stage, if it named one — what this device fetches is a SLICE
     // then, and quoting the whole checkpoint's size for it is the figure that
     // once promised an iPhone 14.1 GB for a fraction of it.
-    const st = intent.split && Q.get('model') === v.param ? intent.split : null
-    const stage = st ? { start: st.bounds[st.index], end: st.bounds[st.index + 1] } : undefined
-    show('.cs-url-gate', true)
-    show('.cs-verbs', false)
-    show('.cs-verbs-note', false)
+    const st = intent.split && Q.get('model') === plan.param ? intent.split : null
+    const stage = st ? { start: st.bounds[st.index], end: st.bounds[st.index + 1] } : null
+
+    /** The dialog's words, from the plan it will boot and nothing else. */
+    const say = (cached: boolean): void => {
+      const c = gateCopy(plan, { room, cached, stage, int8: INT8_KV })
+      el<HTMLElement>('#cs-gate-title').textContent = c.title
+      el<HTMLElement>('#cs-gate-what').textContent = c.what
+      el<HTMLElement>('#cs-gate-cost').textContent = c.cost
+      go.textContent = c.go
+    }
+    // Written COLD and shown BEFORE the probe runs, so the dialog's opening
+    // announcement (aria-labelledby + aria-describedby) already carries the
+    // download size and the RAM note. Cold is also the honest side to be
+    // wrong on.
+    say(false)
+    setGate({ plan, room })
+    dlg.showModal()
+
+    // EVERY WAY OUT IS WIRED BEFORE THE PROBE IS AWAITED. Attaching these
+    // after it means that for as long as the probe runs, "Not now" does
+    // nothing and Escape closes the dialog with no handler — leaving the
+    // scene gated, the verbs hidden and no dialog on screen: worse than the
+    // stranding this replaces. The accept does not need the probe's answer
+    // either; `go` is disabled until it lands, which is what makes it wait.
+    let accepted = false
+    go.addEventListener('click', () => {
+      accepted = true
+      go.disabled = true
+      dlg.close()
+      setGate(null)
+      if (!('gpu' in navigator)) { location.href = `zero-tvm.html${plan.query}`; return }
+      // The PLAN, not the roster. This used to synthesise a click on the
+      // hidden CTA, and that click resolved the live selection all over again.
+      enter(plan, room)
+    }, { once: true })
+    no.addEventListener('click', () => dlg.close())
+    // Escape fires `cancel` and then `close`, and the decline path is the
+    // same either way — so it is written once, on `close`.
+    dlg.addEventListener('close', () => {
+      if (accepted) return
+      setGate(null)
+      root.querySelector<HTMLElement>('.mb-cta')?.focus()
+    })
+
     // The SAME probe share.html's gate uses, on the same spec and the same
     // stage, so the two surfaces cannot disagree about whether this device
     // already holds the weights. Dynamic: it pulls in the loaders, which read
     // GPUBufferUsage at module scope.
+    //
+    // BOUNDED. A probe that never settles used to leave the button disabled
+    // on "Checking this device…" with the verbs already hidden — a page with
+    // no way forward and no way back. Asking without the cached wording is
+    // strictly better than never asking.
     let cached = false
     try {
       if ('gpu' in navigator) {
         const { isModelCached } = await import('./zero-tvm/cache-probe.js')
-        cached = await isModelCached(v.spec, stage)
+        cached = await Promise.race([
+          isModelCached(plan.spec, stage ?? undefined),
+          new Promise<boolean>((r) => { setTimeout(() => r(false), 2500) }),
+        ])
       }
     } catch { /* treat as cold — the honest side to be wrong on */ }
-    const weights = cached
-      ? (stage
-          ? `Layers ${stage.start}–${stage.end} are already cached on this device.`
-          : 'The weights are already cached on this device.')
-      : (stage
-          ? `Layers ${stage.start}–${stage.end} of ${v.spec.layers} download once — a slice of `
-            + `the full ${b.sizeLabel}, not all of it — and are cached locally.`
-          : `The weights download once (${b.sizeLabel}) and are cached locally; every later `
-            + 'visit starts from disk.')
-    el<HTMLElement>('#cs-gate-what').textContent =
-      `This link asks to run ${b.name} on this machine. ${weights} Nothing has downloaded yet.`
-    // The second half of the price: the KV cache is allocated EAGERLY at boot,
-    // and ?ctx= moves it. b.ramNote is a whole-checkpoint figure and is false
-    // for a stage, so a stage does not carry it.
-    el<HTMLElement>('#cs-gate-cost').textContent = [
-      `${ctxLabel(cx.tokens)} context · ~${kvPrice(v.spec, cx.tokens, INT8_KV)} allocated at boot`,
-      stage ? '' : (b.ramNote ?? ''),
-    ].filter(Boolean).join(' — ')
-    go.textContent = room
-      ? (cached ? 'Enter & open a room →' : 'Download & open a room →')
-      : (cached ? 'Enter chat →' : 'Download & enter →')
+    if (gate === null) return            // declined while the probe was out
+    if (cached) say(true)                // role=status announces the change
     go.disabled = false
-    go.focus()
-    go.addEventListener('click', () => {
-      go.disabled = true
-      show('.cs-url-gate', false)
-      show('.cs-verbs', true)
-      show('.cs-verbs-note', true)
-      // The link has been honoured — take its verbs out of the address bar so
-      // the way OUT of the chat works. "⟨ Roster" and /roster both reload.
-      history.replaceState(null, '', `${location.pathname}${urlAfterEnter(location.search)}${location.hash}`)
-      root.querySelector<HTMLElement>(room ? '.mb-cta-room' : '.mb-cta')?.click()
-    }, { once: true })
+    // NO go.focus() HERE. showModal() has already placed focus inside the
+    // dialog; stealing it when an async probe happens to land yanks a
+    // keyboard user mid-Tab onto a button whose label is all they are told.
+    // The focus showModal() gives is "Not now", because it is the first
+    // enabled control — the safe default for a question about gigabytes.
   }
 
   // "Swarm" in the nav and the footer pointed at the section below. That

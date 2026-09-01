@@ -178,16 +178,42 @@ async function high1() {
   await gateReady(page)
   const before = await snap(page)
   await armBootWatch(page)
+
+  // (a) The bypass as reported, aimed straight at the listener that carried
+  //     it. A keydown whose target is #model-browser is exactly what the
+  //     splash-dismissing click produced — the scene is a DIV with
+  //     tabIndex = 0 — and it reaches the handler whatever the focus ring is
+  //     doing, so this does not depend on where showModal() put focus.
+  await page.evaluate(() => {
+    document.getElementById('model-browser')
+      ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+  })
+  await sleep(800)
+  const dispatched = await snap(page)
+  const bootedA = await bootedName(page)
+
+  // (b) And through the real keyboard. The scene is inert under showModal(),
+  //     so focus cannot even land on it — the press goes to whatever the
+  //     dialog holds. Either way nothing may boot.
   await page.focus('#model-browser')
+  const focusAfter = await page.evaluate(() => {
+    const a = document.activeElement
+    return a ? `${a.tagName}${a.id ? `#${a.id}` : ''}` : 'none'
+  })
   await page.keyboard.press('Enter')
   await sleep(1200)
   const after = await snap(page)
-  const booted = await bootedName(page)
-  check('HIGH-1  Enter on the scene does not walk past the gate', !after.chatting && booted === null, [
-    `before:      gate ${before.gateDisplay !== 'none' ? 'up' : 'down'}, .cs-verbs display: ${before.verbsDisplay}, chatting: ${before.chatting}`,
-    'focus #model-browser, press Enter',
-    `AFTER Enter: chatting: ${after.chatting}, booted: ${JSON.stringify(booted)}, gate display: ${after.gateDisplay}, url: ${JSON.stringify(after.url)}`,
-  ])
+  const bootedB = await bootedName(page)
+
+  check('HIGH-1  Enter on the scene does not walk past the gate',
+    !dispatched.chatting && bootedA === null && dispatched.gateDisplay !== 'none'
+    && !after.chatting && bootedB === null, [
+      `before:        gate ${before.gateDisplay !== 'none' ? 'up' : 'down'}, .cs-verbs display: ${before.verbsDisplay}, chatting: ${before.chatting}`,
+      'dispatch keydown Enter AT #model-browser (the reported path):',
+      `               chatting: ${dispatched.chatting}, booted: ${JSON.stringify(bootedA)}, gate display: ${dispatched.gateDisplay}, url: ${JSON.stringify(dispatched.url)}`,
+      `focus #model-browser → activeElement is ${focusAfter} (the scene is inert), press Enter:`,
+      `               chatting: ${after.chatting}, booted: ${JSON.stringify(bootedB)}, gate display: ${after.gateDisplay}, url: ${JSON.stringify(after.url)}`,
+    ])
   await page.close()
 }
 
@@ -261,6 +287,57 @@ async function f2Decline() {
   await page.close()
 }
 
+// ── F2 · Escape is a decline, and it works while the probe is still out ──
+async function f2Escape() {
+  const page = await open('/?model=llama32&chat=1')
+  // Deliberately NOT gateReady: the dialog is on screen before the cache
+  // probe resolves, and the first version wired "Not now" and the close
+  // handler only after that await — so for the length of the probe, Escape
+  // closed the dialog with nothing listening and left the scene gated, the
+  // verbs hidden, and no dialog to act on.
+  await page.waitForSelector('.cs-url-gate[open]', { timeout: 15_000 })
+  await page.keyboard.press('Escape')
+  await sleep(400)
+  const after = await snap(page)
+  check('F2      Escape declines, even mid-probe',
+    after.gateDisplay === 'none' && after.verbsDisplay === 'flex' && !/chat=1/.test(after.url), [
+      `after Escape: gate display: ${after.gateDisplay}, .cs-verbs display: ${after.verbsDisplay}, url: ${JSON.stringify(after.url)}`,
+    ])
+  await page.close()
+}
+
+// ── layout · the two widths the review measured as fine ──────────────────
+async function mobile() {
+  const bad = []
+  for (const [w, h] of [[390, 844], [360, 740]]) {
+    const page = await open('/?model=qwen36q3&chat=1')
+    await page.setViewport({ width: w, height: h })
+    await gateReady(page)
+    const m = await page.evaluate(() => {
+      const d = document.querySelector('.cs-url-gate')
+      const r = d.getBoundingClientRect()
+      const btns = [...d.querySelectorAll('button')].map((b) => {
+        const q = b.getBoundingClientRect()
+        return { id: b.id, w: Math.round(q.width), inView: q.top >= 0 && q.bottom <= innerHeight }
+      })
+      return {
+        page: document.documentElement.scrollWidth <= innerWidth + 1,
+        fits: r.left >= -1 && r.right <= innerWidth + 1 && r.height <= innerHeight,
+        box: `${Math.round(r.width)}x${Math.round(r.height)} at ${Math.round(r.left)},${Math.round(r.top)}`,
+        btns,
+      }
+    })
+    const ok = m.page && m.fits && m.btns.length === 2 && m.btns.every((b) => b.w > 0 && b.inView)
+    if (!ok) bad.push(`${w}x${h}`)
+    check(`layout  the gate fits ${w}x${h} and both buttons are reachable`, ok, [
+      `dialog ${m.box}; no horizontal page scroll: ${m.page}; inside the viewport: ${m.fits}`,
+      `buttons: ${JSON.stringify(m.btns)}`,
+    ])
+    await page.close()
+  }
+  return bad
+}
+
 // ── F1/F3 · it has to BE a dialog, and say what it is ────────────────────
 async function f3Semantics() {
   const page = await open('/?model=llama32&chat=1')
@@ -321,7 +398,8 @@ async function lowCtx() {
 const only = process.argv.find((a) => a.startsWith('--only='))?.slice(7)
 const cases = [
   ['high1', high1], ['high2-key', high2Keyboard], ['high2-pointer', high2Pointer],
-  ['f2', f2Decline], ['f3', f3Semantics], ['medium', mediumCtx], ['low', lowCtx],
+  ['f2', f2Decline], ['f2-esc', f2Escape], ['f3', f3Semantics],
+  ['mobile', mobile], ['medium', mediumCtx], ['low', lowCtx],
 ]
 try {
   await start()
