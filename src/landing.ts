@@ -17,7 +17,7 @@
  * The mascot and the cached badge are additive; both fail to silence.
  */
 
-import { SHIPPED_MODELS, canSplitAcrossDevices, kvBytesPerTokenShown as kvBytesPerToken, modelBranding, quantLabel, specWithCtx } from './zero-tvm/model-registry.js'
+import { SHIPPED_MODELS, canSplitAcrossDevices, kvBytesPerTokenShown as kvBytesPerToken, modelBranding, quantLabel, specForParam, specWithCtx } from './zero-tvm/model-registry.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
@@ -32,11 +32,6 @@ interface Group { name: string; params: string; variants: Variant[] }
 /** Context ceiling, derived from the spec (maxPages x pageSize) — a fact about
  *  the build rather than a figure typed into the page. */
 const ctxLabel = (t: number): string => (t >= 1024 ? `${Math.round(t / 1024)}k` : String(t))
-
-/** Whether the engine this page hands off to will quantise its KV cache.
- *  Default ON; `?kv8=0` opts out — the SAME rule variants.ts applies, read
- *  here rather than assumed, so the price shown is the price charged. */
-const INT8_KV = new URLSearchParams(location.search).get('kv8') !== '0'
 
 /** What a context window costs: KV bytes, from the spec's own per-token rate.
  *  Computed, never typed — the same rule as every other figure here. */
@@ -86,7 +81,179 @@ function buildGroups(): Group[] {
   return [...out.values()]
 }
 
-const GROUPS = buildGroups()
+/** The roster the entrance renders. Exported so a headless test can resolve a
+ *  slot the URL grammar returns to the spec it will actually boot. */
+export const GROUPS = buildGroups()
+
+// ─────────────────────────────────────────────────────────────────────────
+// THE ENTRANCE URL GRAMMAR
+// ─────────────────────────────────────────────────────────────────────────
+
+/** The stage of a split this tab holds. */
+export interface EntranceSplit {
+  /** [0, ...cuts, spec.layers] — the WHOLE split, so the room strip can write
+   *  the other machines' links; this machine's slice alone cannot say where
+   *  the others begin. */
+  bounds: number[]
+  /** Which stage this tab is. */
+  index: number
+}
+
+/** Everything a link may ask this page to do. */
+export interface EntranceIntent {
+  /** Roster group and variant the URL names. */
+  gi: number
+  vi: number
+  /** The split this tab holds, or null for no split (boot the whole model). */
+  split: EntranceSplit | null
+  /** The URL asked to enter the chat. There is deliberately no verb here
+   *  meaning "enter now": a URL is not a click, so the only thing a link can
+   *  ask for is to be ASKED — see openUrlGate() in render(). */
+  enter: { room: boolean; act: 'consent' } | null
+  /** The URL asked for swarm mode. */
+  swarm: boolean
+}
+
+/**
+ * The roster slot the URL names. TWO QUESTIONS, deliberately answered
+ * differently — do not fold them back into one.
+ *
+ * NO `model` KEY AT ALL is not a model request. It is "which character does
+ * the select screen OPEN on", and that is a presentation choice this page
+ * owns alone: the standalone pages have no roster, so `specForParam` has no
+ * opinion about it. The answer is the roster's first card — the strongest
+ * model this project runs. Phi-3 used to lead the roster and the whole
+ * reorder (b37e849) exists because the weakest shipped model was the
+ * project's first impression.
+ *
+ * A `model` KEY THAT IS PRESENT but names nothing is a COMPATIBILITY
+ * question — "what does an unrecognised ?model= mean" — and there the two
+ * surfaces must not disagree. `specForParam` is where `?model=` is resolved,
+ * and /zero-tvm.html, share.html and validate.html have always asked it.
+ * The entrance ran its own findIndex over the roster instead and fell back to
+ * slot 0 on a miss, which was harmless while slot 0 was Phi-3 and became a
+ * 14.1 GB liability the day the roster was reordered:
+ * `/zero-tvm.html?model=not-a-model` booted Phi-3 while `/?model=not-a-model`
+ * booted Qwen3.8-27B. Every pre-registry URL depends on that fall-through.
+ *
+ * So the split is on PRESENCE (`q.get('model') !== null`), not on whether the
+ * value resolves. `?model=bogus`, `?model=` and `?model=embed` are all Phi-3;
+ * a bare `/` is the flagship.
+ *
+ * A spec the ROSTER does not carry — the embedding model, which answers
+ * nothing a visitor typed, or a build that is generated but not yet
+ * numerics-validated — takes the registry's own fallback rather than slot 0.
+ * The entrance cannot put a character on stage that it deliberately does not
+ * ship, and slot 0 is whichever model leads the roster this month.
+ */
+function rosterSlotFor(param: string | null): { gi: number; vi: number } {
+  // Presentation: no ?model= key, so nothing was asked for. Open on the
+  // roster's first card.
+  if (param === null) return { gi: 0, vi: 0 }
+  const slotOf = (id: string): { gi: number; vi: number } | null => {
+    for (let g = 0; g < GROUPS.length; g++) {
+      const v = GROUPS[g].variants.findIndex((x) => x.spec.id === id)
+      if (v >= 0) return { gi: g, vi: v }
+    }
+    return null
+  }
+  // Compatibility: the registry's answer, whatever it is.
+  return slotOf(specForParam(param).id) ?? slotOf(specForParam(null).id) ?? { gi: 0, vi: 0 }
+}
+
+/**
+ * `?split=0,18,36&stage=0` — the stage of a split this tab holds, or null.
+ *
+ * A MALFORMED SPLIT IS NO SPLIT: the entrance boots the whole model rather
+ * than a broken stage. The old guard checked only that there were three
+ * boundaries, that the index was in range, and that the last boundary equalled
+ * the layer count, and every rule below is one that was measured breaking
+ * something downstream of that:
+ *
+ *  - Boundaries must be integers, START AT 0, ascend strictly and end at
+ *    `spec.layers`. `split=4,8,16&stage=0` on a 16-layer checkpoint passed and
+ *    served layers 4-8 from a HOST stage — a stage with no embedding, which
+ *    share.ts refuses outright ("a hosting stage must start at layer 0").
+ *    `split=0,999,16` passed too and died inside the weight loader on
+ *    `Cannot read properties of undefined (reading 'normGamma1')`, before
+ *    engine-core's own `layerRange ... is not a range` guard could fire.
+ *  - The stage index must be an INTEGER in range. `stage=0.5` passed the range
+ *    check, `bounds[0.5]` is undefined, and the room plan then read
+ *    "This tab holds layers undefined-undefined".
+ *  - The stage must be the one that STARTS the model. Besides share.ts's own
+ *    rule, `swarmUrls` writes machine 1's row with `room: null` on purpose —
+ *    it assumes this tab is machine 1 — so from a later stage the room strip
+ *    hands out a serving link with no room fragment, which `roleFor` routes to
+ *    the host branch: a brand new room, the silent failure room-url.ts exists
+ *    to prevent.
+ *  - The checkpoint must be one the loader can CUT. `canSplitAcrossDevices` is
+ *    the registry's own predicate and it exists so the swarm link builder
+ *    cannot hand out a `?layers=` URL that throws at boot; this reader was a
+ *    second builder that could. `?model=&split=0,16,32` sent Phi-3 into
+ *    serving mode to die on "loadWeights: layerRange needs an MLX checkpoint;
+ *    phi3-mini ships MLC shards".
+ */
+function splitFor(spec: ModelSpec, splitParam: string | null, stageParam: string | null): EntranceSplit | null {
+  if (splitParam === null || splitParam === '') return null
+  if (!canSplitAcrossDevices(spec)) return null
+  const bounds = splitParam.split(',').map(Number)
+  if (bounds.length < 3 || !bounds.every((n) => Number.isInteger(n))) return null
+  if (bounds[0] !== 0 || bounds[bounds.length - 1] !== spec.layers) return null
+  if (!bounds.every((n, i) => i === 0 || n > bounds[i - 1])) return null
+  const index = stageParam === null ? 0 : Number(stageParam)
+  if (!Number.isInteger(index) || index < 0 || index >= bounds.length - 1) return null
+  // A later stage joins a room as a HELPER, through share.html — never here.
+  if (bounds[index] !== 0) return null
+  return { bounds, index }
+}
+
+/**
+ * The URL a reload should land on once a link's request has been honoured:
+ * the same page and the same character, minus the keys that mean "act without
+ * a click".
+ *
+ * "⟨ Roster" and the /roster command both `location.reload()`, and a reload
+ * keeps the query — so on any `?chat=1` URL the way OUT of the conversation
+ * walked straight back into it. Every link the room plan writes carries
+ * `chat=1`, so that was the way out of every split. Cleaning the address bar
+ * at the moment consent is given fixes it here, where the link is read,
+ * without landing-chat.ts having to know the entrance's grammar.
+ */
+export function urlAfterEnter(search: string): string {
+  const q = new URLSearchParams(search)
+  q.delete('chat')
+  q.delete('room')
+  const rest = q.toString()
+  return rest ? `?${rest}` : ''
+}
+
+/** What this URL asks the entrance to do. Pure, so the headless suite can
+ *  hold the whole grammar. */
+export function entranceIntent(search: string, hash: string): EntranceIntent {
+  const q = new URLSearchParams(search)
+  const model = q.get('model')
+  const { gi, vi } = rosterSlotFor(model)
+  const v = GROUPS[gi].variants[vi]
+  // The split applies only to the character the URL actually NAMES, so walking
+  // the roster afterwards cannot carry a stale set of bounds onto a model with
+  // a different layer count.
+  const split = model !== null && model === v.param
+    ? splitFor(v.spec, q.get('split'), q.get('stage'))
+    : null
+  return {
+    gi,
+    vi,
+    split,
+    // A split has to open the room strip: the other stages need links.
+    enter: q.get('chat') === '1'
+      ? { room: q.get('room') === '1' || split !== null, act: 'consent' }
+      : null,
+    // README publishes https://zerotvm.com/#swarm. Only a CLICK on
+    // `a[href="#swarm"]` was ever wired, and render() hides the #swarm
+    // fallback section — so the published link opened nothing at all.
+    swarm: hash === '#swarm',
+  }
+}
 
 /** Class sigils — one per architecture lane, same circuit-rune language as
  *  the /entrance assets. currentColor, so they sit in the accent for free. */
@@ -218,6 +385,15 @@ function render(): void {
         <a class="mb-cta-room btn btn-room">⟁ Open a room</a>
       </div>
       <p class="cs-verbs-note">A room serves this model to other machines. <span class="cs-verbs-split"></span></p>
+      <!-- A LINK IS NOT CONSENT. ?chat=1 used to click ENTER for you. This is
+           the same question share.html's confirmDownload() asks, in the same
+           voice, and it is asked EVEN WHEN THE WEIGHTS ARE CACHED — being
+           cached changes the wording, not whether anybody agreed. -->
+      <div class="cs-room-consent cs-url-gate" style="display:none;max-width:52ch;text-align:center">
+        <p id="cs-gate-what"></p>
+        <p class="cs-plan-line" id="cs-gate-cost"></p>
+        <button type="button" class="cs-chat-tool" id="cs-gate-go" disabled>Checking this device…</button>
+      </div>
     </div>
     <div class="cs-live" aria-live="polite"></div>
     <div class="cs-wipe" aria-hidden="true"></div>
@@ -249,6 +425,11 @@ function render(): void {
     }
   }
 
+  /** Whether the engine this page hands off to will quantise its KV cache.
+   *  Default ON; `?kv8=0` opts out — the SAME rule variants.ts applies, read
+   *  here rather than assumed, so the price shown is the price charged. */
+  const INT8_KV = new URLSearchParams(location.search).get('kv8') !== '0'
+
   const el = <T extends Element>(s: string): T => host.querySelector<T>(s)!
   const canvas = el<HTMLCanvasElement>('.mb-mascot')
   const dots = el<HTMLElement>('.mb-dots')
@@ -260,12 +441,9 @@ function render(): void {
      shape the chat panel's own build strip writes when you change one. */
   const Q = new URLSearchParams(location.search)
   const wanted = Q.get('model')
-  let gi = 0
-  let vi = 0
-  if (wanted !== null) {
-    const g = GROUPS.findIndex((x) => x.variants.some((v) => v.param === wanted))
-    if (g >= 0) { gi = g; vi = Math.max(0, GROUPS[g].variants.findIndex((v) => v.param === wanted)) }
-  }
+  const intent = entranceIntent(location.search, location.hash)
+  let gi = intent.gi
+  let vi = intent.vi
   /** Selected memory build (index into the spec's poolModes; 0 = full). Reset
    *  on every model/variant change — a build belongs to a character. */
   let mi = 0
@@ -529,6 +707,13 @@ function render(): void {
     // rather than a fallback. Absent on the three MLC specs, whose loader
     // refuses a layerRange.
     const splitNote = el<HTMLElement>('.cs-verbs-split')
+    // This button is destroyed on every paint(), and the keydown handler lives
+    // on #model-browser — so a keyboard user who pressed an arrow while it held
+    // focus landed on <body>, out of the handler's reach, and every later arrow
+    // did nothing at all. Same refocus the .mb-mode / .mb-ctx / .mb-variant
+    // chips get, falling back to the scene itself when the character walked to
+    // has no split button to restore focus to.
+    const hadSplitFocus = splitNote.contains(document.activeElement)
     splitNote.replaceChildren()
     if (splittable) {
       const b = document.createElement('button')
@@ -536,7 +721,8 @@ function render(): void {
       b.className = 'cs-verbs-split-btn'
       b.textContent = 'Too big for one machine? Split it ▸'
       splitNote.append(b)
-    }
+      if (hadSplitFocus) b.focus()
+    } else if (hadSplitFocus) root.focus()
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
       const on = Number(d.dataset.i) === gi
@@ -680,10 +866,14 @@ function render(): void {
       // than on variants[0] and then hand out links for a different one.
       const k = GROUPS[gi].variants.findIndex((x) => canSplitAcrossDevices(x.spec))
       if (k < 0) {
-        // Nothing to split here. Say so, and give the sheet back.
+        // Nothing to split here. Give the sheet back FIRST, then say why:
+        // exitSwarm() repaints, and paint()'s first act is to write the model
+        // name into this same aria-live region. Two writes in one task announce
+        // only the last, so saying it first meant the builder vanished with no
+        // reason — neither on screen nor announced.
+        exitSwarm()
         const live = root.querySelector<HTMLElement>('.cs-live')
         if (live) live.textContent = `${GROUPS[gi].name} cannot be split — it is not an MLX checkpoint`
-        exitSwarm()
         return
       }
       vi = k
@@ -814,16 +1004,12 @@ function render(): void {
     // only applies to the character the URL actually names, so walking the
     // roster afterwards cannot carry a stale set of bounds onto a model with
     // a different layer count.
-    let urlRange: { start: number; end: number } | undefined
-    let urlSplit: { bounds: number[]; index: number; ctx: number } | undefined
-    if (Q.get('model') === v.param) {
-      const raw = (Q.get('split') ?? '').split(',').map(Number).filter((n) => Number.isFinite(n))
-      const idx = Number(Q.get('stage') ?? 0)
-      if (raw.length >= 3 && idx >= 0 && idx < raw.length - 1 && raw[raw.length - 1] === v.spec.layers) {
-        urlRange = { start: raw[idx], end: raw[idx + 1] }
-        urlSplit = { bounds: raw, index: idx, ctx: cx.tokens }
-      }
-    }
+    // The URL's split, but only while the character it named is still the one
+    // on stage — walking the roster must not carry a stale set of bounds onto
+    // a model with a different layer count.
+    const st = intent.split && Q.get('model') === v.param ? intent.split : null
+    const urlRange = st ? { start: st.bounds[st.index], end: st.bounds[st.index + 1] } : undefined
+    const urlSplit = st ? { bounds: st.bounds, index: st.index, ctx: cx.tokens } : undefined
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
       root,
       spec: v.spec,
@@ -848,34 +1034,124 @@ function render(): void {
   // ?chat=1 — how the chat panel's build strip comes back after changing a
   // build. It goes through the CTA's own click rather than a second entry
   // point, so the auto path and the human path cannot drift.
-  if (Q.get('chat') === '1') {
-    root.querySelector<HTMLElement>(Q.get('room') === '1' ? '.mb-cta-room' : '.mb-cta')?.click()
+  /**
+   * ASK BEFORE SPENDING GIGABYTES — the URL path only.
+   *
+   * `?chat=1` used to click ENTER for you: any link a stranger sent started a
+   * multi-gigabyte download and an eager KV allocation (up to 16 GiB at the
+   * top of the ?ctx= range) before the page had finished painting, with no
+   * click anywhere. share.html grew a gate for exactly this incident — a
+   * visitor who clicked "Rooms" in the site nav was ~2 GB into a download
+   * before reading a word about it — and the entrance is the surface people
+   * actually link to.
+   *
+   * Same rule as confirmDownload() in share.ts: the question is ALWAYS put,
+   * and an already-cached model changes the WORDING, not whether anyone
+   * agreed. Clicking ENTER on this page is a click already and is not gated —
+   * this is only the door a URL opens.
+   */
+  async function openUrlGate(room: boolean): Promise<void> {
+    const go = el<HTMLButtonElement>('#cs-gate-go')
+    // `hidden` loses to `#models .cs-verbs { display: flex }`, so the verbs
+    // are moved by the property that actually wins.
+    const show = (sel: string, on: boolean): void => {
+      const n = root.querySelector<HTMLElement>(sel)
+      if (n) n.style.display = on ? '' : 'none'
+    }
+    const v = GROUPS[gi].variants[vi]
+    const b = modelBranding(v.spec)
+    const cxs = ctxModesOf(v.spec)
+    const cx = cxs[xi] ?? cxs[0]
+    // The URL's stage, if it named one — what this device fetches is a SLICE
+    // then, and quoting the whole checkpoint's size for it is the figure that
+    // once promised an iPhone 14.1 GB for a fraction of it.
+    const st = intent.split && Q.get('model') === v.param ? intent.split : null
+    const stage = st ? { start: st.bounds[st.index], end: st.bounds[st.index + 1] } : undefined
+    show('.cs-url-gate', true)
+    show('.cs-verbs', false)
+    show('.cs-verbs-note', false)
+    // The SAME probe share.html's gate uses, on the same spec and the same
+    // stage, so the two surfaces cannot disagree about whether this device
+    // already holds the weights. Dynamic: it pulls in the loaders, which read
+    // GPUBufferUsage at module scope.
+    let cached = false
+    try {
+      if ('gpu' in navigator) {
+        const { isModelCached } = await import('./zero-tvm/cache-probe.js')
+        cached = await isModelCached(v.spec, stage)
+      }
+    } catch { /* treat as cold — the honest side to be wrong on */ }
+    const weights = cached
+      ? (stage
+          ? `Layers ${stage.start}–${stage.end} are already cached on this device.`
+          : 'The weights are already cached on this device.')
+      : (stage
+          ? `Layers ${stage.start}–${stage.end} of ${v.spec.layers} download once — a slice of `
+            + `the full ${b.sizeLabel}, not all of it — and are cached locally.`
+          : `The weights download once (${b.sizeLabel}) and are cached locally; every later `
+            + 'visit starts from disk.')
+    el<HTMLElement>('#cs-gate-what').textContent =
+      `This link asks to run ${b.name} on this machine. ${weights} Nothing has downloaded yet.`
+    // The second half of the price: the KV cache is allocated EAGERLY at boot,
+    // and ?ctx= moves it. b.ramNote is a whole-checkpoint figure and is false
+    // for a stage, so a stage does not carry it.
+    el<HTMLElement>('#cs-gate-cost').textContent = [
+      `${ctxLabel(cx.tokens)} context · ~${kvPrice(v.spec, cx.tokens, INT8_KV)} allocated at boot`,
+      stage ? '' : (b.ramNote ?? ''),
+    ].filter(Boolean).join(' — ')
+    go.textContent = room
+      ? (cached ? 'Enter & open a room →' : 'Download & open a room →')
+      : (cached ? 'Enter chat →' : 'Download & enter →')
+    go.disabled = false
+    go.focus()
+    go.addEventListener('click', () => {
+      go.disabled = true
+      show('.cs-url-gate', false)
+      show('.cs-verbs', true)
+      show('.cs-verbs-note', true)
+      // The link has been honoured — take its verbs out of the address bar so
+      // the way OUT of the chat works. "⟨ Roster" and /roster both reload.
+      history.replaceState(null, '', `${location.pathname}${urlAfterEnter(location.search)}${location.hash}`)
+      root.querySelector<HTMLElement>(room ? '.mb-cta-room' : '.mb-cta')?.click()
+    }, { once: true })
   }
 
   // "Swarm" in the nav and the footer pointed at the section below. That
   // section is the no-JS fallback now, so with JS the same href opens the
   // stage mode instead — and a browser that never runs this still scrolls to
   // the prose, which is the whole point of leaving the href alone.
+  /** Open the swarm mode. THREE doors land here — the nav and footer links'
+   *  click, the hash on a cold load, and a later hashchange — so they cannot
+   *  drift. Only the click was ever wired, and README publishes
+   *  https://zerotvm.com/#swarm, so the published link opened nothing. */
+  function openSwarm(): void {
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+    if (swarm) return
+    // The character on stage may be one that cannot be cut — walk to the
+    // first that can rather than opening a mode with nothing in it.
+    if (!canSplitAcrossDevices(GROUPS[gi].variants[vi].spec)) {
+      const g = GROUPS.findIndex((x) => x.variants.some((y) => canSplitAcrossDevices(y.spec)))
+      if (g < 0) return
+      gi = g
+      vi = GROUPS[g].variants.findIndex((x) => canSplitAcrossDevices(x.spec))
+      mi = 0
+      xi = 0
+      paint()
+    }
+    void enterSwarm()
+  }
   for (const link of document.querySelectorAll<HTMLAnchorElement>('a[href="#swarm"]')) {
     link.addEventListener('click', (e) => {
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
       e.preventDefault()
-      window.scrollTo({ top: 0, behavior: 'smooth' })
-      if (swarm) return
-      // The character on stage may be one that cannot be cut — walk to the
-      // first that can rather than opening a mode with nothing in it.
-      if (!canSplitAcrossDevices(GROUPS[gi].variants[vi].spec)) {
-        const g = GROUPS.findIndex((x) => x.variants.some((y) => canSplitAcrossDevices(y.spec)))
-        if (g < 0) return
-        gi = g
-        vi = GROUPS[g].variants.findIndex((x) => canSplitAcrossDevices(x.spec))
-        mi = 0
-        xi = 0
-        paint()
-      }
-      void enterSwarm()
+      openSwarm()
     })
   }
+  // The click preventDefaults, so the hash only ever arrives from OUTSIDE:
+  // a published link, a bookmark, someone editing the address bar.
+  window.addEventListener('hashchange', () => {
+    if (entranceIntent(location.search, location.hash).swarm) openSwarm()
+  })
 
   // Idle: 18 s without input and the realm starts breathing on its own; 50 s
   // and the character falls ASLEEP — heavy lids, slow breath, dim ring — but
@@ -914,6 +1190,15 @@ function render(): void {
     mascot = m
     m.setSpec(GROUPS[gi].variants[vi].spec, CACHED.has(GROUPS[gi].variants[vi].spec.id))
   })
+
+  // ── What the URL asked for, now that the scene is on screen ──────────────
+  // Neither may happen silently: the gate asks before a byte is spent, and
+  // #swarm opens a mode that starts nothing.
+  if (intent.enter) void openUrlGate(intent.enter.room)
+  else if (intent.swarm) openSwarm()
 }
 
-render()
+// The URL grammar above is exported and unit-tested; the scene renders only
+// where there is a page to render it into, so the headless suite can import
+// this module without a DOM.
+if (typeof document !== 'undefined') render()
