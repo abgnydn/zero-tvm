@@ -277,7 +277,7 @@ function render(): void {
     const pal0 = mascotPalette(spec0)
     return `<button class="mb-dot" data-i="${i}" role="tab" title="${g.name}" aria-label="${g.name}">
        <span class="mb-dot-face" aria-hidden="true"></span>
-       <span class="mb-dot-text"><b>${g.name.replace(/-Instruct.*$/, '')}</b><i>${g.params}</i></span>
+       <span class="mb-dot-text"><b>${g.name}</b><i>${g.params}</i></span>
        <span class="mb-dot-sigil" style="color:${pal0.accent}" aria-hidden="true">${LANE_SIGIL[laneOf(spec0)] ?? ''}</span>
      </button>`
   }).join('')
@@ -514,7 +514,13 @@ function render(): void {
     }
 
     for (const d of root.querySelectorAll<HTMLElement>('.mb-dot')) {
-      d.setAttribute('aria-selected', String(Number(d.dataset.i) === gi))
+      const on = Number(d.dataset.i) === gi
+      d.setAttribute('aria-selected', String(on))
+      // The rail scrolls, so the arrows could walk the stage onto a character
+      // whose card was below the fold — the roster then showed no selection at
+      // all and the model on stage looked like one the roster did not carry.
+      // 'nearest' scrolls only when the card is actually out of view.
+      if (on) d.scrollIntoView({ block: 'nearest' })
       // ANY variant counts: the user who downloaded the 3-bit 35B has the
       // group ready even though variants[0] is the 4-bit — keying the badge
       // to variants[0] alone hid exactly the downloads worth showing.

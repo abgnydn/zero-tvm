@@ -397,7 +397,15 @@ footer li a:hover { color: var(--accent); }
 
 /* Nameplate: display face over an ornamental divider. */
 #models .mb-plate {
-  grid-area: plate; position: relative; z-index: 1; justify-self: center;
+  /* left/transform are RESET, not inherited. The base .mb-plate is absolutely
+     positioned for the old carousel and centres itself with the standard
+     left:50% + translateX(-50%) pair. This rule switches position to relative
+     but used to leave that pair standing, and on a relative box the two halves
+     no longer cancel: left:50% shifts by half the COLUMN (573 -> +286) while
+     the transform pulls back only half the ELEMENT (429 -> -215). The name sat
+     72px right of the character it names, and of the buttons under it. */
+  grid-area: plate; position: relative; left: auto; transform: none;
+  z-index: 1; justify-self: center;
   text-align: center; margin-top: 4px; padding: 0 26px 14px;
   border: 0; background: none;
 }

@@ -271,7 +271,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // same Qwen3-4B as the MLC build above, from the MLX-affine checkpoint;
   // validated against mlx_lm (cosine 0.999879, greedy token-exact).
   [QWEN3_4B_MLX.id]: { name: 'Qwen3-4B', params: '4B dense · MLX 4-bit', sizeLabel: '~2.1 GB', rateLabel: '~81 t/s' },  // 80.78 total, M2 Max (BENCH.md 2026-08-13)
-  [LLAMA_3_2_1B_INSTRUCT_4BIT.id]: { name: 'Llama-3.2-1B-Instruct', params: '1B dense', sizeLabel: '~0.6 GB', rateLabel: '~256 t/s' },  // 255.90 total, M2 Max (BENCH.md 2026-08-13)
+  [LLAMA_3_2_1B_INSTRUCT_4BIT.id]: { name: 'Llama-3.2-1B', params: '1B dense', sizeLabel: '~0.6 GB', rateLabel: '~256 t/s' },  // 255.90 total, M2 Max (BENCH.md 2026-08-13)
   // First MoE WITHOUT a shared expert, and the first 4-bit router — both are
   // spec flags now rather than engine assumptions. Validated against mlx_lm in
   // f32: cosine 0.999985, greedy token-exact through the stop id. (Against
