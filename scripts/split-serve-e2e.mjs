@@ -29,7 +29,9 @@ import puppeteer from 'puppeteer'
 import { specForParam } from '../src/zero-tvm/model-registry.ts'
 
 const ROOT = resolve(import.meta.dirname, '..')
-const VITE_PORT = 5194
+// VITE_PORT is overridable ONLY so the port guard below can be exercised on a
+// scratch port without disturbing a real run on 5194.
+const VITE_PORT = Number(process.env.VITE_PORT ?? 5194)
 const SIGNAL_PORT = 8791
 const MODEL = process.env.MODEL ?? 'llama32'
 const spec = specForParam(MODEL)
@@ -47,16 +49,92 @@ const BASE = `http://localhost:${VITE_PORT}`
 const procs = []
 function run(cmd, args, cwd) {
   const p = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WRANGLER_SEND_METRICS: 'false' } })
-  p.stderr.on('data', (b) => { if (/error|EADDRINUSE/i.test(String(b))) process.stderr.write(`[${cmd}] ${b}`) })
+  // Keep the tail of BOTH streams. stdout is where vite announces the port it
+  // actually bound — the only evidence available that the thing answering is
+  // the thing we started — and it was being piped and then never read, which
+  // is also how a chatty child eventually blocks on a full pipe.
+  p.log = ''
+  const keep = (b) => { p.log = (p.log + b).slice(-4000) }
+  p.stdout.on('data', keep)
+  p.stderr.on('data', (b) => { keep(b); if (/error|EADDRINUSE/i.test(String(b))) process.stderr.write(`[${cmd}] ${b}`) })
+  // A child that never started is a child that died. Without the 'error'
+  // handler an ENOENT here is an unhandled event that takes the whole harness
+  // down with a stack trace instead of a sentence.
+  p.on('error', (e) => { p.dead = `failed to start (${e.code ?? e.message})` })
+  p.on('exit', (code, sig) => { p.dead = `exited ${code ?? sig}` })
   procs.push(p)
   return p
 }
-async function waitHttp(url, timeoutMs) {
+
+/**
+ * A SERVER THIS HARNESS DID NOT START IS NOT THIS HARNESS'S SERVER.
+ *
+ * `fetch(url)` proves that SOMETHING answers on the port. It does not prove it
+ * is ours. On 2026-08-25 an orphaned vite held 5194 serving source two commits
+ * behind; this file spawned its own vite, that vite died, and the wait
+ * resolved against the STRANGER in 103 ms — after which every browser, every
+ * assertion and the final PASS were about code the run never loaded. That is
+ * this repo's signature defect: something occupying the position of a check
+ * without performing one.
+ *
+ * `--strictPort` was already on and did not save it, for two measured reasons
+ * (both reproduced on this machine, vite 6.4.1, macOS):
+ *
+ *   1. When the squatter binds the SAME loopback family, vite does print
+ *      `Error: Port N is already in use` and exit 1 — but nothing here read
+ *      the child's exit code, and it loses the race anyway: the squatter is
+ *      already listening, so it answers the very first poll. Measured: the old
+ *      `waitHttp` resolved against a decoy in 28 ms, well inside vite's
+ *      startup.
+ *   2. When the squatter binds the OTHER loopback family there is no
+ *      EADDRINUSE AT ALL. vite binds `localhost`, which resolves to `[::1]`
+ *      here; a squatter on `127.0.0.1` coexists with it happily, both report
+ *      themselves up, and which one a client reaches is decided by whatever
+ *      that client's resolver does with "localhost". Verified: `curl
+ *      localhost:P` reached vite while `curl 127.0.0.1:P` reached the
+ *      squatter, at the same instant.
+ *
+ * So EADDRINUSE cannot be the check. Two things replace it, and both are
+ * needed: refuse a port that ALREADY answers (either family, since either can
+ * be the one Chrome picks), and then wait for OUR child to announce itself
+ * rather than for the port to respond.
+ */
+async function requirePortFree(port, what) {
+  for (const host of ['127.0.0.1', '[::1]']) {
+    const answered = await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(2000) })
+      .then(() => true, () => false)
+    if (!answered) continue
+    throw new Error(
+      `http://${host}:${port}/ already answers — something this harness did not start is `
+      + `serving ${what}. Refusing to run: a previous version of this file would have tested `
+      + `that server instead and printed PASS. Stop it (lsof -nP -iTCP:${port} -sTCP:LISTEN) `
+      + `and rerun.`)
+  }
+}
+
+/** vite's own ready line, pinned to the port we asked for. Matching this is
+ *  what makes the server ours rather than merely present. */
+const VITE_READY = new RegExp(`Local:\\s+https?://localhost:${VITE_PORT}/`)
+
+/**
+ * Wait for the server WE STARTED, not for the port to answer.
+ *
+ * `ready` is a regex over the child's own output; when it is given, no HTTP
+ * response counts until the child has said the words itself. A child that
+ * dies is fatal here rather than something to keep polling past.
+ */
+async function waitServer(proc, url, timeoutMs, what, ready) {
   const t0 = Date.now()
   while (Date.now() - t0 < timeoutMs) {
-    try { await fetch(url); return } catch { await new Promise((r) => setTimeout(r, 250)) }
+    if (proc.dead) {
+      throw new Error(`${what} ${proc.dead} before serving ${url}\n--- its output ---\n${proc.log.trim()}`)
+    }
+    if (!ready || ready.test(proc.log)) {
+      try { await fetch(url); return } catch { /* bound but not serving yet */ }
+    }
+    await new Promise((r) => setTimeout(r, 250))
   }
-  throw new Error(`timed out waiting for ${url}`)
+  throw new Error(`timed out waiting for ${what} at ${url}\n--- its output ---\n${proc.log.trim()}`)
 }
 const launch = (userDataDir) => puppeteer.launch({
   headless: false,
@@ -101,10 +179,13 @@ try {
   }
   console.log(`${spec.id}: ${spec.layers} layers across ${STAGES} stages — `
     + BOUNDS.slice(0, -1).map((b, i) => `${b}-${BOUNDS[i + 1]}`).join(' → '))
-  run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
-  run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
-  await waitHttp(`http://localhost:${SIGNAL_PORT}/`, 30_000)
-  await waitHttp(`${BASE}/share.html`, 30_000)
+  // Before anything is spawned: neither port may already be serving.
+  await requirePortFree(SIGNAL_PORT, 'the signaling relay')
+  await requirePortFree(VITE_PORT, 'the dev server')
+  const signal = run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
+  const vite = run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
+  await waitServer(signal, `http://localhost:${SIGNAL_PORT}/`, 30_000, 'wrangler dev', null)
+  await waitServer(vite, `${BASE}/share.html`, 30_000, 'vite', VITE_READY)
   for (let i = 0; i < STAGES; i++) mkdirSync(PROFILE(i), { recursive: true })
 
   // ── stage 0: layers [0, BOUNDS[1]), hosts the room ──

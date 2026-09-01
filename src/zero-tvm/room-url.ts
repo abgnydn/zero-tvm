@@ -25,10 +25,20 @@
  * must run on machines with no WebGPU at all.
  */
 
-/** The 128 random bits room-host.ts puts in the link fragment, base64url. */
+/**
+ * The 128 random bits room-host.ts puts in the link fragment, base64url.
+ *
+ * ONE definition, read by the PARSER below and by the BUILDER at the bottom of
+ * this file. A second copy would be two copies of a security check, and two
+ * copies drift: the parser would go on refusing what the builder had quietly
+ * started to emit. No `g` flag, so it carries no lastIndex between calls.
+ */
+const ROOM_ID = /^[A-Za-z0-9_-]{16,64}$/
+
+/** The room id out of a fragment, with or without the leading `#`. */
 export function roomIdFrom(hash: string): string | null {
   const id = hash.replace(/^#/, '')
-  return /^[A-Za-z0-9_-]{16,64}$/.test(id) ? id : null
+  return ROOM_ID.test(id) ? id : null
 }
 
 /** `?layers=0-20` — this device holds that slice of the model, nothing else. */
@@ -37,14 +47,10 @@ export function stageRangeFrom(search: string): { start: number; end: number } |
   return m ? { start: Number(m[1]), end: Number(m[2]) } : null
 }
 
-/** `?ctx=N` — the KV budget the room runs at, in tokens. Null when the link
- *  carries none, which is every link written before links carried config. */
-export function ctxFrom(search: string): number | null {
-  const n = Number(new URLSearchParams(search).get('ctx'))
-  return Number.isFinite(n) && n > 0 ? n : null
-}
-
 /**
+ * `?ctx=N` — the KV budget the room runs at, in tokens. THE ONE READER of that
+ * key; every surface that sizes a KV cache from a URL comes through here.
+ *
  * CONTEXT PRECEDENCE — the LINK wins over this device's own compiled default.
  *
  * WHY: every stage allocates its own KV cache from spec.maxContext, eagerly,
@@ -57,12 +63,23 @@ export function ctxFrom(search: string): number | null {
  * maxContext (post-clamp, from the spec it actually built) into the links it
  * hands out, and a stage adopts it verbatim.
  *
- * `ownDefault` is used only when the link says nothing — an OLD link, where
- * the spec default is the only value there has ever been, and is what the
- * host had too.
+ * NULL WHEN THE LINK CARRIES NO ctx, and null must stay a distinct answer from
+ * a number. There used to be a `ctxFor(search, ownDefault)` here that collapsed
+ * the two, returning the caller's own default for an absent key — and a number
+ * always reads downstream as "re-size me". `specFromSearch` passed the spec's
+ * own maxContext as that default and fed it back through `specWithCtx`, whose
+ * ceiling is floor(maxSeq / pageSize). A no-op on ten of eleven shipped specs,
+ * and a silent SHRINK on Phi-3, the default model of zero-tvm.html and
+ * validate.html: KV pages round UP, so its 257 pages hold 4112 tokens against
+ * a 4096-token window, and every plain page load lost the 257th page (measured
+ * 4112 → 4096). Not asking for a budget is not the same as
+ * asking for the one you already have, and no signature that cannot say
+ * "absent" can keep those apart. ctxFor was deleted with that fix rather than
+ * left exported and tested with no caller.
  */
-export function ctxFor(search: string, ownDefault: number): number {
-  return ctxFrom(search) ?? ownDefault
+export function ctxFrom(search: string): number | null {
+  const n = Number(new URLSearchParams(search).get('ctx'))
+  return Number.isFinite(n) && n > 0 ? n : null
 }
 
 export type RoomRole = 'host' | 'helper' | 'guest'
@@ -132,7 +149,8 @@ export interface RoomLinkParts {
   path: string
   /** The room id. FRAGMENT, always — it is 128 bits of secret, and browsers
    *  do not send fragments over HTTP, so the static host never logs it. Null
-   *  writes a link that opens a NEW room. */
+   *  writes a link that opens a NEW room. Anything that is neither null nor a
+   *  ROOM_ID makes roomLink THROW — see the note there. */
   room: string | null
   /** `?model=` — LEAVE UNSET (or null) for a link that must route as a guest:
    *  roleFor reads a model inside a room as "this device serves too". The
@@ -142,7 +160,7 @@ export interface RoomLinkParts {
   model?: string | null
   /** `?layers=` — the slice the opener holds. */
   layers?: { start: number; end: number } | null
-  /** `?ctx=` — see ctxFor. */
+  /** `?ctx=` — see ctxFrom. */
   ctx?: number | null
   /** `?sig=` — dev signaling override, carried so a peer dials the same relay
    *  the host is on rather than the default one. */
@@ -157,8 +175,43 @@ export interface RoomLinkParts {
  * parses as a room id, so roleFor takes the host branch and the device opens
  * a brand-new room in silence. Every caller goes through here so no caller
  * can get it wrong by hand.
+ *
+ * THE ROOM ID IS VALIDATED HERE, not by the callers.
+ *
+ * It is the only field that does not go through URLSearchParams — it is a
+ * fragment, so it is written raw — and the only one that can arrive from
+ * outside this build: `hostRoom`'s `existingRoom` option, or a link somebody
+ * pasted. Every caller happens to check it today (share.ts and
+ * landing-swarm.ts both run theirs through roomIdFrom; landing-room.ts passes
+ * no `existingRoom`, so hostRoom's own crypto bytes are the id), but nothing
+ * pinned that, and the contract never asked for it. Meanwhile
+ * landing-room.ts's `paintSplit` writes what comes out of here straight into
+ * `<input readonly value="…">`, and the site ships no CSP. "Join an existing
+ * room from the entrance" is one small feature away from turning that into an
+ * injection sink. The guarantee belongs to this function.
+ *
+ * THROW rather than drop the bad id. Dropping it would emit a perfectly
+ * well-formed URL with no fragment — which roleFor reads as HOST, so the
+ * recipient opens a BRAND NEW room and the two machines sit waiting for each
+ * other with nothing on screen saying why. That is the exact silent failure
+ * the header of this file exists to prevent, and reaching it through the
+ * validation would be worse than reaching it through a typo. A throw cannot
+ * strand a user in its place: both real sources of an id (16 bytes of
+ * crypto.getRandomValues, or a string that already passed roomIdFrom) satisfy
+ * ROOM_ID, so this fires only on a genuinely new bug — and it fires at the
+ * builder, with the caller on the stack, instead of inside rendered markup.
+ *
+ * `origin` and `path` are concatenated raw too, and deliberately: neither is
+ * remote-controlled. `origin` is `location.origin` or `''`, browser-normalised
+ * to scheme + host; `path` is the literal `/share.html` everywhere except
+ * share.ts, which passes `location.pathname` — already percent-encoded by the
+ * browser, `<`, `>` and `"` included. Nothing else in this module reaches a
+ * URL or markup by concatenation.
  */
 export function roomLink(p: RoomLinkParts): string {
+  if (p.room != null && !ROOM_ID.test(p.room)) {
+    throw new Error(`roomLink: invalid room id ${JSON.stringify(p.room)}`)
+  }
   const q = new URLSearchParams()
   // `!= null`, not truthiness: `model: ''` is the DEFAULT model, and dropping
   // it turns a serving link into a guest link that quietly runs nothing.
@@ -191,7 +244,7 @@ export function swarmUrls(o: {
   machines: number
   room: string | null
   /** `?ctx=` for the serving links, so every stage sizes the same KV cache
-   *  (ctxFor). Omit to let each machine use its build's default. */
+   *  (ctxFrom). Omit to let each machine use its build's default. */
   ctx?: number | null
   /** Interior cut points, when the operator has moved them. Omit for an even
    *  split. Clamped by clampBounds, so a caller cannot produce an empty or

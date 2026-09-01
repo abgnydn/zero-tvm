@@ -22,33 +22,69 @@ import { resolve } from 'node:path'
 import puppeteer from 'puppeteer'
 
 const ROOT = resolve(import.meta.dirname, '..')
-const VITE_PORT = 5191
+// Overridable ONLY so the port guard below can be exercised on a scratch port.
+const VITE_PORT = Number(process.env.VITE_PORT ?? 5191)
 const SIGNAL_PORT = 8787
 const PROFILE = resolve(ROOT, '.tests-cache/chrome-share-profile')
 
 const procs = []
 function run(cmd, args, cwd) {
   const p = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WRANGLER_SEND_METRICS: 'false' } })
-  p.stderr.on('data', (b) => { if (/error|EADDRINUSE/i.test(String(b))) process.stderr.write(`[${cmd}] ${b}`) })
+  p.log = ''
+  const keep = (b) => { p.log = (p.log + b).slice(-4000) }
+  p.stdout.on('data', keep)
+  p.stderr.on('data', (b) => { keep(b); if (/error|EADDRINUSE/i.test(String(b))) process.stderr.write(`[${cmd}] ${b}`) })
+  p.on('error', (e) => { p.dead = `failed to start (${e.code ?? e.message})` })
+  p.on('exit', (code, sig) => { p.dead = `exited ${code ?? sig}` })
   procs.push(p)
   return p
 }
-async function waitHttp(url, timeoutMs) {
+
+// A server this harness did not start is not this harness's server. This file
+// had the same silent-adoption hole split-serve-e2e.mjs was found with on
+// 2026-08-25 — waitHttp resolving against an orphaned vite and the whole run
+// reporting PASS for code it never loaded. The reasoning, and the measurements
+// showing why --strictPort does NOT close it, are written out once in
+// scripts/split-serve-e2e.mjs; this is the same two-part guard.
+async function requirePortFree(port, what) {
+  for (const host of ['127.0.0.1', '[::1]']) {
+    const answered = await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(2000) })
+      .then(() => true, () => false)
+    if (!answered) continue
+    throw new Error(
+      `http://${host}:${port}/ already answers — something this harness did not start is `
+      + `serving ${what}. Refusing to run. Stop it (lsof -nP -iTCP:${port} -sTCP:LISTEN) and rerun.`)
+  }
+}
+
+/** vite's own ready line, pinned to the port we asked for. */
+const VITE_READY = new RegExp(`Local:\\s+https?://localhost:${VITE_PORT}/`)
+
+/** Wait for the server WE STARTED, not for the port to answer. */
+async function waitServer(proc, url, timeoutMs, what, ready) {
   const t0 = Date.now()
   while (Date.now() - t0 < timeoutMs) {
-    try { await fetch(url); return } catch { await new Promise((r) => setTimeout(r, 250)) }
+    if (proc.dead) {
+      throw new Error(`${what} ${proc.dead} before serving ${url}\n--- its output ---\n${proc.log.trim()}`)
+    }
+    if (!ready || ready.test(proc.log)) {
+      try { await fetch(url); return } catch { /* bound but not serving yet */ }
+    }
+    await new Promise((r) => setTimeout(r, 250))
   }
-  throw new Error(`timed out waiting for ${url}`)
+  throw new Error(`timed out waiting for ${what} at ${url}\n--- its output ---\n${proc.log.trim()}`)
 }
 
 let failed = false
 let browser = null
 try {
   console.log('starting wrangler dev (signal) + vite …')
-  run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
-  run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
-  await waitHttp(`http://localhost:${SIGNAL_PORT}/`, 30_000)          // any response = worker is up
-  await waitHttp(`http://localhost:${VITE_PORT}/share.html`, 30_000)
+  await requirePortFree(SIGNAL_PORT, 'the signaling relay')
+  await requirePortFree(VITE_PORT, 'the dev server')
+  const signal = run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
+  const vite = run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
+  await waitServer(signal, `http://localhost:${SIGNAL_PORT}/`, 30_000, 'wrangler dev', null)
+  await waitServer(vite, `http://localhost:${VITE_PORT}/share.html`, 30_000, 'vite', VITE_READY)
 
   mkdirSync(PROFILE, { recursive: true })
   browser = await puppeteer.launch({
