@@ -24,6 +24,7 @@ import { makeStageClient } from './pipeline-peer.js'
 // The chain-assembly rules and the split token loop live in room-chain.ts —
 // pure, WebRTC-free, and unit-tested there. This file wires the channels to it.
 import { makeRoomChain, type ChainMsg, type StageOffer } from './room-chain.js'
+import { roomLink } from './room-url.js'
 
 // ── signaling endpoint (single source for host/guest/helper) ──
 const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
@@ -52,7 +53,12 @@ export interface StopReq { type: 'stop'; id: number }
 export type { StageOffer }
 type GuestMsg = ChatReq | StopReq | StageOffer
 export type HostMsg =
-  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string; specId: string }
+  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string
+      specId: string
+      /** The room's context window, in tokens — what a guest is actually
+       *  chatting into, and what a guest that copies the weights must pass
+       *  as ?ctx= to serve the same room. Absent from hosts predating this. */
+      ctx?: number }
   | { type: 'text'; id: number; full: string }
   | { type: 'done'; id: number; tokens: number; tps: number }
   | { type: 'busy'; id: number; pos: number }
@@ -102,7 +108,16 @@ export interface HostRoomOptions {
 
 export interface RoomHandle {
   roomId: string
+  /** The link you hand to someone who just wants to CHAT. No query at all: a
+   *  `?model=` inside a room routes to the host branch (roleFor), so a guest
+   *  link that carried the model would quietly make every recipient a host. */
   link: string
+  /** The link for a machine that will SERVE this room — same room id, plus the
+   *  model and the context this room runs, and (when this host holds only the
+   *  first layers) the layers still missing. This is what used to be
+   *  hand-edited out of the guest link, ?ctx= included, which is how a stage
+   *  ended up with a differently sized KV cache than the host. */
+  helperLink: string
   close: () => void
 }
 
@@ -115,10 +130,24 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
   const bytes = crypto.getRandomValues(new Uint8Array(16))
   const roomId = opts.existingRoom
     ?? btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-  // Carry a dev signaling override into the guest link, or the guest dials the
+  // Carry a dev signaling override into both links, or the peer dials the
   // default relay and the room never forms.
-  const link = `${location.origin}${opts.guestPath ?? '/share.html'}`
-    + `${sigOverride ? `?sig=${encodeURIComponent(sigOverride)}` : ''}#${roomId}`
+  const path = opts.guestPath ?? '/share.html'
+  const link = roomLink({ origin: location.origin, path, room: roomId, sig: sigOverride })
+  // The room's configuration travels in the QUERY, the room id in the
+  // fragment — roomLink writes them in that order, which is the whole reason
+  // it exists. ctx is this host's EFFECTIVE maxContext (spec was already
+  // rebuilt through specWithCtx), so a stage opening this link reproduces the
+  // host's spec instead of falling back to its own default (see ctxFor).
+  const helperLink = roomLink({
+    origin: location.origin, path, room: roomId, sig: sigOverride,
+    model: param, ctx: spec.maxContext,
+    // What this host does NOT hold. Omitted when it holds the whole model:
+    // the recipient then joins as another full host, which is legal and is
+    // what a guest that copied the weights does.
+    layers: stageRange && stageRange.end < spec.layers
+      ? { start: stageRange.end, end: spec.layers } : null,
+  })
 
   const ws = new WebSocket(`${signalBase}/room/${roomId}?role=host`)
   const peers = new Map<string, { pc: RTCPeerConnection; dc: RTCDataChannel | null }>()
@@ -266,6 +295,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
       send(guest, {
         type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel,
         tag: quantTagFor(spec), param, specId: spec.id,
+        ctx: spec.maxContext,
       })
       announce()
     }
@@ -314,6 +344,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
   return {
     roomId,
     link,
+    helperLink,
     close() {
       window.removeEventListener('beforeunload', onUnload)
       ws.close()

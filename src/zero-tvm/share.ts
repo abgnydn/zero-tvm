@@ -44,7 +44,7 @@ import { serveStage } from './pipeline-peer.js'
 // The URL grammar lives in room-url.ts — shared with the entrance's swarm
 // link builder, so a URL that page hands out is routed by the same three-way
 // branch that reads it here.
-import { roomIdFrom, stageRangeFrom, roleFor } from './room-url.js'
+import { roomIdFrom, stageRangeFrom, roleFor, roomLink } from './room-url.js'
 // The host loop, the wire protocol, and the signaling constants live in
 // room-host.ts — shared with the landing entrance's in-place room
 // (landing-room.ts), so the two hosting surfaces cannot drift.
@@ -316,11 +316,20 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   }
 
   // Membership + chain text must not overwrite each other — one renderer,
-  // one source for each half (the lesson from the two-writer #room-stats bug).
+  // one source for each SEGMENT (the lesson from the two-writer #room-stats
+  // bug). `shape` is the third: what this tab actually is, which the room
+  // card never said — a host could not read its own model, its own slice or
+  // its own context off the screen, and neither could anyone it showed it to.
+  // Fixed for the tab's life, so it is a constant rather than a callback.
+  const shape = `${brand.name} \u00b7 `
+    + (stageRange
+        ? `layers ${stageRange.start}-${stageRange.end} of ${spec.layers} here`
+        : `all ${spec.layers} layers here`)
+    + ` \u00b7 ${spec.maxContext.toLocaleString()}-token context`
   let roomMembers = '1 machine serving \u00b7 0 guests connected'
   let chainText = ''
   function renderStats(): void {
-    $('room-stats').textContent = chainText ? `${chainText} \u00b7 ${roomMembers}` : roomMembers
+    $('room-stats').textContent = [shape, chainText, roomMembers].filter(Boolean).join(' \u00b7 ')
   }
 
   const room = hostRoom({
@@ -354,8 +363,16 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     setTimeout(() => { $('copy-link').textContent = 'Copy' }, 1200)
   })
 
+  // The link a SECOND machine opens to serve this room — model, context and
+  // (when this host holds only the first layers) the layers still missing,
+  // all in the query, room id in the fragment. It used to be hand-edited out
+  // of the guest link above, which is how a stage ended up on a different
+  // ?ctx= than the host.
+  logRow('room', room.helperLink).textContent = 'open this on a machine that will help'
+
   // e2e hooks
   ;(window as unknown as Record<string, unknown>).__shareLink = room.link
+  ;(window as unknown as Record<string, unknown>).__helperLink = room.helperLink
   ;(window as unknown as Record<string, unknown>).__shareReady = true
 }
 
@@ -408,7 +425,12 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
   // written once and never again until the chain pairs, so it reads as
   // "loading" whether the tab is working, finished, or dead. It now states
   // only what is true at each point, and the progress panel carries the rest.
-  stats.textContent = `layers ${range.start}-${range.end} of ${spec.layers} — not started yet`
+  // The context is the host's, adopted from the link (ctxFor) — printed
+  // because a stage silently sizing its KV cache off its own default is
+  // exactly the failure that rule prevents, and an unprinted number cannot
+  // be checked against the host's.
+  stats.textContent = `${brand.name} \u00b7 layers ${range.start}-${range.end} of ${spec.layers} \u00b7 `
+    + `${spec.maxContext.toLocaleString()}-token context — not started yet`
 
   // Consent BEFORE the first byte — same gate as the host. A helper link in
   // a chat message used to boot the download and enrol the GPU in a
@@ -541,12 +563,14 @@ async function runGuest(roomId: string): Promise<void> {
     if (msg.type === 'info') {
       setChatIdentity(msg.name, msg.tag)
       $('guest-model').textContent = `${msg.name} — remote`
-      setStatus(`${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''} · runs on the host machine — the host can read what you send; this page holds only the conversation.`)
+      setStatus(`${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''}`
+        + `${msg.ctx ? ` · ${msg.ctx.toLocaleString()}-token context` : ''}`
+        + ' · runs on the host machine — the host can read what you send; this page holds only the conversation.')
       setBadge('Ready', 'ready')
       inp.disabled = false
       inp.placeholder = 'Message the remote model…'
       sendBtn.disabled = false
-      void offerLocalCopy(msg.param, msg.specId)
+      void offerLocalCopy(msg.param, msg.specId, msg.ctx)
     } else if (msg.type === 'text') {
       liveFull = msg.full
       live?.render(liveFull)
@@ -641,7 +665,7 @@ async function runGuest(roomId: string): Promise<void> {
    * against the host's spec id: the OPFS directory this writes into is chosen
    * LOCALLY, never from a string the host sent.
    */
-  async function offerLocalCopy(param: string, specId: string): Promise<void> {
+  async function offerLocalCopy(param: string, specId: string, ctx?: number): Promise<void> {
     const panel = $('local-copy')
     const spec = specForParam(param)
     if (spec.id !== specId) return   // this build doesn't know the host's model — offer nothing
@@ -674,12 +698,18 @@ async function runGuest(roomId: string): Promise<void> {
         .then((res) => {
           const secs = ((performance.now() - t) / 1000).toFixed(0)
           const p = encodeURIComponent(param)
-          const sig = SIG_OVERRIDE ? `&sig=${encodeURIComponent(SIG_OVERRIDE)}` : ''
+          // The swarm-forming link: this device has the weights now, so it
+          // can serve the SAME room instead of only consuming it. Built by
+          // roomLink so the query lands BEFORE the fragment, and carrying the
+          // host's ctx so this machine runs the room's context rather than
+          // its own compiled default (ctxFor).
+          const serve = roomLink({
+            origin: '', path: '/share.html', room: roomId,
+            model: param, ctx: ctx ?? null, sig: SIG_OVERRIDE,
+          })
           status.innerHTML = `Done — ${(res.bytes / 1e9).toFixed(2)} GB in ${secs}s. `
             + `<a href="/zero-tvm.html?model=${p}">Open the chat on this device →</a><br>`
-            // The swarm-forming link: this device has the weights now, so it
-            // can serve the SAME room instead of only consuming it.
-            + `<a href="/share.html?model=${p}${sig}#${roomId}">…or serve this room from here too →</a>`
+            + `<a href="${serve}">…or serve this room from here too →</a>`
           btn.remove()
           ;(window as unknown as Record<string, unknown>).__pullDone = res
         })
