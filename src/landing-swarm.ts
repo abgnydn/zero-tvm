@@ -3,10 +3,12 @@
  *
  * It used to be a documentation block below the character screen: its own
  * heading, its own band of explainer cards, its own panel. It read as a manual
- * stapled to a game screen, and — worse — nothing on the screen connected the
- * amber "needs ~N GB free RAM" line to the one thing that answers it. The
- * doorway is that line now (landing.ts appends the ⟁ control to it), and what
- * it opens is a mode of the same stage: `cs-swarm`, parallel to `cs-chatting`.
+ * stapled to a game screen. It was then put behind a ⟁ control on the sheet's
+ * amber "needs ~N GB free RAM" line, which framed the swarm as a consolation
+ * for not having enough memory; the RAM line states a fact and stops there
+ * now. The doorway is the "Too big for one machine? Split it" button landing.ts
+ * puts under ENTER, and what it opens is a mode of the same stage: `cs-swarm`,
+ * parallel to `cs-chatting`.
  *
  * So this file owns no chrome of its own. The role rows go into the sheet the
  * stats live in, the explainer cards become the character's passives in the
@@ -74,7 +76,7 @@ const SPLITS: ReadonlyArray<{ n: number; label: string }> = [
  *  where those roles are LIVED — the helper stage the builder sent someone to
  *  states its job with the same sentence the builder promised it would. */
 export const ROLE_NOTE: Record<SwarmStop['role'], string> = {
-  host: 'Opens the room and holds the start of the model. It asks before it downloads anything.',
+  host: 'Opens the room and holds the start of the model. "Open here" boots that stage in this tab; the link opens share.html, which asks before it downloads anything.',
   helper: 'Joins that room holding its own range. It answers no chat of its own — it runs its layers and hands the residual back.',
   guest: 'The link to hand out. Chats with the assembled model; downloads nothing, needs no WebGPU.',
 }
@@ -86,7 +88,7 @@ const PASSIVES: ReadonlyArray<{ name: string; desc: string }> = [
   { name: 'Split by layer', desc: 'each machine downloads only the layers it holds — the one that starts the model carries the embedding, the one that ends it carries the output head' },
   { name: 'Tokens hop', desc: 'what crosses between machines is the bare residual, one hand-off per token, on its own data channel' },
   { name: 'Guests just talk', desc: 'the room link opens a chat and nothing else — no WebGPU, no download, nothing runs on their machine' },
-  { name: 'Weights spread', desc: 'a guest can copy the cached weights from the machine serving it, over a second channel, and then serve the room itself' },
+  { name: 'Weights spread', desc: 'a guest can copy the cached weights from the machine serving it, over a second channel, instead of downloading them again — what it gets is whatever that machine holds, which in a split is one layer range' },
 ]
 
 const ordinal = (i: number): string =>

@@ -53,7 +53,7 @@ Two things here are unusual, and they are the two sections to read first:
 
 The rest of the shape:
 
-- Models from a 3.8B dense up to Qwen3.6-35B-A3B, a sparse MoE of 256 experts
+- Models from a 1B dense up to Qwen3.6-35B-A3B, a sparse MoE of 256 experts
   routed top-8 plus a shared expert — and the first model here with no WebLLM
   build to benchmark it against
 - int4 / int3 quantized weights, loaded by byte range, cached in the browser
@@ -139,8 +139,9 @@ fragments over HTTP, so the static host never sees it. The engine is
 single-stream, so guest requests are serialized — the rest are told their queue
 position, and the host tab shows every request as it arrives.
 
-The entrance builds the links for you at
-**[zerotvm.com/#swarm](https://zerotvm.com/#swarm)**.
+The entrance builds the links for you: on
+**[zerotvm.com](https://zerotvm.com/#swarm)**, pick a model that can be split
+and press *Too big for one machine? Split it* under the enter buttons.
 
 ### The URL grammar — the query goes BEFORE the fragment
 
@@ -356,7 +357,7 @@ milestone.
 
 | page | module | what it is |
 |---|---|---|
-| `index.html` | `src/landing.ts` | The entrance: a character-select over the roster, cards rendered from `model-registry.ts`. ENTER mounts the chat in place. `src/landing-swarm.ts` adds the swarm link builder below it. |
+| `index.html` | `src/landing.ts` | The entrance: a character-select over the roster, cards rendered from `model-registry.ts`. ENTER mounts the chat in place. `src/landing-swarm.ts` is the swarm: a second mode of the same screen, which turns the stat sheet into the link builder. |
 | `zero-tvm.html` | `src/zero-tvm/chat.ts` | The same chat as a direct link, for deep-linking one model (`?model=…`). |
 | `share.html` | `src/zero-tvm/share.ts` | Host, help or join a room — [the swarm](#the-swarm). |
 | `validate.html` | `src/zero-tvm/validate.ts` | Multi-prompt smoke test driving `engine-core.ts` against local weights. |

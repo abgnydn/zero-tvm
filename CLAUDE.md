@@ -25,13 +25,16 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
   kernel window and carousel left with the 2026-08-15 redesign; docs.html
   carries the why. The screen has TWO stage-modes, both classes on `.cs-root`:
   `cs-chatting` and `cs-swarm`. The swarm (`src/landing-swarm.ts`) opens from
-  the ⟁ control on the sheet's amber RAM line — the doorway from "this model
-  does not fit" to its answer — turns the stat sheet into the host/helper/guest
+  the "Too big for one machine? Split it" button under ENTER — the RAM line
+  states a fact and stops — turns the stat sheet into the host/helper/guest
   link builder and the summoning ring into one arc per machine, and builds
   every URL from `room-url.ts`, the same grammar share.ts routes on, so a link
-  the entrance hands out cannot be read as another role. `index.html`'s
-  `#swarm` section and `public/swarm.css` are the NO-JS FALLBACK for that mode
-  and nothing else — landing.ts hides the section once the scene renders.
+  the entrance hands out cannot be read as another role. The first machine is
+  this one: "Open here" boots that stage in the same tab, and
+  `landing-room.ts`'s `paintSplit` writes the other machines' links once the
+  room id exists. `index.html`'s `#swarm` section and `public/swarm.css` are
+  the NO-JS FALLBACK for that mode and nothing else — landing.ts hides the
+  section once the scene renders.
 - `zero-tvm.html` — the hand-written chat surface
 - `docs.html`, `validate.html` — docs and the validation harness
 - `share.html` — host a model for other devices; `agent-host.html` — the
@@ -63,11 +66,11 @@ multi-GB downloads on page load. Their src/ modules remain, unbuilt.
   all take an optional spec (default PHI3 — Phi-3 behavior unchanged).
   `npm run test:kernels:qwen` runs under QWEN3_4B dims — it compiles every
   shader AND asserts numerics (maxRel < 0.02), so it needs a GPU.
-  `src/compiler/shaders/` holds the 37 WGSL files
-  (10 roles + tiled/subgroup/int8/f32 variants; the int4_matmul generator
-  emits 18 more). The WebLLM/TVM
-  reference path is `chat-v2.ts` (the `compiler-chat` page), which is
-  the only file here that imports `@mlc-ai/web-llm`.
+  `src/compiler/shaders/` holds the WGSL files (10 roles +
+  tiled/subgroup/int8/f32 variants; `int4_matmul.gen.ts` emits the int4/int3
+  matmul family on top of them — `INT4_MATMUL_VARIANTS` is the list). The
+  WebLLM/TVM reference path is `chat-v2.ts` (the `compiler-chat` page), which
+  is the only file here that imports `@mlc-ai/web-llm`.
 - `src/shaders/` — 3 *unwired* "max-fusion" experiments
   (`fused-norm-matmul`, `fused-ffn`, `argmax`). Documented in
   `architecture.html` but NOT imported by the engine, which still uses
@@ -306,8 +309,8 @@ the chat page, which is why the two cannot drift.
 
 `share.html` has **no stylesheet of its own**: it renders the ENTRANCE'S SCENE
 (`public/landing.css` — plate, summoning ring, `.mb-panel` sheet, `.cs-boot`,
-`.cs-room-consent`/`.cs-room-live`, `.sw-arc`, `.cs-chat`), one character on the
-stage, per role. It used to carry ~130 lines of inline CSS re-implementing that
+`.cs-room-consent`, `.sw-arc`, `.cs-chat`), one character on the stage, per
+role. It used to carry ~130 lines of inline CSS re-implementing that
 chrome as a parallel design language. Anything new on this page comes from a
 component the entrance already has, or it does not go on.
 
@@ -563,8 +566,8 @@ those were caught by reading a diff.
 **The test that matters is the one that FAILS on the old code.** Write it, run
 it against the bug, watch it fail, then fix. A test written after the fix and
 never seen red proves nothing. `node scripts/mutation-gate.mjs` re-checks that
-for eight bugs that actually shipped — a suite can lose its teeth in a refactor
-and still look green.
+against bugs that actually shipped (`--list` names them) — a suite can lose
+its teeth in a refactor and still look green.
 
 **`docs/VERIFICATION.md` is the doctrine.** Its top rule, and the only line
 worth memorising: **something that looks like a check is not a check.** Every
