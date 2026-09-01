@@ -18,6 +18,7 @@
 
 import type { ModelSpec } from '../compiler/model-spec.js'
 import { specForParam, specWithCtx } from './model-registry.js'
+import { ctxFor } from './room-url.js'
 import { resolveModelBase } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
 import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt, buildDeepSeekChatPrompt, buildLlama3ChatPrompt, buildMistralChatPrompt, buildTuluChatPrompt } from './tokenizer-bpe.js'
@@ -30,7 +31,11 @@ export function specFromSearch(search: string): ModelSpec {
   const q = new URLSearchParams(search)
   // `?ctx=` is documented on specWithCtx (model-registry.ts) — the logic lives
   // there so it can be unit-tested without this file's weight-loader import.
-  return specWithCtx(specForParam(q.get('model')), Number(q.get('ctx')))
+  // Which ctx WINS is room-url.ts's ctxFor: the link's, over this build's
+  // compiled default. One parser for the room grammar, so a helper booting
+  // from a host's link cannot size its KV cache off a different rule.
+  const base = specForParam(q.get('model'))
+  return specWithCtx(base, ctxFor(search, base.maxContext))
 }
 
 export { modelBranding, SHIPPED_MODELS } from './model-registry.js'

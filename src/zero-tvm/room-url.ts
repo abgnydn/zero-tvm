@@ -37,6 +37,34 @@ export function stageRangeFrom(search: string): { start: number; end: number } |
   return m ? { start: Number(m[1]), end: Number(m[2]) } : null
 }
 
+/** `?ctx=N` — the KV budget the room runs at, in tokens. Null when the link
+ *  carries none, which is every link written before links carried config. */
+export function ctxFrom(search: string): number | null {
+  const n = Number(new URLSearchParams(search).get('ctx'))
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+/**
+ * CONTEXT PRECEDENCE — the LINK wins over this device's own compiled default.
+ *
+ * WHY: every stage allocates its own KV cache from spec.maxContext, eagerly,
+ * one buffer per attention layer. A helper that fell back to its build's
+ * default while the host ran `?ctx=8192` would hold a DIFFERENT number of
+ * slots for the same conversation — the host prefills to a position its own
+ * cache has room for and the stage behind it does not, so the room dies deep
+ * inside a generation instead of at boot, and the two tabs disagree about a
+ * number neither of them prints. The host therefore writes its EFFECTIVE
+ * maxContext (post-clamp, from the spec it actually built) into the links it
+ * hands out, and a stage adopts it verbatim.
+ *
+ * `ownDefault` is used only when the link says nothing — an OLD link, where
+ * the spec default is the only value there has ever been, and is what the
+ * host had too.
+ */
+export function ctxFor(search: string, ownDefault: number): number {
+  return ctxFrom(search) ?? ownDefault
+}
+
 export type RoomRole = 'host' | 'helper' | 'guest'
 
 /**
@@ -76,6 +104,51 @@ export interface SwarmStop {
   url: string | null
 }
 
+export interface RoomLinkParts {
+  /** Scheme + host, no trailing slash. */
+  origin: string
+  /** Page path, e.g. `/share.html`. */
+  path: string
+  /** The room id. FRAGMENT, always — it is 128 bits of secret, and browsers
+   *  do not send fragments over HTTP, so the static host never logs it. Null
+   *  writes a link that opens a NEW room. */
+  room: string | null
+  /** `?model=` — LEAVE UNSET (or null) for a link that must route as a guest:
+   *  roleFor reads a model inside a room as "this device serves too". The
+   *  EMPTY STRING is a real value, not "unset": it is how the default model
+   *  is named in this grammar (specForParam('') is Phi-3), and `?model=`
+   *  routes to a serving role exactly like a named one. */
+  model?: string | null
+  /** `?layers=` — the slice the opener holds. */
+  layers?: { start: number; end: number } | null
+  /** `?ctx=` — see ctxFor. */
+  ctx?: number | null
+  /** `?sig=` — dev signaling override, carried so a peer dials the same relay
+   *  the host is on rather than the default one. */
+  sig?: string | null
+}
+
+/**
+ * The ONE place a room URL is assembled: query first, fragment last.
+ *
+ * That order is the whole point. Written the other way round —
+ * `#<room>?model=X` — location.search is empty and location.hash no longer
+ * parses as a room id, so roleFor takes the host branch and the device opens
+ * a brand-new room in silence. Every caller goes through here so no caller
+ * can get it wrong by hand.
+ */
+export function roomLink(p: RoomLinkParts): string {
+  const q = new URLSearchParams()
+  // `!= null`, not truthiness: `model: ''` is the DEFAULT model, and dropping
+  // it turns a serving link into a guest link that quietly runs nothing.
+  if (p.model != null) q.set('model', p.model)
+  if (p.layers) q.set('layers', `${p.layers.start}-${p.layers.end}`)
+  if (p.ctx) q.set('ctx', String(p.ctx))
+  if (p.sig) q.set('sig', p.sig)
+  const search = q.toString()
+  return `${p.origin}${p.path}${search ? `?${search}` : ''}${p.room ? `#${p.room}` : ''}`
+}
+
 /**
  * Every URL a split needs, in the order they must be opened.
  *
@@ -84,6 +157,10 @@ export interface SwarmStop {
  * fragment would be worse than emitting nothing: a placeholder fails
  * roomIdFrom, which routes the link to the host branch, which is the silent
  * new-room failure this module exists to prevent.
+ *
+ * The guest link carries NO query at all — not even ctx. A guest runs nothing
+ * locally, so it has no KV cache to size, and every key it could carry is one
+ * more chance to write `?model=` into a link that must not host.
  */
 export function swarmUrls(o: {
   origin: string
@@ -92,16 +169,22 @@ export function swarmUrls(o: {
   layers: number
   machines: number
   room: string | null
+  /** `?ctx=` for the serving links, so every stage sizes the same KV cache
+   *  (ctxFor). Omit to let each machine use its build's default. */
+  ctx?: number | null
 }): SwarmStop[] {
   const bounds = splitBounds(o.layers, o.machines)
   const at = (i: number): { start: number; end: number } => ({ start: bounds[i], end: bounds[i + 1] })
-  const q = (r: { start: number; end: number }): string =>
-    `${o.origin}/share.html?model=${encodeURIComponent(o.param)}&layers=${r.start}-${r.end}`
-  const out: SwarmStop[] = [{ role: 'host', range: at(0), url: q(at(0)) }]
+  const serve = (r: { start: number; end: number }, room: string | null): string =>
+    roomLink({ origin: o.origin, path: '/share.html', room, model: o.param, layers: r, ctx: o.ctx })
+  const out: SwarmStop[] = [{ role: 'host', range: at(0), url: serve(at(0), null) }]
   for (let i = 1; i < bounds.length - 1; i++) {
     const range = at(i)
-    out.push({ role: 'helper', range, url: o.room ? `${q(range)}#${o.room}` : null })
+    out.push({ role: 'helper', range, url: o.room ? serve(range, o.room) : null })
   }
-  out.push({ role: 'guest', url: o.room ? `${o.origin}/share.html#${o.room}` : null })
+  out.push({
+    role: 'guest',
+    url: o.room ? roomLink({ origin: o.origin, path: '/share.html', room: o.room }) : null,
+  })
   return out
 }

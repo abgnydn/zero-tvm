@@ -148,6 +148,12 @@ function mountSwarmBuilder(host: HTMLElement): void {
       layers: spec.layers,
       machines,
       room: pastedRoom(),
+      // State the context EXPLICITLY, even though it is this build's own
+      // default. Two machines in one swarm can be on two deploys of the site,
+      // and a compiled default that moved between them would give the stages
+      // differently sized KV caches for the same conversation (room-url.ts's
+      // ctxFor). A number in the link cannot drift; a default can.
+      ctx: spec.maxContext,
     })
     el('.sw-host').innerHTML = stopRow(stops[0], 0)
     el('.sw-rest').innerHTML = stops.slice(1).map((s, i) => stopRow(s, i + 1)).join('')

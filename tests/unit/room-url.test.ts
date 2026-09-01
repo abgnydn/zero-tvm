@@ -13,7 +13,9 @@
 // whose output routes somewhere else fails here.
 
 import { describe, expect, it } from 'vitest'
-import { roleFor, roomIdFrom, splitBounds, stageRangeFrom, swarmUrls } from '../../src/zero-tvm/room-url.ts'
+import {
+  ctxFor, ctxFrom, roleFor, roomIdFrom, roomLink, splitBounds, stageRangeFrom, swarmUrls,
+} from '../../src/zero-tvm/room-url.ts'
 import { SHIPPED_MODELS, canSplitAcrossDevices, modelBranding } from '../../src/zero-tvm/model-registry.ts'
 
 const ORIGIN = 'https://zerotvm.com'
@@ -152,5 +154,139 @@ describe('the builder only offers models that can actually be split', () => {
     for (const { param, spec } of offered) {
       expect(spec.layers, `${param} has too few layers to split`).toBeGreaterThanOrEqual(4)
     }
+  })
+})
+
+// ── the link carries the room's CONFIGURATION ────────────────────────────────
+// A link used to say only which room. A guest could not tell what it was
+// joining, and a helper link had to be hand-edited out of a guest link — which
+// is how a stage ended up on a different ?ctx= than the host, and so a
+// differently sized KV cache for the same conversation.
+
+describe('an OLD link keeps working', () => {
+  it('/share.html#<room> with no query at all is still a guest link', () => {
+    // Every link handed out before links carried config looks like this. If it
+    // ever routes anywhere else, every one of them silently opens a new room.
+    expect(routeOf(`${ORIGIN}/share.html#${ROOM}`)).toBe('guest')
+    expect(roomIdFrom(`#${ROOM}`)).toBe(ROOM)
+    expect(stageRangeFrom('')).toBeNull()
+    expect(ctxFrom('')).toBeNull()
+  })
+})
+
+describe('ctxFrom', () => {
+  it('reads a positive ?ctx=', () => {
+    expect(ctxFrom('?ctx=8192')).toBe(8192)
+    expect(ctxFrom('?model=qwen3mlx&ctx=262144&layers=0-18')).toBe(262144)
+  })
+
+  it('refuses everything that is not a real budget', () => {
+    // specWithCtx treats these as "no override"; ctxFrom must agree, or the
+    // link's ctx and the spec's ctx disagree about whether one was given.
+    for (const q of ['', '?ctx=', '?ctx=0', '?ctx=-1', '?ctx=junk', '?ctx=Infinity', '?ctx=NaN']) {
+      expect(ctxFrom(q), q).toBeNull()
+    }
+  })
+})
+
+describe('ctxFor — the link beats this device default', () => {
+  it('adopts the link value, not the local one', () => {
+    // The failure this prevents: the host runs 8192 and the helper falls back
+    // to its build's 32768, so the two stages allocate different numbers of KV
+    // slots for the same conversation and the room dies mid-generation.
+    expect(ctxFor('?model=qwen35&ctx=8192', 32768)).toBe(8192)
+  })
+
+  it('falls back only when the link says nothing', () => {
+    expect(ctxFor('', 32768)).toBe(32768)
+    expect(ctxFor('?model=qwen35', 32768)).toBe(32768)
+    expect(ctxFor('?model=qwen35&ctx=junk', 32768)).toBe(32768)
+  })
+})
+
+describe('roomLink', () => {
+  it('writes the query BEFORE the fragment, every time', () => {
+    // The whole reason this builder exists. Assert on the ROUTE, not on the
+    // string: a link that reads right and routes wrong is the actual bug.
+    const helper = roomLink({
+      origin: ORIGIN, path: '/share.html', room: ROOM,
+      model: 'qwen3mlx', layers: { start: 18, end: 36 }, ctx: 8192,
+    })
+    expect(helper.indexOf('?')).toBeLessThan(helper.indexOf('#'))
+    expect(routeOf(helper)).toBe('helper')
+    const u = new URL(helper)
+    expect(stageRangeFrom(u.search)).toEqual({ start: 18, end: 36 })
+    expect(ctxFrom(u.search)).toBe(8192)
+    expect(roomIdFrom(u.hash)).toBe(ROOM)
+  })
+
+  it('never puts the room id in the query — it is 128 bits of secret', () => {
+    // Fragments are not sent over HTTP, so the static host never logs the id.
+    // A query would hand it to every access log between here and the origin.
+    const link = roomLink({
+      origin: ORIGIN, path: '/share.html', room: ROOM, model: 'qwen3mlx', ctx: 4096,
+    })
+    expect(new URL(link).search).not.toContain(ROOM)
+    expect(new URL(link).hash).toBe(`#${ROOM}`)
+  })
+
+  it('omits every key it was not given', () => {
+    expect(roomLink({ origin: ORIGIN, path: '/share.html', room: ROOM }))
+      .toBe(`${ORIGIN}/share.html#${ROOM}`)
+    expect(routeOf(roomLink({ origin: ORIGIN, path: '/share.html', room: ROOM }))).toBe('guest')
+  })
+
+  it('model + ctx inside a room is a SECOND FULL HOST, not a helper', () => {
+    // This is what room-host.ts emits when it holds the whole model, and what
+    // a guest that copied the weights opens. It must keep routing to host —
+    // `start > 0` is the only thing that makes a link a helper.
+    const link = roomLink({
+      origin: ORIGIN, path: '/share.html', room: ROOM, model: 'qwen3mlx', ctx: 8192,
+    })
+    expect(routeOf(link)).toBe('host')
+    expect(ctxFrom(new URL(link).search)).toBe(8192)
+  })
+
+  it("model:'' is the DEFAULT model, not an absent one", () => {
+    // room-host.ts passes the raw `?model=` value, which is '' for Phi-3.
+    // Dropping it would emit a "help this room" link that routes to GUEST —
+    // the recipient joins, runs nothing, and the room never gains a machine.
+    const link = roomLink({ origin: ORIGIN, path: '/share.html', room: ROOM, model: '', ctx: 4096 })
+    expect(routeOf(link)).toBe('host')
+    expect(new URL(link).searchParams.has('model')).toBe(true)
+    // null/undefined still means "no model" — that is the guest link.
+    expect(routeOf(roomLink({ origin: ORIGIN, path: '/share.html', room: ROOM, model: null }))).toBe('guest')
+  })
+
+  it('a null room writes a link that opens a NEW room', () => {
+    const link = roomLink({ origin: ORIGIN, path: '/share.html', room: null, model: 'qwen3mlx', ctx: 8192 })
+    expect(link).not.toContain('#')
+    expect(routeOf(link)).toBe('host')
+  })
+})
+
+describe('swarmUrls carries ctx to every SERVING machine', () => {
+  it('puts the same ctx on the host and on every helper', () => {
+    const stops = swarmUrls({ origin: ORIGIN, param: 'qwen3mlx', layers: 36, machines: 3, room: ROOM, ctx: 8192 })
+    for (const s of stops) {
+      expect(routeOf(s.url!), `${s.url} routes to the wrong role`).toBe(s.role)
+      if (s.role === 'guest') continue
+      expect(ctxFrom(new URL(s.url!).search), `${s.role} lost its ctx`).toBe(8192)
+    }
+  })
+
+  it('leaves the guest link bare even when a ctx is given', () => {
+    // A guest runs nothing locally, so it has no KV cache to size — and every
+    // key on a guest link is one more chance to write ?model= into a link that
+    // must not host.
+    const guest = swarmUrls({ origin: ORIGIN, param: 'qwen3mlx', layers: 36, machines: 3, room: ROOM, ctx: 8192 }).at(-1)!
+    expect(guest.role).toBe('guest')
+    expect(new URL(guest.url!).search).toBe('')
+    expect(routeOf(guest.url!)).toBe('guest')
+  })
+
+  it('omitting ctx writes no ?ctx= at all — each machine keeps its own default', () => {
+    const stops = swarmUrls({ origin: ORIGIN, param: 'qwen3mlx', layers: 36, machines: 2, room: ROOM })
+    for (const s of stops) expect(ctxFrom(new URL(s.url!).search)).toBeNull()
   })
 })
