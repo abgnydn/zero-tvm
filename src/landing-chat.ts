@@ -46,13 +46,42 @@ export interface EnterChatOptions {
    *  machine is this machine, so it boots in place; only the other stages
    *  need a URL. */
   layerRange?: { start: number; end: number }
+  /** The same three build choices the entrance sheet offers, already resolved
+   *  to links by the entrance (it owns GROUPS, the context ladder and the
+   *  pool modes — this panel only paints them). Chat covers the sheet, so
+   *  without these the build you are running is neither visible nor
+   *  changeable once you are in. */
+  builds?: BuildStrip
+}
+
+export interface BuildChoice { label: string; href: string; on: boolean }
+export interface BuildStrip {
+  quant: BuildChoice[]
+  ctx: BuildChoice[]
+  pool: BuildChoice[]
 }
 
 const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>'
 const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
 const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>'
 
-function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, buildLabel: string): string {
+/** One labelled row of build chips. Empty (and the row is skipped) when the
+ *  character offers only one of that kind — a picker with a single option
+ *  reads as a broken control, not a choice. */
+function buildRow(name: string, opts: BuildChoice[] | undefined): string {
+  if (!opts || opts.length < 2) return ''
+  // The chips get their own box so a long one wraps under its NEIGHBOUR and
+  // not under the label — the memory builds carry a resident size and a rate,
+  // and as bare siblings they fell back to the row's left edge.
+  return `<div class="cs-build-row"><span class="cs-build-label">${name}</span>`
+    + `<div class="cs-build-chips">`
+    + opts.map((o) =>
+      `<a class="mb-variant" role="tab" aria-selected="${o.on}" href="${o.href}">${o.label}</a>`,
+    ).join('')
+    + `</div></div>`
+}
+
+function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, buildLabel: string, builds?: BuildStrip): string {
   const sigil = LANE_SIGIL[laneOf(spec)] ?? ''
   const size = brand.params.split(/[\s·]/)[0]
   // The one note a visitor cannot undo by waiting: RAM for the full build,
@@ -69,9 +98,19 @@ function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, b
         <i>${buildLabel}</i>
       </div>
       <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">Summoning</span></span>
+      ${builds ? `<button class="cs-chat-tool" id="build-btn" type="button"
+        aria-expanded="false" title="Quantisation, context and memory build">Build</button>` : ''}
       <button class="cs-chat-tool" id="new-chat-btn" type="button" title="New chat" disabled>New chat</button>
       <a class="cs-chat-tool" id="cs-roster-link" href="/" title="Back to the character select">⟨ Roster</a>
     </div>
+    ${builds ? `<div class="cs-build" id="build-strip" hidden>
+      ${buildRow('Quantisation', builds.quant)}
+      ${buildRow('Context', builds.ctx)}
+      ${buildRow('Memory', builds.pool)}
+      <p class="cs-build-note">Changing a build reloads this character on it.
+        The weights are already on this device, so it opens in seconds, and the
+        conversation carries across.</p>
+    </div>` : ''}
     <div class="cs-boot" id="progress-wrap">
       <div class="cs-boot-title" id="loading-title">Summoning ${brand.name}</div>
       <div class="cs-boot-status" id="progress-status" aria-live="polite">Preparing…</div>
@@ -143,7 +182,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   panel.className = 'cs-chat'
   panel.setAttribute('role', 'region')
   panel.setAttribute('aria-label', `Chat with ${brand.name}`)
-  panel.innerHTML = panelMarkup(spec, brand, buildLabel)
+  panel.innerHTML = panelMarkup(spec, brand, buildLabel, opts.builds)
   root.appendChild(panel)
   root.classList.add('cs-chatting')
   // ENTER just display:none'd itself — without a new focus target the whole
@@ -151,6 +190,18 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   // (its aria-live status then narrates the summoning).
   panel.tabIndex = -1
   panel.focus()
+
+  // Same rule as the roster link below: a build change is a fresh page. The
+  // chips are plain links, so that happens without any code here.
+  {
+    const bb = panel.querySelector<HTMLElement>('#build-btn')
+    const strip = panel.querySelector<HTMLElement>('#build-strip')
+    bb?.addEventListener('click', () => {
+      if (!strip) return
+      strip.hidden = !strip.hidden
+      bb.setAttribute('aria-expanded', String(!strip.hidden))
+    })
+  }
 
   // Leaving is a fresh page — the engine and its weights do not tear down
   // mid-session, and OPFS makes the way back in fast.

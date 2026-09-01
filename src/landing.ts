@@ -252,8 +252,20 @@ function render(): void {
   const el = <T extends Element>(s: string): T => host.querySelector<T>(s)!
   const canvas = el<HTMLCanvasElement>('.mb-mascot')
   const dots = el<HTMLElement>('.mb-dots')
+  /* The entrance reads its own URL. It used to ignore it entirely, so there
+     was no way back into a chosen build without walking the roster again —
+     which is what made the build controls unreachable once chat had covered
+     the sheet. ?model= picks the character and its quantisation, ?ctx= and
+     ?pool= the two builds, and ?chat=1 goes straight in. That is exactly the
+     shape the chat panel's own build strip writes when you change one. */
+  const Q = new URLSearchParams(location.search)
+  const wanted = Q.get('model')
   let gi = 0
   let vi = 0
+  if (wanted !== null) {
+    const g = GROUPS.findIndex((x) => x.variants.some((v) => v.param === wanted))
+    if (g >= 0) { gi = g; vi = Math.max(0, GROUPS[g].variants.findIndex((v) => v.param === wanted)) }
+  }
   /** Selected memory build (index into the spec's poolModes; 0 = full). Reset
    *  on every model/variant change — a build belongs to a character. */
   let mi = 0
@@ -261,6 +273,19 @@ function render(): void {
    *  Context is a KV-memory dial, not a model property — the number the sheet
    *  shows is whichever build is chosen here, priced in KV bytes. */
   let xi = 0
+  if (wanted !== null) {
+    const spec0 = GROUPS[gi].variants[vi].spec
+    const wp = Q.get('pool')
+    if (wp !== null) {
+      const j = (modelBranding(spec0).poolModes ?? []).findIndex((m) => String(m.slots) === wp)
+      if (j >= 0) mi = j
+    }
+    const wc = Number(Q.get('ctx'))
+    if (Number.isFinite(wc) && wc > 0) {
+      const j = ctxModesOf(spec0).findIndex((c) => c.tokens === wc)
+      if (j >= 0) xi = j
+    }
+  }
   let mascot: MascotHandle | null = null
   /** The swarm stage-mode, when it is on. Non-null exactly while the root
    *  carries `cs-swarm` — the second mode this screen has, after cs-chatting. */
@@ -779,8 +804,39 @@ function render(): void {
     const v = GROUPS[gi].variants[vi]
     const modes = modelBranding(v.spec).poolModes ?? []
     const mode = modes[mi] ?? modes[0]
-    const cx = ctxModesOf(v.spec)[xi] ?? ctxModesOf(v.spec)[0]
+    const cxs = ctxModesOf(v.spec)
+    const cx = cxs[xi] ?? cxs[0]
+    // The build strip the chat panel paints. The entrance resolves it, because
+    // the entrance is what knows the roster, the context ladder and the pool
+    // modes; the panel only draws chips. Each chip is the URL that re-enters
+    // on that build — the same ?model=/?ctx=/?pool=/?chat=1 this file reads on
+    // boot, so the way out and the way back in are one grammar.
+    const buildHref = (param: string, tokens: number, slots: number): string => {
+      const q = new URLSearchParams()
+      q.set('model', param)
+      if (tokens) q.set('ctx', String(tokens))
+      if (slots) q.set('pool', String(slots))
+      q.set('chat', '1')
+      if (openRoom) q.set('room', '1')
+      return `/?${q.toString()}`
+    }
+    const builds = {
+      // Quantisation belongs to the character, and the two builds belong to a
+      // quantisation — so switching it drops them rather than carrying numbers
+      // that may not exist on the other checkpoint.
+      quant: GROUPS[gi].variants.map((x, j) => ({
+        label: x.label, href: buildHref(x.param, 0, 0), on: j === vi,
+      })),
+      ctx: cxs.map((c, j) => ({
+        label: `${c.name} · ${ctxLabel(c.tokens)}`,
+        href: buildHref(v.param, c.tokens, mode?.slots ?? 0), on: j === xi,
+      })),
+      pool: modes.map((m, j) => ({
+        label: m.label, href: buildHref(v.param, cx.tokens, m.slots), on: j === mi,
+      })),
+    }
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
+      builds,
       root,
       spec: v.spec,
       param: v.param,
@@ -799,6 +855,12 @@ function render(): void {
   // The room path is the same summoning with the room strip already open on
   // its CONSENT step — discoverable from the select screen, never auto-armed.
   root.querySelector<HTMLAnchorElement>('.mb-cta-room')?.addEventListener('click', (e) => engage(e, true))
+  // ?chat=1 — how the chat panel's build strip comes back after changing a
+  // build. It goes through the CTA's own click rather than a second entry
+  // point, so the auto path and the human path cannot drift.
+  if (Q.get('chat') === '1') {
+    root.querySelector<HTMLElement>(Q.get('room') === '1' ? '.mb-cta-room' : '.mb-cta')?.click()
+  }
 
   // "Swarm" in the nav and the footer pointed at the section below. That
   // section is the no-JS fallback now, so with JS the same href opens the
