@@ -24,6 +24,9 @@ import { mountMascot } from './mascot.js'
 import { modelBranding, canSplitAcrossDevices } from './zero-tvm/model-registry.js'
 import { buildChatPromptFor } from './zero-tvm/model-select.js'
 import { hostRoom, type RoomHandle } from './zero-tvm/room-host.js'
+// The throttling exemption, one generator, shared with share.html's serving
+// roles — see keep-awake.ts for why it is not two.
+import { KEEP_AWAKE_NOTE, wireKeepAwake } from './zero-tvm/keep-awake.js'
 import { swarmUrls, splitBounds } from './zero-tvm/room-url.js'
 import { recordFeat } from './feats.js'
 
@@ -100,6 +103,32 @@ export function mountRoomTool(o: RoomToolOptions): void {
   btn.title = 'Serve this model to other machines'
   head.insertBefore(btn, head.querySelector('#new-chat-btn'))
 
+  /**
+   * KEEP-AWAKE, beside the tool that opens the room.
+   *
+   * This surface is the PRIMARY hosting path now — the swarm's first machine
+   * boots in place rather than opening share.html — and it was the one without
+   * the control: a bare `wakeLock.request('screen')` taken when the room opened,
+   * which the UA drops on the first tab-hide and never gives back, and no audio
+   * track at all. A backgrounded host generates at ~23 tok/s against ~65 and
+   * serves at ~1 MB/s, so the recommended flow was the throttled one while the
+   * path it replaced had a toggle.
+   *
+   * That bare wake lock is GONE rather than left beside this: two owners of the
+   * machine's wake state means the visible control cannot honestly claim to
+   * release it. This button is the one owner, and like share.html's it does
+   * nothing until the operator presses it — the audio track needs a user gesture
+   * and a room opening is not one.
+   */
+  const awake = document.createElement('button')
+  awake.type = 'button'
+  awake.className = 'cs-chat-tool'
+  awake.id = 'awake'
+  awake.textContent = '⟁ Awake'
+  awake.title = KEEP_AWAKE_NOTE
+  head.insertBefore(awake, head.querySelector('#new-chat-btn'))
+  wireKeepAwake(awake)
+
   const strip = document.createElement('div')
   strip.className = 'cs-room'
   strip.hidden = !o.openStrip
@@ -123,7 +152,6 @@ export function mountRoomTool(o: RoomToolOptions): void {
 
   const $ = <T extends HTMLElement>(sel: string): T => strip.querySelector(sel) as T
   let room: RoomHandle | null = null
-  let wake: { release(): Promise<void> } | null = null
   /** One small mascot per connected guest, flanking the character. */
   const guestMascots: { canvas: HTMLCanvasElement; handle: MascotHandle | null }[] = []
 
@@ -304,9 +332,6 @@ export function mountRoomTool(o: RoomToolOptions): void {
     $('.cs-room-live').hidden = false
     btn.classList.add('cs-tool-live')
     recordFeat('room')
-    // Best-effort: hosting from a sleeping screen serves nobody.
-    void (navigator as unknown as { wakeLock?: { request(t: string): Promise<{ release(): Promise<void> }> } })
-      .wakeLock?.request('screen').then((l) => { wake = l }).catch(() => {})
   })
 
   $('#room-copy').addEventListener('click', () => {
@@ -319,8 +344,10 @@ export function mountRoomTool(o: RoomToolOptions): void {
   $('#room-close').addEventListener('click', () => {
     room?.close()
     room = null
-    void wake?.release().catch(() => {})
-    wake = null
+    // Keep-awake is NOT released here. It is the operator's toggle, next to the
+    // ⟁ Room tool rather than inside the strip, and it survives a room the same
+    // way share.html's does — a machine that just closed one room is usually
+    // about to open another.
     syncGuestMascots(0)
     $('.cs-room-live').hidden = true
     $('.cs-room-consent').hidden = false

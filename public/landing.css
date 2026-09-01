@@ -1365,6 +1365,14 @@ footer li a:hover { color: var(--accent); }
   #models .cs-chatting .mb-name { font-size: 1.3rem; }
   .cs-sug-grid { grid-template-columns: 1fr; }
   .cs-chat-tool#new-chat-btn { display: none; }
+  /* The head's fifth tool. ⟁ Awake is the control a PHONE needs MOST — a
+     serving tab is a background tab for its whole life — so it is not the one
+     to drop when the row runs short; that is #new-chat-btn, above. It sheds
+     padding and letter-spacing instead, which is what keeps the row on one
+     line at 360px (measured 399px against 360 before this). Scoped to the head:
+     share.html carries the same control as a SHEET row, not a head tool, and
+     must not move. */
+  .cs-chat-head #awake { padding-left: 5px; padding-right: 5px; letter-spacing: 0.03em; }
 }
 @media (prefers-reduced-motion: reduce) {
   #models .cs-chat, #models .cs-root.cs-chatting .cs-engage.cs-go { animation: none; }

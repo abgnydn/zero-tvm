@@ -66,6 +66,9 @@ import { ROLE_NOTE, drawArcs, lightArcs } from '../landing-swarm.js'
 // link builder, so a URL that page hands out is routed by the same three-way
 // branch that reads it here.
 import { roomIdFrom, stageRangeFrom, roleFor, roomLink } from './room-url.js'
+// …and the bound that parser cannot apply, because bounding a range needs the
+// spec it is a range OF. See stage-range.ts for what an unbounded one did.
+import { stageFor } from './stage-range.js'
 // The host loop, the wire protocol, and the signaling constants live in
 // room-host.ts — shared with the landing entrance's in-place room
 // (landing-room.ts), so the two hosting surfaces cannot drift.
@@ -73,6 +76,10 @@ import {
   hostRoom, signalEnv, ICE,
   type HostMsg, type ChatReq, type StopReq, type StageOffer,
 } from './room-host.js'
+// The keep-awake toggle used to be defined right here, and the entrance's room
+// had a bare wake lock instead — two answers to one question. It imports
+// nothing, so it is safe on the guest role's path too.
+import { KEEP_AWAKE_NOTE, wireKeepAwake } from './keep-awake.js'
 
 const { base: SIGNAL_BASE, override: SIG_OVERRIDE } = signalEnv()
 
@@ -103,12 +110,30 @@ const REACH_STUN = 'STUN only, no TURN — same network or an ordinary home rout
 // what turns a room into a swarm: a guest that copied the weights adds
 // ?model= to the link it already has and starts serving.
 const room = roomIdFrom(location.hash)
-const stage = stageRangeFrom(location.search)
 // The assertions hold by roleFor's own definition: it returns 'helper' only
 // when both parses succeeded and 'guest' only when the room did.
 const role = roleFor(location.search, location.hash)
-if (role === 'helper') void runHelper(room!, stage!)
-else if (role === 'guest') void runGuest(room!)
+// BOUNDED HERE, before any role is handed a range. `stageRangeFrom` takes any
+// `\d+-\d+` — it has no spec — so `?layers=0-64` on a 64-layer checkpoint used
+// to describe the WHOLE model as "a slice of the full ~14.1 GB, not all of it"
+// and take the RAM warning down with it, and `?layers=0-9999` planned past the
+// end of the model and died in the loader. Every consumer of a range on this
+// page (the title, the sheet's Layers row, the consent paragraph, the download
+// gate, the loader's layerRange, the helper links) reads what these two
+// functions are handed, so this is the one place that makes them agree.
+const stage = stageFor(
+  stageRangeFrom(location.search),
+  specForParam(new URLSearchParams(location.search).get('model') ?? '').layers,
+  role === 'helper' ? 'helper' : 'host',
+)
+if (role === 'helper') {
+  // A helper whose range does not bound cannot hold the slice it was sent for,
+  // and there is no honest fallback that SERVES: taking on the whole model in
+  // someone else's room is a larger commitment than the link asked for. So it
+  // joins as a guest, which needs no WebGPU and downloads nothing.
+  if (stage) void runHelper(room!, stage)
+  else void runGuest(room!)
+} else if (role === 'guest') void runGuest(room!)
 else void runHost(room, stage)
 
 // ============================================================
@@ -281,60 +306,21 @@ function bootFail(reason: string, badge: string): void {
   if (t) t.textContent = badge
 }
 
-/**
- * Keep-awake — screen wake-lock plus a silent audio track. The wake lock stops
- * the machine sleeping; the audio track is the standard exemption from
- * background-tab throttling (measured: a backgrounded host generated at
- * ~23 tok/s where the focused tab does ~65, and served weights at ~1 MB/s).
- * Honestly labeled: the browser shows its audio indicator on the tab.
- *
- * Both serving roles need it — a helper stage especially, since it is a
- * background tab for its whole life. It is a `.cs-chat-tool` toggle now rather
- * than a checkbox, so it wears the scene's own control chrome and lights with
- * `.cs-tool-live` when it is on, the way the entrance's ⟁ Room tool does.
- */
-function wireKeepAwake(): void {
-  const btn = document.getElementById('awake') as HTMLButtonElement | null
-  if (!btn) return
-  let on = false
-  let wakeLock: WakeLockSentinel | null = null
-  let audioCtx: AudioContext | null = null
-  const apply = async (want: boolean): Promise<void> => {
-    if (want) {
-      try { wakeLock = await navigator.wakeLock.request('screen') } catch { /* unsupported / not visible */ }
-      if (!audioCtx) {
-        audioCtx = new AudioContext()
-        const osc = audioCtx.createOscillator()
-        const gain = audioCtx.createGain()
-        gain.gain.value = 0.0001   // inaudible, but "playing" as far as the scheduler cares
-        osc.connect(gain).connect(audioCtx.destination)
-        osc.start()
-      }
-      void audioCtx.resume()
-    } else {
-      void wakeLock?.release().catch(() => {})
-      wakeLock = null
-      void audioCtx?.suspend()
-    }
-  }
-  btn.addEventListener('click', () => {
-    on = !on
-    btn.setAttribute('aria-pressed', String(on))
-    btn.classList.toggle('cs-tool-live', on)
-    void apply(on)
-  })
-  document.addEventListener('visibilitychange', () => {
-    // The UA releases wake locks on hide; re-acquire when we come back.
-    if (on && document.visibilityState === 'visible') void apply(true)
-  })
-}
-
-/** The keep-awake control and the sentence under it, as sheet rows. */
+/** The keep-awake control and the sentence under it, as sheet rows. Both
+ *  serving roles need it — a helper stage especially, since it is a background
+ *  tab for its whole life. It is a `.cs-chat-tool` toggle rather than a
+ *  checkbox, so it wears the scene's own control chrome and lights with
+ *  `.cs-tool-live` when it is on, the way the entrance's ⟁ Room tool does.
+ *  The wiring and the sentence are keep-awake.ts's; only the rows are here. */
 function keepAwakeRows(i: number): string {
   return `
     <button type="button" class="cs-chat-tool sw-row" style="--i:${i}" id="awake" aria-pressed="false">⟁ Keep this tab awake</button>
-    <p class="sw-note sw-row" style="--i:${i + 1}">Screen wake-lock plus a silent audio track, so the browser throttles
-      generation and weight serving less while this tab is in the background. The tab shows its audio indicator.</p>`
+    <p class="sw-note sw-row" style="--i:${i + 1}">${KEEP_AWAKE_NOTE}</p>`
+}
+
+/** The `#awake` row this page just wrote, handed to the shared wiring. */
+function wireKeepAwakeRow(): void {
+  wireKeepAwake(document.getElementById('awake'))
 }
 
 // ============================================================
@@ -508,7 +494,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   paintCharacter(root, baseSpec, brand.name, stageLine || brand.params)
   selectFx(root)
   void mountFigure(root, baseSpec, true)
-  wireKeepAwake()
+  wireKeepAwakeRow()
 
   // Before the gate, not after it. Without this a Firefox or old-Safari
   // visitor was shown "Download & host →" for a download whose engine could
@@ -747,7 +733,7 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
   paintCharacter(root, baseSpec, brand.name, layersLine)
   selectFx(root)
   void mountFigure(root, baseSpec, true)
-  wireKeepAwake()
+  wireKeepAwakeRow()
 
   // ONE arc on the ring — this machine's place in the chain the swarm builder
   // drew. Lit when the host accepts the stage, which is the only moment this
