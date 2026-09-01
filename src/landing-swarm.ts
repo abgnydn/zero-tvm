@@ -51,7 +51,7 @@ export interface SwarmOptions {
   /** Host the FIRST stage in this tab. The first machine is this machine, so
    *  it has no business being a URL — the entrance boots the stage in place
    *  and the room strip carries the link for the next one. */
-  onHostHere: (range: { start: number; end: number }, ctx: number) => void
+  onHostHere: (bounds: readonly number[], index: number, ctx: number) => void
 }
 
 export interface SwarmHandle {
@@ -249,6 +249,9 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
    *  describe a different number of stages. */
   let cuts: number[] | null = null
 
+  /** Stage boundaries from the last paint, [0, …cuts, layers]. */
+  let lastBounds: number[] = []
+
   /** Context for the whole room. Starts at the spec's own default; the field
    *  lets it come down for a machine that cannot afford the KV. */
   let ctx: number = spec.maxContext
@@ -274,6 +277,11 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
       // ctxFor). A number in the link cannot drift; a default can.
       ctx,
     })
+    // The room strip needs the WHOLE split, not just this machine's slice —
+    // it writes a link per stage once the room exists. The serving stops carry
+    // it: their starts plus the last one's end are the bounds.
+    lastBounds = [...stops.filter((x) => x.range).map((x) => x.range!.start),
+                  spec.layers]
     el('.sw-host').innerHTML = stopRow(stops[0], 0, true)
     el('.sw-rest').innerHTML = stops.slice(1)
       .map((s, i) => stopRow(s, i + 1, i === 0 || s.role === 'guest')).join('')
@@ -323,10 +331,7 @@ export function mountSwarm(o: SwarmOptions): SwarmHandle {
     }
     const here = t.closest<HTMLElement>('.sw-here')
     if (here) {
-      o.onHostHere(
-        { start: Number(here.dataset.start), end: Number(here.dataset.end) },
-        ctx,
-      )
+      o.onHostHere(lastBounds, 0, ctx)
       return
     }
     if (t.closest('.sw-exit')) o.onExit()

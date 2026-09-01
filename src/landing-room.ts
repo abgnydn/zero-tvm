@@ -24,6 +24,7 @@ import { mountMascot } from './mascot.js'
 import { modelBranding } from './zero-tvm/model-registry.js'
 import { buildChatPromptFor } from './zero-tvm/model-select.js'
 import { hostRoom, type RoomHandle } from './zero-tvm/room-host.js'
+import { swarmUrls } from './zero-tvm/room-url.js'
 import { recordFeat } from './feats.js'
 
 export interface RoomToolOptions {
@@ -45,6 +46,9 @@ export interface RoomToolOptions {
   /** This tab holds only these layers — the room serves a STAGE, and the
    *  helper links it writes start where this one ends. */
   stageRange?: { start: number; end: number }
+  /** The split this stage belongs to — bounds, which stage, the room context.
+   *  Present exactly when the entrance opened a room for a SPLIT. */
+  split?: { bounds: number[]; index: number; ctx: number }
 }
 
 export function mountRoomTool(o: RoomToolOptions): void {
@@ -77,6 +81,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
         <button type="button" class="cs-chat-tool" id="room-copy">Copy</button>
         <button type="button" class="cs-chat-tool" id="room-close">Close room</button>
       </div>
+      <div class="cs-room-split" id="room-split" hidden></div>
       <div class="cs-room-members" id="room-members" aria-live="polite">waiting for guests…</div>
       <ul class="cs-room-log" id="room-log" role="log" aria-live="polite" aria-label="Guest requests"></ul>
     </div>`
@@ -118,6 +123,60 @@ export function mountRoomTool(o: RoomToolOptions): void {
   btn.addEventListener('click', () => {
     strip.hidden = !strip.hidden
     btn.setAttribute('aria-expanded', String(!strip.hidden))
+  })
+
+  /**
+   * The split, as it stands, inside the room. The Split panel could not write
+   * these links — it had no room id yet, which is why it asked you to open the
+   * host in another tab and paste the link back. Hosting here means the id
+   * exists the moment the room does, so every other machine's link can simply
+   * be shown. Ranges come from the same swarmUrls the panel used, so the two
+   * surfaces cannot disagree about who holds what.
+   */
+  function paintSplit(roomId: string): void {
+    const sp = o.split
+    const box = $('#room-split')
+    if (!sp || sp.bounds.length < 3) return
+    const machines = sp.bounds.length - 1
+    const stops = swarmUrls({
+      origin: location.origin,
+      param: o.param,
+      layers: o.spec.layers,
+      machines,
+      room: roomId,
+      ctx: sp.ctx,
+      cuts: sp.bounds.slice(1, -1),
+    })
+    const rows = stops.map((st, i) => {
+      const mine = st.role !== 'guest' && i === sp.index
+      const who = st.role === 'guest' ? 'Anyone else' : `Machine ${i + 1}`
+      const range = st.range ? ` · layers ${st.range.start}–${st.range.end}` : ''
+      const link = mine
+        ? `<span class="cs-split-mine">running in this tab</span>`
+        : `<input readonly value="${st.url ?? ''}" aria-label="${who} link">
+           <button type="button" class="cs-chat-tool cs-split-copy">Copy</button>`
+      return `<div class="cs-split-row${mine ? ' is-mine' : ''}">
+        <div class="cs-split-who"><b>${who}</b><i>${st.role}${range}</i></div>
+        <div class="cs-split-link">${link}</div>
+      </div>`
+    }).join('')
+    box.innerHTML = `
+      <div class="cs-split-head">Split across ${machines} machines · ${sp.ctx} tokens each</div>
+      ${rows}
+      <p class="cs-split-note">Changing the split means re-holding different
+        layers, so it reopens the room. Close this one first.</p>`
+    box.hidden = false
+  }
+
+  // Copy on any stage link, same behaviour as the room link's own button.
+  strip.addEventListener('click', (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>('.cs-split-copy')
+    if (!b) return
+    const input = b.parentElement?.querySelector('input')
+    if (!input) return
+    void navigator.clipboard.writeText(input.value)
+    b.textContent = 'Copied'
+    setTimeout(() => { b.textContent = 'Copy' }, 1200)
   })
 
   $('#room-open').addEventListener('click', () => {
@@ -162,6 +221,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
       },
     })
     ;($('#room-link') as unknown as HTMLInputElement).value = room.link
+    paintSplit(room.roomId)
     $('.cs-room-consent').hidden = true
     $('.cs-room-live').hidden = false
     btn.classList.add('cs-tool-live')

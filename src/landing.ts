@@ -644,7 +644,7 @@ function render(): void {
       // already set up to do; the other stages are other machines and still
       // need a URL. Booting here also removes the paste-the-room-link step:
       // the room strip writes the helper link once the stage is live.
-      onHostHere: (range, ctxTokens) => {
+      onHostHere: (bounds, index, ctxTokens) => {
         exitSwarm()
         void import('./landing-chat.js').then(({ enterChat }) => enterChat({
           root,
@@ -654,7 +654,11 @@ function render(): void {
           poolLabel: '',
           ctxTokens: ctxTokens !== v.spec.maxContext ? ctxTokens : 0,
           openRoom: true,
-          layerRange: range,
+          layerRange: { start: bounds[index], end: bounds[index + 1] },
+          // The room strip writes a link per stage, so it needs the whole
+          // split — this machine's slice alone cannot say where the others
+          // begin, and with moved cuts it cannot even be inferred.
+          split: { bounds: [...bounds], index, ctx: ctxTokens },
           mascot,
         })).catch((err) => console.error('[landing] hosting a stage here failed:', err))
       },
@@ -806,37 +810,7 @@ function render(): void {
     const mode = modes[mi] ?? modes[0]
     const cxs = ctxModesOf(v.spec)
     const cx = cxs[xi] ?? cxs[0]
-    // The build strip the chat panel paints. The entrance resolves it, because
-    // the entrance is what knows the roster, the context ladder and the pool
-    // modes; the panel only draws chips. Each chip is the URL that re-enters
-    // on that build — the same ?model=/?ctx=/?pool=/?chat=1 this file reads on
-    // boot, so the way out and the way back in are one grammar.
-    const buildHref = (param: string, tokens: number, slots: number): string => {
-      const q = new URLSearchParams()
-      q.set('model', param)
-      if (tokens) q.set('ctx', String(tokens))
-      if (slots) q.set('pool', String(slots))
-      q.set('chat', '1')
-      if (openRoom) q.set('room', '1')
-      return `/?${q.toString()}`
-    }
-    const builds = {
-      // Quantisation belongs to the character, and the two builds belong to a
-      // quantisation — so switching it drops them rather than carrying numbers
-      // that may not exist on the other checkpoint.
-      quant: GROUPS[gi].variants.map((x, j) => ({
-        label: x.label, href: buildHref(x.param, 0, 0), on: j === vi,
-      })),
-      ctx: cxs.map((c, j) => ({
-        label: `${c.name} · ${ctxLabel(c.tokens)}`,
-        href: buildHref(v.param, c.tokens, mode?.slots ?? 0), on: j === xi,
-      })),
-      pool: modes.map((m, j) => ({
-        label: m.label, href: buildHref(v.param, cx.tokens, m.slots), on: j === mi,
-      })),
-    }
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
-      builds,
       root,
       spec: v.spec,
       param: v.param,

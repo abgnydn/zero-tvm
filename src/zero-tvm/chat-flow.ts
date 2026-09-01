@@ -171,6 +171,14 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
         fused,
         int8KV,
         spec: s,
+        // The range has to reach the ENGINE, not just the loader. Passing it
+        // to bootEngine alone made the loader fetch one stage's layers while
+        // buildDecodeEngine still composed the whole model, so the tail's
+        // pipelines bound weights that were never loaded:
+        //   Error: bg: null buffer at binding 2 of pipeline 'add_norm'
+        // share.ts always passed it in both places; this path did not, because
+        // until the entrance could host a stage it never had a range to pass.
+        ...(opts.layerRange ? { layerRange: opts.layerRange } : {}),
         ...(poolSlots ? { expertPool: poolSlots } : {}),
         prefixReuse: q.get('reuse') !== '0',
         chunkedPrefill: q.get('chunk') !== '0',
@@ -189,6 +197,16 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
     // first chat message streams at steady-state speed. The KV slots it writes
     // are overwritten by the first real turn's prefill (chat prefills from 0).
     warmup: async (engine, tokenizer, log) => {
+      // A STAGE cannot run this warmup at all: generatePipelined is a
+      // whole-model loop and the engine refuses it ("this engine is one
+      // pipeline stage — drive it with pipelineStep"). One pipelineStep at
+      // position 0 JITs the same shaders, and the real prefill overwrites
+      // position 0 anyway — the same warmup share.ts uses for its stages.
+      if (opts.layerRange) {
+        log?.(`Warming up stage ${opts.layerRange.start}–${opts.layerRange.end}…`)
+        await engine.pipelineStep({ tokenId: 1 }, 0)
+        return
+      }
       // One forward pass warms every pipeline — all layers dispatch the same
       // ones. The full-prompt warmup is a POLISH step (first message streams at
       // steady state) and it costs promptLen per-token passes, because chunked

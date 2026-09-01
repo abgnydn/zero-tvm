@@ -1456,25 +1456,35 @@ footer li a:hover { color: var(--accent); }
 
 /* ══ THE ROOM ══ Hosting from inside the game: the strip in the panel, and
    one small mascot per connected guest flanking the character. */
-/* The build strip: the entrance sheet's three choices, in the chat panel.
-   Same padding and rule as .cs-room below, because it is the same kind of
-   thing — a tool drawer under the head. */
-.cs-build { padding: 10px 14px 12px; border-bottom: 1px solid #ffffff0f; }
-.cs-build-row {
-  display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;
+/* The split, inside the room. Same register as the Split panel's stop rows,
+   at the room strip's own scale. */
+.cs-room-split { margin: 10px 0 4px; }
+.cs-split-head {
+  font-family: var(--mono); font-size: 0.58rem; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--dim); margin-bottom: 7px;
 }
-.cs-build-chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
-.cs-build-label {
-  flex: 0 0 84px; font-family: var(--mono); font-size: 0.58rem;
-  letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim);
+.cs-split-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 0; border-top: 1px solid #ffffff0d;
 }
-.cs-build .mb-variant { text-decoration: none; }
-.cs-build-note {
-  margin: 6px 0 0; font-size: 0.68rem; line-height: 1.5; color: var(--dim);
+.cs-split-row.is-mine { color: var(--cs-accent, var(--accent)); }
+.cs-split-who { display: flex; flex-direction: column; gap: 1px; flex: 0 0 148px; }
+.cs-split-who b { font-size: 0.78rem; font-weight: 600; }
+.cs-split-who i {
+  font-style: normal; font-family: var(--mono); font-size: 0.56rem;
+  letter-spacing: 0.09em; text-transform: uppercase; color: var(--dim);
 }
-@media (max-width: 900px) {
-  .cs-build-label { flex: 1 0 100%; }
+.cs-split-link { display: flex; gap: 6px; align-items: center; flex: 1 1 240px; min-width: 0; }
+.cs-split-link input {
+  flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 0.62rem;
+  padding: 5px 8px; border-radius: 3px; color: var(--text);
+  border: 1px solid #ffffff1c; background: #ffffff07;
 }
+.cs-split-mine {
+  font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.cs-split-note { margin: 8px 0 0; font-size: 0.66rem; line-height: 1.5; color: var(--dim); }
 
 .cs-room { padding: 12px 14px; border-bottom: 1px solid #ffffff0f; }
 .cs-room-consent p { font-size: 0.76rem; line-height: 1.55; color: var(--text-dim, #a9b3c6);
