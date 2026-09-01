@@ -11,14 +11,21 @@
 // from running specFromSearch on anything but the input under test.
 
 import { describe, expect, it } from 'vitest'
-// Through the registry, not model-select — the latter imports weight-loader,
-// which reads GPUBufferUsage at module scope and cannot load under Node.
-import { specForParam, specWithCtx } from '../../src/zero-tvm/model-registry.ts'
+// THE SHIPPED FUNCTION, not a copy of it. This file used to re-declare
+// specFromSearch locally — "through the registry, not model-select, because
+// the latter imports weight-loader, which reads GPUBufferUsage at module
+// scope and cannot load under Node". That stopped being true when
+// weight-loader made the read LAZY (see the `usage()` comment there), and the
+// copy outlived the reason for it: model-select grew a ctxFor round-trip that
+// shrank the default spec, and every assertion below still passed, because
+// they were being run against the local copy of the OLD formula. Right
+// assertions, wrong subject — docs/VERIFICATION.md's second family. Import it.
+import { specFromSearch } from '../../src/zero-tvm/model-select.ts'
+import { SHIPPED_MODELS } from '../../src/zero-tvm/model-registry.ts'
 
-const specFromSearch = (search: string) => {
-  const q = new URLSearchParams(search)
-  return specWithCtx(specForParam(q.get('model')), Number(q.get('ctx')))
-}
+/** `?model=` for a registry entry — '' is a real param (Phi-3), so a link to
+ *  the default carries no query at all. */
+const search = (param: string): string => (param ? `?model=${param}` : '')
 
 describe('?ctx= override', () => {
   it('is absent → the compiled spec, byte-for-byte the same object', () => {
@@ -28,6 +35,39 @@ describe('?ctx= override', () => {
     expect(a.maxContext).toBe(32768)
     expect(b).toBe(a)          // no rebuild on a nonsense value
     expect(c).toBe(a)
+  })
+
+  it('is absent → EVERY shipped spec is the object the registry holds', () => {
+    // The sweep, not one sample: the only spec this can bite is one whose
+    // maxContext exceeds its maxSeq, and there is exactly one of those today.
+    // A sample that happened to miss it is how the shrink below shipped.
+    for (const { param, spec } of SHIPPED_MODELS) {
+      expect(specFromSearch(search(param)), param || '(default)').toBe(spec)
+    }
+  })
+
+  it('the DEFAULT model keeps its 257th KV page — pages round UP, past maxSeq', () => {
+    // Phi-3 is the one spec where maxContext (4112) is ABOVE maxSeq (4096):
+    // 4096 tokens need ceil(4096/16) = 256 pages... but the compiled budget is
+    // 257, and 257 × 16 = 4112. scripts/station.mjs states the rule this pins
+    // — "KV pages round UP, so Phi-3's table holds 4112 tokens against a
+    // 4096-token trained window, and a naive clamp to maxSeq would SHRINK the
+    // shipped default". Routing the no-flag default through the maxSeq clamp
+    // is that naive clamp, and it cost the default model on zero-tvm.html and
+    // validate.html one page without a word.
+    const s = specFromSearch('')
+    expect(s.id).toBe('phi3-mini')
+    expect(s.maxPages).toBe(257)
+    expect(s.maxContext).toBe(4112)
+  })
+
+  it('an EXPLICIT ctx is clamped even when it names the spec default', () => {
+    // The two paths are genuinely different, and this is the pair that proves
+    // it: not asking is not the same as asking for the number you already
+    // have. An explicit budget is a request to re-size, and re-sizing clamps
+    // to the trained window.
+    expect(specFromSearch('?ctx=4112').maxPages).toBe(256)
+    expect(specFromSearch('').maxPages).toBe(257)
   })
 
   it('raises qwen35 to its native window: 262,144 tokens, 8 GiB of KV', () => {
