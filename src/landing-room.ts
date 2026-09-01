@@ -51,6 +51,42 @@ export interface RoomToolOptions {
   split?: { bounds: number[]; index: number; ctx: number }
 }
 
+/* CONSENT:BEGIN — one paragraph, two files: src/landing-room.ts (the entrance's
+   ⟁ Room tool) and src/zero-tvm/share.ts (share.html's host role). They cannot
+   share one import: share.html's guest needs no WebGPU and downloads nothing,
+   while landing-room.ts reaches model-select → weight-loader. So this block is
+   kept BYTE-IDENTICAL in both files and tests/unit/stage-honesty.test.ts
+   compares them. Edit both. */
+/**
+ * What opening a room actually commits this machine to.
+ *
+ * The whole-model paragraph was written when a serving tab could only hold the
+ * whole model, and all three of its promises are false under a split: a stage's
+ * tab does not run the reply (room-chain.ts's stepAll runs this tab's layers and
+ * then awaits every downstream stage on OTHER machines), and a guest copying
+ * weights from a stage host gets one layer range rather than a model it can run
+ * (loadWeights writes only that range into the model's OPFS dir, and
+ * peer-weights.ts streams that dir as it stands). So the copy branches.
+ */
+export function roomConsentCopy(
+  name: string,
+  stage: { start: number; end: number } | null,
+  layers: number,
+): string {
+  if (stage) {
+    return `Open a room and whoever has the link chats with <b>${name}</b>, split across the `
+      + `machines in this room. This tab holds layers ${stage.start}–${stage.end} of ${layers}: `
+      + 'every guest token runs its share on your GPU and the rest on the other machines. '
+      + 'Every request is listed here as it arrives. Weights copied from this tab are those '
+      + 'layers only, not a model that runs on its own. Keep this tab in the foreground while serving.'
+  }
+  return `Open a room and whoever has the link chats with <b>${name}</b> running on `
+    + 'THIS machine. Their prompts run on your GPU; every request is listed here as it '
+    + "arrives. Guests can also copy the model's cached weights from this machine to "
+    + 'run it locally. Keep this tab in the foreground while serving.'
+}
+/* CONSENT:END */
+
 export function mountRoomTool(o: RoomToolOptions): void {
   const head = o.panel.querySelector('.cs-chat-head')
   if (!head) return
@@ -69,10 +105,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
   strip.hidden = !o.openStrip
   strip.innerHTML = `
     <div class="cs-room-consent">
-      <p>Open a room and whoever has the link chats with <b>${brand.name}</b> running on
-      THIS machine. Their prompts run on your GPU; every request is listed here as it
-      arrives. Guests can also copy the model's cached weights from this machine to
-      run it locally. Keep this tab in the foreground while serving.</p>
+      <p>${roomConsentCopy(brand.name, o.stageRange ?? null, o.spec.layers)}</p>
       <div class="cs-room-plan" id="room-plan"></div>
       <button type="button" class="cs-chat-tool" id="room-open">Open room →</button>
     </div>

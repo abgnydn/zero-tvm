@@ -359,6 +359,12 @@
       padding: 0.5rem 0.5rem 0.5rem 0.9rem;
       transition: border-color 0.15s, background 0.15s;
     }
+    /* A class `display` beats the UA's `[hidden] { display: none }`, so setting
+       the attribute did nothing here: a tab serving one stage of a split holds
+       no chat of its own and hides the composer, and rendered a greyed but fully
+       laid-out one anyway (782x53, checkVisibility() true — measured 2026-09-01).
+       Same guard `.composer-btn[hidden]` already carries one class over. */
+    .composer[hidden] { display: none; }
     /* border-color used to restate the UNFOCUSED border — a focus style that
        cancelled itself, leaving a 1.07:1 background shift as the only cue on
        the product's main control. The accent is the ring every other control
