@@ -20,6 +20,16 @@
 //     holding a stage, names the range, and drops the two promises that are
 //     false under a split — and the entrance's copy and share.html's copy stay
 //     byte-identical, since they are two generators of one fact.
+//   - …and the CALL SITES, which are the half a source comparison cannot see.
+//     Both of them sit OUTSIDE the delimited block, so passing a constant where
+//     the surface's own stage belongs renders the whole-model promises to a
+//     stage host with both blocks untouched. Measured: share.ts's `stageRange`
+//     argument replaced by `null` left this file 13/13 and the suite 909/909
+//     while share.html told a `?layers=0-8` host that the model runs "on THIS
+//     machine" and that guests "can copy the weights to run it locally". So
+//     each surface's own call-site expression is EVALUATED here, against that
+//     surface's own copy of the generator, and the rendered paragraph is what
+//     is asserted.
 //   - The composer's `hidden` is a CSS specificity bug, so the gate is over the
 //     stylesheet: anything this repo hides with the attribute needs a [hidden]
 //     rule, because a class `display` beats the UA sheet.
@@ -43,6 +53,100 @@ const read = (rel: string): string => readFileSync(join(ROOT, rel), 'utf8')
 const SPEC = QWEN3_8_27B_4BIT
 const BRAND = modelBranding(SPEC)
 const STAGE = { start: 0, end: 8 }
+
+type Stage = { start: number; end: number } | null
+type Consent = (name: string, stage: Stage, layers: number) => string
+
+/** A name no branch treats specially, and the layer count both branches count
+ *  against. Rendering is compared against roomConsentCopy on the same three. */
+const NAME = 'NAME'
+const LAYERS = SPEC.layers
+/** The sentence the stale-copy check anchors on. Named so the test can say
+ *  which phrase went missing instead of silently checking nothing. */
+const ANCHOR = 'Keep this tab'
+
+const SURFACE_FILES = [
+  ['the entrance', 'src/landing-room.ts'],
+  ['share.html', 'src/zero-tvm/share.ts'],
+] as const
+
+/**
+ * A file's OWN copy of the generator, pulled out of its source and made
+ * runnable. share.ts cannot be imported here — its module body dispatches
+ * straight into runHost/runGuest and touches `location` and `document` — so
+ * the only way to RUN what that file actually ships is to lift the function
+ * out of it. The block delimiters are not used: this matches the declaration
+ * itself, so a copy that drifted out of the block would still be the one run.
+ */
+function generatorFrom(rel: string): Consent {
+  const m = /export function roomConsentCopy\s*\([^)]*\)\s*:\s*string\s*\{([\s\S]*?)\n\}/
+    .exec(read(rel))
+  expect(m, `${rel} has no roomConsentCopy declaration to run`).not.toBeNull()
+  return new Function('name', 'stage', 'layers', (m as RegExpExecArray)[1]) as Consent
+}
+
+/**
+ * WHERE THE PARAGRAPH IS RENDERED, and the locals each call site reads. A
+ * call site lives inside a markup template and has no other scope, so the
+ * locals are bound by name here. A rename makes this ReferenceError — bind
+ * the new local, do not drop the surface.
+ */
+const SURFACES: Array<{
+  what: string
+  rel: string
+  locals: (stage: Stage) => Record<string, unknown>
+}> = [
+  {
+    what: "share.html's host sheet",
+    rel: 'src/zero-tvm/share.ts',
+    // runHost(existingRoom, stageRange) builds the sheet from these.
+    locals: (stage) => ({
+      brand: { name: NAME },
+      baseSpec: { layers: LAYERS },
+      stageRange: stage,
+    }),
+  },
+  {
+    what: "the entrance's ⟁ Room strip",
+    rel: 'src/landing-room.ts',
+    // mountRoomTool(o) builds strip.innerHTML from these.
+    locals: (stage) => ({
+      brand: { name: NAME },
+      o: { spec: { layers: LAYERS }, stageRange: stage ?? undefined },
+    }),
+  },
+]
+
+/** Every `roomConsentCopy(…)` a file CALLS. The declaration is not a call, and
+ *  neither argument list contains a parenthesis, so balanced counting is
+ *  enough to take the whole expression back out of the template. */
+function callSites(src: string): string[] {
+  const out: string[] = []
+  for (const m of src.matchAll(/roomConsentCopy\(/g)) {
+    if (/function\s+$/.test(src.slice(0, m.index))) continue
+    let depth = 0
+    let i = m.index + m[0].length - 1
+    for (; i < src.length; i++) {
+      if (src[i] === '(') depth++
+      else if (src[i] === ')' && --depth === 0) break
+    }
+    expect(depth, `unbalanced roomConsentCopy( in ${src.slice(m.index, m.index + 60)}`).toBe(0)
+    out.push(src.slice(m.index, i + 1))
+  }
+  return out
+}
+
+/** The paragraph a surface renders when it holds `stage` — its own call-site
+ *  expression, run against its own copy of the generator. */
+function renderedAt(s: (typeof SURFACES)[number], stage: Stage): string {
+  const calls = callSites(read(s.rel))
+  expect(calls.length, `${s.rel} renders the paragraph in ${calls.length} places, not 1 — `
+    + 'a new call site needs its own locals above').toBe(1)
+  const locals = s.locals(stage)
+  const names = Object.keys(locals)
+  const run = new Function(...names, 'roomConsentCopy', `return (${calls[0]})`)
+  return run(...names.map((k) => locals[k]), generatorFrom(s.rel)) as string
+}
 
 describe('a stage does not quote the whole checkpoint', () => {
   // The premise. If the registry ever stops giving this model a size label and
@@ -122,14 +226,63 @@ describe('the entrance and share.html host the same room', () => {
   it('and the block really is the code that renders — not a stale copy', () => {
     // Two identical blocks that no longer hold the live function would compare
     // equal to each other and prove nothing. The phrases are taken FROM the
-    // output, so they cannot go stale the way a typed-in expectation would.
+    // output, so they cannot go stale the way a typed-in expectation would —
+    // PROVIDED the phrase is found. `lastIndexOf` returns -1 when it is not,
+    // `slice(-1)` returns ".", and the assertion silently degrades to
+    // `toContain('.')`: deleting this sentence from both copies left the file
+    // 13/13 green with the anchor gone. So the index is checked before it is
+    // used, which is the shape, not just this instance.
     const b = block('src/landing-room.ts')
     expect(b).toContain('export function roomConsentCopy')
     for (const stage of [null, STAGE]) {
-      const out = roomConsentCopy('NAME', stage, SPEC.layers)
-      expect(b).toContain(out.slice(out.lastIndexOf('Keep this tab')))
+      const out = roomConsentCopy(NAME, stage, LAYERS)
+      const at = out.lastIndexOf(ANCHOR)
+      expect(at, `the live copy no longer ends with "${ANCHOR}" — re-anchor this`)
+        .toBeGreaterThanOrEqual(0)
+      expect(b).toContain(out.slice(at))
     }
   })
+
+  // The two blocks, EXECUTED. Byte-equality above says the source text matches;
+  // this says the two generators return one string for a stage and one for a
+  // whole model, and that both are the live function this file imports. It is
+  // what the surfaces below are then rendered against.
+  for (const [what, rel] of SURFACE_FILES) {
+    it(`${what}'s own copy of the generator returns the live paragraph`, () => {
+      const own = generatorFrom(rel)
+      for (const stage of [null, STAGE]) {
+        expect(own(NAME, stage, LAYERS)).toBe(roomConsentCopy(NAME, stage, LAYERS))
+      }
+    })
+  }
+})
+
+describe('a surface that holds a stage renders the stage paragraph', () => {
+  // THE HALF NO SOURCE COMPARISON CAN SEE. Both call sites are outside the
+  // CONSENT delimiters, so the block gate above is blind to what they pass:
+  // share.ts's `stageRange` argument replaced by `null` left every assertion in
+  // this file green while share.html told a `?layers=0-8` stage host that the
+  // model runs on THIS machine and that guests can copy the weights and run it
+  // locally — the exact three sentences the branch exists to remove.
+  //
+  // So the surface's own expression is evaluated, with that surface's own copy
+  // of the generator, and the RENDERED paragraph is asserted. A constant where
+  // the stage belongs renders the wrong branch and fails here.
+  for (const s of SURFACES) {
+    it(`${s.what} renders the whole-model paragraph when it holds everything`, () => {
+      expect(renderedAt(s, null)).toBe(roomConsentCopy(NAME, null, LAYERS))
+    })
+
+    it(`${s.what} renders the stage paragraph when it holds layers ${STAGE.start}–${STAGE.end}`, () => {
+      const out = renderedAt(s, STAGE)
+      expect(out, `${s.what} tells a stage host the model runs on THIS machine`)
+        .not.toContain('THIS machine')
+      expect(out, `${s.what} offers a stage host's cache as a model a guest can run`)
+        .not.toContain('run it locally')
+      expect(out).toContain(`layers ${STAGE.start}–${STAGE.end} of ${LAYERS}`)
+      expect(out).toBe(roomConsentCopy(NAME, STAGE, LAYERS))
+    })
+  }
 })
 
 describe('an element hidden with the attribute is actually hidden', () => {
@@ -177,7 +330,12 @@ describe('an element hidden with the attribute is actually hidden', () => {
         // Strip every attribute VALUE first, so class="hidden" is not read as
         // the attribute (chat-ui.ts uses a `hidden` CLASS for the welcome box).
         const bare = tag.replace(/=\s*"[^"]*"/g, '=""').replace(/=\s*'[^']*'/g, "=''")
-        if (/\bhidden\b/.test(bare.slice(bare.indexOf(' ')))) for (const c of names) out.add(c)
+        // The attribute list starts after the tag NAME. Guarded, not sliced on
+        // the raw index: `<div>` has no space, indexOf returns -1, and
+        // slice(-1) is ">" — a tag whose attributes are separated by anything
+        // but a space would be dropped from the sweep in silence.
+        const attrs = /^<[a-zA-Z][\w-]*([\s\S]*)$/.exec(bare)?.[1]
+        if (attrs !== undefined && /\bhidden\b/.test(attrs)) for (const c of names) out.add(c)
       }
       // Runtime hides, per line: querySelector('#composer')…setAttribute('hidden').
       for (const line of src.split('\n')) {
@@ -191,15 +349,25 @@ describe('an element hidden with the attribute is actually hidden', () => {
 
   const all = rules()
   const hideable = hiddenClasses()
+  /** The classes this sweep actually has something to say about: hidden with
+   *  the attribute AND given a display by a class rule. */
+  const checked = [...hideable].sort()
+    .filter((cls) => all.some((r) => r.sel === `.${cls}` && r.display !== 'none'))
 
   it('found the composer — otherwise this test is scanning nothing', () => {
     expect(hideable.has('composer')).toBe(true)
     expect(hideable.has('composer-btn')).toBe(true)
+    // Same shape as the anchor above: the cases below are GENERATED, so a
+    // stylesheet that stopped parsing (moved file, changed comment syntax)
+    // would produce an empty `all`, skip every case, and leave this describe
+    // green with nothing in it. Both halves have to have found something.
+    expect(all.length, 'no display rule parsed out of chat-ui.css').toBeGreaterThan(0)
+    expect(checked, 'no hideable class has a class display — nothing is checked')
+      .toContain('composer')
   })
 
-  for (const cls of [...hiddenClasses()].sort()) {
+  for (const cls of checked) {
     const setters = all.filter((r) => r.sel === `.${cls}` && r.display !== 'none')
-    if (!setters.length) continue
     it(`.${cls} carries a [hidden] guard against its own display: ${setters[0].display}`, () => {
       const guard = all.find((r) => r.sel === `.${cls}[hidden]` && r.display === 'none')
       expect(guard, `.${cls} sets display but nothing restores display:none under [hidden]`)

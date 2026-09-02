@@ -31,7 +31,19 @@
  *    416.91px panel, leaving .chat-main 0px and pushing the composer 83px out
  *    of the panel's bottom edge. share.html's guest panel carries the same
  *    component in the same place, boots nothing to render it, and so is where
- *    the rule can be pinned honestly.
+ *    the rule can be pinned cheaply.
+ *
+ *    But share.html's strip is the SHORT case — the weight-copy offer is two
+ *    elements, 61px at 360x740 against a 181.71px body row, so it never asks
+ *    the rule for anything. The half the rule was written for is a strip
+ *    TALLER than the cell it sits in, and the fix has two clauses for it:
+ *    `max-height: 100%` and `overflow-y: auto`. Dropping the clamp leaves
+ *    share.html's numbers byte-identical and every assertion above green
+ *    (measured), while the entrance's four-machine plan grows to 372.27px in
+ *    a 249.05px row and hangs 15.98px past the panel's bottom edge, over the
+ *    composer. So the tall case is rendered too: mountRoomTool driven
+ *    directly, the way landing-chat.ts drives it after a boot, which needs no
+ *    engine, no tokenizer and no weights.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
@@ -145,6 +157,136 @@ describe('a room strip costs the conversation nothing on a phone', () => {
           .toBeCloseTo(m.hiddenH, 1)
         expect(m.composerBottom, 'the composer left the panel')
           .toBeLessThanOrEqual(m.panelBottom + 1)
+      } finally {
+        await page.close()
+      }
+    }, 60_000)
+  }
+})
+
+describe("...and the entrance's own strip is the one that is too tall", () => {
+  // The case above is short enough to fit whatever it is given, so it asks the
+  // phone rule for nothing. This one does not fit: consent paragraph + four
+  // machine-count chips + plan line is 371px of content in a 249.05px body row
+  // at 360x740 — the shape that broke, measured at 333.48px for the entrance's
+  // plain plan and 371.14px for a four-machine split against a 416.91px panel.
+  //
+  // mountRoomTool is called the way landing-chat.ts calls it once the engine is
+  // live. Everything the strip needs to RENDER is the spec and the split;
+  // engine, tokenizer and lock are read only inside the "Open room →" handler,
+  // so a stub reaches the geometry without a weight ever being fetched.
+  //
+  // The HEIGHT is what makes these the tall case, so the pair above's 844 is
+  // not reused: at 390x844 the strip measures 353px against a 352.97px row —
+  // a tie, and a test that passed on 0.03px of margin would be claiming
+  // coverage it does not have. At 740 the same panel gives the conversation
+  // ~249px against the same content. Measured, all four:
+  //   390x844 -> 353 in 352.97   390x740 -> 353 in 248.97
+  //   360x740 -> 371 in 249.05   360x640 -> 371 in 149.05
+  for (const [w, h] of [[390, 740], [360, 740]] as const) {
+    test(`${w}x${h}: a four-machine plan scrolls inside the body row`, async () => {
+      const page = await sized('/', w, h)
+      try {
+        await page.waitForSelector('#model-browser', { timeout: 20_000 })
+        const m = await page.evaluate(async () => {
+          // These are dev-server URLs the page resolves, not modules this test
+          // file can resolve at compile time. Built with the Function
+          // constructor because vitest transforms a literal `import()` in this
+          // callback into `__vite_ssr_dynamic_import__`, which does not exist
+          // in the browser — a string body is passed through untouched.
+          const load = new Function('p', 'return import(p)') as
+            (p: string) => Promise<Record<string, unknown>>
+          const { panelMarkup } = await load('/src/landing-chat.ts') as unknown as {
+            panelMarkup: (s: unknown, b: unknown, l: string, r?: unknown) => string
+          }
+          const { specForParam, modelBranding } =
+            await load('/src/zero-tvm/model-registry.ts') as unknown as {
+              specForParam: (p: string) => { layers: number }
+              modelBranding: (s: unknown) => { params: string }
+            }
+          const { splitBounds } = await load('/src/zero-tvm/room-url.ts') as unknown as {
+            splitBounds: (layers: number, machines: number) => number[]
+          }
+          const { mountRoomTool } = await load('/src/landing-room.ts') as unknown as {
+            mountRoomTool: (o: Record<string, unknown>) => void
+          }
+
+          const root = document.getElementById('model-browser')
+          if (!root) return null
+          // qwen38 is an MLX checkpoint, so canSplitAcrossDevices() is true and
+          // paintPlan draws the whole 1/2/3/4-machine row. On an MLC spec that
+          // row is a single dead chip and this stops being the tall case.
+          const spec = specForParam('qwen38')
+          const brand = modelBranding(spec)
+          const bounds = splitBounds(spec.layers, 4)
+          const range = { start: bounds[0], end: bounds[1] }
+
+          const panel = document.createElement('section')
+          panel.className = 'cs-chat'
+          panel.innerHTML = panelMarkup(spec, brand, brand.params, range)
+          root.appendChild(panel)
+          root.classList.add('cs-chatting')
+          // enterChat marks the boot card done once the engine is ready. The
+          // cell the strip has to fit in is the one the conversation gets
+          // AFTER that, not the one left while the download is on screen.
+          panel.querySelector('.cs-boot')?.classList.add('cs-done')
+
+          mountRoomTool({
+            root, panel, spec, param: 'qwen38',
+            engine: null, tokenizer: null, mascot: null, lock: null,
+            poolSlots: 0, openStrip: true,
+            stageRange: range,
+            split: { bounds: [...bounds], index: 0, ctx: 4096 },
+          })
+
+          const strip = panel.querySelector<HTMLElement>('.cs-room')
+          const main = panel.querySelector('.chat-main')
+          const composer = panel.querySelector('.composer-wrap')
+          if (!strip || !main || !composer) return null
+          strip.hidden = true
+          const hiddenH = main.getBoundingClientRect().height
+          strip.hidden = false
+          const rect = strip.getBoundingClientRect()
+          const mainRect = main.getBoundingClientRect()
+          return {
+            chips: strip.querySelectorAll('.cs-room-plan .mb-variant').length,
+            hiddenH,
+            shownH: mainRect.height,
+            // What the strip WANTS, before the cell clamps it.
+            contentH: strip.scrollHeight,
+            stripH: rect.height,
+            stripBottom: rect.bottom,
+            // The strip shares the `body` grid area with .chat-main, so the
+            // conversation's box IS the cell the strip has to stay inside.
+            mainBottom: mainRect.bottom,
+            panelBottom: panel.getBoundingClientRect().bottom,
+            composerBottom: composer.getBoundingClientRect().bottom,
+          }
+        })
+        expect(m, 'the entrance panel or the room strip did not mount').not.toBeNull()
+        const s = m!
+        // THE PREMISE. Without both of these this is the short case again and
+        // the file is back to not covering the failure it was written for.
+        expect(s.chips, 'the plan drew no machine-count row').toBe(4)
+        // By a MARGIN, not by a pixel: the clamp is only under test while the
+        // content genuinely does not fit, and 390x844 sits within 0.03px of
+        // its row. A tie must read as "wrong viewport", not as a pass.
+        expect(s.contentH,
+          `the strip wants ${s.contentH}px in a ${s.shownH}px row — not the tall case`)
+          .toBeGreaterThan(s.shownH + 40)
+
+        expect(s.shownH, 'the strip took height from the conversation')
+          .toBeCloseTo(s.hiddenH, 1)
+        // Both clauses of the rule, and the body row is the bound that matters:
+        // a taller panel can absorb the overflow without the strip ever leaving
+        // it, and the composer would still be underneath a strip that covers
+        // the cell it was told to scroll inside.
+        expect(s.stripH, 'the strip is taller than the row it shares with the conversation')
+          .toBeLessThanOrEqual(s.shownH + 1)
+        expect(s.stripBottom, 'the strip spills out of the body row instead of scrolling inside it')
+          .toBeLessThanOrEqual(s.mainBottom + 1)
+        expect(s.composerBottom, 'the composer left the panel')
+          .toBeLessThanOrEqual(s.panelBottom + 1)
       } finally {
         await page.close()
       }
