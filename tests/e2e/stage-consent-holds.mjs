@@ -81,7 +81,6 @@ import puppeteer from 'puppeteer'
 //
 // That second one is why `--strictPort` is not the check, and why the guard
 // probes BOTH loopback families. The rest of the reasoning is in port-guard.ts.
-// (tests/e2e/probe-bound-and-head.mjs is still on the old `waitForUrl` shape.)
 import { requirePortFree, viteReady, waitForChild, watch } from './port-guard.ts'
 
 // Movable, because the guard turns "occupied" into a refusal and a harness that
