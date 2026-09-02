@@ -47,10 +47,39 @@ export function wireKeepAwake(btn: HTMLElement | null): void {
   let on = false
   let wakeLock: WakeLockSentinel | null = null
   let audioCtx: AudioContext | null = null
+  // WHAT THE BUTTON SAYS IS WHAT THE MACHINE IS DOING, and `apply` has an
+  // await in the middle of making that true. Each call takes the next
+  // generation; after the await, a generation that has moved means the state
+  // this work was requested for is gone. Then the sentinel it just took is
+  // handed back rather than installed, and no audio graph is built at all.
+  //
+  // Without this, two clicks in one tick interleave — the OFF branch runs to
+  // completion while both holds are still null, so both releases are no-ops,
+  // and the ON branch's await then installs a live sentinel and a running
+  // context underneath a control that already reads off. The screen stays
+  // awake, the tab stays exempt from throttling, and the audio indicator this
+  // file offers as its proof of honesty becomes the only true thing on screen.
+  //
+  // The alternative — serialising the toggles behind a queue — would make the
+  // button either lag the operator's clicks or appear to respond while doing
+  // nothing, and this control's whole job is to not lie about the machine.
+  // Comparing the resolved `want` against `on` is NOT enough either: on
+  // off→on→off→on the first request comes back to a state that matches it
+  // again, and installing it there leaks the sentinel the second one takes.
+  let generation = 0
   btn.setAttribute('aria-pressed', 'false')
   const apply = async (want: boolean): Promise<void> => {
+    const mine = ++generation
     if (want) {
-      try { wakeLock = await navigator.wakeLock.request('screen') } catch { /* unsupported / not visible */ }
+      let taken: WakeLockSentinel | null = null
+      try { taken = await navigator.wakeLock.request('screen') } catch { /* unsupported / not visible */ }
+      if (mine !== generation) {
+        // Nobody wants this any more — including the grant that arrived after
+        // the operator gave up on it.
+        void taken?.release().catch(() => {})
+        return
+      }
+      if (taken) wakeLock = taken
       if (!audioCtx) {
         audioCtx = new AudioContext()
         const osc = audioCtx.createOscillator()

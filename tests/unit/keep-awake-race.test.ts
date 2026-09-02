@@ -29,6 +29,23 @@
 // Both halves matter. "No sentinel held" alone would pass a version that leaks
 // a second sentinel while showing on; "exactly one" catches that too.
 //
+// Seen red before the fix, on the double-click alone (vitest, this file):
+//
+//     {
+//       "ariaPressed": "false",     <- the control says OFF
+//     -   "audioRunning": false,
+//     +   "audioRunning": true,     <- silent track still playing, indicator lit
+//       "lit": false,
+//     -   "sentinelsHeld": 0,
+//     +   "sentinelsHeld": 1,       <- one sentinel held forever
+//     -   "wakeReleases": 1,
+//     +   "wakeReleases": 0,
+//       "wakeRequests": 1,
+//     }
+//
+// 8 of the 15 failed there; the other 7 are the regression guards, which were
+// already green and had to stay that way.
+//
 // The stubs model the two browser APIs closely enough for the races to be real:
 // `wakeLock.request()` can be held pending and can reject with NotAllowedError
 // (which is what a hidden tab actually answers), the UA drops granted sentinels
