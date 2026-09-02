@@ -30,10 +30,13 @@
  * use, not a copy of it that could drift. The lines it is tested against are
  * byte-exact captures of real vite 6.4.1 and wrangler 4.105.0 output taken on
  * this machine, coloured and plain.
+ *
+ * A SECOND BLOCK, at the bottom of this file, covers the harnesses under
+ * tests/e2e — by enumerating the directory rather than by naming them.
  */
 
 import { describe, expect, it } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const ROOT = join(import.meta.dirname, '../..')
@@ -140,5 +143,94 @@ describe.each(HARNESSES)('%s', (rel) => {
     const other = matchersOf(rel, VITE_COLOUR_PORT + 1, WRANGLER_PLAIN_PORT + 1)
     expect(other.VITE_READY.test(other.plain(VITE_COLOUR)), "matched another vite's port").toBe(false)
     expect(other.SIGNAL_READY.test(other.plain(WRANGLER_PLAIN)), "matched another relay's port").toBe(false)
+  })
+})
+
+/**
+ * ── AND EVERY HARNESS UNDER tests/e2e, BY ENUMERATION ────────────────────
+ *
+ * The three above are a hardcoded list, and a hardcoded list is how this rule
+ * broke. The guard was written for scripts/ on 2026-08-25. Over the following
+ * days FOUR harnesses under tests/e2e were written or edited without it — each
+ * by someone who had just read the fix in a neighbouring file and did not
+ * carry it across. harness.ts, gate-holds.mjs and stage-consent-holds.mjs were
+ * fixed on 2026-09-02; probe-bound-and-head.mjs, the last of them, in the
+ * commit that adds this block. Nothing asserted any of it, so nothing noticed,
+ * four times running.
+ *
+ * So this block takes no list. It READS THE DIRECTORY, and every harness it
+ * finds has to import the one shared guard and call it before it spawns
+ * anything. A fifth harness added tomorrow is covered the moment the file
+ * lands, without anyone remembering to come back here.
+ *
+ * WHAT THIS IS AND IS NOT. It is a source-text check — a LINT-SHAPED RULE
+ * ABOUT FILE STRUCTURE. It proves the call is WRITTEN. It does not prove the
+ * guard RUNS, and it cannot: a file that imported `requirePortFree` and called
+ * it in some unreachable branch would satisfy these regexes. That is accepted
+ * deliberately, because structure is what drifted here — four files, none of
+ * which had the line at all. THE BEHAVIOURAL PROOF IS A DECOY RUN, not this
+ * test: a foreign HTTP server on the harness's port, on either loopback
+ * family, and the harness must refuse before spawning. The `4/4 passed` a
+ * pre-fix harness printed against such a stranger is recorded in
+ * tests/e2e/probe-bound-and-head.mjs's own header.
+ *
+ * Importing these files to check them properly is not on the table either:
+ * each one is a top-level script that spawns vite and a browser on import.
+ */
+
+/** Read off disk, never a list. `tests/e2e/*.mjs` is every standalone
+ *  certification harness; `harness.ts` is the vitest one, which the
+ *  `tests/e2e/*.test.ts` files share instead of spawning a server each — so
+ *  those are not harnesses and are not enumerated. port-guard.ts is the guard
+ *  itself, the subject OF the rule rather than a subject TO it, and is
+ *  excluded by name in case it is ever renamed into the glob. */
+const GUARD = 'tests/e2e/port-guard.ts'
+const E2E_HARNESSES = [
+  ...readdirSync(join(ROOT, 'tests/e2e'))
+    .filter((f) => f.endsWith('.mjs'))
+    .map((f) => `tests/e2e/${f}`),
+  'tests/e2e/harness.ts',
+].filter((rel) => rel !== GUARD).sort()
+
+/** THE PREMISE, and it is not decoration: an enumeration that matches nothing
+ *  makes `describe.each` below run zero cases and report all green. So it has
+ *  to be non-empty AND still contain the four harnesses this rule was written
+ *  for. More than four is the expected direction of change and passes; fewer
+ *  means the enumeration broke, not that the problem went away. */
+it('finds the harnesses it is supposed to be guarding', () => {
+  expect(E2E_HARNESSES.length, 'nothing enumerated out of tests/e2e — every '
+    + 'case below would be vacuous').toBeGreaterThan(0)
+  expect(E2E_HARNESSES, 'a harness this rule was written for is missing from '
+    + 'the enumeration').toEqual(expect.arrayContaining([
+    'tests/e2e/gate-holds.mjs',
+    'tests/e2e/harness.ts',
+    'tests/e2e/probe-bound-and-head.mjs',
+    'tests/e2e/stage-consent-holds.mjs',
+  ]))
+})
+
+describe.each(E2E_HARNESSES)('%s', (rel) => {
+  const src = readFileSync(join(ROOT, rel), 'utf8')
+
+  it('imports the one shared port guard', () => {
+    // Imported, not reimplemented locally for the fifth time. Both spellings
+    // of the specifier pass: Node strips the types for the .mjs consumers and
+    // vitest resolves it for harness.ts.
+    expect(src, `${rel} does not import requirePortFree from ./port-guard — a `
+      + 'harness that does not check the port grades whatever answers it')
+      .toMatch(/import \{[^}]*\brequirePortFree\b[^}]*\} from '\.\/port-guard(\.ts)?'/)
+  })
+
+  it('calls it, and before it spawns anything', () => {
+    expect(src, `${rel} imports requirePortFree without ever calling it`)
+      .toMatch(/await requirePortFree\(/)
+    // The order is the whole point. A guard that runs after the spawn is a
+    // guard that has already let a squatter be adopted.
+    const guarded = src.indexOf('await requirePortFree(')
+    const spawned = src.indexOf('spawn(')
+    expect(spawned, `${rel} was enumerated as a harness but never spawns anything`)
+      .toBeGreaterThan(-1)
+    expect(guarded, `${rel} guards the port only AFTER spawning the server`)
+      .toBeLessThan(spawned)
   })
 })
