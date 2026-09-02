@@ -1597,11 +1597,39 @@ footer li a:hover { color: var(--accent); }
     /* minmax(0, …), not 1fr: an auto column is max-content, and the nowrap
        composer-hint made every row 437.8px wide inside a 332px panel. */
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    /* The BOOT row is fit-content(), not auto, for the same reason the strip
+       moved out of flow: an uncapped row is whatever its content asks for, and
+       the rite card asks for more than the panel has. In the FAILED state —
+       'The summoning failed', the reason, and the Retry button — it measured
+       274.08px of a 416.91px panel at 360x740, which left .chat-main 0px and
+       pushed the composer 24.45px BELOW the panel's bottom edge; mid-rite with
+       the log open it was 30.66px out, so the SUCCESS path was over the edge
+       too. Worse on anything shorter: 97.45px out at 360x667, 214.59px at
+       320x568. This predates the grid rework (identical on 902a4e4^, the flex
+       layout) — the rework fixed the strip beside it and left this row alone.
+       Nothing is hidden, because a boot failure is exactly when the error and
+       the Retry button have to be readable: the card SCROLLS instead.
+       The budget: head (60.13) + composer (106.16) = 166.29px is the fixed
+       cost of staying usable, so 188px reserves that plus a sliver of
+       conversation. Percentages in a track size resolve against the grid
+       container's content box, which is definite here (the panel is the 1fr
+       row of .cs-root), so this is the PANEL's height, not the viewport's —
+       and fit-content() falls back to the content size when the content is
+       smaller, so a card that fits still takes exactly what it needs and a
+       folded-away one (.cs-done, display:none) still takes nothing. */
+    grid-template-rows: auto fit-content(calc(100% - 188px)) minmax(0, 1fr) auto;
     grid-template-areas: 'head' 'boot' 'body' 'composer';
   }
   #models .cs-chat > .cs-chat-head { grid-area: head; }
-  #models .cs-chat > .cs-boot { grid-area: boot; }
+  #models .cs-chat > .cs-boot {
+    grid-area: boot;
+    /* Both halves of the cap: it is what lets a clipped card be read to the
+       end, and it is what sets the row's automatic minimum size to 0 — an
+       overflow:visible item keeps its content as that minimum, and fit-content
+       could not shrink the row below it. */
+    overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+  }
   #models .cs-chat > .chat-main { grid-area: body; }
   #models .cs-chat > .composer-wrap { grid-area: composer; }
   #models .cs-chat > .cs-room {
