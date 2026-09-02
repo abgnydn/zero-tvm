@@ -15,6 +15,7 @@
 // up with the same file count and byte total as A's inventory.
 //
 //   node scripts/peer-weights-e2e.mjs
+//   SIGNAL_PORT=8795 VITE_PORT=5292 node scripts/peer-weights-e2e.mjs  # movable
 //
 // Needs the qwen3 mirror primed (node scripts/download-weights.mjs --model qwen3)
 // and a run of scripts/share-e2e.mjs first, to populate profile A's OPFS.
@@ -25,9 +26,14 @@ import { resolve } from 'node:path'
 import puppeteer from 'puppeteer'
 
 const ROOT = resolve(import.meta.dirname, '..')
-// Overridable ONLY so the port guard below can be exercised on a scratch port.
+// BOTH ports are overridable: a harness that cannot move off an occupied port
+// is a harness that cannot run, and the guard below turns "occupied" into a
+// refusal. VITE_PORT had this hatch and SIGNAL_PORT did not — the shape that
+// made share-e2e.mjs unrunnable on any machine with a `wrangler dev` up
+// (its port was 8787, wrangler's own default). This one was never on that
+// port, so the hatch is here for symmetry and for a second concurrent run.
 const VITE_PORT = Number(process.env.VITE_PORT ?? 5192)
-const SIGNAL_PORT = 8788
+const SIGNAL_PORT = Number(process.env.SIGNAL_PORT ?? 8788)
 const HOST_PROFILE = resolve(ROOT, '.tests-cache/chrome-share-profile')
 const PEER_PROFILE = resolve(ROOT, '.tests-cache/chrome-peer-profile')
 const MODEL = process.env.MODEL ?? 'qwen3'
@@ -62,8 +68,23 @@ async function requirePortFree(port, what) {
   }
 }
 
+/** A child's output with ANSI escapes stripped, for MATCHING only — the dumps
+ *  below keep the colour. Under FORCE_COLOR=1 vite's ready line is
+ *  `<esc>[1mLocal<esc>[22m:   <esc>[36mhttp://localhost:<esc>[1m5294<esc>[22m/`:
+ *  escapes sit between `Local` and `:` AND inside the port digits, so a regex
+ *  written for plain text never fires. Measured on THIS file before the fix:
+ *  `VITE_PORT=5294 FORCE_COLOR=1 node scripts/peer-weights-e2e.mjs` ran 31.9 s
+ *  and exited 1 against a vite that had printed "ready in 125 ms". Piped
+ *  stdout turns colour off by default, so only a CI or a shell that forces it
+ *  ever saw this — as a mystery timeout. */
+const plain = (s) => s.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '')
+
 /** vite's own ready line, pinned to the port we asked for. */
 const VITE_READY = new RegExp(`Local:\\s+https?://localhost:${VITE_PORT}/`)
+/** wrangler's, held to the same standard: `[wrangler:info] Ready on
+ *  http://localhost:<port>`. Without it the relay's wait fell back to "the
+ *  port answers", which is exactly the check requirePortFree distrusts. */
+const SIGNAL_READY = new RegExp(`Ready on https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]):${SIGNAL_PORT}\\b`)
 
 /** Wait for the server WE STARTED, not for the port to answer. */
 async function waitServer(proc, url, timeoutMs, what, ready) {
@@ -72,7 +93,7 @@ async function waitServer(proc, url, timeoutMs, what, ready) {
     if (proc.dead) {
       throw new Error(`${what} ${proc.dead} before serving ${url}\n--- its output ---\n${proc.log.trim()}`)
     }
-    if (!ready || ready.test(proc.log)) {
+    if (!ready || ready.test(plain(proc.log))) {
       try { await fetch(url); return } catch { /* bound but not serving yet */ }
     }
     await new Promise((r) => setTimeout(r, 250))
@@ -116,7 +137,7 @@ try {
   await requirePortFree(VITE_PORT, 'the dev server')
   const signal = run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
   const vite = run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
-  await waitServer(signal, `http://localhost:${SIGNAL_PORT}/`, 30_000, 'wrangler dev', null)
+  await waitServer(signal, `http://localhost:${SIGNAL_PORT}/`, 30_000, 'wrangler dev', SIGNAL_READY)
   await waitServer(vite, `http://localhost:${VITE_PORT}/share.html`, 30_000, 'vite', VITE_READY)
 
   // Fresh receiving profile every run — a leftover cache would make the pull

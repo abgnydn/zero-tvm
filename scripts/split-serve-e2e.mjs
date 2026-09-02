@@ -13,6 +13,7 @@
 //   node scripts/split-serve-e2e.mjs            # llama32, 2 stages at 8/16
 //   STAGES=6 node scripts/split-serve-e2e.mjs   # six of them
 //   MODEL=qwen3mlx SPLIT=18 node scripts/split-serve-e2e.mjs
+//   SIGNAL_PORT=8795 VITE_PORT=5294 node scripts/split-serve-e2e.mjs   # movable
 //
 // Helpers join in REVERSE order on purpose. Six tabs opened at once connect in
 // whatever order they finish loading, so the host must hold a stage that does
@@ -29,10 +30,14 @@ import puppeteer from 'puppeteer'
 import { specForParam } from '../src/zero-tvm/model-registry.ts'
 
 const ROOT = resolve(import.meta.dirname, '..')
-// VITE_PORT is overridable ONLY so the port guard below can be exercised on a
-// scratch port without disturbing a real run on 5194.
+// BOTH ports are overridable: the guard below turns an occupied port into a
+// refusal, so a harness with no way to move off one cannot run at all.
+// VITE_PORT had this hatch and SIGNAL_PORT did not — the shape that made
+// share-e2e.mjs unrunnable on any machine with a `wrangler dev` up, since its
+// signal port was 8787, wrangler's own default. 8791 was never that port, so
+// the hatch here is for symmetry and for a second concurrent run.
 const VITE_PORT = Number(process.env.VITE_PORT ?? 5194)
-const SIGNAL_PORT = 8791
+const SIGNAL_PORT = Number(process.env.SIGNAL_PORT ?? 8791)
 const MODEL = process.env.MODEL ?? 'llama32'
 const spec = specForParam(MODEL)
 const STAGES = Number(process.env.STAGES ?? 2)
@@ -112,9 +117,36 @@ async function requirePortFree(port, what) {
   }
 }
 
+/**
+ * A child's output with ANSI escapes stripped, for MATCHING only — the error
+ * dumps below keep the colour.
+ *
+ * The ready regexes below are written for plain text, and vite's line is not
+ * plain text when anything forces colour on. Under FORCE_COLOR=1 it reads
+ * `<esc>[1mLocal<esc>[22m:   <esc>[36mhttp://localhost:<esc>[1m5294<esc>[22m/`
+ * — escapes between `Local` and `:` AND inside the port digits, so the match
+ * never fires and the wait runs to its full timeout. Measured on the sibling
+ * harness before this landed: `VITE_PORT=5294 FORCE_COLOR=1 node
+ * scripts/peer-weights-e2e.mjs` took 31.9 s and exited 1 against a vite that
+ * had printed "ready in 125 ms". Piped stdout turns colour off by default,
+ * which is why the happy path never saw it — a CI, or a shell that exports
+ * FORCE_COLOR, turns a working harness into a mystery timeout.
+ */
+const plain = (s) => s.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '')
+
 /** vite's own ready line, pinned to the port we asked for. Matching this is
  *  what makes the server ours rather than merely present. */
 const VITE_READY = new RegExp(`Local:\\s+https?://localhost:${VITE_PORT}/`)
+/**
+ * wrangler's, held to the SAME standard: `[wrangler:info] Ready on
+ * http://localhost:<port>`, pinned to the port we asked for.
+ *
+ * The relay was the one server here still waited for with `ready = null` —
+ * which is precisely the "the port answers" test the paragraph above exists to
+ * reject, left in place because nothing had been written for wrangler. It
+ * prints the line; nothing was reading it.
+ */
+const SIGNAL_READY = new RegExp(`Ready on https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]):${SIGNAL_PORT}\\b`)
 
 /**
  * Wait for the server WE STARTED, not for the port to answer.
@@ -129,7 +161,7 @@ async function waitServer(proc, url, timeoutMs, what, ready) {
     if (proc.dead) {
       throw new Error(`${what} ${proc.dead} before serving ${url}\n--- its output ---\n${proc.log.trim()}`)
     }
-    if (!ready || ready.test(proc.log)) {
+    if (!ready || ready.test(plain(proc.log))) {
       try { await fetch(url); return } catch { /* bound but not serving yet */ }
     }
     await new Promise((r) => setTimeout(r, 250))
@@ -184,7 +216,7 @@ try {
   await requirePortFree(VITE_PORT, 'the dev server')
   const signal = run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
   const vite = run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
-  await waitServer(signal, `http://localhost:${SIGNAL_PORT}/`, 30_000, 'wrangler dev', null)
+  await waitServer(signal, `http://localhost:${SIGNAL_PORT}/`, 30_000, 'wrangler dev', SIGNAL_READY)
   await waitServer(vite, `${BASE}/share.html`, 30_000, 'vite', VITE_READY)
   for (let i = 0; i < STAGES; i++) mkdirSync(PROFILE(i), { recursive: true })
 
