@@ -33,20 +33,38 @@
 // broken range.
 //
 // What this file holds and what it does not: the RULE is pure and is asserted
-// directly. That share.ts actually routes through it — rather than keeping its
-// own unbounded copy — is a source check, because share.ts cannot be imported
-// headlessly (`signalEnv()` reads `location` at module scope). The rendered
-// gate copy for the three URLs above was checked against a real Chrome.
+// directly, and WHAT REACHES A ROLE is asserted by RUNNING share.ts's own
+// routing block. share.ts cannot be imported headlessly (`signalEnv()` reads
+// `location` at module scope), so the block is lifted out and evaluated the way
+// stage-honesty.test.ts's `renderedAt` evaluates each surface's call site. The
+// rendered gate copy for the three URLs above was checked against a real Chrome.
+//
+// IT USED TO BE THREE REGEXES OVER THE SOURCE — `toMatch(/stageFor\(/)`,
+// `not.toMatch(/runHost\(room,\s*stageRangeFrom\(/)`,
+// `not.toMatch(/runHelper\(room!,\s*stage!\)/)` — and all three are satisfied by
+// `void runHost(room, raw)`, which hands the role the parser's UNBOUNDED range.
+// Re-measured here on 2026-09-02 with exactly that mutation applied to
+// share.ts: all THREE old assertions PASS and `npm run typecheck` is clean,
+// while the assertions below go red on three cases. (The review that found it
+// also drove the mutated build in Chrome and reproduced the defect sentence
+// verbatim — "Layers 0-9999 of 64 … a slice of the full ~14.1 GB, not all of
+// it", RAM note gone; that half is its measurement, not this file's.)
+// A regex over a call site cannot see what the call site passes.
 
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
+import { canSplitAcrossDevices, specForParam } from '../../src/zero-tvm/model-registry.ts'
+import { roleFor, roomIdFrom, stageRangeFrom } from '../../src/zero-tvm/room-url.ts'
 import { stageFor } from '../../src/zero-tvm/stage-range.ts'
 
 const ROOT = join(import.meta.dirname, '../..')
 const share = (): string => readFileSync(join(ROOT, 'src/zero-tvm/share.ts'), 'utf8')
 
-/** qwen38's layer count — the checkpoint the defect was measured on. */
+/** qwen38's layer count — the checkpoint the defect was measured on. Checked
+ *  against the registry below, so a spec change breaks the test rather than
+ *  quietly re-pointing every bound in this file at a number that moved. */
 const L = 64
 
 describe('a hosting stage is a SLICE, never the whole checkpoint', () => {
@@ -105,21 +123,126 @@ describe('degenerate ranges are no range at all', () => {
   })
 })
 
-describe('share.html routes through the bound', () => {
-  it('imports the rule', () => {
-    expect(share()).toMatch(/import\s*\{[^}]*\bstageFor\b[^}]*\}\s*from\s*'\.\/stage-range\.js'/)
+/**
+ * SHARE.HTML'S OWN ROUTING BLOCK, PULLED OUT AND RUN.
+ *
+ * From `const room = roomIdFrom(` to the end of the `runHost(` call that closes
+ * the three-way dispatch — the one region where a parsed range becomes a role's
+ * ARGUMENT. Everything downstream (the title, the sheet's Layers row, the
+ * consent paragraph, the download gate, the loader's layerRange, the helper
+ * links) reads what runHost/runHelper are handed, so this is the value the whole
+ * page agrees on.
+ *
+ * The end anchor stops at `runHost(`, deliberately, and the argument list is
+ * taken by BALANCED COUNTING rather than matched: a mutated argument must be
+ * RUN here, not fail to be found. `void runHost(room, raw)` is what this exists
+ * to catch, and a regex that included `, stage)` would simply stop matching and
+ * report "no routing block" — a different failure, and one a reader could
+ * mistake for a refactor.
+ */
+const BEGIN = 'const room = roomIdFrom('
+const END = 'void runHost('
+
+function routingBlock(): string {
+  const src = share()
+  const from = src.indexOf(BEGIN)
+  expect(from, `share.ts no longer starts routing with \`${BEGIN}…\``).toBeGreaterThan(-1)
+  const call = src.indexOf(END, from)
+  expect(call, `share.ts no longer dispatches with \`${END}…\``).toBeGreaterThan(from)
+  let depth = 0
+  let i = call + END.length - 1
+  for (; i < src.length; i++) {
+    if (src[i] === '(') depth++
+    else if (src[i] === ')' && --depth === 0) break
+  }
+  expect(depth, `unbalanced \`${END}\` in share.ts`).toBe(0)
+  return src.slice(from, i + 1)
+}
+
+type Stage = { start: number; end: number } | null
+type Routed = { role: 'host' | 'helper' | 'guest'; stage: Stage }
+
+/**
+ * Where one URL lands, and with WHAT. Every free name in the block is bound to
+ * the real function share.ts imports — only the three roles are stubs, because
+ * they are what the assertion reads. The block carries `room!`, so it goes
+ * through the actual TypeScript transpiler rather than a hand-rolled strip: a
+ * `!` regex that mangled an unrelated `!==` would be a second bug hiding in the
+ * test that is supposed to find one.
+ */
+function route(url: string): Routed {
+  const u = new URL(url, 'http://localhost/share.html')
+  const js = ts.transpileModule(routingBlock(), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  }).outputText
+  const seen: Routed[] = []
+  const run = new Function(
+    'location', 'roomIdFrom', 'roleFor', 'stageRangeFrom', 'specForParam',
+    'canSplitAcrossDevices', 'stageFor', 'runHost', 'runHelper', 'runGuest', js)
+  run(
+    { search: u.search, hash: u.hash },
+    roomIdFrom, roleFor, stageRangeFrom, specForParam, canSplitAcrossDevices, stageFor,
+    (_room: string | null, stage: Stage) => { seen.push({ role: 'host', stage }) },
+    (_room: string, stage: Stage) => { seen.push({ role: 'helper', stage }) },
+    () => { seen.push({ role: 'guest', stage: null }) },
+  )
+  expect(seen.length, `${url} reached ${seen.length} roles, not exactly 1`).toBe(1)
+  return seen[0]
+}
+
+describe('share.html hands the ROLE a bounded range', () => {
+  /** A real room-id shape: 22 base64url characters, inside ROOM_ID's 16-64. */
+  const ROOM = '#Zm9vYmFyYmF6cXV4MDE'
+
+  it('the premises — qwen38 really has L layers, and the parser really is unbounded', () => {
+    // Without the first, every bound below is checked against the wrong number.
+    // Without the second, `stage: null` could mean the parser stopped producing
+    // the range rather than the bound refusing it.
+    expect(specForParam('qwen38').layers).toBe(L)
+    expect(canSplitAcrossDevices(specForParam('qwen38'))).toBe(true)
+    expect(stageRangeFrom('?model=qwen38&layers=0-9999')).toEqual({ start: 0, end: 9999 })
   })
 
-  it('hands the ROLES a bounded range, never the parser\'s raw one', () => {
-    // The three consumers of a range on this page — the title and sheet, the
-    // consent gate, and the loader's layerRange — all read whatever runHost and
-    // runHelper are handed. Bounding it at the routing point is what makes them
-    // agree; a check further in would leave the sheet already painted with a
-    // range the loader then refuses.
-    const src = share()
-    expect(src).toMatch(/stageFor\(/)
-    // The raw parse must not reach a role directly any more.
-    expect(src).not.toMatch(/runHost\(room,\s*stageRangeFrom\(/)
-    expect(src).not.toMatch(/runHelper\(room!,\s*stage!\)/)
+  it('THE REPORTED LINK: ?layers=0-9999 reaches the host as NO stage', () => {
+    expect(route('/share.html?model=qwen38&layers=0-9999')).toEqual({ role: 'host', stage: null })
+  })
+
+  it('?layers=0-64 — the whole checkpoint — reaches the host as NO stage', () => {
+    expect(route(`/share.html?model=qwen38&layers=0-${L}`)).toEqual({ role: 'host', stage: null })
+  })
+
+  it('an honest slice reaches the host intact', () => {
+    expect(route('/share.html?model=qwen38&layers=0-32'))
+      .toEqual({ role: 'host', stage: { start: 0, end: 32 } })
+  })
+
+  it('no ?layers= is the whole model with the whole-model gate', () => {
+    expect(route('/share.html?model=qwen38')).toEqual({ role: 'host', stage: null })
+  })
+
+  it('a helper is handed the far half — the one range that MAY end the model', () => {
+    expect(route(`/share.html?model=qwen38&layers=32-${L}${ROOM}`))
+      .toEqual({ role: 'helper', stage: { start: 32, end: L } })
+  })
+
+  it('a helper whose range does not bound joins as a GUEST, holding nothing', () => {
+    // Not the whole model in someone else's room: that is a larger commitment
+    // than the link asked for. A guest needs no WebGPU and downloads nothing.
+    expect(route(`/share.html?model=qwen38&layers=32-9999${ROOM}`))
+      .toEqual({ role: 'guest', stage: null })
+  })
+
+  it('a checkpoint the loader cannot cut is handed no stage at all', () => {
+    // `?model=` is Phi-3, an MLC checkpoint: canSplitAcrossDevices is false, so
+    // the layer count arrives as null. This used to paint a whole consent screen
+    // for a split that cannot exist and then die inside loadWeights.
+    expect(canSplitAcrossDevices(specForParam(''))).toBe(false)
+    expect(route('/share.html?model=&layers=0-16')).toEqual({ role: 'host', stage: null })
+  })
+
+  it('and it is THIS module the page routes through, not a local copy', () => {
+    // `route` injects the real stageFor, so a share.ts that grew its own broken
+    // one would still pass above. This is the half that cannot be run.
+    expect(share()).toMatch(/import\s*\{[^}]*\bstageFor\b[^}]*\}\s*from\s*'\.\/stage-range\.js'/)
   })
 })

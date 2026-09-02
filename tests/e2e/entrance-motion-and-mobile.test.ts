@@ -58,10 +58,55 @@ afterAll(async () => {
   await stopHarness()
 })
 
+/**
+ * A page at a viewport that has SETTLED — asserted, not assumed.
+ *
+ * `1512x982` failed once, intermittently, with `canvas=482.5` against
+ * `art=500`, and it is the TEST that was wrong, not the CSS. The review that
+ * chased it did not reproduce it in 34 attempts, nor a second pass in 109
+ * observations, and anchored the mechanism: `--cs-char-h: min(54dvh, 500px)`
+ * feeds both boxes, so `canvas=482.5` needs 54dvh resolved at 893.5px while
+ * `art=500` needs it resolved at >= 926px. A settled layout cannot hold both —
+ * forcing dvh=894 gave `art=432.39 canvas=432.39`, coupled, never split. (Those
+ * numbers are that review's; what is verified here is that the file passes with
+ * the check below in place.) So the two were read either side of a viewport the
+ * page had not finished resolving `dvh` against, and a `setViewport` + `reload`
+ * that returns before that is a race every assertion after it inherits.
+ *
+ * The check is on `100dvh` as well as `innerHeight`, because `dvh` is the unit
+ * the stylesheet actually resolves against and the two are what disagreed. Both
+ * are polled first and then ASSERTED, so a viewport that never settles fails
+ * here, naming the numbers, instead of surfacing later as one flaky ratio.
+ */
 async function sized(path: string, width: number, height: number): Promise<Page> {
   const page = await newPage(path)
   await page.setViewport({ width, height, deviceScaleFactor: 1 })
   await page.reload({ waitUntil: 'networkidle0' })
+  const read = (): Promise<{ w: number; h: number; dvh: number }> => page.evaluate(() => {
+    // What `min(54dvh, …)` in landing.css resolves to right now, measured the
+    // only way a page can measure it: give an element the unit and read it back.
+    const probe = document.createElement('div')
+    probe.style.cssText =
+      'position:fixed;top:0;left:0;width:0;height:100dvh;visibility:hidden;pointer-events:none'
+    document.body.appendChild(probe)
+    const dvh = probe.getBoundingClientRect().height
+    probe.remove()
+    return { w: innerWidth, h: innerHeight, dvh }
+  })
+  let m = await read()
+  const t0 = Date.now()
+  while (Date.now() - t0 < 5_000
+    && (m.w !== width || m.h !== height || Math.abs(m.dvh - height) > 0.5)) {
+    await new Promise((r) => setTimeout(r, 100))
+    m = await read()
+  }
+  const asked = `${width}x${height}`
+  expect(m.w, `innerWidth is ${m.w}, not the ${width} this test asked for`).toBe(width)
+  expect(m.h, `innerHeight is ${m.h}, not the ${height} this test asked for — `
+    + `every box measured below would be read against a viewport that is not ${asked}`).toBe(height)
+  expect(m.dvh, `100dvh resolves to ${m.dvh}, not ${height} — the stylesheet sizes the `
+    + 'character off this unit, so a box read now can disagree with a box read a frame later')
+    .toBeCloseTo(height, 1)
   return page
 }
 
