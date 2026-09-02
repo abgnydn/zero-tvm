@@ -1054,10 +1054,9 @@ export const QWEN36_35B_A3B: ModelSpec = makeModelSpec({
  * disk. UNRUN as of 2026-08-10 (it needs a quiet machine; an attempt hit 23.3
  * of 23.5 GB swap). Until it is run, treat 3-bit-vs-4-bit quality as UNKNOWN.
  *
- * The checkpoint is produced locally by scripts/convert-q3-experts.py; the
- * hfRepo below is where an upload WOULD live and what names the dev-mirror
- * directory — until it is uploaded, this spec only works where the converted
- * checkpoint exists on disk.
+ * The checkpoint is produced locally by scripts/convert-q3-experts.py and is
+ * uploaded to the hfRepo below, which also names the dev-mirror directory.
+ * The spec no longer depends on a converted copy being on disk.
  */
 export const QWEN36_35B_A3B_Q3: ModelSpec = makeModelSpec({
   ...QWEN36_35B_A3B,

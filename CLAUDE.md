@@ -75,8 +75,8 @@ multi-GB downloads on page load. Their src/ modules remain, unbuilt.
   (`fused-norm-matmul`, `fused-ffn`, `argmax`). Documented in
   `architecture.html` but NOT imported by the engine, which still uses
   the `src/compiler/shaders/` versions.
-- `src/tvm-shaders/` — 85 dumped TVM shaders, for apples-to-apples
-  inspection against `src/compiler/shaders/`.
+- `src/tvm-shaders/` — the WGSL a whole WebLLM session dumps, for
+  apples-to-apples inspection against `src/compiler/shaders/`.
 - `src/webllm-bench/` — the head-to-head benchmarker (imports
   `@mlc-ai/web-llm`).
 - `src/{engine,capture,ui}.ts` — an older engine generation +
@@ -223,9 +223,10 @@ PROMPT=400 node scripts/chunk-prefill-test.mjs qwen36q3   # MoE + GDN + shared +
 
 Weights load via `weight-loader-mlx.ts`: byte-range fetches (never a whole
 5.3 GB shard), OPFS keyed by BUILT buffer, bf16 conversion at load. The dev
-mirror serves both checkpoints; `?model=qwen36q3` needs the locally-converted
-`.weights-local/Qwen3.6-35B-A3B-MLX-q3exp` (16.36 GB) until it is uploaded to
-`abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp`.
+mirror serves both checkpoints; `?model=qwen36q3` resolves to
+`abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp`, which is uploaded. The dev mirror
+reads the locally-converted `.weights-local/Qwen3.6-35B-A3B-MLX-q3exp`
+(16.36 GB); a browser without it fetches the same shards from the Hub.
 
 ```bash
 # 4-bit: huggingface-cli download lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit \
