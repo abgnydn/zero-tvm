@@ -367,36 +367,116 @@ async function f3Semantics() {
 }
 
 // ── MEDIUM · ?ctx= has no lower bound ────────────────────────────────────
+
+/** Printed in place of a figure the surface did not render. */
+const NOTHING = '(NO CONTEXT FIGURE ON THE PAGE)'
+
+/**
+ * The context figure each surface renders WHETHER OR NOT ITS GATE IS UP.
+ *
+ * The old read regexed `/([\d.]+K?)\s*CONTEXT/i` over zero-tvm.html's
+ * innerText, and the only thing that has ever matched is the DOWNLOAD GATE's
+ * stat block — `#gate-ctx`, "16K" above the caption "context". chat.ts's
+ * boot() removes that dialog outright when `isModelCached(SPEC)` is true, and
+ * on a dev server that is true for every MLX model whose mirror is primed:
+ * `isModelCached` falls through to cache-probe.ts's `mirrorHasModel`, which
+ * HEADs `/local-weights/Qwen3.8-27B-4bit/model.safetensors.index.json` and
+ * gets a 200 (measured `HTTP/1.1 200 OK`, 2026-09-02). So the anchor was not
+ * in the DOM, the regex read null, and both of that check's assertions were
+ * NEGATIVE — "the page does not say 16 tokens", "the page does not say 0K" —
+ * and therefore vacuously true of nothing. The decisive control: on the same
+ * primed tree, the same page with NO `?ctx=` AT ALL read the same null, so
+ * the result carried no information about `?ctx=0.5` in either direction.
+ *
+ * These two anchors are written before either page consults the cache —
+ * `#welcome-ctx` by chat.ts's applyModelBranding(), which boot() calls above
+ * the `isModelCached` branch, and share.html's Context row by share.ts before
+ * its own `confirmDownload`. Measured present and correct in BOTH states,
+ * mirror primed (gate gone) and mirror absent (gate up).
+ */
+const CTX_SURFACES = [
+  {
+    name: 'share.html?model=qwen38',
+    path: '/share.html?model=qwen38',
+    where: 'the Context row of .mb-stats',
+    // share.ts: rows[] -> `<div><dt>Context</dt><dd>16,384 tokens</dd></div>`
+    read: () => [...document.querySelectorAll('.mb-stats div')]
+      .find((d) => d.querySelector('dt')?.textContent?.trim() === 'Context')
+      ?.querySelector('dd')?.textContent?.trim() ?? null,
+    tokens: (s) => Number(s.replace(/\D/g, '')),
+    // room-url.ts records what this row read before ctxFrom grew its floor.
+    degenerate: /^16 tokens?$/i,
+  },
+  {
+    name: 'zero-tvm.html?model=qwen38',
+    path: '/zero-tvm.html?model=qwen38',
+    where: 'the welcome pill #welcome-ctx',
+    // chat.ts: `${Math.round(SPEC.maxContext / 1024)} K context`
+    read: () => document.getElementById('welcome-ctx')?.textContent?.trim() ?? null,
+    tokens: (s) => Number(s.replace(/\D/g, '')) * 1024,
+    // Math.round(16 / 1024) is 0, so a 16-token window prints "0 K context"
+    // here — the same fault the gate's "0K" showed before the fix.
+    degenerate: /^0\s*K/i,
+  },
+]
+
+/** One surface, one query string, one figure. */
+async function readCtx(surface, query) {
+  const page = await open(surface.path + query)
+  // The same settle every other case in this file uses. Both figures are
+  // rewritten from the spec after the module graph loads, over static Phi-3
+  // markup; an under-sleep would read that markup — which the "moves when
+  // honoured" assertion below turns into a RED, never a false green.
+  await sleep(1500)
+  const v = await page.evaluate(surface.read)
+  await page.close()
+  return v
+}
+
 async function mediumCtx() {
-  const share = await open('/share.html?model=qwen38&ctx=0.5')
-  await sleep(1500)
-  const shareText = await share.evaluate(() => document.body.innerText)
-  const shareCtx = /Context\s*\n?\s*([^\n]+)/i.exec(shareText)?.[1]?.trim() ?? null
-  await share.close()
+  const lines = []
+  let allOk = true
+  for (const s of CTX_SURFACES) {
+    // THE CONTROL FIRST: what this surface prints when the link asks for
+    // nothing. "Refused" is defined as "?ctx=0.5 lands exactly here" — the
+    // page's own compiled default — rather than as a number this file holds
+    // a second copy of and would have to keep in step with the registry.
+    const base = await readCtx(s, '')
+    // And a budget the code DOES honour, derived from that control: half of
+    // it on a 256-token step (16384 -> 8192, comfortably inside qwen38's
+    // range and above room-url.ts's MIN_CTX).
+    const probe = base === null ? null : Math.round(s.tokens(base) / 512) * 256
+    const honoured = probe === null ? null : await readCtx(s, `&ctx=${probe}`)
+    const sub = await readCtx(s, '&ctx=0.5')
 
-  const std = await open('/zero-tvm.html?model=qwen38&ctx=0.5')
-  await sleep(1500)
-  const stdText = await std.evaluate(() => document.body.innerText)
-  const stdCtx = /([\d.]+K?)\s*CONTEXT/i.exec(stdText)?.[1] ?? null
-
-  await std.close()
-
-  // FOUND FIRST, then judged. Both assertions below are NEGATIVE — "the page
-  // does not say 16 tokens", "the page does not say 0K" — and a `?? '(not
-  // found)'` fallback satisfies both, so a surface that stopped rendering its
-  // context figure at all (a rename, a layout change, a page that failed to
-  // boot) read as a PASS for a check that had nothing to read. Same shape as
-  // stage-honesty.test.ts's ANCHOR guard: an anchor that went missing must be
-  // a failure, not a silent green.
-  const found = shareCtx !== null && stdCtx !== null
-  // qwen38 compiled default is 16384 tokens = 16K. A sub-page ?ctx= must be
-  // refused outright, not honoured as a 16-token window.
-  check('MEDIUM  ?ctx=0.5 is refused on every surface, not honoured',
-    found && !/^16 tokens?$/i.test(shareCtx) && !/^0K?$/i.test(stdCtx), [
-      `share.html?model=qwen38&ctx=0.5   Context: ${JSON.stringify(shareCtx ?? '(NO CONTEXT FIGURE ON THE PAGE)')}`,
-      `zero-tvm.html?model=qwen38&ctx=0.5   ${JSON.stringify(stdCtx ?? '(NO CONTEXT FIGURE ON THE PAGE)')} CONTEXT`,
-      ...(found ? [] : ['a surface rendered no context figure at all — this check read nothing']),
-    ])
+    // FOUND FIRST, then judged — the premise, not an assertion. Everything
+    // below compares two reads, and two nulls compare equal, so a surface
+    // that stopped rendering its figure at all (a rename, a layout change, a
+    // page that failed to boot, a gate that was never built) would otherwise
+    // read as a PASS for a check that had nothing to read. Same shape as
+    // stage-honesty.test.ts's ANCHOR guard.
+    const found = base !== null && honoured !== null && sub !== null
+    // THE ANCHOR MOVES. Without this the whole case is satisfied by any
+    // constant string — a figure frozen at the static markup, a slot that
+    // stopped being derived from the spec — because a constant always
+    // "agrees with the control". This is what makes the agreement below a
+    // measurement instead of a tautology.
+    const live = found && honoured !== base
+    // THE CLAIM: a sub-page ?ctx= is refused outright, not honoured.
+    const refused = found && sub === base
+    // And it is not the specific window room-url.ts used to build from 0.5.
+    const sane = found && !s.degenerate.test(sub)
+    if (!(found && live && refused && sane)) allOk = false
+    lines.push(
+      `${s.name} — ${s.where}`,
+      `   &ctx=0.5      ${JSON.stringify(sub ?? NOTHING)}`,
+      `   (no ?ctx=)    ${JSON.stringify(base ?? NOTHING)}   <- the control; 0.5 must land here`,
+      `   &ctx=${probe ?? '?'}     ${JSON.stringify(honoured ?? NOTHING)}   <- a budget that IS honoured`,
+      `   found: ${found} · anchor moves: ${live} · 0.5 == control: ${refused} · not a sub-page window: ${sane}`,
+      ...(found ? [] : ['   ^ a read came back empty — this surface told this check NOTHING']),
+    )
+  }
+  check('MEDIUM  ?ctx=0.5 is refused on every surface, not honoured', allOk, lines)
 }
 
 // ── LOW · the entrance drops a ?ctx= the room plan writes ─────────────────
