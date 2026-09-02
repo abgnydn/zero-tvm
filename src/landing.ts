@@ -23,6 +23,10 @@ import { SHIPPED_MODELS, canSplitAcrossDevices, kvBytesPerTokenShown as kvBytesP
 // disagree with share.html and zero-tvm.html about the same link — see the
 // note on the ctx picker below.
 import { ctxFrom } from './zero-tvm/room-url.js'
+// The words a consent gate may say about a stage. Shared with share.html's own
+// gate, so the two surfaces cannot describe the same range differently — see
+// stage-range.ts for the 98%-reads-like-12% defect that put them there.
+import { stageGateCopy } from './zero-tvm/stage-range.js'
 import type { ModelSpec } from './compiler/model-spec.js'
 import { mountMascot, mascotPalette, type MascotHandle } from './mascot.js'
 import { LANE_SIGIL, laneOf, loreOf, abilitiesOf } from './landing-lore.js'
@@ -353,23 +357,26 @@ export function gateCopy(plan: BootPlan, o: {
   stage: { start: number; end: number } | null
   int8: boolean
 }): { title: string; what: string; cost: string; go: string } {
-  const s = o.stage
-  const weights = o.cached
-    ? (s ? `Layers ${s.start}–${s.end} are already cached on this device.`
-      : 'The weights are already cached on this device.')
-    : (s ? `Layers ${s.start}–${s.end} of ${plan.spec.layers} download once — a slice of `
-        + `the full ${plan.sizeLabel}, not all of it — and are cached locally.`
-      : `The weights download once (${plan.sizeLabel}) and are cached locally; every later `
-        + 'visit starts from disk.')
+  // Both sentences come from stage-range.ts, which is also where share.html's
+  // gate gets them: a stage that is 98% of a checkpoint must not read like one
+  // that is 12%, and neither may delete the whole-checkpoint RAM note — the
+  // rule that let `?split=0,63,64&stage=0` take ~13.9 of 14.1 GB in silence.
+  const c = stageGateCopy({
+    stage: o.stage,
+    layers: plan.spec.layers,
+    cached: o.cached,
+    sizeLabel: plan.sizeLabel,
+    ramNote: plan.ramNote,
+  })
   return {
     title: `Run ${plan.name} on this machine?`,
-    what: `This link asks to run ${plan.name} on this machine. ${weights} Nothing has downloaded yet.`,
+    what: `This link asks to run ${plan.name} on this machine. ${c.weights} Nothing has downloaded yet.`,
     // The second half of the price: the KV cache is allocated EAGERLY at boot,
-    // and ?ctx= moves it. ramNote is a whole-checkpoint figure and is false
-    // for a stage, so a stage does not carry it.
+    // and ?ctx= moves it. A stage's RAM line names the whole checkpoint as the
+    // whole checkpoint's rather than dropping the figure.
     cost: [
       `${ctxLabel(plan.ctxTokens)} context · ~${kvPrice(plan.spec, plan.ctxTokens, o.int8)} allocated at boot`,
-      s ? '' : plan.ramNote,
+      c.ram,
     ].filter(Boolean).join(' — '),
     go: o.room
       ? (o.cached ? 'Enter & open a room →' : 'Download & open a room →')
@@ -1048,6 +1055,14 @@ function render(): void {
       // need a URL. Booting here also removes the paste-the-room-link step:
       // the room strip writes the helper link once the stage is live.
       onHostHere: (bounds, index, ctxTokens) => {
+        // THE SECOND DOOR INTO enterChat, and the only one that does not carry
+        // a BootPlan. It is reachable today only by a real click on a control
+        // the swarm sheet mounts, and the sheet cannot be mounted while the
+        // gate is up (openSwarm refuses, and the URL path opens one or the
+        // other, never both) — so this is belt and braces rather than a
+        // reported way in. It is here because "every path to enterChat asks
+        // `gate` first" is a list, and a list with an exception is not one.
+        if (gate) return
         exitSwarm()
         void import('./landing-chat.js').then(({ enterChat }) => enterChat({
           root,
@@ -1305,12 +1320,27 @@ function render(): void {
    * button between "Enter chat" and "Download & enter".
    *
    * Capturing is only honest if changing your mind is POSSIBLE, which is why
-   * the dialog carries "Not now". A deliberate change of character while the
-   * gate is up is neither silently ignored nor silently obeyed — it cannot
-   * happen. Decline (or press Escape), the scene comes back, the
-   * act-without-a-click keys leave the address bar, and choosing another
-   * character and pressing ENTER is a click, which is consent on its own
-   * terms.
+   * the dialog carries "Not now". Decline (or press Escape), the scene comes
+   * back, the act-without-a-click keys leave the address bar, and choosing
+   * another character and pressing ENTER is a click, which is consent on its
+   * own terms.
+   *
+   * FREEZING THE ROSTER IS THE OTHER HALF, and it is held by every input path
+   * asking `gate` FIRST rather than by anything structural: the click delegate
+   * (`if (gate) return`), `keyIntent` (`if (s.gated) return 'ignore'`),
+   * `engage`, and `openSwarm`. That list is the invariant — nothing else may
+   * reach the roster while the dialog is up, and a path added without the
+   * check silently rejoins it. `openSwarm` was the one that had no check, and
+   * it moves gi/vi: `location.hash = '#swarm'` with the gate open walked the
+   * scene onto a different character while the dialog went on naming the
+   * first. A hash that arrives while the question is open is DROPPED, not
+   * queued — the same answer a click on a roster card gets, and the link is
+   * still there to follow once the question has been answered.
+   *
+   * `showModal()` is not that boundary and cannot be. It makes the document
+   * behind it inert, which stops REAL POINTER INPUT only: a synthesised
+   * `.mb-cta.click()` still reaches its listener, and nothing boots because
+   * `engage` checks `gate`, not because the element is inert.
    */
   async function openUrlGate(room: boolean): Promise<void> {
     const dlg = el<HTMLDialogElement>('.cs-url-gate')
@@ -1422,8 +1452,17 @@ function render(): void {
   /** Open the swarm mode. THREE doors land here — the nav and footer links'
    *  click, the hash on a cold load, and a later hashchange — so they cannot
    *  drift. Only the click was ever wired, and README publishes
-   *  https://zerotvm.com/#swarm, so the published link opened nothing. */
+   *  https://zerotvm.com/#swarm, so the published link opened nothing.
+   *
+   *  THE THIRD DOOR IS AN INPUT PATH LIKE ANY OTHER, and it was the one that
+   *  did not ask about the gate. `location.hash = '#swarm'` with the consent
+   *  dialog open walked the roster behind it — this function moves gi/vi when
+   *  the character on stage cannot be cut — so the scene showed one character
+   *  while the dialog named another. Nothing booted (the accept boots
+   *  `gate.plan`, which is captured), but the capture is only honest while the
+   *  roster is FROZEN: that is the half openUrlGate's note below is about. */
   function openSwarm(): void {
+    if (gate) return
     window.scrollTo({ top: 0, behavior: 'smooth' })
     if (swarm) return
     // The character on stage may be one that cannot be cut — walk to the
