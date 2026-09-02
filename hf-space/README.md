@@ -7,7 +7,7 @@ sdk: static
 pinned: true
 license: mit
 thumbnail: https://huggingface.co/spaces/abgunaydin/zero-tvm/resolve/main/og.png
-short_description: Phi-3 to a 35B MoE in the browser, on hand-written WGSL
+short_description: 1B dense to a 35B MoE in the browser, on hand-written WGSL
 tags:
   - webgpu
   - llm
@@ -25,15 +25,18 @@ models:
   - mlx-community/Qwen3-4B-4bit
   - mlx-community/Qwen3-30B-A3B-4bit
   - mlx-community/Llama-3.2-1B-Instruct-4bit
+  - mlx-community/Qwen3.8-27B-4bit
+  - mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ
+  - lmstudio-community/Qwen3.5-9B-MLX-4bit
   - lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit
   - abgunaydin/Qwen3.6-35B-A3B-MLX-q3exp
 ---
 
 # Zero-TVM
 
-Models from a 3.8B dense to a 35B sparse MoE, running in the browser on hand-written WGSL. No TVM, no ONNX, no WASM runtime.
+Models from a 1B dense up to a 35B sparse MoE, running in the browser on hand-written WGSL. No TVM, no ONNX, no WASM runtime.
 
-The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that autotunes its WGSL — 85 shaders captured across a session, around 11 of them on the decode path. This Space replaces that entire stack with hand-written WGSL — **10 kernel roles** for the Phi-3 forward pass, plus the gated-DeltaNet and mixture-of-experts roles the newer architectures need — and runs models WebLLM ships (same weights, measured faster) as well as one it does not: Qwen3.6-35B-A3B, a 256-expert sparse MoE.
+The standard way to run a modern LLM in a browser is [WebLLM / MLC-LLM](https://webllm.mlc.ai/), which ships an Apache-TVM compiler pipeline that autotunes its WGSL. This Space replaces that entire stack with hand-written WGSL — **10 kernel roles** for the Phi-3 forward pass, plus the gated-DeltaNet and mixture-of-experts roles the newer architectures need — and runs models WebLLM ships (same weights, measured faster) as well as models it does not — Qwen3.6-35B-A3B, a 256-expert sparse MoE, was the first of those.
 
 The whole forward pass — 32 transformer layers, paged KV cache, int4-dequant matmul, RoPE, fused FFN, RMSNorm, paged attention, argmax sampling — is readable end-to-end in a single sitting. That is the point.
 
@@ -43,7 +46,7 @@ Measured on an Apple M2 Max (Chrome 150, WebLLM v0.2.80, identical Phi-3-mini-q4
 
 | | WebLLM (TVM) | Zero-TVM |
 |---|---|---|
-| WGSL kernels (decode path) | **~11 TVM-generated** (85 captured across a session) | **10 hand-written roles** |
+| WGSL kernels (decode path) | **~11 TVM-generated** | **10 hand-written roles** |
 | Dispatches per decode step | **342** | **260** default (228 with `?kv8=0&splitk=0`) |
 | Total throughput (prefill + decode) | **59.95 tok/s** | **69.55 tok/s** — **+16.0%** |
 | Decode only | **63.23 tok/s** (self-reported) | **83.10 tok/s** — **+31.4%** |
@@ -60,19 +63,25 @@ Exact medians, full methodology, and the optimization experiments that were meas
 
 ## Run it
 
-The Space opens on a character-select entrance: pick a model and it loads and chats in place. [`zero-tvm.html`](./zero-tvm.html) is the same chat as a direct link, if you want to deep-link a specific model.
+The Space opens on a character-select entrance: pick a model and it loads and chats in place. The roster runs strongest first, so it opens on Qwen3.8-27B. [`zero-tvm.html`](./zero-tvm.html) is the same chat as a direct link, if you want to deep-link a specific model — with no `?model=` flag that page still boots Phi-3-mini.
 
-Picking a character starts the download immediately — the sheet shows the weight size before you click, and there is no second confirmation. It streams ~2 GB of Phi-3-mini-q4f16_1 weights from the Hugging Face mirror at [`mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC) into OPFS (Origin Private File System).
+Clicking ENTER starts the download. The sheet states the weight size and the free RAM before you click, and the click is the consent, so no second dialog follows it. A link that asks the page to enter for you (`?chat=1`) is gated instead: it opens a dialog naming the model, its download size and the KV cache allocated at boot, and nothing downloads until that is accepted. `share.html` puts the same question before a room or a helper stage fetches anything.
+
+Weights stream from the Hugging Face repo named in the model's spec into OPFS (Origin Private File System). Sizes, RAM requirements and `?model=` flags for every shipped model are defined in [`src/zero-tvm/model-registry.ts`](https://github.com/abgnydn/zero-tvm/blob/main/src/zero-tvm/model-registry.ts), and the entrance's cards render from that table, so what the sheet says and what the engine allocates cannot disagree.
 
 Subsequent loads are instant — the weights stay in OPFS, so returning to a model you have already downloaded starts it straight away.
 
-**Requirements**: Chrome / Edge with WebGPU enabled and the `shader-f16` feature available (default on macOS Apple-Silicon, enabled on most modern Windows / Linux GPUs).
+A model too big for one machine can be split by layer range across several. Each machine holds only its own layers and its own KV cache, a token's hidden state hops device to device over WebRTC, and a guest with the room link just chats — it downloads nothing and needs no WebGPU. [`share.html`](./share.html) is that surface, and the entrance builds its links under ENTER, from the "Too big for one machine? Split it" button. Splitting needs an MLX checkpoint, every serving tab has to stay awake (both serving roles carry a keep-awake toggle), and there is no TURN relay — same network or an ordinary home router, not a corporate one. The design and the rest of its limits are in the [repo README](https://github.com/abgnydn/zero-tvm#the-swarm).
+
+**Requirements**: Chrome / Edge with WebGPU enabled and the `shader-f16` feature available (default on macOS Apple-Silicon, enabled on most modern Windows / Linux GPUs). The MoE models also need subgroups. The KV cache is allocated eagerly at boot, so a model needs the free RAM its card names or it fails there.
 
 ## Models
 
+These are the three models measured head-to-head against WebLLM on identical weights. They are not the whole roster — the registry linked above is the shipped list, and the DeltaNet hybrids and sparse MoEs on it have no WebLLM build to sit beside.
+
 All three pairs re-measured 2026-07-30 under the corrected protocol — same session, identical local weight bytes, both engines paying a full prefill on every run, total and decode reported side by side.
 
-- **Phi-3-mini-4k-instruct (3.8B, q4f16_1)** — the default; every headline number above is Phi-3, no URL flag needed. Zero-TVM **69.55 tok/s total** (TTFT 291 ms, decode 83.10) vs WebLLM 0.2.80's **59.95 tok/s total** (self-reported decode 63.23) — **+16.0% total, +31.4% decode**.
+- **Phi-3-mini-4k-instruct (3.8B, q4f16_1)** — `zero-tvm.html`'s no-flag default, though the entrance opens on Qwen3.8-27B; every headline number above is Phi-3. Zero-TVM **69.55 tok/s total** (TTFT 291 ms, decode 83.10) vs WebLLM 0.2.80's **59.95 tok/s total** (self-reported decode 63.23) — **+16.0% total, +31.4% decode**.
 - **Qwen3-4B (q4f16_1)** — append `?model=qwen3` to `zero-tvm.html` or `validate.html`; weights stream from [`mlc-ai/Qwen3-4B-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Qwen3-4B-q4f16_1-MLC) (~2.3 GB). A port on the spec-parameterized engine: GQA 32/8, per-head QK-norm, byte-level BPE, tied lm_head, with the tuning round's fused post-matmul chain (`qk_norm_rope_append`, 8 dispatches/layer) and K%512 wide loads. Zero-TVM **59.85 tok/s total** (TTFT 453 ms, decode 75.49) vs WebLLM 0.2.84's prebuilt Qwen3-4B at **45.46 tok/s total** (self-reported decode 47.77) — **+31.7% total, +58.0% decode**. This is the model where WebLLM most clearly beats us on first-token latency (~150 ms implied vs our 453 ms). The previously published "75.7 vs 43.8, +73%" pair is **withdrawn** — a bench-harness defect had stopped our half paying prefill; and the 2026-07-28 pair (25.43 vs 14.15) was a degraded session that did not reproduce. Both are kept as dated history with the reason in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md).
 - **Qwen3.5-4B (q4f16_1)** — append `?model=qwen35` to `zero-tvm.html` or `validate.html`; weights stream from [`mlc-ai/Qwen3.5-4B-q4f16_1-MLC`](https://huggingface.co/mlc-ai/Qwen3.5-4B-q4f16_1-MLC) (~2.6 GB). The first *hybrid* on the engine: 24 gated-DeltaNet (linear-attention) layers + 8 gated-attention layers (GQA 16/4, head_dim 256, partial RoPE, sigmoid attention gate) — to our knowledge the first hand-written-kernel int4 gated-DeltaNet hybrid in a browser. Zero-TVM **65.28 tok/s total** (TTFT 171 ms, decode 73.30) vs WebLLM 0.2.84's prebuilt Qwen3.5-4B at **32.56 tok/s total** (self-reported decode 34.32) — **+100.5% total, +113.6% decode**, and the one model where first-token latency is a wash rather than a loss. The GDN decode kernels are still scalar (non-subgroup), so the decode number is a floor; prefill runs in chunks of ≤64 (202 tok/s on an 816-token prompt) and every model reuses its cross-turn prefix. The 14.3 s → 0.19 s turn-3 figure published here until 2026-08-19 is **withdrawn**: it was measured while every past assistant turn was re-rendered with an empty `<think>` block, which made each turn an exact token extension of the last. No Qwen template does that, and rendering them correctly ended the property. What reuse does now depends on the model. On the pure-attention builds (Phi-3, Llama-3, Qwen3) it still covers everything up to the last assistant turn, and only that reply plus the new message are re-read. On the gated-DeltaNet hybrids (Qwen3.5, Qwen3.6) reuse is all-or-nothing — the recurrence cannot be rewound a token at a time — so a conversation shorter than one prefill chunk re-reads in full on every turn. Not re-measured, and being worked on. The previously published "65.7 vs 34.0, +93%" cross-check is **withdrawn** (same harness defect); the earlier 53.07/32.36 (+64%) and 47.99/31.99 (+50%) pairs were like-for-like but are superseded. One machine, one pair each; caveats in [BENCH.md](https://github.com/abgnydn/zero-tvm/blob/main/BENCH.md).
 
@@ -80,8 +89,10 @@ All three pairs re-measured 2026-07-30 under the corrected protocol — same ses
 
 - [`index.html`](./index.html) — the entrance: pick a model, chat in place (start here)
 - [`zero-tvm.html`](./zero-tvm.html) — the chat surface as a direct link
+- [`share.html`](./share.html) — host a model for other machines, join a split, or chat as a guest
 - [`validate.html`](./validate.html) — multi-prompt smoke test
 - [`docs.html`](./docs.html) — annotated reference, including the kernel walkthrough
+- [`agent-host.html`](./agent-host.html) — OpenAI-shaped front door for local agent tools; needs an agent server running on `127.0.0.1`, so it does nothing on its own
 
 Six pages were removed on 2026-08-14 — `architecture`, `demo`, `compiler-chat`,
 `dump`, `shaders`, `webllm-bench`. Three of them started multi-gigabyte
@@ -94,8 +105,10 @@ downloads on page load. `docs.html` carries what the first two explained.
 - `?sg=0` — disable all subgroup shaders (argmax / attention / QKV matmul)
 - `?sgqkv=0` / `?sgattn=0` / `?sgargmax=0` — disable one at a time
 - `?qkvtile=1` / `?qkvtile2=1` — opt into tiled QKV variants
-- `?ffnsg=1` — opt into the tiled-subgroup fused FFN
+- `?sgffn=0` — opt OUT of the tiled-subgroup fused FFN, which is on by default
 - `?kv8=0` — opt OUT of the int8 KV cache, which is the default since 2026-08-18
+
+One flag that is not a shader variant: `?ctx=N` sets the KV budget in tokens, clamped to the model's trained window. It is allocated eagerly at boot, so raising it can fail there; the entrance offers the same choice as a picker on the sheet.
 
 ## How it relates to a published paper
 
