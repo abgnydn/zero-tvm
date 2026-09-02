@@ -669,7 +669,7 @@ footer li a:hover { color: var(--accent); }
      specificity fight to rules further down the file and had been for as long
      as they have existed: `.cs-fog i` (0,1,1) loses to `.cs-fog i:nth-child(1)`
      (0,2,1), and `#models .mb-pedestal::after` (1,1,1) loses to
-     `#models .mb-art.cs-in .mb-pedestal::after` (1,2,1) — and .cs-in is applied
+     `#models .mb-art.cs-in .mb-pedestal::after` (1,3,1) — and .cs-in is applied
      unconditionally by selectFx(), so that is the resting state, not a
      transition. Measured with document.getAnimations() under reduce: fogA
      (46s), fogB (58s) and ringPulse (5s) all running, on / and — since it
