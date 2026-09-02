@@ -29,8 +29,21 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import puppeteer from 'puppeteer'
+// The guard scripts/{split-serve,share,peer-weights}-e2e.mjs got on 2026-08-25
+// and this file did not — which matters most here, because this is the script
+// that certifies the gate. Measured 2026-09-02, with a foreign server holding
+// this file's port on both loopback families and the port as the only edit to
+// the old file: it printed `[vite] error when starting dev server: Error: Port
+// 5301 is already in use` from its own dying child, ran the case against that
+// server anyway, and reported `0/1 passed`. The symmetric case is the
+// dangerous one — a foreign tree that happens to pass hands out the green this
+// script's fix is published on.
+import { requirePortFree, viteReady, waitForChild, watch } from './port-guard.ts'
 
-const PORT = 5285
+// Movable, because the guard turns "occupied" into a refusal and a harness
+// that cannot step aside is a harness that cannot run. Same variable name as
+// the four sibling harnesses.
+const PORT = Number(process.env.VITE_PORT ?? 5285)
 const BASE = `http://localhost:${PORT}`
 const ROOT = resolve(import.meta.dirname, '../..')
 const SHOW = process.argv.includes('--show')
@@ -52,22 +65,21 @@ const profile = mkdtempSync(join(tmpdir(), 'ztvm-gate-'))
 let vite = null
 let browser = null
 
-async function waitForUrl(url, ms) {
-  const t0 = Date.now()
-  let last = null
-  while (Date.now() - t0 < ms) {
-    try { if ((await fetch(url)).ok) return } catch (e) { last = e }
-    await new Promise((r) => setTimeout(r, 150))
-  }
-  throw new Error(`timed out waiting for ${url}: ${last}`)
-}
-
 async function start() {
-  vite = spawn(VITE, ['--port', String(PORT), '--strictPort', '--clearScreen', 'false'], {
+  // Before the spawn: a port that already answers is refused outright. After
+  // it: wait for OUR child's own ready line on OUR port, never for "the port
+  // responds" — a squatter answers that poll long before vite's EADDRINUSE
+  // reaches stderr, and on the other loopback family vite raises no EADDRINUSE
+  // at all. Both measurements are in port-guard.ts.
+  await requirePortFree(PORT, 'the dev server')
+  const proc = spawn(VITE, ['--port', String(PORT), '--strictPort', '--clearScreen', 'false'], {
     stdio: ['ignore', 'pipe', 'pipe'], cwd: ROOT, env: process.env,
   })
-  vite.stderr?.on('data', (b) => process.stderr.write(`[vite] ${b}`))
-  await waitForUrl(`${BASE}/index.html`, 30_000)
+  vite = proc
+  const watched = watch(proc, (s) => {
+    if (/error|ERROR|EADDRINUSE|already in use/.test(s)) process.stderr.write(`[vite] ${s}`)
+  })
+  await waitForChild(watched, `${BASE}/index.html`, 30_000, 'vite', viteReady(PORT))
   browser = await puppeteer.launch({
     headless: !SHOW,
     userDataDir: profile,
@@ -359,21 +371,31 @@ async function mediumCtx() {
   const share = await open('/share.html?model=qwen38&ctx=0.5')
   await sleep(1500)
   const shareText = await share.evaluate(() => document.body.innerText)
-  const shareCtx = /Context\s*\n?\s*([^\n]+)/i.exec(shareText)?.[1]?.trim() ?? '(not found)'
+  const shareCtx = /Context\s*\n?\s*([^\n]+)/i.exec(shareText)?.[1]?.trim() ?? null
   await share.close()
 
   const std = await open('/zero-tvm.html?model=qwen38&ctx=0.5')
   await sleep(1500)
   const stdText = await std.evaluate(() => document.body.innerText)
-  const stdCtx = /([\d.]+K?)\s*CONTEXT/i.exec(stdText)?.[1] ?? '(not found)'
+  const stdCtx = /([\d.]+K?)\s*CONTEXT/i.exec(stdText)?.[1] ?? null
+
   await std.close()
 
+  // FOUND FIRST, then judged. Both assertions below are NEGATIVE — "the page
+  // does not say 16 tokens", "the page does not say 0K" — and a `?? '(not
+  // found)'` fallback satisfies both, so a surface that stopped rendering its
+  // context figure at all (a rename, a layout change, a page that failed to
+  // boot) read as a PASS for a check that had nothing to read. Same shape as
+  // stage-honesty.test.ts's ANCHOR guard: an anchor that went missing must be
+  // a failure, not a silent green.
+  const found = shareCtx !== null && stdCtx !== null
   // qwen38 compiled default is 16384 tokens = 16K. A sub-page ?ctx= must be
   // refused outright, not honoured as a 16-token window.
   check('MEDIUM  ?ctx=0.5 is refused on every surface, not honoured',
-    !/^16 tokens?$/i.test(shareCtx) && !/^0K?$/i.test(stdCtx), [
-      `share.html?model=qwen38&ctx=0.5   Context: ${JSON.stringify(shareCtx)}`,
-      `zero-tvm.html?model=qwen38&ctx=0.5   ${JSON.stringify(stdCtx)} CONTEXT`,
+    found && !/^16 tokens?$/i.test(shareCtx) && !/^0K?$/i.test(stdCtx), [
+      `share.html?model=qwen38&ctx=0.5   Context: ${JSON.stringify(shareCtx ?? '(NO CONTEXT FIGURE ON THE PAGE)')}`,
+      `zero-tvm.html?model=qwen38&ctx=0.5   ${JSON.stringify(stdCtx ?? '(NO CONTEXT FIGURE ON THE PAGE)')} CONTEXT`,
+      ...(found ? [] : ['a surface rendered no context figure at all — this check read nothing']),
     ])
 }
 
