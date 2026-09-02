@@ -52,9 +52,11 @@
  * TRUE on the unfixed tree, and true PRECISELY BECAUSE `#model-browser` is
  * `overflow: hidden` and clips the control that does not fit. A number can be
  * right and support nothing. So what is measured here is each control's own
- * box against the head's CLIENT box — after asking the browser to scroll it
- * into view, so a head that scrolls sideways counts as reachable and a head
- * that clips does not.
+ * box against the head's CLIENT box, after scrolling THE HEAD as far as a
+ * person could — and only when the head is user-scrollable (overflow-x auto or
+ * scroll). Not scrollIntoView: an overflow:hidden box is scrollable
+ * programmatically, so scrollIntoView pans the very container that does the
+ * clipping and reports every control reachable. A thumb cannot do that.
  *
  * Why a standalone script and not a vitest file: tests/unit must stay GPU-free
  * and fast, and tests/e2e/harness.ts owns port 5189 and a SHARED Chrome
@@ -265,18 +267,31 @@ const HEAD_PROBE = `(async () => {
     }
   }
 
+  // NOT scrollIntoView. An overflow:hidden box is scrollable
+  // PROGRAMMATICALLY — scrollIntoView will happily pan #model-browser, which
+  // is exactly the box that clips this row — and a thumb cannot. Only the head
+  // is scrolled, and only when the head is scrollable BY A PERSON: overflow-x
+  // auto or scroll. Anything else and "reachable" would be a fact about the
+  // test rather than about the phone.
+  const userScrollable = cs.overflowX === 'auto' || cs.overflowX === 'scroll'
+  const show = (el) => {
+    if (!userScrollable) return
+    head.scrollLeft = 0
+    const from = el.getBoundingClientRect().left - contentBox().left
+    head.scrollLeft = Math.max(0, Math.min(head.scrollWidth - head.clientWidth,
+      from + el.getBoundingClientRect().width - head.clientWidth))
+  }
+
   // Every control a person can act on. The sigil is decorative
   // (aria-hidden) and the badge is a readout, so neither is a control — but
   // both are measured, because a readout pushed off the row is still a
   // regression and the numbers should say which.
   const parts = [...head.children].map((el) => {
     const id = el.id ? '#' + el.id : '.' + (el.className || el.tagName.toLowerCase()).split(' ')[0]
+    head.scrollLeft = 0
     const r0 = el.getBoundingClientRect()
     const box0 = contentBox()
-    // Ask the browser to bring it in. A head that scrolls sideways satisfies
-    // this; a head that clips does not. inline/block 'nearest' so the page is
-    // not scrolled any further than it has to be.
-    el.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    show(el)
     const r = el.getBoundingClientRect()
     const box = contentBox()
     return {
@@ -286,7 +301,7 @@ const HEAD_PROBE = `(async () => {
       pastRightAtRest: +(r0.right - box0.right).toFixed(1),
       leftAtRest: +r0.left.toFixed(1),
       // Reachable = fully inside the head's content box AND inside the
-      // viewport, after the browser has been asked to show it.
+      // viewport, once the head has been scrolled as far as a person could.
       inHead: r.left >= box.left - 1 && r.right <= box.right + 1
         && r.top >= box.top - 1 && r.bottom <= box.bottom + 1,
       inViewport: r.left >= -1 && r.right <= innerWidth + 1
@@ -294,15 +309,22 @@ const HEAD_PROBE = `(async () => {
       actionable: el.tagName === 'BUTTON' || el.tagName === 'A',
     }
   })
-  // Undo whatever scrollIntoView did to the row before reading its geometry.
   head.scrollLeft = 0
 
   const idW = panel.querySelector('.cs-chat-id')?.getBoundingClientRect().width ?? null
+  // What the row costs the conversation, and whether the composer survives it.
+  // A head that wraps takes its height from .chat-main, so this is the price
+  // and it has to be reported next to the reachability it buys.
+  const pr = panel.getBoundingClientRect()
+  const mainH = panel.querySelector('.chat-main').getBoundingClientRect().height
+  const composerPast = panel.querySelector('.composer-wrap').getBoundingClientRect().bottom - pr.bottom
 
   return {
     scrollW: head.scrollWidth,
     clientW: head.clientWidth,
     headH: +head.getBoundingClientRect().height.toFixed(2),
+    mainH: +mainH.toFixed(2),
+    composerPast: +composerPast.toFixed(2),
     flexWrap: cs.flexWrap,
     overflowX: cs.overflowX,
     // TRUE on the unfixed tree, and it proves nothing: #model-browser is
@@ -341,12 +363,15 @@ async function headReach() {
       && ids.includes('#cs-roster-link')
     const controls = m.parts.filter((p) => p.actionable && p.w > 0)
     const unreachable = controls.filter((p) => !(p.inHead && p.inViewport))
-    const ok = premise && unreachable.length === 0
+    // The row must not buy its reachability by pushing the composer out of the
+    // panel — that is the failure boot-card-fits-the-panel.test.ts exists for,
+    // and a taller head is exactly the shape that could cause it.
+    const ok = premise && unreachable.length === 0 && m.composerPast <= 1 && m.mainH > 0
     if (!ok) allOk = false
 
     const roster = m.parts.find((p) => p.id === '#cs-roster-link')
     rows.push({ size: `${w}x${h}`, scrollW: m.scrollW, clientW: m.clientW,
-      headH: m.headH, chatIdW: m.chatIdW,
+      headH: m.headH, chatIdW: m.chatIdW, mainH: m.mainH,
       rosterPast: roster?.pastRightAtRest, rosterLeft: roster?.leftAtRest })
 
     check(`head    ${w}x${h}: every chat-head control is reachable`, ok, [
@@ -354,6 +379,7 @@ async function headReach() {
       `head scrollWidth/clientWidth: ${m.scrollW}/${m.clientW}`
       + `   height: ${m.headH}   flex-wrap: ${m.flexWrap}   overflow-x: ${m.overflowX}`,
       `.cs-chat-id width: ${m.chatIdW}`,
+      `the row's price: .chat-main ${m.mainH}px, composer ${m.composerPast}px past the panel`,
       `⟨ Roster at rest: ${roster?.pastRightAtRest}px past the head's right edge, `
       + `left edge at ${roster?.leftAtRest} in a ${w}px viewport, width ${roster?.w}`,
       `unreachable controls: ${JSON.stringify(unreachable.map((p) =>
@@ -365,11 +391,11 @@ async function headReach() {
   }
 
   console.log('')
-  console.log('        head           scroll/client   height   .cs-chat-id   ⟨ Roster past right   ⟨ Roster left')
+  console.log('        head        scroll/client  head h   .cs-chat-id  .chat-main  ⟨ Roster past right  ⟨ Roster left')
   for (const r of rows) {
-    console.log(`        ${r.size.padEnd(14)} ${String(`${r.scrollW}/${r.clientW}`).padEnd(15)} `
-      + `${String(r.headH).padEnd(8)} ${String(r.chatIdW).padEnd(13)} `
-      + `${String(r.rosterPast).padEnd(21)} ${r.rosterLeft}`)
+    console.log(`        ${r.size.padEnd(11)} ${String(`${r.scrollW}/${r.clientW}`).padEnd(14)} `
+      + `${String(r.headH).padEnd(8)} ${String(r.chatIdW).padEnd(12)} ${String(r.mainH).padEnd(11)} `
+      + `${String(r.rosterPast).padEnd(20)} ${r.rosterLeft}`)
   }
   console.log('')
   return allOk

@@ -1365,13 +1365,63 @@ footer li a:hover { color: var(--accent); }
   #models .cs-chatting .mb-name { font-size: 1.3rem; }
   .cs-sug-grid { grid-template-columns: 1fr; }
   .cs-chat-tool#new-chat-btn { display: none; }
-  /* The head's fifth tool. ⟁ Awake is the control a PHONE needs MOST — a
-     serving tab is a background tab for its whole life — so it is not the one
-     to drop when the row runs short; that is #new-chat-btn, above. It sheds
-     padding and letter-spacing instead, which is what keeps the row on one
-     line at 360px (measured 399px against 360 before this). Scoped to the head:
-     share.html carries the same control as a SHEET row, not a head tool, and
-     must not move. */
+  /* THE HEAD WRAPS ONCE THE ROOM TOOLS ARE IN IT. ⟁ Awake is the control a
+     PHONE needs MOST — a serving tab is a background tab for its whole life —
+     and ⟨ Roster is the only way back to the character select from inside a
+     conversation, so neither is droppable; #new-chat-btn, above, is the one
+     that goes.
+
+     Shedding padding off ⟁ Awake was tried first and did NOT keep the row on
+     one line. Measured with mountRoomTool driven the way landing-chat.ts
+     drives it (tests/e2e/probe-bound-and-head.mjs), .cs-chat-head
+     scrollWidth/clientWidth and ⟨ Roster's right edge against the head's:
+
+        320x568   378/290   +88.4    ⟨ Roster's LEFT edge at 317.8 of 320
+        360x740   378/330   +48.4
+        390x844   378/360   +18.4
+
+     — the row overflowed its container at ALL THREE widths, worst on the
+     smallest, and at 320 2.2px of a 75.6px control was on screen. The old
+     comment here claimed one line at 360 and cited 399px: the pre-rule figure
+     is 391, and 360 was the VIEWPORT, not the 330px content box the row
+     actually has to fit. ⟁ Awake is not the whole story either — with it
+     removed the row is still 309/290 at 320, ⟨ Roster 19.2px past the edge.
+     What does not fit is the TOOLS, so that is what the condition names.
+
+     No sideways page scroll was measured alongside that, and it was true, and
+     it meant nothing: #model-browser is overflow:hidden, so it CLIPPED the
+     control instead of scrolling to it. Reachability is the property; a
+     document that does not scroll is not evidence of it.
+
+     wrap, not overflow-x: auto — the row is 60px tall and ⟨ Roster is the last
+     item in it, so a scrolling head would put the only way out off the right
+     edge behind a swipe nobody is told about.
+
+     :has(#room-btn), not the media query alone, because wrap is not free: it
+     stops .cs-chat-id SHRINKING and lets it take its max-content 140.3px
+     instead, which wraps a row that fits today. Unconditionally, the head
+     BEFORE the boot went 60.06 -> 98.42 at 320 and 360, and share.html's guest
+     head 60.06 -> 98.42 at 320 (measured, both). Those rows fit; only the one
+     mountRoomTool has added to does not. Scoped this way share.html is
+     untouched — nothing there puts ⟁ Awake or ⟁ Room in a head, it carries
+     ⟁ Awake as a SHEET row — and the .cs-boot budget below still describes the
+     head it was measured against, since mountRoomTool runs after the engine is
+     ready, when the rite card is already .cs-done. */
+  .cs-chat-head:has(#room-btn) { flex-wrap: wrap; }
+  /* …AND THE IDENTITY GIVES THE ROW UP TO THE TOOLS. It is the item that
+     shrinks, so in this state it is ALREADY 0px wide — measured 0 at 320, 360
+     and 390 — while still setting its line's height from two lines of text.
+     Wrapping without this makes it visible again at 140.3px and costs a whole
+     line: the head went to 134.25px at 320x568, leaving .chat-main 2.53px of
+     the 76.72px it had. Nothing readable is lost by hiding what is already 0px
+     wide, and the phone layout puts .mb-plate directly above the panel with
+     the name at 1.3rem — share.ts says the same thing about the serving
+     sheet's head, for the same reason. Before the boot the row fits, the
+     condition is false, and the build label stays readable at 41.9 / 81.9px. */
+  .cs-chat-head:has(#room-btn) .cs-chat-id { display: none; }
+  /* ⟁ Awake sheds padding and letter-spacing. This no longer has to keep the
+     row on one line — wrap does — but it still decides how many lines the row
+     costs the conversation, so it stays. */
   .cs-chat-head #awake { padding-left: 5px; padding-right: 5px; letter-spacing: 0.03em; }
 }
 @media (prefers-reduced-motion: reduce) {

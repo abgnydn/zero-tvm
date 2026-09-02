@@ -1421,16 +1421,31 @@ function render(): void {
     // already holds the weights. Dynamic: it pulls in the loaders, which read
     // GPUBufferUsage at module scope.
     //
-    // BOUNDED. A probe that never settles used to leave the button disabled
-    // on "Checking this device…" with the verbs already hidden — a page with
-    // no way forward and no way back. Asking without the cached wording is
-    // strictly better than never asking.
+    // BOUNDED — AND THE MODULE FETCH IS INSIDE THE BOUND. A probe that never
+    // settles used to leave the button disabled on "Checking this device…"
+    // with the verbs already hidden — a page with no way forward and no way
+    // back. Asking without the cached wording is strictly better than never
+    // asking.
+    //
+    // The first version of the bound raced `isModelCached(...)` only, and left
+    // the `import()` above it unbounded — so the sentence above was still not
+    // true. Measured by holding that one module request open in Chrome: after
+    // 20.1 s the button was still disabled, on "Download & enter →", with the
+    // verbs hidden. Escape and "Not now" worked (they are wired above), so the
+    // way BACK was fine and the way FORWARD was gone — which is exactly the
+    // "never asking" state this exists to prevent. The whole probe, module
+    // included, is one raced promise now.
+    //
+    // Held, not failed, is the case that reaches it: a rejected import settles
+    // and the catch already had it.
     let cached = false
     try {
       if ('gpu' in navigator) {
-        const { isModelCached } = await import('./zero-tvm/cache-probe.js')
         cached = await Promise.race([
-          isModelCached(plan.spec, stage ?? undefined),
+          (async () => {
+            const { isModelCached } = await import('./zero-tvm/cache-probe.js')
+            return isModelCached(plan.spec, stage ?? undefined)
+          })(),
           new Promise<boolean>((r) => { setTimeout(() => r(false), 2500) }),
         ])
       }
