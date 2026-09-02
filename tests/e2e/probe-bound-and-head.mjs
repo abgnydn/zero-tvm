@@ -61,7 +61,8 @@
  * Why a standalone script and not a vitest file: tests/unit must stay GPU-free
  * and fast, and tests/e2e/harness.ts owns port 5189 and a SHARED Chrome
  * profile that other agents are using right now. This brings its own vite
- * (5303) and its own throwaway profile and touches neither.
+ * (5303, movable with VITE_PORT) and its own throwaway profile and touches
+ * neither.
  *
  *   node tests/e2e/probe-bound-and-head.mjs          # run both cases
  *   node tests/e2e/probe-bound-and-head.mjs --show   # watch it happen
@@ -73,7 +74,30 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import puppeteer from 'puppeteer'
+// The guard scripts/{split-serve,share,peer-weights}-e2e.mjs got on 2026-08-25,
+// and tests/e2e/{harness.ts,gate-holds.mjs,stage-consent-holds.mjs} got on
+// 2026-09-02. This file was the FOURTH AND LAST certification harness without
+// it, and it is the one that certifies the consent gate's bound and the phone
+// chat head. Measured 2026-09-02 on this machine, with a foreign HTTP server
+// holding `[::]:5306` (dual-stack) and the port as the only change to the
+// pre-fix file:
+//
+//     VITE_PORT=5306 node tests/e2e/probe-bound-and-head.mjs   →   4/4 passed
+//
+// exit 0, and `--strictPort` raised NOTHING. The stranger held `*:5306` while
+// vite bound `[::1]:5306` — both servers live at once — and Chrome's resolver
+// picked IPv6, so vite is what got graded. A client that picked IPv4 (another
+// Chrome, a CI) would have graded the stranger and printed the same green.
+// Which checkout that `4/4` describes was decided by resolver order, which is
+// to say it carries no information at all.
+//
+// That is why `--strictPort` is not the check and why the guard probes BOTH
+// loopback families. The rest of the reasoning is in port-guard.ts.
+import { requirePortFree, viteReady, waitForChild, watch } from './port-guard.ts'
 
+// Movable, because the guard turns "occupied" into a refusal and a harness
+// that cannot step aside is a harness that cannot run. Same variable name as
+// the sibling harnesses — one knob, one grammar.
 const PORT = Number(process.env.VITE_PORT ?? 5303)
 const BASE = `http://localhost:${PORT}`
 const ROOT = resolve(import.meta.dirname, '../..')
@@ -96,22 +120,23 @@ const profile = mkdtempSync(join(tmpdir(), 'ztvm-head-'))
 let vite = null
 let browser = null
 
-async function waitForUrl(url, ms) {
-  const t0 = Date.now()
-  let last = null
-  while (Date.now() - t0 < ms) {
-    try { if ((await fetch(url)).ok) return } catch (e) { last = e }
-    await new Promise((r) => setTimeout(r, 150))
-  }
-  throw new Error(`timed out waiting for ${url}: ${last}`)
-}
-
 async function start() {
-  vite = spawn(VITE, ['--port', String(PORT), '--strictPort', '--clearScreen', 'false'], {
+  // Before the spawn: a port that already answers is refused outright, on BOTH
+  // loopback families — either can be the one a resolver picks for `localhost`,
+  // and the dual-stack squatter measured above is the case `--strictPort`
+  // misses entirely. After it: wait for OUR child's own ready line on OUR port,
+  // never for "the port responds" — a squatter satisfies that poll from t=0,
+  // which is how the run above drove a whole Chrome at a tree that was not
+  // this one and called it 4/4.
+  await requirePortFree(PORT, 'the dev server')
+  const proc = spawn(VITE, ['--port', String(PORT), '--strictPort', '--clearScreen', 'false'], {
     stdio: ['ignore', 'pipe', 'pipe'], cwd: ROOT, env: process.env,
   })
-  vite.stderr?.on('data', (b) => process.stderr.write(`[vite] ${b}`))
-  await waitForUrl(`${BASE}/index.html`, 30_000)
+  vite = proc
+  const watched = watch(proc, (s) => {
+    if (/error|ERROR|EADDRINUSE|already in use/.test(s)) process.stderr.write(`[vite] ${s}`)
+  })
+  await waitForChild(watched, `${BASE}/index.html`, 30_000, 'vite', viteReady(PORT))
   browser = await puppeteer.launch({
     headless: !SHOW,
     userDataDir: profile,
