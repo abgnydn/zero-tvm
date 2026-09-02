@@ -12,7 +12,7 @@
  *      of it" — for ~98% of the checkpoint. `0-64` is caught by the bound;
  *      `0-63` is a LEGITIMATE host stage in a two-machine split, so the answer
  *      is not a tighter end bound. The SUPPRESSION RULE was wrong: both gates
- *      dropped `ramNote` for any non-null stage, so 12% and 98% read the same.
+ *      dropped `ramNote` for any non-null stage, so 13% and 98% read the same.
  *
  *   2  /share.html?model=&layers=0-31       (Phi-3, 32 layers, MLC)
  *      A whole consent screen for a split that cannot exist: title
@@ -211,7 +211,7 @@ async function ramNoteSurvivesAStage() {
   const d = await shareSnap(small)
 
   const saysRam = (s) => (s.ram ?? '').includes('18 GB')
-  check('1  share.html — a 98% stage still states the RAM limit, and does not read like a 12% one',
+  check('1  share.html — a 98% stage still states the RAM limit, and does not read like a 13% one',
     saysRam(a) && saysRam(b) && saysRam(c) && saysRam(d)
     && (c.weights ?? '') !== (d.weights ?? ''), [
       `?model=qwen38                 ram: ${JSON.stringify(a.ram)}`,
@@ -246,9 +246,9 @@ async function ramNoteOnTheEntrance() {
     (a.cost ?? '').includes('18 GB') && (b.cost ?? '').includes('18 GB')
     && (c.cost ?? '').includes('18 GB') && (b.what ?? '') !== (c.what ?? ''), [
       `?model=qwen38&chat=1                        cost: ${JSON.stringify(a.cost)}`,
-      `&split=0,63,64&stage=0  (98% of the model)  cost: ${JSON.stringify(b.cost)}`,
+      `&split=0,63,64&stage=0  (98% of its layers)  cost: ${JSON.stringify(b.cost)}`,
       `                                            what: ${JSON.stringify(b.what)}`,
-      `&split=0,8,64&stage=0   (12% of the model)  cost: ${JSON.stringify(c.cost)}`,
+      `&split=0,8,64&stage=0   (13% of its layers)  cost: ${JSON.stringify(c.cost)}`,
       `                                            what: ${JSON.stringify(c.what)}`,
     ])
   for (const p of [whole, big, small]) await p.close()
@@ -302,15 +302,25 @@ async function hashCannotWalkTheRoster() {
   await page.evaluate(() => { location.hash = '#swarm' })
   await sleep(900)
   const after = await landingSnap(page)
+  // …and the refusal is not permanent: the question is answered, the same link
+  // works. A gate check that quietly disabled the swarm mode for the rest of
+  // the session would be a worse bug than the one it closes.
+  await page.click('#cs-gate-no')
+  await sleep(300)
+  await page.evaluate(() => document.querySelector('a[href="#swarm"]')?.click())
+  await sleep(900)
+  const declined = await landingSnap(page)
   check('3  #swarm arriving while the gate is up does not move the character behind it',
     after.stage === before.stage && after.swarm === false
-    && after.what === before.what, [
+    && after.what === before.what && declined.swarm === true, [
       '/?model=&chat=1 — the gate names Phi-3, which cannot be split, so openSwarm',
       'walks the roster to the first checkpoint that can be.',
       `before:  stage ${JSON.stringify(before.stage)}, gate says ${JSON.stringify((before.what ?? '').slice(0, 60))}, swarm mode: ${before.swarm}`,
       '[location.hash = "#swarm"]',
       `after:   stage ${JSON.stringify(after.stage)}, gate says ${JSON.stringify((after.what ?? '').slice(0, 60))}, swarm mode: ${after.swarm}`,
       `         gate still open: ${after.gateOpen}, url: ${JSON.stringify(after.url)}`,
+      '[decline, then click the nav\'s #swarm link]',
+      `then:    stage ${JSON.stringify(declined.stage)}, swarm mode: ${declined.swarm}`,
     ])
   await page.close()
 }

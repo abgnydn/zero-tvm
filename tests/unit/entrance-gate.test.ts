@@ -146,17 +146,22 @@ describe('the gate says what it will boot', () => {
     expect(plan.ctxTokens).toBe(specOf(sel).maxContext)
   })
 
-  it('a STAGE is priced as a slice, and carries no whole-checkpoint RAM note', () => {
+  it('a STAGE is priced as a slice, and says how big a slice', () => {
     // Quoting the whole checkpoint's size for a stage is the figure that once
-    // promised a phone 14.1 GB for a fraction of it.
+    // promised a phone 14.1 GB for a fraction of it. Dropping the RAM note for
+    // any stage was the overcorrection: `?split=0,63,64&stage=0` fetched ~13.9
+    // of 14.1 GB and read exactly like this 12% one. The rule is stage-range.ts's
+    // now, and tests/unit/stage-consent.test.ts holds it — what is pinned here
+    // is that the entrance's gate goes through it.
     const sel = SLOTS.find((s) => bootPlanFor(s, null).ramNote !== '')!
     const plan = bootPlanFor(sel, null)
     const whole = gateCopy(plan, { room: false, cached: false, stage: null, int8: true })
     const slice = gateCopy(plan, { room: false, cached: false, stage: { start: 0, end: 8 }, int8: true })
     expect(whole.cost).toContain(plan.ramNote)
-    expect(slice.cost).not.toContain(plan.ramNote)
+    expect(slice.cost).toContain(plan.ramNote)
+    expect(slice.cost).toContain('whole checkpoint')
     expect(slice.what).toContain('Layers 0–8')
-    expect(slice.what).toContain('not all of it')
+    expect(slice.what).toMatch(/\d+% of this checkpoint's layers/)
   })
 
   it('being cached changes the WORDING, never whether the question is put', () => {

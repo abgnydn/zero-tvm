@@ -48,7 +48,7 @@ import {
   setChatIdentity, autoGrow, wireScrollFab, hideWelcome,
   addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
-import { specForParam, modelBranding, quantLabel } from './model-registry.js'
+import { specForParam, modelBranding, quantLabel, canSplitAcrossDevices } from './model-registry.js'
 import { ENGINE_GPU_FEATURES } from './variants.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
 import { fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
@@ -67,8 +67,11 @@ import { ROLE_NOTE, drawArcs, lightArcs } from '../landing-swarm.js'
 // branch that reads it here.
 import { roomIdFrom, stageRangeFrom, roleFor, roomLink } from './room-url.js'
 // …and the bound that parser cannot apply, because bounding a range needs the
-// spec it is a range OF. See stage-range.ts for what an unbounded one did.
-import { stageFor } from './stage-range.js'
+// spec it is a range OF, plus the words a gate is allowed to say about a
+// bounded one. See stage-range.ts for what an unbounded one did, and for what
+// a bounded one bought before the gate stopped taking a stage as a size-free
+// pass.
+import { stageFor, stageGateCopy } from './stage-range.js'
 // The host loop, the wire protocol, and the signaling constants live in
 // room-host.ts — shared with the landing entrance's in-place room
 // (landing-room.ts), so the two hosting surfaces cannot drift.
@@ -121,9 +124,17 @@ const role = roleFor(location.search, location.hash)
 // page (the title, the sheet's Layers row, the consent paragraph, the download
 // gate, the loader's layerRange, the helper links) reads what these two
 // functions are handed, so this is the one place that makes them agree.
+//
+// `canSplitAcrossDevices` is the registry's own predicate — the one
+// landing.ts's `splitFor` asks about `?split=` — and NULL LAYERS is how a
+// checkpoint that cannot be cut says so: `?model=&layers=0-31` on Phi-3 built
+// a whole consent screen for a split that cannot exist and then died in
+// loadWeights. The predicate needs a spec, which this module deliberately does
+// not take, so it is asked here and answered there.
+const urlSpec = specForParam(new URLSearchParams(location.search).get('model') ?? '')
 const stage = stageFor(
   stageRangeFrom(location.search),
-  specForParam(new URLSearchParams(location.search).get('model') ?? '').layers,
+  canSplitAcrossDevices(urlSpec) ? urlSpec.layers : null,
   role === 'helper' ? 'helper' : 'host',
 )
 if (role === 'helper') {
@@ -360,32 +371,38 @@ async function confirmDownload(
   const { stage } = role
   const cached = await isModelCached(spec, stage)
 
-  // WHAT THIS DEVICE FETCHES — one sentence, both roles, because both can be
-  // a stage. The gate used to quote brand.sizeLabel unconditionally: the
-  // iPhone that held one layer of the 27B was asked to approve "~14.1 GB" for
-  // a slice worth a fraction of that (real device, 2026-08-29). A stage's
-  // exact bytes are not knowable here — they come from the safetensors
-  // headers, read after consent — so this states the RANGE and leaves the
-  // size to the progress panel. It does not guess a number.
-  const weightsLine = cached
-    ? (stage
-        ? `Layers ${stage.start}-${stage.end} are already cached on this device.`
-        : 'The weights are already cached on this device.')
-    : (stage
-        ? `Layers ${stage.start}-${stage.end} of ${spec.layers} download once — a slice of the `
-          + `full ${brand.sizeLabel}, not all of it — and are cached locally; the progress panel `
-          + 'below shows the real size as it arrives.'
-        : `The weights download once (${brand.sizeLabel}) and are cached locally; every later visit starts from disk.`)
-  // brand.ramNote is a whole-checkpoint figure ("needs ~20 GB free RAM") and
-  // is false for a stage. Nothing replaces it: a per-stage number would have
-  // to be invented.
+  // WHAT THIS DEVICE FETCHES, AND WHAT IT NEEDS TO HOLD IT — both sentences
+  // from stage-range.ts, which is also where the entrance's gate gets them, so
+  // the two surfaces cannot say different things about the same range.
+  //
+  // The gate used to quote brand.sizeLabel unconditionally: the iPhone that
+  // held one layer of the 27B was asked to approve "~14.1 GB" for a slice
+  // worth a fraction of that (real device, 2026-08-29). The repair for that
+  // then went one step too far and DELETED the RAM note for any stage, so
+  // `?layers=0-63` of 64 — ~13.9 of 14.1 GB — read exactly like `0-8`. Neither
+  // sentence guesses a per-stage byte count; a stage's real size is not known
+  // until the safetensors headers are read, after consent.
+  const copy = stageGateCopy({
+    stage: stage ?? null,
+    layers: spec.layers,
+    cached,
+    sizeLabel: brand.sizeLabel,
+    ramNote: brand.ramNote ?? '',
+  })
   const ram = document.getElementById('gate-ram')
   if (ram) {
-    if (!stage && brand.ramNote) ram.textContent = brand.ramNote
+    if (copy.ram) ram.textContent = copy.ram
     else ram.hidden = true
   }
   const weights = document.getElementById('gate-weights')
-  if (weights) weights.textContent = weightsLine
+  // The progress panel is this page's own — the entrance's gate has no such
+  // row under it, so the pointer at it is added here rather than in the
+  // shared sentence.
+  if (weights) {
+    weights.textContent = !cached && stage
+      ? `${copy.weights} The progress panel below shows the real size as it arrives.`
+      : copy.weights
+  }
 
   const go = document.getElementById('share-gate-go') as HTMLButtonElement
   go.textContent = role.kind === 'helper'
@@ -521,10 +538,14 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       import('./engine-core.js'),
     ])
 
+  // A hosting stage that skipped layer 0 used to throw HERE — from inside the
+  // boot, with the title, the nameplate and the consent paragraph already
+  // painted with the stage it was about to refuse, and the raw message on
+  // screen. stageFor holds that rule now, at the routing point, where a
+  // refusal means "no stage" and this page falls back to the whole model and
+  // the honest whole-model gate. Nothing left to check by the time we are
+  // here: `stageRange` is what that function returned.
   const spec = specFromSearch(location.search)
-  if (stageRange && stageRange.start !== 0) {
-    throw new Error(`share: a hosting stage must start at layer 0 (got ${stageRange.start}); later stages join a room as helpers`)
-  }
 
   // The sheet, from the spec that will actually boot. A stage replaces the
   // Weights row: the download is a SLICE, and quoting the whole checkpoint's
