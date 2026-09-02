@@ -73,7 +73,7 @@ Subsequent loads are instant — the weights stay in OPFS, so returning to a mod
 
 A model too big for one machine can be split by layer range across several. Each machine holds only its own layers and its own KV cache, a token's hidden state hops device to device over WebRTC, and a guest with the room link just chats — it downloads nothing and needs no WebGPU. [`share.html`](./share.html) is that surface, and the entrance builds its links under ENTER, from the "Too big for one machine? Split it" button. Splitting needs an MLX checkpoint, every serving tab has to stay awake (both serving roles carry a keep-awake toggle), and there is no TURN relay — same network or an ordinary home router, not a corporate one. The design and the rest of its limits are in the [repo README](https://github.com/abgnydn/zero-tvm#the-swarm).
 
-**Requirements**: Chrome / Edge with WebGPU enabled and the `shader-f16` feature available (default on macOS Apple-Silicon, enabled on most modern Windows / Linux GPUs). The MoE models also need subgroups. The KV cache is allocated eagerly at boot, so a model needs the free RAM its card names or it fails there.
+**Requirements**: Chrome / Edge with WebGPU enabled and the `shader-f16` feature available (default on macOS Apple-Silicon, enabled on most modern Windows / Linux GPUs). The MoE models also need subgroups. The KV cache is allocated eagerly at boot, so a model needs the free RAM its card names. On unified memory the allocation can succeed and the GPU process die later anyway — Metal commits lazily, so a successful allocation is not a promise.
 
 ## Models
 
@@ -108,7 +108,7 @@ downloads on page load. `docs.html` carries what the first two explained.
 - `?sgffn=0` — opt OUT of the tiled-subgroup fused FFN, which is on by default
 - `?kv8=0` — opt OUT of the int8 KV cache, which is the default since 2026-08-18
 
-One flag that is not a shader variant: `?ctx=N` sets the KV budget in tokens, clamped to the model's trained window. It is allocated eagerly at boot, so raising it can fail there; the entrance offers the same choice as a picker on the sheet.
+One flag that is not a shader variant: `?ctx=N` sets the KV budget in tokens, clamped to the model's trained window. It is allocated eagerly at boot, so raising it can fail there; the entrance's sheet offers the same knob as a picker of named windows (Standard / Long / Full).
 
 ## How it relates to a published paper
 
