@@ -115,15 +115,17 @@ try {
     'relay dropped spoofed control message')
 
   // ── churn: host B disappears mid-session ──
-  const peerJoinedOnB = hostB.seen.filter((m) => m.type === 'peer-joined' && m.from === joined2.from).length
+  // NOTE (not a check): assign()'s dead-host fallback cannot be exercised
+  // from outside — the relay is single-threaded, so no host vanishes between
+  // leastLoadedHost() and assign() at any existing call site. It is
+  // defense-in-depth for a future async refactor, verified by reading
+  // worker.js, not by this harness. A test asserting "dead host got no
+  // peer-joined" would pass on code without the fallback and prove nothing.
   hostB.close()
   await guest2.expect((m) => m.type === 'host-changed', 'host-changed after its host died')
   const takenOver = await hostA.expect((m) => m.type === 'peer-joined' && m.from === joined2.from,
     'peer-joined for the orphaned guest')
   check('takeover on host death', true, `host A picked up guest ${takenOver.from}`)
-  check('orphan not reassigned to dead host',
-    hostB.seen.filter((m) => m.type === 'peer-joined' && m.from === joined2.from).length === peerJoinedOnB,
-    'dead host B received no extra peer-joined')
   await hostA.expect((m) => m.type === 'room' && m.hosts === 1, 'room back to 1 host')
 
   // The takeover must survive: the orphan can talk to its new host.
