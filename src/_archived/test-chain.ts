@@ -16,17 +16,17 @@
  * This isolates the chain test to: embed, norm, matmuls, rope, addnorm, fused_ffn, argmax.
  */
 
-import { LLMEngine, MODELS } from '../engine.js'
-import { patchForCapture, getCaptureResult, CapturedDispatch, CaptureResult } from '../capture.js'
+import { LLMEngine, MODELS } from './engine.js'
+import { patchForCapture, getCaptureResult, CapturedDispatch, CaptureResult } from './capture.js'
 
-import { withPrelude } from './shader-prelude'
-import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
-import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
-import addNormSrc from './shaders/add_norm.wgsl?raw'
-import ropeSrc from './shaders/rope.wgsl?raw'
-import fusedFfnSrc from './shaders/fused_ffn.wgsl?raw'
-import embeddingSrc from './shaders/embedding.wgsl?raw'
-import argmaxSrc from './shaders/argmax.wgsl?raw'
+import { withPrelude } from '../compiler/shader-prelude'
+import { int4MatmulWGSL } from '../compiler/shaders/int4_matmul.gen'
+import rmsNormSrc from '../compiler/shaders/rms_norm.wgsl?raw'
+import addNormSrc from '../compiler/shaders/add_norm.wgsl?raw'
+import ropeSrc from '../compiler/shaders/rope.wgsl?raw'
+import fusedFfnSrc from '../compiler/shaders/fused_ffn.wgsl?raw'
+import embeddingSrc from '../compiler/shaders/embedding.wgsl?raw'
+import argmaxSrc from '../compiler/shaders/argmax.wgsl?raw'
 
 // ============================================================
 // Helpers

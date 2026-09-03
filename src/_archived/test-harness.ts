@@ -8,20 +8,20 @@
  *   4. Compare
  */
 
-import { LLMEngine, MODELS } from '../engine.js'
-import { patchForCapture, getCaptureResult, CapturedDispatch, CaptureResult } from '../capture.js'
+import { LLMEngine, MODELS } from './engine.js'
+import { patchForCapture, getCaptureResult, CapturedDispatch, CaptureResult } from './capture.js'
 
-import { withPrelude } from './shader-prelude'
-import { int4MatmulWGSL } from './shaders/int4_matmul.gen'
-import rmsNormSrc from './shaders/rms_norm.wgsl?raw'
-import addNormSrc from './shaders/add_norm.wgsl?raw'
-import ropeSrc from './shaders/rope.wgsl?raw'
+import { withPrelude } from '../compiler/shader-prelude'
+import { int4MatmulWGSL } from '../compiler/shaders/int4_matmul.gen'
+import rmsNormSrc from '../compiler/shaders/rms_norm.wgsl?raw'
+import addNormSrc from '../compiler/shaders/add_norm.wgsl?raw'
+import ropeSrc from '../compiler/shaders/rope.wgsl?raw'
 // KV append + attention tested in chain test (different binding layout)
-// import kvAppendSrc from './shaders/kv_append.wgsl?raw'
-// import attentionSrc from './shaders/attention.wgsl?raw'
-import fusedFfnSrc from './shaders/fused_ffn.wgsl?raw'
-import embeddingSrc from './shaders/embedding.wgsl?raw'
-import argmaxSrc from './shaders/argmax.wgsl?raw'
+// import kvAppendSrc from '../compiler/shaders/kv_append.wgsl?raw'
+// import attentionSrc from '../compiler/shaders/attention.wgsl?raw'
+import fusedFfnSrc from '../compiler/shaders/fused_ffn.wgsl?raw'
+import embeddingSrc from '../compiler/shaders/embedding.wgsl?raw'
+import argmaxSrc from '../compiler/shaders/argmax.wgsl?raw'
 
 // ============================================================
 // Helpers

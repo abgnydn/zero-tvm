@@ -12,7 +12,7 @@
  */
 
 import { PHI3, type ModelSpec } from '../compiler/model-spec.js'
-import { openMlxCheckpoint, assembleMlx, planModel, progressEvery, type MlxSource } from './weight-loader-mlx.js'
+import { openMlxCheckpoint, assembleMlx, planModel, planKey, progressEvery, type MlxSource } from './weight-loader-mlx.js'
 import {
   fetchSlabSource, opfsSlabSource, type SlabDirectory, type SlabSource,
 } from './slab-source.js'
@@ -61,6 +61,22 @@ const FETCH_RETRIES = 4
 /** Set on the first mid-stream network failure; sticky for the page session
  *  so a retried loadWeights also runs at the reduced concurrency. */
 let networkDegraded = false
+
+/** Count of consecutive shard fetches that completed without hitting a
+ *  transient failure while in degraded mode. Ten successes reset concurrency
+ *  back to full — a single stray reset does not flip-flop the session. */
+let consecutiveSuccesses = 0
+
+/** Called when a shard fetch completes without transients. Resets the session
+ *  back to full concurrency after 10 consecutive clean fetches. */
+function markFetchSuccess(onRetry?: (msg: string) => void): void {
+  if (!networkDegraded) return
+  consecutiveSuccesses++
+  if (consecutiveSuccesses >= 10) {
+    networkDegraded = false
+    onRetry?.(`network stable — restoring shard concurrency ${DEGRADED_FETCH_CONCURRENCY} → ${FETCH_CONCURRENCY}`)
+  }
+}
 
 // ============================================================
 // ndarray-cache.json types
@@ -156,6 +172,27 @@ export function opfsKey(dataPath: string): string {
   return dataPath.replace(/[^A-Za-z0-9._-]/g, '_')
 }
 
+/** Throw if two distinct data paths sanitize to the same OPFS filename.
+ *
+ *  The regex above is lossy: `a/b` and `a_b` both become `a_b`. That would
+ *  write two different shards/buffers to one file and silently serve the wrong
+ *  bytes on a later load. The check is done where the full list is known, so
+ *  the collision is caught before any bytes are cached. */
+function throwOnOpfsKeyCollision(label: string, paths: string[]): void {
+  const seen = new Map<string, string>()
+  for (const raw of paths) {
+    const k = opfsKey(raw)
+    const prev = seen.get(k)
+    if (prev !== undefined && prev !== raw) {
+      throw new Error(
+        `${label}: two distinct paths map to the same OPFS key '${k}': ` +
+          `'${prev}' and '${raw}'. Refusing to cache different data under one filename.`,
+      )
+    }
+    seen.set(k, raw)
+  }
+}
+
 async function opfsRead(dir: OPFSDir, dataPath: string): Promise<ArrayBuffer | null> {
   if (!dir) return null
   try {
@@ -224,6 +261,7 @@ async function fetchBufWithRetry(
   // A mid-stream / connection failure — degrade session concurrency once.
   const transient = (e: unknown) => {
     lastErr = e
+    consecutiveSuccesses = 0 // the streak above is consecutive, not cumulative
     if (!networkDegraded) {
       networkDegraded = true
       onRetry?.(`network unstable — dropping shard concurrency ${FETCH_CONCURRENCY} → ${DEGRADED_FETCH_CONCURRENCY}`)
@@ -292,6 +330,7 @@ async function fetchBufWithRetry(
       transient(new Error(`truncated body: got ${received} of ${expectTotal} bytes`))
       continue
     }
+    markFetchSuccess(onRetry)
     const only = chunks.length === 1 ? chunks[0] : null
     if (only && only.byteOffset === 0 && only.byteLength === only.buffer.byteLength) {
       return only.buffer
@@ -616,8 +655,31 @@ export async function loadWeights(
   if (spec.weightFormat === 'mlx-safetensors') {
     const src = mlxSource(baseUrl, mirrorBase, onProgress)
     onProgress?.('Reading safetensors headers…')
-    const { locate, shards } = await openMlxCheckpoint(src)
-    const total = planModel(spec, layerRange).length
+    const { locate, records, shards } = await openMlxCheckpoint(src)
+    const plans = planModel(spec, layerRange)
+    // Built-buffer keys are what actually land in OPFS; catch a sanitization
+    // collision before any bytes are written or uploaded.
+    throwOnOpfsKeyCollision(
+      `loadWeights(${spec.id})`,
+      plans.map(({ plan, layer }) => planKey(plan, layer)),
+    )
+    // Every record the plans concatenate must exist in THIS checkpoint. A new
+    // family whose naming drifted fails here with the missing name — before
+    // any ranged read, GPU upload, or cache write — instead of mid-load.
+    {
+      const have = new Set(records)
+      for (const { plan } of plans) {
+        for (const part of plan.parts) {
+          if (!have.has(part.record)) {
+            throw new Error(
+              `loadWeights(${spec.id}): plan '${plan.name}' needs record ` +
+              `'${part.record}', absent from this checkpoint`,
+            )
+          }
+        }
+      }
+    }
+    const total = plans.length
     onProgress?.(`${shards.length} shards, ${total} buffers to build`)
     // WHICH SLAB SOURCE is not a guess — it is the same rule `cacheWrite` five
     // lines below follows. Serving from the dev mirror means this load writes
@@ -688,6 +750,11 @@ export async function loadWeights(
 
   const allRecords = flattenRecords(manifest)
   onProgress?.(`Manifest: ${allRecords.length} parameters`)
+  // The manifest itself and every shard path go through opfsKey before writing.
+  throwOnOpfsKeyCollision(
+    `loadWeights(${spec.id})`,
+    [manifestName, ...allRecords.map((r) => r.dataPath)],
+  )
 
   // Group records by dataPath so each shard is fetched exactly once.
   const byShard = new Map<string, FlatRecord[]>()

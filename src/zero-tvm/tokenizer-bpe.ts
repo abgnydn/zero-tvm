@@ -61,6 +61,8 @@
  * (scripts/gen-tokenizer-fixtures-qwen.mjs).
  */
 
+import type { Tokenizer } from './tokenizer.js'
+
 // ============================================================
 // tokenizer.json types (subset we need)
 // ============================================================
@@ -119,11 +121,7 @@ async function fetchText(url: string): Promise<string> {
 // Byte-level BPE implementation
 // ============================================================
 
-export interface ByteLevelTokenizer {
-  encode(text: string): number[]
-  decode(ids: number[] | Int32Array): string
-  eosId: number
-  bosId: number
+export interface ByteLevelTokenizer extends Tokenizer {
   /** Generation stop set: [<|im_end|>, <|endoftext|>] per mlc-chat-config. */
   stopIds: number[]
 }
@@ -201,7 +199,7 @@ const utf8Encoder = new TextEncoder()
  * delegates here. Same interface shape as createTokenizer() in tokenizer.ts
  * so the engine can consume either.
  */
-export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): ByteLevelTokenizer {
+export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): Tokenizer {
   const vocab = json.model.vocab   // token_str → id
   const { byteToChar, charToByte } = buildByteUnicodeMaps()
   const pretokRe = pretokenizeRegexFrom(json)
@@ -400,7 +398,7 @@ export function createByteLevelTokenizer(json: ByteLevelTokenizerJSON): ByteLeve
 export async function loadByteLevelTokenizer(
   onProgress?: (msg: string) => void,
   baseUrl: string = QWEN3_MODEL_BASE,
-): Promise<ByteLevelTokenizer> {
+): Promise<Tokenizer> {
   onProgress?.('Loading tokenizer.json...')
   const url = baseUrl + 'tokenizer.json'
   const json: ByteLevelTokenizerJSON = JSON.parse(await fetchText(url))
@@ -503,7 +501,7 @@ export function buildChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   // Only encode() is needed, so the SPM Tokenizer shape (no stopIds) is
   // accepted too — the model-select factory routes either kind here.
-  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  tokenizer: Pick<Tokenizer, 'encode'>,
   opts?: {
     thinking?: boolean
     generation?: ChatMLGeneration
@@ -621,7 +619,7 @@ export function llama3DateString(d: Date = new Date()): string {
  */
 export function buildDeepSeekChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  tokenizer: Pick<Tokenizer, 'encode'>,
   opts?: { bosToken?: string; eosToken?: string },
 ): number[] {
   const bos = opts?.bosToken ?? '<｜begin▁of▁sentence｜>'
@@ -641,7 +639,7 @@ export function buildLlama3ChatPrompt(
   // tool results in ipython turns and the loop below renders any role as its
   // own header, so this only widens the type to what the body already did.
   messages: Array<{ role: 'system' | 'user' | 'assistant' | 'ipython'; content: string }>,
-  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  tokenizer: Pick<Tokenizer, 'encode'>,
   // dateString exists so tests can pin the fixture date; live chat renders
   // today's, exactly like mlx_lm running the template with strftime_now.
   opts?: { dateString?: string },
@@ -714,7 +712,7 @@ export type MistralTemplateVariant = 'v1' | 'nemo' | 'ministral'
 
 export function buildMistralChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  tokenizer: Pick<Tokenizer, 'encode'>,
   opts?: { variant?: MistralTemplateVariant; bosToken?: string; eosToken?: string },
 ): number[] {
   const variant = opts?.variant ?? 'v1'
@@ -786,7 +784,7 @@ export function buildMistralChatPrompt(
 
 export function buildTuluChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-  tokenizer: Pick<ByteLevelTokenizer, 'encode'>,
+  tokenizer: Pick<Tokenizer, 'encode'>,
   opts?: { bosToken?: string; eosToken?: string },
 ): number[] {
   const eos = opts?.eosToken ?? '<|endoftext|>'
