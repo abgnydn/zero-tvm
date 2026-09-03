@@ -919,7 +919,9 @@ path untouched (`recordForward` unchanged; same 340 dispatches/token).
    392.50s cold became 12.76s and 26.30s on the following turns. Only a
    divergence older than the ring prefills from zero (re-zeroing GDN state). Template mechanics measured:
    - *ChatML (Qwen3/Qwen3.5, non-thinking)*: **this mechanism was removed on
-     2026-08-19 and the Qwen rows below are historical.** It re-rendered past
+     2026-08-19; the Qwen rows below, and the 14.3 s → 0.19 s turn-3 figure
+     published from them, are WITHDRAWN as current claims and kept as
+     history.** It re-rendered past
      assistant turns WITH the empty `<think>\n\n</think>\n\n` block, which made
      each turn an exact token-level extension of the absorbed sequence — the
      ≤1-token overrun being the `<|im_end|>` stop id. That is not what any Qwen
