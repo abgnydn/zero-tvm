@@ -18,13 +18,34 @@
 //   node scripts/mutation-gate.mjs            # all
 //   node scripts/mutation-gate.mjs --list
 //   node scripts/mutation-gate.mjs think-block
-import { readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, rmSync, statSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { basename, dirname, join } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const arg = process.argv[2]
+
+// Mutations rewrite src/ IN PLACE, so two concurrent runs corrupt each other
+// and each sees a false red baseline. Serialize on a lockfile via flock(1):
+// re-exec this same script under `flock LOCKFILE`, which is held for the whole
+// run. `--locked` only ever comes from the re-exec below (it starts with --,
+// so the `chosen` filter ignores it). No flock or no .git dir: warn and run
+// unlocked rather than refuse — the gate must stay runnable by hand.
+if (!process.argv.includes('--locked')) {
+  const underGit = (() => {
+    try { return statSync(join(ROOT, '.git')).isDirectory() } catch { return false }
+  })()
+  const flockProbe = spawnSync('flock', ['--version'], { encoding: 'utf8' })
+  if (flockProbe.error || !underGit) {
+    console.log('  WARNING: no flock lock (flock(1) missing or no .git dir) — do not run two gates at once')
+  } else {
+    const inner = spawnSync('flock',
+      [join(ROOT, '.git', 'mutation-gate.lock'), process.execPath, ...process.argv.slice(1), '--locked'],
+      { cwd: ROOT, stdio: 'inherit' })
+    process.exit(inner.status ?? 1)
+  }
+}
 
 /** Each mutation names the DEFECT it reinstates, not the edit it makes. `find`
  *  must match exactly once — a mutation that silently matches nothing is a test

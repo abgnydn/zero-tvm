@@ -3,26 +3,26 @@
  */
 
 // @ts-ignore
-import embeddingWGSL from './compiler/shaders/embedding.wgsl?raw'
+import embeddingWGSL from '../compiler/shaders/embedding.wgsl?raw'
 // @ts-ignore
-import rmsNormWGSL from './compiler/shaders/rms_norm.wgsl?raw'
+import rmsNormWGSL from '../compiler/shaders/rms_norm.wgsl?raw'
 // @ts-ignore
-import qkvFusedWGSL from './compiler/shaders/qkv_fused.wgsl?raw'
+import qkvFusedWGSL from '../compiler/shaders/qkv_fused.wgsl?raw'
 // @ts-ignore
-import attentionWGSL from './compiler/shaders/attention.wgsl?raw'
-import { int4MatmulWGSL as genInt4Matmul } from './compiler/shaders/int4_matmul.gen'
+import attentionWGSL from '../compiler/shaders/attention.wgsl?raw'
+import { int4MatmulWGSL as genInt4Matmul } from '../compiler/shaders/int4_matmul.gen'
 // The int4_matmul family is generated; render the scalar variant for display.
 const int4MatmulWGSL = genInt4Matmul()
 // @ts-ignore
-import fusedFFNWGSL from './compiler/shaders/fused_ffn.wgsl?raw'
+import fusedFFNWGSL from '../compiler/shaders/fused_ffn.wgsl?raw'
 // @ts-ignore
-import addNormWGSL from './compiler/shaders/add_norm.wgsl?raw'
+import addNormWGSL from '../compiler/shaders/add_norm.wgsl?raw'
 // @ts-ignore
-import kvAppendWGSL from './compiler/shaders/kv_append.wgsl?raw'
+import kvAppendWGSL from '../compiler/shaders/kv_append.wgsl?raw'
 // @ts-ignore
-import ropeWGSL from './compiler/shaders/rope.wgsl?raw'
+import ropeWGSL from '../compiler/shaders/rope.wgsl?raw'
 // @ts-ignore
-import argmaxWGSL from './compiler/shaders/argmax.wgsl?raw'
+import argmaxWGSL from '../compiler/shaders/argmax.wgsl?raw'
 
 // ============================================================
 // Dispatch Timeline Visualization

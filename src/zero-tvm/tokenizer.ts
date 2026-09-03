@@ -88,6 +88,8 @@ export interface Tokenizer {
   decode(ids: number[] | Int32Array): string
   eosId: number
   bosId: number
+  /** Optional generation stop set (byte-level BPE tokenizers expose this). */
+  stopIds?: number[]
 }
 
 // The metaspace character (▁, U+2581) is used as space prefix in SentencePiece
