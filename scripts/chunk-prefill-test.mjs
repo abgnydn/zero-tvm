@@ -2,6 +2,7 @@
 // CHUNK-PREFILL-TEST — does chunked prefill compute what per-token prefill does?
 //
 //   node scripts/chunk-prefill-test.mjs qwen3mlx
+//   node scripts/chunk-prefill-test.mjs qwen38 --long   # 16k prompt, the depth that broke once
 //
 // Chunking replaces n matvecs with one batched GEMM over n tokens. That is a
 // different ARITHMETIC ORDER, not a different algorithm, so f16 rounding can
@@ -15,10 +16,13 @@ import { startHarness, stopHarness, newPage } from '../tests/e2e/harness.ts'
 
 const param = process.argv.slice(2).find((a) => !a.startsWith('--')) ?? 'qwen3mlx'
 const GEMM = process.env.GEMM || ''
-const TOKENS = Number(process.env.TOKENS) || 24
+// --long runs the configuration that actually broke once (qwen38 at ~16k):
+// multi-chunk accumulation at depth, not the 150-token default.
+const LONG = process.argv.includes('--long')
+const TOKENS = Number(process.env.TOKENS) || (LONG ? 8 : 24)
 // Long enough to span several chunks (CHUNK_CAP is 64) and to make the batched
 // GEMM's ragged final block non-trivial.
-const PROMPT = Number(process.env.PROMPT) || 150
+const PROMPT = Number(process.env.PROMPT) || (LONG ? 16000 : 150)
 const CAP = Number(process.env.CAP) || 0
 const IDS = Array.from({ length: PROMPT }, (_, i) => 1000 + ((i * 37) % 900))
 
@@ -97,6 +101,6 @@ console.log(failed
 if (!failed && IDS.length < 4000) {
   console.log('  NOTE: this is a SHORT prompt. The defect found on 2026-08-19 needed ~16k')
   console.log('  tokens and got worse with chunk SIZE, so a short pass does not cover it:')
-  console.log(`    PROMPT=16000 TOKENS=8 node scripts/chunk-prefill-test.mjs ${process.argv[2] ?? '<spec>'}`)
+  console.log(`    node scripts/chunk-prefill-test.mjs ${process.argv[2] ?? '<spec>'} --long`)
 }
 process.exit(failed ? 1 : 0)
