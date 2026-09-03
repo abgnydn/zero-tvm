@@ -209,6 +209,49 @@ export function resolveChunkCap(
   return Math.min(sgmatAvail ? 1024 : 64, spec.maxChunkCap ?? Infinity)
 }
 
+export type ChunkGemmName = 'e5' | 'sgmat' | 'tiled' | 'matvec'
+
+/**
+ * Chunk-prefill GEMM selection as a pure function, so the ordering is
+ * unit-testable without a GPU: E5 (matrix unit, 64-row tile) > sgmat >
+ * tiled (explicit `chunkGemm:'tiled'` or `chunkTiled` only) > matvec.
+ *
+ * An EXPLICIT `want` that cannot run is a rejection (`rejected` carries the
+ * throw text), never a silent substitution — silently substituting is how a
+ * kernel A/B measures the same code twice. The ladder still applies when
+ * nothing was asked for (`want` undefined).
+ *
+ * `capTiles64`: E5's A stage reads a full 64 rows whatever M is, so the
+ * activation buffers — which are exactly CHUNK_CAP rows — must tile by 64,
+ * not 32.
+ */
+export function pickChunkGemm(caps: {
+  want?: ChunkGemmName
+  chunkTiled: boolean
+  dimsOK: boolean
+  capTiles64: boolean
+  e5Ready: boolean
+  sgmatReady: boolean
+  cap: number
+}): { used: ChunkGemmName; rejected: string | null } {
+  const want = caps.want ?? (caps.e5Ready ? 'e5' : caps.sgmatReady ? 'sgmat' : 'matvec')
+  const ladder: Array<{ name: ChunkGemmName; ok: () => boolean }> = [
+    { name: 'e5', ok: () => want === 'e5' && caps.dimsOK && caps.capTiles64 && caps.e5Ready },
+    { name: 'sgmat', ok: () => (want === 'sgmat' || want === 'e5') && caps.dimsOK && caps.sgmatReady },
+    { name: 'tiled', ok: () => (want === 'tiled' || caps.chunkTiled) && caps.dimsOK },
+    { name: 'matvec', ok: () => true },
+  ]
+  const used = ladder.find((e) => e.ok())!.name
+  if (caps.want && used !== caps.want) {
+    const why = !caps.dimsOK ? `dims do not tile (cap ${caps.cap}, d/qDim/ffn must be %64 and cap %32)`
+      : caps.want === 'e5' && !caps.capTiles64 ? `E5 stages a 64-row tile, so cap must be %64 (got ${caps.cap})`
+      : caps.want === 'e5' || caps.want === 'sgmat' ? 'its pipeline was not built — usually a device without chromium-experimental-subgroup-matrix'
+      : 'that pipeline was not built'
+    return { used, rejected: `chunkGemm: asked for '${caps.want}', can only run '${used}' — ${why}` }
+  }
+  return { used, rejected: null }
+}
+
 export function allocKVFor(
   device: GPUDevice,
   spec: ModelSpec,
@@ -3494,29 +3537,30 @@ export function buildDecodeEngine(
     // affine), and qwen35, which is both MLC-symmetric and hybrid GDN. Measured
     // in-engine on all three: +13.1% / +14.7% / +39.7% prefill.
     // It degrades to sgmat by itself when the cap does not tile by 64.
-    const wantGemm = opts.chunkGemm ?? (e5Pipes ? 'e5' : sgmatPipes ? 'sgmat' : 'matvec')
-    // E5's A stage reads a full 64 rows whatever M is, so the activation
-    // buffers — which are exactly CHUNK_CAP rows — must tile by 64, not 32.
-    const e5OK = wantGemm === 'e5' && dimsOK && CHUNK_CAP % 64 === 0 && e5Pipes != null
-    const sgmatOK = !e5OK && (wantGemm === 'sgmat' || wantGemm === 'e5') && dimsOK && sgmatPipes != null
-    const tiledOK = !sgmatOK && !e5OK && (wantGemm === 'tiled' || opts.chunkTiled === true) && dimsOK
-    const gemm = e5OK ? e5Pipes!
-      : sgmatOK ? sgmatPipes!
-      : tiledOK ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
+    const pick = pickChunkGemm({
+      want: opts.chunkGemm,
+      chunkTiled: opts.chunkTiled === true,
+      dimsOK,
+      capTiles64: CHUNK_CAP % 64 === 0,
+      e5Ready: e5Pipes != null,
+      sgmatReady: sgmatPipes != null,
+      cap: CHUNK_CAP,
+    })
+    const gemm = pick.used === 'e5' ? e5Pipes!
+      : pick.used === 'sgmat' ? sgmatPipes!
+      : pick.used === 'tiled' ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
       : (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
-    const gemmTiledGrid = sgmatOK || tiledOK
-    chunkGemmUsed = e5OK ? 'e5' : sgmatOK ? 'sgmat' : tiledOK ? 'tiled' : 'matvec'
+    const gemmTiledGrid = pick.used === 'sgmat' || pick.used === 'tiled'
+    chunkGemmUsed = pick.used
+    // Kept as names (not re-derived at use): the dispatch grid below tiles
+    // E5 64x32, E1 32x64, tiled 32x32 — the geometry follows the pick.
+    const e5OK = pick.used === 'e5'
+    const sgmatOK = pick.used === 'sgmat'
     // An EXPLICIT request that cannot be honoured is an error, not a fallback.
     // Silently substituting is how a kernel A/B measures the same code twice:
     // ask for 'e5', get sgmat, read two identical numbers, conclude the kernels
     // are equivalent. The ladder still applies when nothing was asked for.
-    if (opts.chunkGemm && chunkGemmUsed !== opts.chunkGemm) {
-      const why = !dimsOK ? `dims do not tile (cap ${CHUNK_CAP}, d/qDim/ffn must be %64 and cap %32)`
-        : opts.chunkGemm === 'e5' && CHUNK_CAP % 64 !== 0 ? `E5 stages a 64-row tile, so cap must be %64 (got ${CHUNK_CAP})`
-        : opts.chunkGemm === 'e5' || opts.chunkGemm === 'sgmat' ? 'its pipeline was not built — usually a device without chromium-experimental-subgroup-matrix'
-        : 'that pipeline was not built'
-      throw new Error(`chunkGemm: asked for '${opts.chunkGemm}', can only run '${chunkGemmUsed}' — ${why}`)
-    }
+    if (pick.rejected) throw new Error(pick.rejected)
     const dyn = gemm
     /** A batched-GEMM bind group. bg() maps array position to binding index, so
      *  the bias buffer must come LAST and only when the affine kernel is in
