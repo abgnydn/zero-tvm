@@ -610,21 +610,20 @@ because it would read as coverage.
   depth, so the threshold is somewhere in (256, 1024], and 24k is untested under the
   quarantine.
 - **The scale gates still do not reach that configuration.**
-  `gdn_chunk_chain_scale` runs at 1024 but on qwen35's dims through
-  `int4_matmul_batched_dyn`, and the kernel harness never requests the
-  subgroup-matrix feature. Cap 1024 is reached by DEFAULT only where that
-  feature exists, which is exactly when the engine picks E5 — so the arm and the
-  configuration that fails never coincide. `attention_prefill`
-  is still 5 tokens against a shipped 1024 and `validate-model` ~20 against 32k.
-  Closing this needs the suite parameterized by spec plus a matrix-unit arm.
-- **CI runs one of the kernel suites, and a running one can still report PASS
-  for tests it did not execute.** `test:kernels:qwen35` — where the new scale
-  arm lives — runs only in a human's shell. When it does run, `skip()` returns
-  `pass: true`, so a machine without 32-lane subgroups reports PASS per test
-  while running nothing; read the detail strings, not the count. With no adapter
-  at all it exits 1, which is correct and was briefly documented here as exit 0
-  — a claim taken from a review without being run. UNRUN is not a pass, and
-  neither is an unverified claim about what UNRUN does.
+  `gdn_chunk_chain_scale` runs at 1024 through `int4_matmul_batched_dyn`, and
+  the kernel harness never requests the subgroup-matrix feature. Cap 1024 is
+  reached by DEFAULT only where that feature exists, which is exactly when the
+  engine picks E5 — so the arm and the configuration that fails never coincide.
+  `attention_prefill` is still 5 tokens against a shipped 1024 and
+  `validate-model` ~20 against 32k. The suite takes the spec as a CLI argument
+  since 2026-09-03 (`npm run test:kernels:qwen38`); the matrix-unit arm is
+  still missing.
+- **CI runs one of the kernel suites; the GDN suite runs only in a human's
+  shell.** `test:kernels:qwen35` / `:qwen38` need a real adapter. Since
+  2026-09-03 a test the adapter cannot run reports UNRUN and the run exits
+  non-zero (`FORCE_NO_SG32=1` shows that path going red); before that `skip()`
+  returned `pass: true` and a machine without 32-lane subgroups reported PASS
+  while running nothing. With no adapter at all it exits 1.
 - **`scripts/mutation-gate.mjs` is not concurrency-safe.** It mutates `src/` in
   place, so two runs in one worktree each see a false red baseline.
 - **No ESLint.** Fixed 2026-08-10: ci.yml calls `npm run typecheck` directly

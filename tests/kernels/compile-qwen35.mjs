@@ -1,5 +1,6 @@
-// QWEN35_4B kernel-correctness suite — the GatedDeltaNet (GDN) kernel family
-// plus the gated-attention pieces, all under shaderPrelude(QWEN35_4B):
+// GDN-hybrid kernel-correctness suite — the GatedDeltaNet (GDN) kernel family
+// plus the gated-attention pieces, under shaderPrelude(<spec>). The spec is
+// the first CLI argument, a model-spec.ts export name; default QWEN35_4B:
 // D=2560, HEADS=16, KV_HEADS=4, HEAD_DIM=256, ROTARY_DIM=64, ATTN_GATE=1,
 // C_ATTN_DIM=10240, GDN 16 k-heads / 32 v-heads × 128, conv width 4,
 // ROPE_THETA=1e7, RMS_EPS=1e-6 — against tests/kernels/ref-gdn.mjs (a
@@ -26,6 +27,11 @@
 //     QWEN35_4B.
 //
 //   npm run test:kernels:qwen35
+//   npm run test:kernels:qwen38        # same suite under QWEN3_8_27B_4BIT dims
+//   node tests/kernels/compile-qwen35.mjs QWEN36_35B_A3B
+//
+// A test that cannot run on this adapter reports UNRUN and the run exits
+// non-zero. UNRUN is not a pass (docs/VERIFICATION.md).
 
 import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -41,7 +47,8 @@ import {
   MM,
 } from './gpu.mjs'
 import { toF16, f16Array, f16BitsToF32, f32ToF16Bits } from './half.mjs'
-import { withPrelude, QWEN35_4B, ropeInvFreqTable } from '../../src/compiler/shader-prelude.ts'
+import { withPrelude, ropeInvFreqTable } from '../../src/compiler/shader-prelude.ts'
+import * as SPECS from '../../src/compiler/model-spec.ts'
 import {
   int4MatmulWGSL,
   int4MatmulEntry,
@@ -62,7 +69,16 @@ import {
   sigmoid,
 } from './ref-gdn.mjs'
 
-const Q = QWEN35_4B
+const SPEC_NAME = process.argv[2] ?? 'QWEN35_4B'
+const Q = SPECS[SPEC_NAME]
+// Non-hybrid specs mirror the attention dims into gdn* so the shaders still
+// compile; layerKinds is what says whether a GDN kernel is ever dispatched.
+const isHybrid = (s) => Array.isArray(s?.layerKinds) && s.layerKinds.includes('gdn')
+if (!isHybrid(Q)) {
+  const gdn = Object.entries(SPECS).filter(([, s]) => isHybrid(s)).map(([k]) => k)
+  console.error(`ERROR: "${SPEC_NAME}" is not a GDN-hybrid spec export. One of: ${gdn.join(', ')}`)
+  process.exit(2)
+}
 const G = {
   kHeads: Q.gdnKHeads, vHeads: Q.gdnVHeads,
   headK: Q.gdnHeadK, headV: Q.gdnHeadV,
@@ -664,7 +680,7 @@ async function testGatedAttnBlockChain(device) {
     device.queue.submit([enc.finish()])
   }
 
-  let maxRel = 0
+  let maxErr = 0
   for (let t = 0; t < STEPS; t++) {
     device.queue.writeBuffer(hidden, 0, f16Array(xs[t]))
     device.queue.writeBuffer(posBuf, 0, new Int32Array([t]))
@@ -678,26 +694,29 @@ async function testGatedAttnBlockChain(device) {
     await dispatch(gateP, [attnOut, gateBuf, pods.gate], [Q.qDim / 256])
     const bytes = await runCompute(device, mm, [outBuf, attnOut, oScales, oWeights, pods.o], [d], 0, d * 2)
     const got = Array.from(new Uint16Array(bytes), f16BitsToF32)
-    maxRel = Math.max(maxRel, maxRelDiff(got, refOuts[t], 1e-2))
+    const rms = Math.sqrt(refOuts[t].reduce((a, v) => a + v * v, 0) / refOuts[t].length)
+    maxErr = Math.max(maxErr, maxAbsDiff(got, refOuts[t]) / rms)
   }
-  // 3e-2 (vs the single-kernel 2e-2): this chain stacks EIGHT f16 buffer
-  // round-trips (c_attn → split → qk_norm → rope → append → attention →
-  // gate → o_proj) and the o_proj dot re-amplifies them; a wiring error
-  // (e.g. swapped Q/gate interleave) diverges by O(1), not O(1e-2) — see the
-  // gdn_recur pairing control for the failure magnitude of a real bug.
+  // The error is the worst element's absolute miss over the output's RMS, not
+  // a per-element ratio: this chain stacks EIGHT f16 buffer round-trips
+  // (c_attn → split → qk_norm → rope → append → attention → gate → o_proj), so
+  // the drift scales with the output's magnitude and lands on near-zero
+  // elements — under qwen38's dims a per-element ratio read 2.2e-1 while every
+  // stage matched its own upstream within 1e-3. A wiring error (e.g. swapped
+  // Q/gate interleave, V fed from K) still diverges by O(1) on this metric.
   return {
     name: 'gated_attn chain 3 steps',
-    pass: maxRel < 0.03,
-    detail: `max rel err ${maxRel.toExponential(2)} across ${STEPS} decode steps`,
+    pass: maxErr < 0.03,
+    detail: `max err ${maxErr.toExponential(2)} of output RMS across ${STEPS} decode steps`,
   }
 }
 
 // Set in main() after the device probe — the chunked-prefill kernels
 // (int4_matmul_batched_dyn) hard-assume 32-lane subgroups like every _sg
-// variant; on adapters without that the chunked tests SKIP (the engine
-// falls back to per-token prefill there too).
+// variant; on adapters without that the chunked tests are UNRUN (the engine
+// falls back to per-token prefill there too) and the run cannot exit 0.
 let HAS_SG32 = false
-const skip = (name) => ({ name, pass: true, detail: 'SKIPPED — no 32-lane subgroup support (engine falls back to per-token prefill)' })
+const skip = (name) => ({ name, pass: false, unrun: true, detail: 'UNRUN — no 32-lane subgroup support (engine falls back to per-token prefill)' })
 
 // Region-view-aware dispatch helper (bind-group entries may be
 // { buffer, offset, size } views — same as the engine binds).
@@ -1490,21 +1509,21 @@ const TESTS = [
   //   covers      chunk-size dependence in the GDN chain kernels at 1024, the
   //               cap the engine ships on the matrix-unit path. 1024, 256 and
   //               64 are all real caps (256 is qwen38's quarantine).
-  //   DOES NOT    the spec — this file is `const Q = QWEN35_4B` (line 65), one
-  //               of the specs that does NOT corrupt.
+  //   the spec    only when asked — `npm run test:kernels:qwen38` runs this
+  //               under qwen38's dims; the default spec does NOT corrupt.
   //   DOES NOT    the GEMM — the projection here is int4_matmul_batched_dyn,
   //               and tests/kernels/gpu.mjs never requests
   //               chromium-experimental-subgroup-matrix. But cap 1024 is only
   //               reached when that feature EXISTS, which is exactly when the
   //               engine picks E5. So the shipped 1024 path always runs E5 and
   //               this arm always runs batched_dyn.
-  //   NOT A PASS  skip() returns pass:true, so on an adapter without 32-lane
-  //               subgroups this reports PASS while running nothing. UNRUN is
-  //               not a pass (docs/VERIFICATION.md) — read the detail string.
+  //   UNRUN       on an adapter without 32-lane subgroups this reports UNRUN
+  //               and the run exits non-zero. UNRUN is not a pass
+  //               (docs/VERIFICATION.md).
   //
-  // So a green run here does NOT clear qwen38. Closing the gap needs this file
-  // parameterized by spec and a matrix-unit arm; both are follow-ups, and until
-  // then this catches the chunk-size class only where the kernels are shared.
+  // So a green run under the default spec does NOT clear qwen38. Closing the
+  // gap needs the matrix-unit arm; until then this catches the chunk-size
+  // class only through the shared kernels.
   {
     label: 'gdn_chunk_chain_scale',
     fn: (d) => testGdnChunkChain(d, {
@@ -1562,11 +1581,12 @@ async function compileAll(device, subgroups) {
     compiled++
   }
   for (const e of errors) console.error(`      ${e}`)
-  const skipNote = skippedSg ? `, ${skippedSg} sg-only skipped (no 'subgroups' feature)` : ''
+  const skipNote = skippedSg ? `, ${skippedSg} sg-only UNRUN (no 'subgroups' feature)` : ''
   return {
     name: 'compile_all',
-    pass: errors.length === 0,
-    detail: `${compiled} shaders compile under QWEN35_4B (${sources.length - INT4_MATMUL_VARIANTS.length} .wgsl + ${INT4_MATMUL_VARIANTS.length} generated${skipNote})`,
+    pass: errors.length === 0 && skippedSg === 0,
+    unrun: errors.length === 0 && skippedSg > 0,
+    detail: `${compiled} shaders compile under ${Q.id} (${sources.length - INT4_MATMUL_VARIANTS.length} .wgsl + ${INT4_MATMUL_VARIANTS.length} generated${skipNote})`,
   }
 }
 
@@ -1593,7 +1613,9 @@ async function main() {
       console.error(`WARN: subgroup-size probe failed (${String(e).split('\n')[0]}); treating as no subgroups`)
     }
   }
-  HAS_SG32 = subgroups && sgSize === 32
+  // FORCE_NO_SG32=1 pretends the adapter has no 32-lane subgroups, so the
+  // UNRUN path can be seen going red on a machine that would otherwise pass.
+  HAS_SG32 = subgroups && sgSize === 32 && !process.env.FORCE_NO_SG32
   const sgLabel = subgroups ? (sgSize ? `yes (size ${sgSize})` : 'yes (size unknown)') : 'no'
   console.log(
     `adapter: ${info.description || info.vendor || 'unknown'} | shader-f16: ${f16} | subgroups: ${sgLabel} | spec: ${Q.id}`,
@@ -1604,7 +1626,15 @@ async function main() {
   }
 
   let failed = 0
-  let ran = 0
+  let unrun = 0
+  let total = 0
+  const report = (label, res) => {
+    const tag = res.unrun ? 'UNRUN' : res.pass ? 'PASS ' : 'FAIL '
+    console.log(`${tag} ${label.padEnd(18)} ${res.detail}`)
+    total++
+    if (res.unrun) unrun++
+    else if (!res.pass) failed++
+  }
   for (const t of TESTS) {
     let res
     try {
@@ -1612,9 +1642,7 @@ async function main() {
     } catch (e) {
       res = { pass: false, detail: String(e).split('\n')[0] }
     }
-    console.log(`${res.pass ? 'PASS' : 'FAIL'}  ${t.label.padEnd(18)} ${res.detail}`)
-    ran++
-    if (!res.pass) failed++
+    report(t.label, res)
   }
 
   {
@@ -1624,13 +1652,13 @@ async function main() {
     } catch (e) {
       res = { pass: false, detail: String(e).split('\n')[0] }
     }
-    console.log(`${res.pass ? 'PASS' : 'FAIL'}  ${'compile_all'.padEnd(18)} ${res.detail}`)
-    ran++
-    if (!res.pass) failed++
+    report('compile_all', res)
   }
 
-  console.log(`\n${ran - failed}/${ran} Qwen3.5 kernels correct`)
-  process.exit(failed ? 1 : 0)
+  const passed = total - failed - unrun
+  console.log(`\n${Q.id}: ${passed} passed, ${failed} failed, ${unrun} unrun of ${total}`)
+  if (unrun) console.log('UNRUN is not a pass — this adapter did not exercise the chunked-prefill kernels.')
+  process.exit(failed || unrun ? 1 : 0)
 }
 
 main()
