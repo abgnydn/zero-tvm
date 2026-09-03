@@ -40,6 +40,11 @@ Vite-built multi-page static site. Each HTML file is a standalone demo:
 - `share.html` — host a model for other devices; `agent-host.html` — the
   local agent-server surface (noindex, needs `npm run agent`)
 
+Three root HTML files are dev-only and excluded from the Vite build:
+`wllama-bench.html` and `tjs-bench.html` (external benchmark harnesses) and
+`model-smoke.html` (the probe `scripts/validate-model.mjs` drives;
+see `vite.config.ts:383-392`).
+
 DELETED 2026-08-14 (pre-publish review): `architecture.html`, `demo.html`,
 `compiler-chat.html`, `dump.html`, `shaders.html`, `webllm-bench.html`. All
 were orphaned yet in the sitemap; `dump`/`shaders`/`webllm-bench` started
@@ -84,7 +89,8 @@ multi-GB downloads on page load. Their src/ modules remain, unbuilt.
   the shipped pages (`capture.ts`/`dump-tvm.ts` back the RESEARCH.md
   interception work).
 - `sites.json` — synced from `~/sites-shared/sites.ts` (consumed by the
-  sibling-link renderer in the HTML pages).
+  sibling-link renderer in the HTML pages); edit the source there, not the
+  generated file — `sites.json:294-297` carries the DO NOT EDIT warning.
 
 `index.html` embeds the JSON-LD `Person` + `sameAs` block and the
 "Related work" grid; the "More by Ahmet" footer is repeated (non-identical)
@@ -583,9 +589,11 @@ does it run versus ship; does it assert the **subject** or a copy/metric/the
 tool; is the value **compared** or only produced; under what **configuration**
 was it true, and is that still the configuration?
 
-The GPU suites are NOT in the hook — they need hardware CI and the agent
-sandbox do not have. They are the gate for anything touching WGSL or the
-engine, and they run in a human's shell:
+The GPU suites are NOT all in the hook. CI runs the scalar suite
+(`npm run test:kernels`) on Mesa lavapipe (`.github/workflows/ci.yml:74-92`),
+which compiles the WGSL kernels on a CPU Vulkan device and skips subgroup
+variants loudly. The subgroup, MLX, and qwen35 suites need a real GPU and run
+in a human's shell (`lefthook.yml:40-49`):
 
 ```bash
 npm run test:kernels:qwen35   # hybrid + the int8 pack at head-dim 256
