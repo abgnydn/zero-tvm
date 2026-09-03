@@ -14,7 +14,7 @@
 // window.webllmResult (webllm-bench/main.ts).
 
 import { spawn, spawnSync } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
+import { writeFileSync, renameSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import puppeteer from 'puppeteer'
@@ -142,6 +142,8 @@ async function bootReady(page, path) {
   }
 
   // Poll the badge; log every transition, bail fast on an error state.
+  // Returns the up-front WebGPU probe so callers can gate on it: a number
+  // measured without an adapter is not a GPU baseline.
   const start = Date.now()
   let last = ''
   while (Date.now() - start < READY_MS) {
@@ -152,7 +154,7 @@ async function bootReady(page, path) {
       console.log(`[boot] badge: ${badge}`)
       last = badge
     }
-    if (badge === 'Ready') return
+    if (badge === 'Ready') return gpu
     if (/error|fail/i.test(badge)) throw new Error(`boot failed — badge="${badge}"`)
     await new Promise((r) => setTimeout(r, 1500))
   }
@@ -163,7 +165,12 @@ async function bootReady(page, path) {
 async function runBaseline(browser, query) {
   const page = await browser.newPage()
   attachDiagnostics(page, BASELINES[BASELINE].label)
-  await bootReady(page, `${BASE_PAGE}${query}`)
+  const probe = await bootReady(page, `${BASE_PAGE}${query}`)
+  // Uniform adapter gate for every baseline half: the per-engine
+  // `webgpuProven` counters below only exist on the tjs/wllama pages, but a
+  // run with no adapter at all is meaningless whichever half it is.
+  if (!probe?.gpu || (!probe.default?.ok && !probe.highPerf?.ok))
+    console.log(`[${BASELINES[BASELINE].label}] *** NO WEBGPU ADAPTER — this is not a GPU number, do not publish it ***`)
   const res = await page
     .waitForFunction((k) => window[k], { timeout: READY_MS, polling: 1000 }, BASE_GLOBAL)
     .then((h) => h.jsonValue())
@@ -238,8 +245,13 @@ try {
   // 1) Zero-TVM decode median via the engine's built-in bench().
   const ztPage = await browser.newPage()
   attachDiagnostics(ztPage, 'zt')
-  await bootReady(ztPage, `/zero-tvm.html${QUERY}`)
+  const ztProbe = await bootReady(ztPage, `/zero-tvm.html${QUERY}`)
+  if (!ztProbe?.gpu || (!ztProbe.default?.ok && !ztProbe.highPerf?.ok))
+    console.log('[zt] *** NO WEBGPU ADAPTER — this is not a GPU number, do not publish it ***')
+  const hasBench = await ztPage.evaluate(() => typeof window.bench === 'function').catch(() => false)
+  if (!hasBench) throw new Error('zero-tvm.html booted without window.bench (bench-console harness did not attach)')
   const zt = await ztPage.evaluate((n, runs) => window.bench(n, runs), N_TOKENS, N_RUNS)
+  if (typeof zt?.median !== 'number') throw new Error('window.bench returned no median — page did not finish booting')
   console.log(`→ Zero-TVM median: ${zt.median.toFixed(2)} tok/s${QUERY ? `  (${QUERY})` : ''}`)
 
   if (BASELINE === 'none') {
@@ -289,7 +301,7 @@ try {
         `${wl.median.toFixed(2)} tok/s — Zero-TVM is ${gap >= 0 ? '+' : ''}${gap.toFixed(1)}% ` +
         `(results.json NOT written — BENCH_BASELINE=${BASELINE})`,
       )
-      console.log(`[pair] CAVEAT: ${wl.caveat}`)
+      if (wl.caveat) console.log(`[pair] CAVEAT: ${wl.caveat}`)
     } else {
       const results = {
         ztDecode: +zt.median.toFixed(2),
@@ -300,7 +312,12 @@ try {
         nTokens: N_TOKENS,
         nRuns: N_RUNS,
       }
-      writeFileSync(resolve(ROOT, 'bench/results.json'), JSON.stringify(results, null, 2) + '\n')
+      // Atomic write: a kill mid-write must not leave a corrupt results.json
+      // for sync-docs.mjs to publish.
+      const resultsPath = resolve(ROOT, 'bench/results.json')
+      const resultsTmp = `${resultsPath}.tmp`
+      writeFileSync(resultsTmp, JSON.stringify(results, null, 2) + '\n')
+      renameSync(resultsTmp, resultsPath)
       console.log('\nwrote bench/results.json')
     }
     ok = true
