@@ -77,6 +77,7 @@ One line per script. Category first:
 - `convert-q3-experts.py` — on-demand-fixture. 4-bit → 3-bit expert stacks (refuses zero-conversion runs).
 - `embed-ref.py` — reference-builder. Reference sentence embeddings from mlx_lm.
 - `gen-tokenizer-fixtures.mjs` / `gen-tokenizer-fixtures-qwen.mjs` / `gen-tokenizer-fixtures-llama.py` — on-demand-fixture. `npm run gen:tokenizer-fixtures*`.
+- `gen-tokenizer-fixtures-bpe.mjs` — on-demand-fixture. `--tag/--repo/--generation/--local-json/--template-file`; Qwen3.5/Qwen3.8 vocab fixtures + per-generation template cross-check (fails loud on drift).
 - `gen-toolcall-fixtures.py` — on-demand-fixture. Tool-call fixture generation.
 - `kv-bits-gate.py` — reference-builder. What per-row int-b KV does to attention output.
 - `kv-quality-ab.py` — bench-harness. Paired perplexity: does int8 KV cost quality.

@@ -200,3 +200,34 @@ describe('the spec → generation dispatch', () => {
     }
   })
 })
+
+describe('the thinking-mode generation prompt, per generation', () => {
+  // Everything above passes { thinking: false }, so the DEFAULT path — the one
+  // buildChatPrompt takes when the caller says nothing — was unpinned, and the
+  // qwen35/qwen38 default diverged from its own template: both checkpoints
+  // emit an opening `<think>\n` after the generation prompt when thinking
+  // (Qwen3.5-4B tokenizer_config.json and Qwen3.8-27B chat_template.jinja both
+  // end `{{- '<think>\\n' }}` in the else branch), while Qwen3 emits nothing.
+  // Read off those templates, not hand-derived.
+  const renderThinking = (m: TemplateMessages, generation: 'qwen3' | 'qwen35' | 'qwen38') =>
+    (buildChatPrompt(m, capture, { generation }) as unknown as string[]).join('')
+  const hi = [{ role: 'user' as const, content: 'hi' }]
+
+  it('qwen3 thinking prompt ends bare', () => {
+    expect(renderThinking(hi, 'qwen3')).toBe('<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n')
+  })
+
+  it('qwen35 thinking prompt opens <think>', () => {
+    expect(renderThinking(hi, 'qwen35')).toBe('<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n')
+  })
+
+  it('qwen38 thinking prompt opens <think>', () => {
+    // ...and synthesizes the instructions system turn (see below).
+    expect(renderThinking(hi, 'qwen38')).toBe(
+      '<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully '
+      + 'through the task, validate key assumptions, consider plausible alternatives, '
+      + 'and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n'
+      + '<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n',
+    )
+  })
+})
