@@ -106,12 +106,24 @@ try {
   const offered = await guest2.expect((m) => m.type === 'offer', 'offer from host B')
   check('host → its guest', offered.sdp.sdp === 'from-host-b', 'offer arrived')
 
+  // ── relay hardening: hosts cannot spoof relay-originated control types ──
+  const hostChangedBefore = early.seen.filter((m) => m.type === 'host-changed').length
+  hostA.send({ to: guest1Id, type: 'host-changed' })
+  await new Promise((r) => setTimeout(r, 400))
+  check('host cannot spoof host-changed',
+    early.seen.filter((m) => m.type === 'host-changed').length === hostChangedBefore,
+    'relay dropped spoofed control message')
+
   // ── churn: host B disappears mid-session ──
+  const peerJoinedOnB = hostB.seen.filter((m) => m.type === 'peer-joined' && m.from === joined2.from).length
   hostB.close()
   await guest2.expect((m) => m.type === 'host-changed', 'host-changed after its host died')
   const takenOver = await hostA.expect((m) => m.type === 'peer-joined' && m.from === joined2.from,
     'peer-joined for the orphaned guest')
   check('takeover on host death', true, `host A picked up guest ${takenOver.from}`)
+  check('orphan not reassigned to dead host',
+    hostB.seen.filter((m) => m.type === 'peer-joined' && m.from === joined2.from).length === peerJoinedOnB,
+    'dead host B received no extra peer-joined')
   await hostA.expect((m) => m.type === 'room' && m.hosts === 1, 'room back to 1 host')
 
   // The takeover must survive: the orphan can talk to its new host.

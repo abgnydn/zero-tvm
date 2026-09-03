@@ -161,6 +161,13 @@ export function stationUi() {
   loaded model's — clients default it low and truncate silently.
   One request at a time: a single KV cache, so parallel calls queue.
 </div>
+<div class="note">
+  From another machine over Tailscale, serve by the <b>MagicDNS name</b>:
+  <code>tailscale serve --bg --http=1234 8017</code>.
+  The raw tailnet IP returns "404 page not found" because <code>tailscale serve</code>
+  is a vhost proxy — only the MagicDNS name matches. This server binds
+  <code>127.0.0.1</code> by design and has no auth.
+</div>
 
 <script>
 const $=(i)=>document.getElementById(i)
