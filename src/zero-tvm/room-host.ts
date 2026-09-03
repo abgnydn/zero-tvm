@@ -20,7 +20,11 @@ import type { ModelSpec } from '../compiler/model-spec.js'
 import type { DecodeEngine } from './engine-core.js'
 import { quantTagFor } from './chat-ui.js'
 import { serveWeights } from './peer-weights.js'
-import { makeStageClient, type StageReply } from './pipeline-peer.js'
+import { makeStageClient } from './pipeline-peer.js'
+// The chain-assembly rules and the split token loop live in room-chain.ts —
+// pure, WebRTC-free, and unit-tested there. This file wires the channels to it.
+import { makeRoomChain, type ChainMsg, type StageOffer } from './room-chain.js'
+import { roomLink } from './room-url.js'
 
 // ── signaling endpoint (single source for host/guest/helper) ──
 const DEV = !!(import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV
@@ -46,18 +50,20 @@ export const ICE: RTCConfiguration = {
 export interface ChatMsg { role: 'system' | 'user' | 'assistant'; content: string }
 export interface ChatReq { type: 'chat'; id: number; messages: ChatMsg[] }
 export interface StopReq { type: 'stop'; id: number }
-/** A peer that holds the REST of a split model, offering to run it. */
-export interface StageOffer { type: 'stage-offer'; start: number; end: number; specId: string }
+export type { StageOffer }
 type GuestMsg = ChatReq | StopReq | StageOffer
 export type HostMsg =
-  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string; specId: string }
+  | { type: 'info'; name: string; params: string; rateLabel: string; tag: string; param: string
+      specId: string
+      /** The room's context window, in tokens — what a guest is actually
+       *  chatting into, and what a guest that copies the weights must pass
+       *  as ?ctx= to serve the same room. Absent from hosts predating this. */
+      ctx?: number }
   | { type: 'text'; id: number; full: string }
   | { type: 'done'; id: number; tokens: number; tps: number }
   | { type: 'busy'; id: number; pos: number }
   | { type: 'error'; id: number; message: string }
-  | { type: 'stage-accept'; start: number; end: number }
-  | { type: 'stage-reject'; message: string }
-  | { type: 'stage-wait'; message: string }
+  | ChainMsg
 
 // ── the host's eyes ───────────────────────────────────────────
 export interface RoomUI {
@@ -102,7 +108,16 @@ export interface HostRoomOptions {
 
 export interface RoomHandle {
   roomId: string
+  /** The link you hand to someone who just wants to CHAT. No query at all: a
+   *  `?model=` inside a room routes to the host branch (roleFor), so a guest
+   *  link that carried the model would quietly make every recipient a host. */
   link: string
+  /** The link for a machine that will SERVE this room — same room id, plus the
+   *  model and the context this room runs, and (when this host holds only the
+   *  first layers) the layers still missing. This is what used to be
+   *  hand-edited out of the guest link, ?ctx= included, which is how a stage
+   *  ended up with a differently sized KV cache than the host. */
+  helperLink: string
   close: () => void
 }
 
@@ -115,10 +130,24 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
   const bytes = crypto.getRandomValues(new Uint8Array(16))
   const roomId = opts.existingRoom
     ?? btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-  // Carry a dev signaling override into the guest link, or the guest dials the
+  // Carry a dev signaling override into both links, or the peer dials the
   // default relay and the room never forms.
-  const link = `${location.origin}${opts.guestPath ?? '/share.html'}`
-    + `${sigOverride ? `?sig=${encodeURIComponent(sigOverride)}` : ''}#${roomId}`
+  const path = opts.guestPath ?? '/share.html'
+  const link = roomLink({ origin: location.origin, path, room: roomId, sig: sigOverride })
+  // The room's configuration travels in the QUERY, the room id in the
+  // fragment — roomLink writes them in that order, which is the whole reason
+  // it exists. ctx is this host's EFFECTIVE maxContext (spec was already
+  // rebuilt through specWithCtx), so a stage opening this link reproduces the
+  // host's spec instead of falling back to its own default (see ctxFrom).
+  const helperLink = roomLink({
+    origin: location.origin, path, room: roomId, sig: sigOverride,
+    model: param, ctx: spec.maxContext,
+    // What this host does NOT hold. Omitted when it holds the whole model:
+    // the recipient then joins as another full host, which is legal and is
+    // what a guest that copied the weights does.
+    layers: stageRange && stageRange.end < spec.layers
+      ? { start: stageRange.end, end: spec.layers } : null,
+  })
 
   const ws = new WebSocket(`${signalBase}/room/${roomId}?role=host`)
   const peers = new Map<string, { pc: RTCPeerConnection; dc: RTCDataChannel | null }>()
@@ -139,52 +168,23 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
   // Helper peers each announce a layer range and are assembled into an
   // ordered CHAIN. Until the chain reaches the last layer the host has a
   // model it cannot finish, and says so rather than generating from part of
-  // a network. Hub-and-spoke on purpose — see share.ts history.
-  interface DownStage {
-    guest: string
-    start: number
-    end: number
-    step: (pos: number, residual: ArrayBuffer) => Promise<StageReply>
-    meanHopMs: () => number
-  }
-  const chain: DownStage[] = []
-  // Offers that are valid but not yet adjacent to the assembled chain.
-  const pendingStages = new Map<string, StageOffer>()
-  /** The first layer still missing — where the next stage must start. */
-  const chainEnd = (): number => (chain.length ? chain[chain.length - 1].end : stageRange!.end)
-  const chainComplete = (): boolean => !!stageRange && chainEnd() === spec.layers
-
-  /**
-   * The token loop for a SPLIT model — the whole-model generatePipelined
-   * cannot run here, because this engine holds only the first layers.
-   */
-  async function generateSplit(
-    promptIds: number[], budget: number,
-    onToken: (id: number) => void, shouldStop: () => boolean,
-  ): Promise<number[]> {
-    if (!chainComplete()) throw new Error(`layers ${chainEnd()}-${spec.layers} of this model are not connected`)
-    const stages = [...chain]
-    const stepAll = async (tokenId: number, pos: number): Promise<number> => {
-      let out: StageReply = await engine.pipelineStep({ tokenId }, pos)
-      for (const s of stages) {
-        if ('tokenId' in out) throw new Error('a stage ended the model before the last one')
-        out = await s.step(pos, out.residual)
-      }
-      if (!('tokenId' in out)) throw new Error('the last stage returned a residual, not a token')
-      return out.tokenId
-    }
-    let tok = 0
-    for (let i = 0; i < promptIds.length; i++) tok = await stepAll(promptIds[i], i)
-    const out: number[] = []
-    for (let n = 0; n < budget; n++) {
-      // Stop ids are consumed, never shown — same contract as generate().
-      if (spec.stops.includes(tok) || shouldStop()) break
-      out.push(tok)
-      onToken(tok)
-      tok = await stepAll(tok, promptIds.length + n)
-    }
-    return out
-  }
+  // a network. Hub-and-spoke on purpose — see share.ts history. The rules and
+  // the split token loop are room-chain.ts; this is the wiring to the wires.
+  const chain = makeRoomChain({
+    spec,
+    stageRange: stageRange ?? null,
+    engine,
+    hasPipe: (guest) => pipelines.has(guest),
+    connect: (guest) => {
+      const pipe = pipelines.get(guest)
+      return pipe ? makeStageClient(pipe) : null
+    },
+    connected: (guest) => peers.has(guest),
+    send,
+    row: ui.row,
+    announce: () => announce(),
+    onPaired: (complete) => ui.onPaired?.(complete),
+  })
 
   async function pump(): Promise<void> {
     if (generating) return
@@ -224,16 +224,16 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
         send(guest, { type: 'text', id: req.id, full: tokenizer.decode(allIds) })
       }
       const stop = () => stopFlags.get(guest) === req.id || !peers.has(guest)
-      if (stageRange) await generateSplit(promptIds, budget, onTok, stop)
+      if (stageRange) await chain.generate(promptIds, budget, onTok, stop)
       else await engine.generatePipelined(promptIds, budget, onTok, stop)
       const secs = (performance.now() - t0) / 1000
       const tps = allIds.length / Math.max(secs, 0.001)
       send(guest, { type: 'done', id: req.id, tokens: allIds.length, tps })
       // The hop SUM is what a token actually waited on — the number that
       // decides whether a long chain is usable at all.
-      const hopTotal = chain.reduce((a, s) => a + s.meanHopMs(), 0)
+      const hopTotal = chain.stages.reduce((a, s) => a + s.meanHopMs(), 0)
       st(`${allIds.length} tok · ${tps.toFixed(1)} tok/s`
-        + (chain.length ? ` · ${hopTotal.toFixed(1)} ms/hop across ${chain.length} stage${chain.length === 1 ? '' : 's'}` : ''))
+        + (chain.stages.length ? ` · ${hopTotal.toFixed(1)} ms/hop across ${chain.stages.length} stage${chain.stages.length === 1 ? '' : 's'}` : ''))
     } catch (e) {
       send(guest, { type: 'error', id: req.id, message: e instanceof Error ? e.message : String(e) })
       st('error')
@@ -255,7 +255,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
     let msg: GuestMsg
     try { msg = JSON.parse(raw) as GuestMsg } catch { return }
     if (msg.type === 'stop') { stopFlags.set(guest, msg.id); return }
-    if (msg.type === 'stage-offer') { offerStage(guest, msg); return }
+    if (msg.type === 'stage-offer') { chain.offer(guest, msg); return }
     if (msg.type !== 'chat' || !Array.isArray(msg.messages)) return
     stopFlags.delete(guest)
     queue.push({ guest, req: msg })
@@ -269,81 +269,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
   let roomCounts = { hosts: 1, guests: 0 }
   function announce(): void {
     ui.onMembers?.({ ...roomCounts, connected: peers.size })
-    ui.onChain?.(stageRange ? describeChain() : '')
-  }
-
-  /** What the room looks like right now, for the host's own eyes. */
-  function describeChain(): string {
-    const held = `${stageRange!.start}-${stageRange!.end} here`
-    const rest = chain.map((s) => `${s.start}-${s.end}`).join(' → ')
-    const missing = chainComplete() ? '' : ` · waiting for layers ${chainEnd()}-${spec.layers}`
-    return `split model — layers ${held}${rest ? ` → ${rest}` : ''}${missing}`
-  }
-
-  /**
-   * A peer says which layers it holds. Refuse what can never fit; hold what
-   * fits but is not adjacent YET — the accepted stages must tile
-   * [k, layers) contiguously, built from peers arriving in any order.
-   */
-  function offerStage(guest: string, offer: StageOffer): void {
-    const pipe = pipelines.get(guest)
-    const bad = !stageRange ? 'this host runs the whole model'
-      : offer.specId !== spec.id ? `different model (${offer.specId} vs ${spec.id})`
-      : !pipe ? 'the pipeline channel is not open'
-      : !(offer.start < offer.end) ? `layers ${offer.start}-${offer.end} is not a range`
-      : offer.end > spec.layers ? `layers ${offer.start}-${offer.end} runs past this model's ${spec.layers}`
-      : offer.start < stageRange.end ? `layers ${offer.start}-${offer.end} overlaps the ${stageRange.start}-${stageRange.end} this host holds`
-      : chain.some((c) => offer.start < c.end && c.start < offer.end)
-        ? `layers ${offer.start}-${offer.end} overlap a stage already in the chain`
-        : null
-    if (bad) {
-      send(guest, { type: 'stage-reject', message: bad })
-      ui.row(guest, `stage offer refused — ${bad}`)
-      return
-    }
-    pendingStages.set(guest, offer)
-    extendChain()
-    if (pendingStages.has(guest)) {
-      const why = `layers ${offer.start}-${offer.end} held — the chain needs ${chainEnd()} next`
-      send(guest, { type: 'stage-wait', message: why })
-      ui.row(guest, why)
-    }
-  }
-
-  /** Attach every pending offer that now continues the chain, repeatedly: one
-   *  arrival can unblock several that came in out of order. */
-  function extendChain(): void {
-    for (;;) {
-      const want = chainEnd()
-      const hit = [...pendingStages].find(([, o]) => o.start === want)
-      if (!hit) break
-      const [guest, offer] = hit
-      const pipe = pipelines.get(guest)
-      if (!pipe) { pendingStages.delete(guest); continue }
-      pendingStages.delete(guest)
-      const client = makeStageClient(pipe)
-      chain.push({ guest, start: offer.start, end: offer.end, step: client.step, meanHopMs: client.meanHopMs })
-      send(guest, { type: 'stage-accept', start: offer.start, end: offer.end })
-      ui.row(guest, `serving layers ${offer.start}-${offer.end}`)
-    }
-    announce()
-    if (chainComplete()) {
-      ui.row('room', `the model is complete across ${chain.length + 1} stages`)
-      ui.onPaired?.(true)
-    }
-  }
-
-  /** A stage left. Everything downstream of it is orphaned: those peers stay
-   *  connected, go back to pending, and re-attach if a replacement arrives. */
-  function dropStage(guest: string): void {
-    const i = chain.findIndex((c) => c.guest === guest)
-    if (i < 0) { pendingStages.delete(guest); return }
-    const orphaned = chain.splice(i)
-    for (const o of orphaned.slice(1)) {
-      if (peers.has(o.guest)) pendingStages.set(o.guest, { type: 'stage-offer', start: o.start, end: o.end, specId: spec.id })
-    }
-    extendChain()
-    ui.onPaired?.(chainComplete())
+    ui.onChain?.(stageRange ? chain.describe() : '')
   }
 
   function makePeer(guest: string): void {
@@ -369,6 +295,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
       send(guest, {
         type: 'info', name: brand.name, params: brand.params, rateLabel: brand.rateLabel,
         tag: quantTagFor(spec), param, specId: spec.id,
+        ctx: spec.maxContext,
       })
       announce()
     }
@@ -401,9 +328,9 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
       peers.get(guest)?.pc.close()
       peers.delete(guest)
       pipelines.delete(guest)
-      if (stageRange && (chain.some((c) => c.guest === guest) || pendingStages.has(guest))) {
+      if (stageRange && chain.holds(guest)) {
         ui.row(guest, 'a stage of the model left')
-        dropStage(guest)
+        chain.drop(guest)
       }
       announce()
     }
@@ -417,6 +344,7 @@ export function hostRoom(opts: HostRoomOptions): RoomHandle {
   return {
     roomId,
     link,
+    helperLink,
     close() {
       window.removeEventListener('beforeunload', onUnload)
       ws.close()

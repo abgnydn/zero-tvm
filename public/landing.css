@@ -179,7 +179,14 @@ section { padding: 72px 0; }
 @media (max-width: 780px) {
   .mb-slide { grid-template-columns: 1fr; text-align: center; min-height: 0; }
   .mb-stats { justify-items: center; }
-  .mb-variants, .mb-info { justify-content: center; align-items: center; }
+  /* .mb-info was in this rule too, from the old .mb-slide carousel. On a flex
+     COLUMN, align-items:center makes the sheet shrink-to-fit instead of filling
+     its track — so any row whose min-content is wider than a phone column (the
+     room log's nowrap request lines) sized the whole panel to itself and it
+     hung off both edges of the screen, measured at 390x844. The entrance never
+     showed it because its own rows all fit; it is still the wrong behaviour for
+     a card in a single-column stack. */
+  .mb-variants { justify-content: center; align-items: center; }
 }
 .mb-art { position: relative; padding-bottom: 66px; }
 .mb-mascot { display: block; width: 100%; height: 320px; position: relative; z-index: 1; }
@@ -342,15 +349,26 @@ footer li a:hover { color: var(--accent); }
    every value is the registry row. */
 #models { padding: 0; }
 #models .cs-root {
+  /* THE CHARACTER'S HEIGHT, declared once. The canvas asks for it, the art box
+     is capped to it, and the floor ring is a share of that box — so the three
+     cannot disagree. Every stage-mode below re-declares this ONE property
+     rather than setting a canvas height of its own. */
+  --cs-char-h: min(54dvh, 500px);
   position: relative;
   min-height: 100dvh;
   display: grid;
   grid-template-columns: minmax(270px, 350px) 1fr minmax(250px, 320px);
   grid-template-rows: auto 1fr auto auto;
+  /* The sheet spans the same three rows as the roster. It used to hold row 2
+     alone while the roster ran rows 1-3, so the left rail was roughly a third
+     the height of the right one and no amount of align-self could change it —
+     it was already filling the single row it had. The plate now sits over the
+     stage column only, which centres the character's name on the character
+     rather than on the character plus the sheet. */
   grid-template-areas:
-    'plate plate  roster'
+    'sheet plate  roster'
     'sheet stage  roster'
-    'enter enter  roster'
+    'sheet enter  roster'
     'note  note   note';
   gap: 10px 24px;
   padding: calc(var(--nav-h, 64px) + 14px) 30px 24px;
@@ -391,7 +409,15 @@ footer li a:hover { color: var(--accent); }
 
 /* Nameplate: display face over an ornamental divider. */
 #models .mb-plate {
-  grid-area: plate; position: relative; z-index: 1; justify-self: center;
+  /* left/transform are RESET, not inherited. The base .mb-plate is absolutely
+     positioned for the old carousel and centres itself with the standard
+     left:50% + translateX(-50%) pair. This rule switches position to relative
+     but used to leave that pair standing, and on a relative box the two halves
+     no longer cancel: left:50% shifts by half the COLUMN (573 -> +286) while
+     the transform pulls back only half the ELEMENT (429 -> -215). The name sat
+     72px right of the character it names, and of the buttons under it. */
+  grid-area: plate; position: relative; left: auto; transform: none;
+  z-index: 1; justify-self: center;
   text-align: center; margin-top: 4px; padding: 0 26px 14px;
   border: 0; background: none;
 }
@@ -412,12 +438,38 @@ footer li a:hover { color: var(--accent); }
 }
 
 /* The stage. */
-#models .mb-stage { grid-area: stage; display: flex; align-items: stretch; gap: 4px; min-height: 0; position: relative; z-index: 1; }
+#models .mb-stage { grid-area: stage; display: flex; align-items: stretch; gap: 4px; min-height: 0; position: relative; z-index: 1;
+  /* The stage row is 1fr, so it takes whatever the viewport leaves — but the
+     canvas stops growing at --cs-char-h. Above ~926px of viewport height (where
+     the 500px half of min(54dvh,500px) starts to bind) the two came apart: at
+     1512x982 the row was 520.39 tall against a 500px canvas, at 1920x1080 it was
+     618.39. Everything the floor ring is measured from is that box, so the ring
+     grew past the character again (149.05 -> 176.92 -> 210.25 tall) and its
+     bottom:2% anchor drifted to 47px below the feet — the exact defect the
+     height-driven ring was written to fix, reappearing above the cap.
+     min(char, 100%) is the whole rule: the row still clamps the stage when the
+     viewport is SHORT (1512x860 stays 398.39), --cs-char-h clamps it when the
+     viewport is TALL, and the canvas fills what is left in both directions. */
+  align-self: center; max-height: min(var(--cs-char-h), 100%); }
 #models .mb-art { flex: 1; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
-#models .mb-mascot { height: min(54dvh, 500px); max-width: 100%; position: relative; z-index: 2; }
+/* max-height matters as much as height here. The canvas asked for
+   min(54dvh,500px) = 464px inside a 398px .mb-art, so it overflowed 33px
+   past the bottom. The floor ring is anchored to .mb-art's bottom, so it
+   landed 41px above the character's feet and cut through the torso.
+   Capping the canvas to its container puts the feet back on the ring. */
+#models .mb-mascot { height: var(--cs-char-h); max-height: 100%; max-width: 100%; position: relative; z-index: 2; }
 #models .mb-pedestal {
   position: absolute; left: 50%; bottom: 2%; transform: translateX(-50%);
-  width: min(560px, 86%); height: 150px; border-radius: 0; filter: none;
+  /* Sized off the character, not the container. The ring took 86% of the
+     art box's WIDTH while the character's size follows its HEIGHT, so in chat
+     mode — where the stage folds to a 110px familiar over a wide panel — the
+     floor ring stayed 311px across and swamped the figure standing on it.
+     Height is now a share of the art box — which the max-height above holds
+     to the canvas at every viewport height — and the width follows through
+     aspect-ratio, so one rule holds at every size. The entrance is unchanged:
+     0.34 x 438 = 149 tall, 395 wide, against the 150 x 397 it had before. */
+  width: auto; height: 34%; aspect-ratio: 2.65; max-width: 86%;
+  border-radius: 0; filter: none;
   background: radial-gradient(ellipse at center,
     color-mix(in srgb, var(--cs-accent, var(--accent)) 30%, transparent) 0%,
     color-mix(in srgb, var(--cs-accent, var(--accent)) 8%, transparent) 52%,
@@ -464,8 +516,15 @@ footer li a:hover { color: var(--accent); }
 #models .mb-stats { display: block; margin: 12px 0 2px; }
 #models .mb-stats > div {
   display: flex; justify-content: space-between; align-items: baseline;
+  gap: 14px;
   padding: 6px 2px; border-bottom: 1px solid #ffffff0d;
 }
+/* The label never wraps and never steals width from the value; the value takes
+   the rest. Without this the label could wrap first and push a long value
+   ("3-bit experts, 4-bit elsewhere · MLX affine · group 64") into a four-line
+   ragged block while the row still had room. */
+#models .mb-stats dt { flex: 0 0 auto; white-space: nowrap; }
+#models .mb-stats dd { flex: 1 1 auto; min-width: 0; text-align: right; }
 #models .mb-stats dt {
   font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.12em; color: var(--dim);
 }
@@ -492,14 +551,31 @@ footer li a:hover { color: var(--accent); }
   padding: 2px 0 0 16px; height: 20px;
 }
 #models .mb-roster {
+  /* flex-wrap and min-height are BOTH resets, and the rail is broken without
+     either. The base .mb-dots (the old carousel strip) sets flex-wrap:wrap;
+     this rule turns the direction to column but used to leave the wrap
+     standing, so on a short window the tail of the roster wrapped into a
+     SECOND COLUMN, off the right edge of the rail, where .cs-root's
+     overflow:hidden ate it. At a 700px viewport that silently hid the last two
+     characters — the roster looked like it simply did not carry them.
+     min-height:0 is what lets overflow-y:auto do the job instead: a grid item
+     defaults to min-height:auto and will not shrink below its content, so the
+     rail grew past the track rather than scrolling inside it. */
   grid-area: roster; z-index: 1; margin: 26px 0 0; padding: 0 4px 4px 14px;
-  display: flex; flex-direction: column; gap: 8px; justify-content: flex-start;
+  display: flex; flex-direction: column; flex-wrap: nowrap; min-height: 0;
+  gap: 8px; justify-content: flex-start;
   overflow-y: auto; border-left: 1px solid #ffffff12;
   scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
 }
 #models .mb-dot {
   width: 100%; height: auto; min-height: 64px; padding: 7px 10px;
-  display: flex; flex-direction: row; align-items: center; gap: 11px;
+  /* justify-content is NOT inherited-safe here: the base .mb-dot (the older
+     carousel thumb) sets `center`, and this rule replaces display, direction,
+     align-items and gap but used to leave that standing — so every card
+     centred its own contents and the portraits sat at a different x per card,
+     indented by however short the model name was. */
+  display: flex; flex-direction: row; justify-content: flex-start;
+  align-items: center; gap: 11px;
   text-align: left; border-radius: 4px; cursor: pointer;
   border: 1px solid #ffffff14;
   background: linear-gradient(180deg, #ffffff08, transparent 60%), #0a0f1acc;
@@ -589,24 +665,49 @@ footer li a:hover { color: var(--accent); }
 @keyframes csSplashOut { 0%, 78% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
 
 @media (prefers-reduced-motion: reduce) {
-  .cs-fog i, .cs-dust, #models .mb-pedestal::after { animation: none; }
+  /* !important, not more specificity. Both halves of this rule were losing a
+     specificity fight to rules further down the file and had been for as long
+     as they have existed: `.cs-fog i` (0,1,1) loses to `.cs-fog i:nth-child(1)`
+     (0,2,1), and `#models .mb-pedestal::after` (1,1,1) loses to
+     `#models .mb-art.cs-in .mb-pedestal::after` (1,3,1) — and .cs-in is applied
+     unconditionally by selectFx(), so that is the resting state, not a
+     transition. Measured with document.getAnimations() under reduce: fogA
+     (46s), fogB (58s) and ringPulse (5s) all running, on / and — since it
+     adopted the scene — on /share.html too. A reduced-motion guard that any
+     later rule can outrank is not a guard; the reader's OS setting is not one
+     more author opinion to be ranked against the rest. */
+  .cs-fog i, .cs-dust, #models .mb-pedestal::after { animation: none !important; }
 }
 
 /* Phones: stage first, roster as a strip, sheet, enter. */
 @media (max-width: 900px) {
   #models .cs-root {
     grid-template-columns: 1fr;
-    grid-template-areas: 'plate' 'stage' 'roster' 'sheet' 'enter' 'note';
+    /* The two verbs follow the character directly. They used to sit fifth,
+       after the roster and the whole stat sheet, which put the primary action
+       — and the room, the most shareable thing here — several hundred pixels
+       below the fold on every phone. Specs are reference material and can
+       wait; the thing you came to do should not. */
+    grid-template-areas: 'plate' 'stage' 'enter' 'roster' 'sheet' 'note';
     padding: calc(var(--nav-h, 64px) + 8px) 14px 18px;
     gap: 8px;
+    --cs-char-h: min(36dvh, 300px);
   }
-  #models .mb-mascot { height: min(36dvh, 300px); }
+  /* The phone grid sizes the stage row from its content, so there is nothing
+     for the desktop clamp to hold back and no definite row for its 100% to
+     resolve against. */
+  #models .mb-stage { align-self: stretch; max-height: none; }
   #models .cs-roster-head { display: none; }
   #models .mb-roster {
     flex-direction: row; overflow-x: auto; overflow-y: hidden; margin-top: 0;
     border-left: 0; border-top: 1px solid #ffffff12; padding: 10px 2px 4px;
   }
-  #models .mb-dot { width: auto; min-width: 168px; flex: 0 0 auto; }
+  /* A swipe strip, not a wrapped grid. The base .mb-dots sets flex-wrap:wrap,
+     which silently defeated the overflow-x:auto above it: cards wrapped onto
+     new lines at their own content widths, so the roster read as a ragged
+     stack rather than a row you scroll. Fixed width so every card matches. */
+  #models .mb-roster { flex-wrap: nowrap; scroll-snap-type: x proximity; }
+  #models .mb-dot { width: 196px; min-width: 196px; flex: 0 0 196px; scroll-snap-align: start; }
   #models .cs-enter .mb-cta { min-width: 0; width: 100%; }
 }
 
@@ -735,7 +836,10 @@ footer li a:hover { color: var(--accent); }
 /* ARMED: a cached character's circle runs a rotating highlight — the same
    OPFS truth as the READY tag, drawn as ceremony. Conic light clipped by the
    very ring mask. */
-#models .mb-art[data-armed] .mb-pedestal::before {
+/* data-swarm-armed rides the same rule: in swarm mode every machine's link is
+   writable, which is the same "ready to summon" state, drawn the same way. */
+#models .mb-art[data-armed] .mb-pedestal::before,
+#models .mb-art[data-swarm-armed] .mb-pedestal::before {
   content: ''; position: absolute; inset: 0;
   background: conic-gradient(from 0deg,
     transparent 0deg, transparent 290deg,
@@ -774,6 +878,7 @@ footer li a:hover { color: var(--accent); }
 
 @media (prefers-reduced-motion: reduce) {
   .cs-aura i, #models .mb-art[data-armed] .mb-pedestal::before,
+  #models .mb-art[data-swarm-armed] .mb-pedestal::before,
   #models .mb-variant[aria-selected="true"] { animation: none; }
   .cs-aura i { opacity: 0.35; transform: translateY(-8vh); }
 }
@@ -894,7 +999,12 @@ footer li a:hover { color: var(--accent); }
 #models .cs-root {
   --cs-gutter: 24px;
   max-width: 1720px; margin: 0 auto;
-  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr) minmax(260px, 310px);
+  /* The sheet was capped at 340px while a 1440+ screen left its margin empty,
+     so long values wrapped four deep — "3-bit experts, 4-bit elsewhere · MLX
+     affine · group 64" broke across four lines beside blank space. The stage
+     still takes what is left (1fr), so the character does not shrink; the caps
+     only stop the rails stretching absurdly on an ultrawide. */
+  grid-template-columns: minmax(300px, 430px) minmax(0, 1fr) minmax(268px, 340px);
   gap: 8px var(--cs-gutter);
   padding: calc(var(--nav-h, 64px) + 12px) max(28px, 4vw) 22px;
 }
@@ -917,6 +1027,15 @@ footer li a:hover { color: var(--accent); }
 /* Chips wrap on the same 8px rhythm. */
 #models .mb-variants, #models .mb-modes { gap: 8px; }
 @media (max-width: 900px) {
+  /* This block re-declares .cs-root AFTER the stacking query at the top of the
+     file, so its three desktop columns won a specificity tie and pinned every
+     stacked row to 280px on a phone — the roster then wrapped its 168px cards
+     into a ragged column instead of scrolling sideways. Restore the single
+     column here, next to the rule that broke it. */
+  #models .cs-root {
+    grid-template-columns: 1fr;
+    padding: calc(var(--nav-h, 64px) + 8px) 14px 18px;
+  }
   #models .cs-enter { grid-column: 1; justify-self: stretch; }
   #models .mb-info { padding-top: 0; }
   #models .mb-roster { margin-top: 0; }
@@ -1122,21 +1241,24 @@ footer li a:hover { color: var(--accent); }
 .cs-chat-tool:hover { color: var(--text); border-color: var(--muted); }
 .cs-chat-tool:disabled { opacity: 0.4; cursor: not-allowed; }
 
-/* Live badge — written by loading-ui.ts (Summoning → % → Ready). */
-.cs-chat .badge {
+/* Live badge — written by loading-ui.ts (Summoning → % → Ready). Scoped to the
+   HEAD rather than to .cs-chat: the badge has only ever lived in this row, and
+   share.html's host and helper wear the same row inside the stat sheet, where
+   there is no conversation panel to hang it off. */
+.cs-chat-head .badge {
   flex: none; display: inline-flex; align-items: center; gap: 6px;
   font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.1em; text-transform: uppercase;
   padding: 4px 9px; border: 1px solid #ffffff1c; border-radius: 999px; color: var(--dim);
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-.cs-chat .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
-.cs-chat .badge.loading { color: #fbbf24; border-color: #fbbf2440; }
-.cs-chat .badge.loading .dot { background: #fbbf24; animation: csBadgePulse 1.4s infinite; }
-.cs-chat .badge.ready { color: var(--cs-accent, var(--accent));
+.cs-chat-head .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.cs-chat-head .badge.loading { color: #fbbf24; border-color: #fbbf2440; }
+.cs-chat-head .badge.loading .dot { background: #fbbf24; animation: csBadgePulse 1.4s infinite; }
+.cs-chat-head .badge.ready { color: var(--cs-accent, var(--accent));
   border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent); }
-.cs-chat .badge.ready .dot { background: var(--cs-accent, var(--accent)); }
-.cs-chat .badge.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
-.cs-chat .badge.error .dot { background: var(--err); }
+.cs-chat-head .badge.ready .dot { background: var(--cs-accent, var(--accent)); }
+.cs-chat-head .badge.error { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); }
+.cs-chat-head .badge.error .dot { background: var(--err); }
 @keyframes csBadgePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
 /* The rite card: download + compile progress, then it folds away. */
@@ -1235,14 +1357,72 @@ footer li a:hover { color: var(--accent); }
     grid-template-columns: 1fr;
     grid-template-rows: auto auto 1fr;
     grid-template-areas: 'plate' 'stage' 'chat';
+    --cs-char-h: 110px;
   }
-  #models .cs-chatting .mb-mascot { height: 110px; -webkit-box-reflect: none; }
-  #models .cs-chatting .mb-pedestal { height: 60px; }
+  #models .cs-chatting .mb-mascot { -webkit-box-reflect: none; }
   #models .cs-chatting .cs-lore { display: none; }
   #models .cs-chatting .mb-plate { padding-bottom: 4px; }
   #models .cs-chatting .mb-name { font-size: 1.3rem; }
   .cs-sug-grid { grid-template-columns: 1fr; }
   .cs-chat-tool#new-chat-btn { display: none; }
+  /* THE HEAD WRAPS ONCE THE ROOM TOOLS ARE IN IT. ⟁ Awake is the control a
+     PHONE needs MOST — a serving tab is a background tab for its whole life —
+     and ⟨ Roster is the only way back to the character select from inside a
+     conversation, so neither is droppable; #new-chat-btn, above, is the one
+     that goes.
+
+     Shedding padding off ⟁ Awake was tried first and did NOT keep the row on
+     one line. Measured with mountRoomTool driven the way landing-chat.ts
+     drives it (tests/e2e/probe-bound-and-head.mjs), .cs-chat-head
+     scrollWidth/clientWidth and ⟨ Roster's right edge against the head's:
+
+        320x568   378/290   +88.4    ⟨ Roster's LEFT edge at 317.8 of 320
+        360x740   378/330   +48.4
+        390x844   378/360   +18.4
+
+     — the row overflowed its container at ALL THREE widths, worst on the
+     smallest, and at 320 2.2px of a 75.6px control was on screen. The old
+     comment here claimed one line at 360 and cited 399px: the pre-rule figure
+     is 391, and 360 was the VIEWPORT, not the 330px content box the row
+     actually has to fit. ⟁ Awake is not the whole story either — with it
+     removed the row is still 309/290 at 320, ⟨ Roster 19.2px past the edge.
+     What does not fit is the TOOLS, so that is what the condition names.
+
+     No sideways page scroll was measured alongside that, and it was true, and
+     it meant nothing: #model-browser is overflow:hidden, so it CLIPPED the
+     control instead of scrolling to it. Reachability is the property; a
+     document that does not scroll is not evidence of it.
+
+     wrap, not overflow-x: auto — the row is 60px tall and ⟨ Roster is the last
+     item in it, so a scrolling head would put the only way out off the right
+     edge behind a swipe nobody is told about.
+
+     :has(#room-btn), not the media query alone, because wrap is not free: it
+     stops .cs-chat-id SHRINKING and lets it take its max-content 140.3px
+     instead, which wraps a row that fits today. Unconditionally, the head
+     BEFORE the boot went 60.06 -> 98.42 at 320 and 360, and share.html's guest
+     head 60.06 -> 98.42 at 320 (measured, both). Those rows fit; only the one
+     mountRoomTool has added to does not. Scoped this way share.html is
+     untouched — nothing there puts ⟁ Awake or ⟁ Room in a head, it carries
+     ⟁ Awake as a SHEET row — and the .cs-boot budget below still describes the
+     head it was measured against, since mountRoomTool runs after the engine is
+     ready, when the rite card is already .cs-done. */
+  .cs-chat-head:has(#room-btn) { flex-wrap: wrap; }
+  /* …AND THE IDENTITY GIVES THE ROW UP TO THE TOOLS. It is the item that
+     shrinks, so in this state it is ALREADY 0px wide — measured 0 at 320, 360
+     and 390 — while still setting its line's height from two lines of text.
+     Wrapping without this makes it visible again at 140.3px and costs a whole
+     line: the head went to 134.25px at 320x568, leaving .chat-main 2.53px of
+     the 76.72px it had. Nothing readable is lost by hiding what is already 0px
+     wide, and the phone layout puts .mb-plate directly above the panel with
+     the name at 1.3rem — share.ts says the same thing about the serving
+     sheet's head, for the same reason. Before the boot the row fits, the
+     condition is false, and the build label stays readable at 41.9 / 81.9px. */
+  .cs-chat-head:has(#room-btn) .cs-chat-id { display: none; }
+  /* ⟁ Awake sheds padding and letter-spacing. This no longer has to keep the
+     row on one line — wrap does — but it still decides how many lines the row
+     costs the conversation, so it stays. */
+  .cs-chat-head #awake { padding-left: 5px; padding-right: 5px; letter-spacing: 0.03em; }
 }
 @media (prefers-reduced-motion: reduce) {
   #models .cs-chat, #models .cs-root.cs-chatting .cs-engage.cs-go { animation: none; }
@@ -1377,6 +1557,51 @@ footer li a:hover { color: var(--accent); }
 
 /* ══ THE ROOM ══ Hosting from inside the game: the strip in the panel, and
    one small mascot per connected guest flanking the character. */
+/* The room's plan, before it opens. Reuses the entrance's chip styling —
+   these are the same kind of choice, in a smaller frame. */
+.cs-room-plan { margin: 0 0 10px; }
+.cs-room-plan .cs-build-row {
+  display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;
+}
+.cs-room-plan .cs-build-chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.cs-room-plan .cs-build-label {
+  flex: 0 0 74px; font-family: var(--mono); font-size: 0.58rem;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim);
+}
+.cs-room-plan .mb-variant { text-decoration: none; }
+.cs-plan-line { font-size: 0.7rem; line-height: 1.5; color: var(--dim); }
+.cs-plan-line b { color: var(--text); font-weight: 600; }
+
+/* The split, inside the room. Same register as the Split panel's stop rows,
+   at the room strip's own scale. */
+.cs-room-split { margin: 10px 0 4px; }
+.cs-split-head {
+  font-family: var(--mono); font-size: 0.58rem; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--dim); margin-bottom: 7px;
+}
+.cs-split-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 0; border-top: 1px solid #ffffff0d;
+}
+.cs-split-row.is-mine { color: var(--cs-accent, var(--accent)); }
+.cs-split-who { display: flex; flex-direction: column; gap: 1px; flex: 0 0 148px; }
+.cs-split-who b { font-size: 0.78rem; font-weight: 600; }
+.cs-split-who i {
+  font-style: normal; font-family: var(--mono); font-size: 0.56rem;
+  letter-spacing: 0.09em; text-transform: uppercase; color: var(--dim);
+}
+.cs-split-link { display: flex; gap: 6px; align-items: center; flex: 1 1 240px; min-width: 0; }
+.cs-split-link input {
+  flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 0.62rem;
+  padding: 5px 8px; border-radius: 3px; color: var(--text);
+  border: 1px solid #ffffff1c; background: #ffffff07;
+}
+.cs-split-mine {
+  font-family: var(--mono); font-size: 0.6rem; letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.cs-split-note { margin: 8px 0 0; font-size: 0.66rem; line-height: 1.5; color: var(--dim); }
+
 .cs-room { padding: 12px 14px; border-bottom: 1px solid #ffffff0f; }
 .cs-room-consent p { font-size: 0.76rem; line-height: 1.55; color: var(--text-dim, #a9b3c6);
   margin: 0 0 10px; }
@@ -1399,6 +1624,86 @@ footer li a:hover { color: var(--accent); }
   color: var(--dim); margin-left: auto; flex: none; }
 .cs-tool-live { border-color: var(--cs-accent, var(--accent)) !important;
   color: color-mix(in srgb, var(--cs-accent, var(--accent)) 80%, #fff) !important; }
+
+/* ⟁ Room is a TOGGLE, and the only way back out of the strip. It looked
+   exactly like the buttons beside it in both states, which is why an open
+   strip read as a dead end rather than as something you had opened. */
+#room-btn[aria-expanded='true'] {
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 80%, #fff);
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 50%, transparent);
+  background: color-mix(in srgb, var(--cs-accent, var(--accent)) 12%, transparent);
+}
+
+/* PHONES: the strip is a sheet OVER the conversation, not a block above it.
+   In flow it is bigger than the panel it sits in — at 360x740 it asked for
+   333.48px of a 416.91px panel, which left .chat-main 0px tall (37.69px at
+   390x844) and pushed the composer out of the panel's bottom edge. The plan
+   block is only ~150px of that; hiding it entirely still left 74.66px of
+   conversation, so shrinking the plan was never going to be the fix.
+   ⟁ Open a room (?chat=1&room=1) lands here with the strip already open, so
+   that was the first thing a phone saw of a room.
+
+   The panel becomes a grid whose body row holds the conversation and the strip
+   in the SAME cell. The strip covers the messages — which is what you are
+   looking past while you set a room up — and the head and the composer, the
+   two things you need to leave or to type, stay in their own rows at full
+   size. Closing the strip returns the whole body row to the conversation with
+   no reflow of anything else. */
+@media (max-width: 900px) {
+  #models .cs-chat {
+    display: grid;
+    /* minmax(0, …), not 1fr: an auto column is max-content, and the nowrap
+       composer-hint made every row 437.8px wide inside a 332px panel. */
+    grid-template-columns: minmax(0, 1fr);
+    /* The BOOT row is fit-content(), not auto, for the same reason the strip
+       moved out of flow: an uncapped row is whatever its content asks for, and
+       the rite card asks for more than the panel has. In the FAILED state —
+       'The summoning failed', the reason, and the Retry button — it measured
+       274.08px of a 416.91px panel at 360x740, which left .chat-main 0px and
+       pushed the composer 24.45px BELOW the panel's bottom edge; mid-rite with
+       the log open it was 30.66px out, so the SUCCESS path was over the edge
+       too. Worse on anything shorter: 97.45px out at 360x667, 214.59px at
+       320x568. This predates the grid rework (identical on 902a4e4^, the flex
+       layout) — the rework fixed the strip beside it and left this row alone.
+       Nothing is hidden, because a boot failure is exactly when the error and
+       the Retry button have to be readable: the card SCROLLS instead.
+       The budget: head (60.13) + composer (106.16) = 166.29px is the fixed
+       cost of staying usable, so 188px reserves that plus a sliver of
+       conversation. Percentages in a track size resolve against the grid
+       container's content box, which is definite here (the panel is the 1fr
+       row of .cs-root), so this is the PANEL's height, not the viewport's —
+       and fit-content() falls back to the content size when the content is
+       smaller, so a card that fits still takes exactly what it needs and a
+       folded-away one (.cs-done, display:none) still takes nothing. */
+    grid-template-rows: auto fit-content(calc(100% - 188px)) minmax(0, 1fr) auto;
+    grid-template-areas: 'head' 'boot' 'body' 'composer';
+  }
+  #models .cs-chat > .cs-chat-head { grid-area: head; }
+  #models .cs-chat > .cs-boot {
+    grid-area: boot;
+    /* Both halves of the cap: it is what lets a clipped card be read to the
+       end, and it is what sets the row's automatic minimum size to 0 — an
+       overflow:visible item keeps its content as that minimum, and fit-content
+       could not shrink the row below it. */
+    overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+  }
+  #models .cs-chat > .chat-main { grid-area: body; }
+  #models .cs-chat > .composer-wrap { grid-area: composer; }
+  #models .cs-chat > .cs-room {
+    grid-area: body; z-index: 4; overflow-y: auto;
+    /* start + max-height, not stretch: a strip shorter than the body row —
+       share.html's weight-copy offer is two elements — covers only its own
+       height, and only the entrance's full room strip takes the whole cell
+       and scrolls inside it. */
+    align-self: start; max-height: 100%;
+    /* Opaque: it is over the conversation now, and the panel's own background
+       is a gradient the messages would read through. */
+    background: linear-gradient(180deg, #0c1220, #090e18);
+    box-shadow: 0 14px 28px #0009;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+  }
+}
 
 /* Guests on stage: small familiars on the ring's edge. */
 .cs-guest-mascot { position: absolute; width: 90px; height: 90px; z-index: 1;
@@ -1439,4 +1744,227 @@ footer li a:hover { color: var(--accent); }
   #models .cs-summoning .mb-pedestal::after,
   #models .cs-thinking .mb-pedestal::after { animation: none; }
   .cs-guest-mascot { animation: none; }
+}
+
+
+/* ══ SWARM MODE ════════════════════════════════════════════════════════════
+   The second stage-mode, parallel to cs-chatting. It was a documentation
+   section stacked under the scene; splitting a model across machines is a
+   thing you do to the character you are looking at, so it happens on the same
+   stage, in the same chrome.
+
+   Nothing below invents a colour, a face or an easing. The rows are the
+   sheet's own (.mb-row-label, .mb-variant, .mb-abilities), the link fields are
+   the room strip's, the buttons are .cs-chat-tool, the entrance transition is
+   cs-wipe + rowIn, and the ring arcs light on ringFlash and arm on armedSpin
+   — every one of them already here. */
+
+/* The doorway. The amber line says a model may not fit this machine; this is
+   the only control on the scene that answers it, so it lives IN the sentence
+   rather than beneath it. */
+/* The two verbs sit together and carry the same weight. Room is offered for
+   every model; only the split offer below is conditional. */
+#models .cs-verbs { display: flex; gap: 10px; align-items: stretch; justify-content: center; flex-wrap: wrap; }
+#models .btn-room {
+  background: transparent; color: var(--cs-accent, var(--accent));
+  border: 1px solid var(--cs-accent, var(--accent));
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0 20px; border-radius: 4px; font-weight: 600; letter-spacing: .02em;
+  min-height: 44px; cursor: pointer; transition: background .15s, box-shadow .15s;
+}
+#models .btn-room:hover { background: color-mix(in srgb, var(--cs-accent, var(--accent)) 14%, transparent); }
+#models .cs-verbs-note {
+  margin: 9px 0 0; text-align: center; font-size: 12.5px; color: var(--muted);
+  display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; align-items: baseline;
+}
+#models .cs-verbs-split-btn {
+  background: none; border: 0; padding: 0; cursor: pointer; font: inherit;
+  color: var(--cs-accent, var(--accent)); text-decoration: underline;
+  text-underline-offset: 3px; text-decoration-color: #ffffff30;
+}
+#models .cs-verbs-split-btn:hover { text-decoration-color: currentColor; }
+@media (max-width: 900px) {
+  #models .cs-verbs { flex-direction: column; }
+  #models .cs-verbs .mb-cta, #models .cs-verbs .btn-room { width: 100%; }
+}
+
+/* ── the sheet becomes the builder ─────────────────────────────────────── */
+/* The stat rows stay in the DOM and step aside — landing.ts keeps repainting
+   them, and leaving the mode has to give the sheet back exactly. */
+#models .cs-swarm .mb-panel > :not(.sw-row) { display: none; }
+/* Four machines of role rows are taller than the stage, and the scene's grid
+   grows to its tallest item — the character floated off the bottom of the
+   screen and the roster went with it. Chat mode already solved this: pin the
+   chamber to the viewport (the nav is sticky IN FLOW, 60px + border) and let
+   the panel that grew scroll inside it. Same height, same reason.
+
+   Column layout ONLY. Under 900px the scene is a single stack — plate, stage,
+   roster, sheet, enter — with no flexible cell to give the leftover height to,
+   and pinning it there crushed every row into the same 800px (caught in the
+   browser, at 390x844). The phone scrolls the page, as it already did. */
+@media (min-width: 901px) {
+  /* The scene is one screen. The roster already scrolled inside itself, but
+     the sheet did not — so on a character with many rows (the 35B carries
+     variants, stats, abilities, context AND a memory build) the left column
+     grew past the fold and dragged the page with it, while the right column
+     ended short. Both rails are bounded now and scroll internally, so the two
+     columns end on the same line and the stage stays put. */
+  #models .cs-root {
+    height: calc(100dvh - 61px);
+    min-height: 0;
+  }
+  #models .cs-root .mb-info { align-self: stretch; min-height: 0; }
+  /* The GLASS BOX is what the eye reads as the column, and it was content-sized
+     — so on a short character it stopped a third of the way down while the
+     roster ran the full height, and the scene looked lopsided. Stretching
+     .mb-info alone did nothing visible, because the border lives on .mb-panel.
+     The panel now fills the rail and scrolls inside itself. */
+  #models .cs-root .mb-panel {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+  }
+  #models .cs-root.cs-swarm {
+    height: calc(100dvh - 61px);
+    min-height: 0;
+    padding-top: 22px;
+  }
+  #models .cs-swarm .mb-info {
+    align-self: stretch; min-height: 0; overflow-y: auto;
+    /* The panel's rune corners sit at -5px; without the padding the scroll box
+       clips them off. */
+    padding: 34px 7px 7px;
+    scrollbar-width: thin; scrollbar-color: var(--border-hi) transparent;
+    /* The cut edge reads as a rendering fault otherwise. Same breath of dark
+       the scene already puts at its top and bottom (.cs-root::before/::after),
+       at the scale of a panel. */
+    -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 26px, #000 calc(100% - 22px), transparent 100%);
+    mask-image: linear-gradient(180deg, transparent 0, #000 26px, #000 calc(100% - 22px), transparent 100%);
+  }
+}
+/* The realm's own two corner statements and the swarm's two reach lines are
+   the same register in the same place — only one pair at a time. */
+#models .cs-swarm .cs-corner { display: none; }
+/* The room path under ENTER hosts the WHOLE model from this tab — beside a
+   builder that cuts it into stages, two ⟁ lines meaning different things. */
+#models .cs-swarm .mb-cta-room { display: none; }
+/* Deeds are things that happened on this device; the note row carries the
+   reach caveat instead while the mode is open. */
+#models .cs-swarm .cs-deeds { display: none; }
+
+/* The rows animate in on the sheet's own stagger. nth-child cannot count them
+   (the hidden stat rows come first), so the step is carried as --i and the
+   keyframe and the 0.05s rhythm are the ones already here. */
+#models .cs-swarm .mb-panel.cs-in > .sw-row {
+  animation: rowIn 0.4s ease both;
+  animation-delay: calc(var(--i, 0) * 0.05s);
+}
+
+#models .sw-room {
+  width: 100%; padding: 6px 9px;
+  font-family: var(--mono); font-size: 0.66rem; color: var(--text);
+  background: #0a101ccc; border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 30%, var(--border));
+}
+#models .sw-room::placeholder { color: var(--dim); }
+#models .sw-hint { margin: 6px 0 0; font-size: 0.68rem; line-height: 1.45; color: var(--dim); }
+
+#models .sw-stops { display: grid; gap: 10px; }
+#models .sw-stop {
+  border-left: 2px solid #ffffff1c; padding: 1px 0 2px 10px;
+}
+/* The guest link is the one that gets handed to other people — the only row
+   here whose keyline earns the accent. */
+#models .sw-stop[data-role="guest"] {
+  border-left-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 65%, transparent);
+}
+#models .sw-stop-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 4px 10px; flex-wrap: wrap;
+}
+#models .sw-stop-head b {
+  font-size: 0.78rem; font-weight: 600; letter-spacing: 0.02em;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 55%, var(--text));
+}
+#models .sw-stop-head span {
+  font-family: var(--mono); font-size: 0.56rem; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--dim);
+}
+#models .sw-linkrow { display: flex; gap: 5px; align-items: center; margin-top: 7px; }
+#models .sw-linkrow input {
+  flex: 1 1 auto; min-width: 0; padding: 5px 8px;
+  font-family: var(--mono); font-size: 0.62rem; color: var(--text);
+  background: #0a101ccc; border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--cs-accent, var(--accent)) 26%, var(--border));
+}
+#models .sw-linkrow input:disabled { color: var(--dim); background: transparent; }
+#models .sw-note { margin: 6px 0 0; font-size: 0.7rem; line-height: 1.45; color: var(--dim); }
+
+#models .sw-exit {
+  align-self: start; margin: 0 0 2px;
+  font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.1em;
+  text-transform: uppercase; cursor: pointer;
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 65%, var(--dim));
+  background: transparent; padding: 4px 9px;
+  border: 1px solid transparent; border-radius: 3px;
+  transition: color 0.15s, border-color 0.15s;
+}
+#models .sw-exit:hover {
+  color: color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff);
+  border-color: color-mix(in srgb, var(--cs-accent, var(--accent)) 40%, transparent);
+}
+
+/* ── the roster states the limit ───────────────────────────────────────── */
+/* Only an MLX checkpoint can be cut. The old section expressed that by
+   offering a shorter list, which read as an arbitrary one; the rail dims the
+   characters that cannot instead, next to the ones that can. */
+#models .cs-swarm .mb-dot:not([data-splittable]) { opacity: 0.38; filter: grayscale(0.6); }
+
+/* ── the summoning ring counts the machines ────────────────────────────── */
+/* One arc per machine, laid over the same ring.svg the pedestal already
+   wears. The arc box is the ring's own 600x240, bottom-aligned, so the conic
+   gradient's centre and the ring's centre are the same point. */
+#models .cs-swarm .mb-pedestal::after { opacity: 0.28; animation: none; }
+#models .sw-arc {
+  position: absolute; left: 0; right: 0; bottom: 0; aspect-ratio: 600 / 240;
+  pointer-events: none;
+  background: conic-gradient(from 0deg at 50% 50%,
+    transparent var(--a0),
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff) var(--a0),
+    color-mix(in srgb, var(--cs-accent, var(--accent)) 85%, #fff) var(--a1),
+    transparent var(--a1));
+  -webkit-mask: url('/entrance/ring.svg') center / 100% 100% no-repeat;
+  mask: url('/entrance/ring.svg') center / 100% 100% no-repeat;
+  opacity: 0.13;
+  transition: opacity 0.35s ease;
+}
+/* Lit = that machine has a URL to open. ringFlash is the selection flash the
+   stage already runs; here it fires once, as the arc comes on. */
+#models .sw-arc[data-lit] { opacity: 0.95; animation: ringFlash 0.7s ease-out; }
+
+/* ── the reach caveat, in the corner-line register ─────────────────────── */
+#models .sw-reach-note { display: none; }
+#models .cs-swarm .sw-reach-note {
+  display: block; grid-area: note; z-index: 1; justify-self: center;
+  text-align: center; max-width: 92ch; padding: 2px 0;
+  font-family: var(--mono); font-size: 0.58rem; letter-spacing: 0.12em;
+  line-height: 1.7; text-transform: uppercase;
+  /* Full --dim, not the corners' 70% wash: the corners are flavour and this
+     is the sentence that decides whether an evening is wasted. */
+  color: var(--dim);
+}
+#models .cs-swarm .sw-reach-note span { display: block; }
+
+@media (max-width: 900px) {
+  #models .cs-swarm .sw-reach-note { letter-spacing: 0.08em; max-width: none; }
+}
+@media (max-width: 560px) {
+  /* A URL field with two buttons beside it is unreadable at this width; the
+     buttons take their own line, the same fix the old panel made. */
+  #models .sw-linkrow { flex-wrap: wrap; }
+  #models .sw-linkrow input { flex: 1 0 100%; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #models .cs-swarm .mb-panel.cs-in > .sw-row,
+  #models .sw-arc[data-lit] { animation: none; }
+  #models .sw-arc { transition: none; }
 }

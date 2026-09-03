@@ -21,9 +21,13 @@ import type { DecodeEngine } from './zero-tvm/engine-core.js'
 import type { Tokenizer } from './zero-tvm/tokenizer.js'
 import type { MascotHandle } from './mascot.js'
 import { mountMascot } from './mascot.js'
-import { modelBranding } from './zero-tvm/model-registry.js'
+import { modelBranding, canSplitAcrossDevices } from './zero-tvm/model-registry.js'
 import { buildChatPromptFor } from './zero-tvm/model-select.js'
 import { hostRoom, type RoomHandle } from './zero-tvm/room-host.js'
+// The throttling exemption, one generator, shared with share.html's serving
+// roles — see keep-awake.ts for why it is not two.
+import { KEEP_AWAKE_NOTE, wireKeepAwake } from './zero-tvm/keep-awake.js'
+import { swarmUrls, splitBounds } from './zero-tvm/room-url.js'
 import { recordFeat } from './feats.js'
 
 export interface RoomToolOptions {
@@ -42,7 +46,49 @@ export interface RoomToolOptions {
   /** Expert-pool slots the engine booted with (0 = full) — a pooled host
    *  must not advertise the full model's measured rate to guests. */
   poolSlots: number
+  /** This tab holds only these layers — the room serves a STAGE, and the
+   *  helper links it writes start where this one ends. */
+  stageRange?: { start: number; end: number }
+  /** The split this stage belongs to — bounds, which stage, the room context.
+   *  Present exactly when the entrance opened a room for a SPLIT. */
+  split?: { bounds: number[]; index: number; ctx: number }
 }
+
+/* CONSENT:BEGIN — one paragraph, two files: src/landing-room.ts (the entrance's
+   ⟁ Room tool) and src/zero-tvm/share.ts (share.html's host role). They cannot
+   share one import: share.html's guest needs no WebGPU and downloads nothing,
+   while landing-room.ts reaches model-select → weight-loader. So this block is
+   kept BYTE-IDENTICAL in both files and tests/unit/stage-honesty.test.ts
+   compares them. Edit both. */
+/**
+ * What opening a room actually commits this machine to.
+ *
+ * The whole-model paragraph was written when a serving tab could only hold the
+ * whole model, and all three of its promises are false under a split: a stage's
+ * tab does not run the reply (room-chain.ts's stepAll runs this tab's layers and
+ * then awaits every downstream stage on OTHER machines), and a guest copying
+ * weights from a stage host gets one layer range rather than a model it can run
+ * (loadWeights writes only that range into the model's OPFS dir, and
+ * peer-weights.ts streams that dir as it stands). So the copy branches.
+ */
+export function roomConsentCopy(
+  name: string,
+  stage: { start: number; end: number } | null,
+  layers: number,
+): string {
+  if (stage) {
+    return `Open a room and whoever has the link chats with <b>${name}</b>, split across the `
+      + `machines in this room. This tab holds layers ${stage.start}–${stage.end} of ${layers}: `
+      + 'every guest token runs its share on your GPU and the rest on the other machines. '
+      + 'Every request is listed here as it arrives. Weights copied from this tab are those '
+      + 'layers only, not a model that runs on its own. Keep this tab in the foreground while serving.'
+  }
+  return `Open a room and whoever has the link chats with <b>${name}</b> running on `
+    + 'THIS machine. Their prompts run on your GPU; every request is listed here as it '
+    + "arrives. Guests can also copy the model's cached weights from this machine to "
+    + 'run it locally. Keep this tab in the foreground while serving.'
+}
+/* CONSENT:END */
 
 export function mountRoomTool(o: RoomToolOptions): void {
   const head = o.panel.querySelector('.cs-chat-head')
@@ -57,15 +103,39 @@ export function mountRoomTool(o: RoomToolOptions): void {
   btn.title = 'Serve this model to other machines'
   head.insertBefore(btn, head.querySelector('#new-chat-btn'))
 
+  /**
+   * KEEP-AWAKE, beside the tool that opens the room.
+   *
+   * This surface is the PRIMARY hosting path now — the swarm's first machine
+   * boots in place rather than opening share.html — and it was the one without
+   * the control: a bare `wakeLock.request('screen')` taken when the room opened,
+   * which the UA drops on the first tab-hide and never gives back, and no audio
+   * track at all. A backgrounded host generates at ~23 tok/s against ~65 and
+   * serves at ~1 MB/s, so the recommended flow was the throttled one while the
+   * path it replaced had a toggle.
+   *
+   * That bare wake lock is GONE rather than left beside this: two owners of the
+   * machine's wake state means the visible control cannot honestly claim to
+   * release it. This button is the one owner, and like share.html's it does
+   * nothing until the operator presses it — the audio track needs a user gesture
+   * and a room opening is not one.
+   */
+  const awake = document.createElement('button')
+  awake.type = 'button'
+  awake.className = 'cs-chat-tool'
+  awake.id = 'awake'
+  awake.textContent = '⟁ Awake'
+  awake.title = KEEP_AWAKE_NOTE
+  head.insertBefore(awake, head.querySelector('#new-chat-btn'))
+  wireKeepAwake(awake)
+
   const strip = document.createElement('div')
   strip.className = 'cs-room'
   strip.hidden = !o.openStrip
   strip.innerHTML = `
     <div class="cs-room-consent">
-      <p>Open a room and whoever has the link chats with <b>${brand.name}</b> running on
-      THIS machine. Their prompts run on your GPU; every request is listed here as it
-      arrives. Guests can also copy the model's cached weights from this machine to
-      run it locally. Keep this tab in the foreground while serving.</p>
+      <p>${roomConsentCopy(brand.name, o.stageRange ?? null, o.spec.layers)}</p>
+      <div class="cs-room-plan" id="room-plan"></div>
       <button type="button" class="cs-chat-tool" id="room-open">Open room →</button>
     </div>
     <div class="cs-room-live" hidden>
@@ -74,6 +144,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
         <button type="button" class="cs-chat-tool" id="room-copy">Copy</button>
         <button type="button" class="cs-chat-tool" id="room-close">Close room</button>
       </div>
+      <div class="cs-room-split" id="room-split" hidden></div>
       <div class="cs-room-members" id="room-members" aria-live="polite">waiting for guests…</div>
       <ul class="cs-room-log" id="room-log" role="log" aria-live="polite" aria-label="Guest requests"></ul>
     </div>`
@@ -81,7 +152,6 @@ export function mountRoomTool(o: RoomToolOptions): void {
 
   const $ = <T extends HTMLElement>(sel: string): T => strip.querySelector(sel) as T
   let room: RoomHandle | null = null
-  let wake: { release(): Promise<void> } | null = null
   /** One small mascot per connected guest, flanking the character. */
   const guestMascots: { canvas: HTMLCanvasElement; handle: MascotHandle | null }[] = []
 
@@ -117,6 +187,104 @@ export function mountRoomTool(o: RoomToolOptions): void {
     btn.setAttribute('aria-expanded', String(!strip.hidden))
   })
 
+  /**
+   * What the room WILL be, before it is opened. The strip used to offer one
+   * button and no way to see or change anything about the room it was about
+   * to open — the split lived on the entrance sheet, which chat has covered by
+   * the time you get here. Each option is a link that re-enters holding that
+   * stage, the same ?split=/?stage= grammar the entrance reads.
+   */
+  function paintPlan(): void {
+    const box = $('#room-plan')
+    const layers = o.spec.layers
+    const ctx = o.split?.ctx ?? o.spec.maxContext
+    const here = o.split ? o.split.bounds.length - 1 : 1
+    const url = (machines: number): string => {
+      const q = new URLSearchParams()
+      q.set('model', o.param)
+      q.set('ctx', String(ctx))
+      if (machines > 1) {
+        q.set('split', splitBounds(layers, machines).join(','))
+        q.set('stage', '0')
+      }
+      q.set('chat', '1')
+      q.set('room', '1')
+      return `/?${q.toString()}`
+    }
+    // Splitting needs an MLX checkpoint; on an MLC one the only honest option
+    // is the whole model, so the row would be a single dead chip.
+    const counts = canSplitAcrossDevices(o.spec) ? [1, 2, 3, 4] : [1]
+    const chips = counts.map((n) => {
+      const label = n === 1 ? 'This machine only' : `${n} machines`
+      return n === here
+        ? `<span class="mb-variant" role="tab" aria-selected="true">${label}</span>`
+        : `<a class="mb-variant" role="tab" aria-selected="false" href="${url(n)}">${label}</a>`
+    }).join('')
+    const mine = o.split
+      ? `layers ${o.split.bounds[o.split.index]}–${o.split.bounds[o.split.index + 1]} of ${layers}`
+      : `all ${layers} layers`
+    box.innerHTML = `
+      <div class="cs-build-row"><span class="cs-build-label">Machines</span>
+        <div class="cs-build-chips">${chips}</div></div>
+      <div class="cs-plan-line">This tab holds <b>${mine}</b> · ${ctx} token context${
+        counts.length > 1 ? ' · changing this reopens the room' : ''}</div>`
+  }
+  paintPlan()
+
+  /**
+   * The split, as it stands, inside the room. The Split panel could not write
+   * these links — it had no room id yet, which is why it asked you to open the
+   * host in another tab and paste the link back. Hosting here means the id
+   * exists the moment the room does, so every other machine's link can simply
+   * be shown. Ranges come from the same swarmUrls the panel used, so the two
+   * surfaces cannot disagree about who holds what.
+   */
+  function paintSplit(roomId: string): void {
+    const sp = o.split
+    const box = $('#room-split')
+    if (!sp || sp.bounds.length < 3) return
+    const machines = sp.bounds.length - 1
+    const stops = swarmUrls({
+      origin: location.origin,
+      param: o.param,
+      layers: o.spec.layers,
+      machines,
+      room: roomId,
+      ctx: sp.ctx,
+      cuts: sp.bounds.slice(1, -1),
+    })
+    const rows = stops.map((st, i) => {
+      const mine = st.role !== 'guest' && i === sp.index
+      const who = st.role === 'guest' ? 'Anyone else' : `Machine ${i + 1}`
+      const range = st.range ? ` · layers ${st.range.start}–${st.range.end}` : ''
+      const link = mine
+        ? `<span class="cs-split-mine">running in this tab</span>`
+        : `<input readonly value="${st.url ?? ''}" aria-label="${who} link">
+           <button type="button" class="cs-chat-tool cs-split-copy">Copy</button>`
+      return `<div class="cs-split-row${mine ? ' is-mine' : ''}">
+        <div class="cs-split-who"><b>${who}</b><i>${st.role}${range}</i></div>
+        <div class="cs-split-link">${link}</div>
+      </div>`
+    }).join('')
+    box.innerHTML = `
+      <div class="cs-split-head">Split across ${machines} machines · ${sp.ctx} tokens each</div>
+      ${rows}
+      <p class="cs-split-note">Changing the split means re-holding different
+        layers, so it reopens the room. Close this one first.</p>`
+    box.hidden = false
+  }
+
+  // Copy on any stage link, same behaviour as the room link's own button.
+  strip.addEventListener('click', (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>('.cs-split-copy')
+    if (!b) return
+    const input = b.parentElement?.querySelector('input')
+    if (!input) return
+    void navigator.clipboard.writeText(input.value)
+    b.textContent = 'Copied'
+    setTimeout(() => { b.textContent = 'Copy' }, 1200)
+  })
+
   $('#room-open').addEventListener('click', () => {
     if (room) return
     room = hostRoom({
@@ -125,6 +293,7 @@ export function mountRoomTool(o: RoomToolOptions): void {
       // the pooled builds are slower and the guest sees the label as truth.
       brand: o.poolSlots ? { ...brand, rateLabel: '' } : brand,
       param: o.param,
+      stageRange: o.stageRange,
       engine: o.engine,
       tokenizer: o.tokenizer,
       lock: o.lock,
@@ -158,13 +327,11 @@ export function mountRoomTool(o: RoomToolOptions): void {
       },
     })
     ;($('#room-link') as unknown as HTMLInputElement).value = room.link
+    paintSplit(room.roomId)
     $('.cs-room-consent').hidden = true
     $('.cs-room-live').hidden = false
     btn.classList.add('cs-tool-live')
     recordFeat('room')
-    // Best-effort: hosting from a sleeping screen serves nobody.
-    void (navigator as unknown as { wakeLock?: { request(t: string): Promise<{ release(): Promise<void> }> } })
-      .wakeLock?.request('screen').then((l) => { wake = l }).catch(() => {})
   })
 
   $('#room-copy').addEventListener('click', () => {
@@ -177,8 +344,10 @@ export function mountRoomTool(o: RoomToolOptions): void {
   $('#room-close').addEventListener('click', () => {
     room?.close()
     room = null
-    void wake?.release().catch(() => {})
-    wake = null
+    // Keep-awake is NOT released here. It is the operator's toggle, next to the
+    // ⟁ Room tool rather than inside the strip, and it survives a room the same
+    // way share.html's does — a machine that just closed one room is usually
+    // about to open another.
     syncGuestMascots(0)
     $('.cs-room-live').hidden = true
     $('.cs-room-consent').hidden = false

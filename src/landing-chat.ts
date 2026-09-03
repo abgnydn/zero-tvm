@@ -42,21 +42,46 @@ export interface EnterChatOptions {
   openRoom?: boolean
   /** The stage mascot — already showing this character. */
   mascot: MascotHandle | null
+  /** Host ONE STAGE of a split here, [start, end). The swarm panel's first
+   *  machine is this machine, so it boots in place; only the other stages
+   *  need a URL. */
+  layerRange?: { start: number; end: number }
+  /** The whole split this stage belongs to: [0, …cuts, layers], which stage
+   *  this machine is, and the room-wide context. The room strip needs all of
+   *  it to write the other machines' links once the room exists. */
+  split?: { bounds: number[]; index: number; ctx: number }
 }
 
 const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>'
 const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
 const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>'
 
-function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, buildLabel: string): string {
+export function panelMarkup(
+  spec: ModelSpec,
+  brand: ReturnType<typeof modelBranding>,
+  buildLabel: string,
+  layerRange?: { start: number; end: number },
+): string {
   const sigil = LANE_SIGIL[laneOf(spec)] ?? ''
   const size = brand.params.split(/[\s·]/)[0]
+  // WHAT THIS TAB IS ABOUT TO FETCH. A stage holds part of the checkpoint, so
+  // the checkpoint's own figures are not its figures — the same bug share.ts's
+  // download gate already fixed once, where "the iPhone that held one layer of
+  // the 27B was asked to approve '~14.1 GB' for a slice worth a fraction of
+  // that (real device, 2026-08-29)". Same resolution here: state the RANGE and
+  // invent no per-stage byte figure, since the real size is not knowable until
+  // the safetensors headers are read. The progress panel shows it as it lands.
+  const detail = layerRange
+    ? `layers ${layerRange.start}–${layerRange.end} of ${spec.layers} · cached after first load`
+    : `${brand.sizeLabel} · cached after first load — next visit starts in seconds`
   // The one note a visitor cannot undo by waiting: RAM for the full build,
   // the build's own caveat for a chosen one (picking less memory IS the
-  // answer to the RAM warning).
+  // answer to the RAM warning). brand.ramNote is a whole-checkpoint number and
+  // is false for a stage; nothing replaces it, because a per-stage figure would
+  // have to be guessed. A chosen memory build is still this tab's build.
   const note = buildLabel !== brand.params
     ? `Build: ${buildLabel}`
-    : (brand.ramNote ?? '')
+    : (layerRange ? '' : (brand.ramNote ?? ''))
   return `
     <div class="cs-chat-head">
       <span class="cs-chat-sigil" aria-hidden="true">${sigil}</span>
@@ -72,7 +97,7 @@ function panelMarkup(spec: ModelSpec, brand: ReturnType<typeof modelBranding>, b
       <div class="cs-boot-title" id="loading-title">Summoning ${brand.name}</div>
       <div class="cs-boot-status" id="progress-status" aria-live="polite">Preparing…</div>
       <div class="cs-boot-track"><i id="progress-bar"></i></div>
-      <div class="cs-boot-detail" id="progress-detail">${brand.sizeLabel} · cached after first load — next visit starts in seconds</div>
+      <div class="cs-boot-detail" id="progress-detail">${detail}</div>
       ${note ? `<div class="cs-boot-note">${note}</div>` : ''}
       <details class="cs-boot-log"><summary>Rite log</summary><pre id="progress-log"></pre></details>
       <div class="cs-boot-error" id="loading-error"></div>
@@ -139,7 +164,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   panel.className = 'cs-chat'
   panel.setAttribute('role', 'region')
   panel.setAttribute('aria-label', `Chat with ${brand.name}`)
-  panel.innerHTML = panelMarkup(spec, brand, buildLabel)
+  panel.innerHTML = panelMarkup(spec, brand, buildLabel, opts.layerRange)
   root.appendChild(panel)
   root.classList.add('cs-chatting')
   // ENTER just display:none'd itself — without a new focus target the whole
@@ -175,6 +200,7 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   const boot = await bootChatEngine({
     spec,
     poolSlots: opts.poolSlots,
+    layerRange: opts.layerRange,
     search: location.search,
     onDeviceLost: (info) => {
       showBootError(`GPU device lost: ${info.message || info.reason}. Reload the page to recover.`)
@@ -220,7 +246,12 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   if (lane === 'dense' || lane === 'hybrid' || lane === 'moe') recordFeat(`lane-${lane}`)
   if (opts.poolSlots) recordFeat('pooled')
   if (opts.ctxTokens) recordFeat('long-ctx')
-  {
+  // Heavyweight is "boot a ≥10 GB footprint", and both terms of that sum are
+  // WHOLE-MODEL: poolLabel/sizeLabel is the whole checkpoint's download and
+  // kvBytesPerToken counts every layer's KV. A stage booted neither, so it is
+  // not awarded one — the deed would be the same false figure as the boot card
+  // used to print, only stored.
+  if (!opts.layerRange) {
     const w = /([\d.]+)\s*GB/.exec(opts.poolLabel || brand.sizeLabel)
     const gb = (w ? parseFloat(w[1]) : 0) + (spec.maxContext * spec.kvBytesPerToken) / 2 ** 30
     if (gb >= 10) recordFeat('heavy')
@@ -231,16 +262,39 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
   // generations into the same KV cache (lens round 2026-08-17).
   const lock = makeEngineLock()
 
-  wireChatSurface({
-    spec,
-    tokenizer: boot.tokenizer,
-    engine: boot.engine,
-    lock,
-    onToken: () => mascot?.pulse(),
-    onPhase: (p) => stage(p),
-    // /roster leaves the chat the same way the header link does.
-    commands: { roster: () => location.reload() },
-  })
+  // A STAGE does not chat. It holds part of the model, so forwardLogits has
+  // nothing to produce — the engine says so itself ("this engine is one
+  // pipeline stage — drive it with pipelineStep"). Wiring the turn loop
+  // anyway threw on the first message. The guest chats; this tab serves, and
+  // the room strip is its whole interface.
+  if (opts.layerRange) {
+    // No marker class here. This carried `cs-serving` and nothing styled it —
+    // a class that styles nothing is a claim the CSS does not keep. Both
+    // obvious visuals were already spoken for: the armed ring is set from the
+    // OPFS probe and stays on for any cached model, and dimming is cs-asleep's
+    // vocabulary, which would say the opposite of the truth about a tab that
+    // is working. The state is stated where it can be checked instead — the
+    // welcome names the range, and the composer is gone.
+    const w = panel.querySelector<HTMLElement>('#welcome')
+    if (w) {
+      w.innerHTML = `<div class="cs-welcome-title">Serving ${brand.name}</div>
+        <div class="cs-welcome-lore">This tab holds layers
+        ${opts.layerRange.start}–${opts.layerRange.end} and answers no chat of its own.
+        Hand out the room link below and keep this tab in the foreground.</div>`
+    }
+    panel.querySelector<HTMLElement>('#composer')?.setAttribute('hidden', '')
+  } else {
+    wireChatSurface({
+      spec,
+      tokenizer: boot.tokenizer,
+      engine: boot.engine,
+      lock,
+      onToken: () => mascot?.pulse(),
+      onPhase: (p) => stage(p),
+      // /roster leaves the chat the same way the header link does.
+      commands: { roster: () => location.reload() },
+    })
+  }
 
   // The Room tool: serve this booted engine to other machines, from inside
   // the game. Additive — a failure to load it must not touch the chat.
@@ -248,6 +302,8 @@ export async function enterChat(opts: EnterChatOptions): Promise<void> {
     root, panel, spec, param: opts.param,
     engine: boot.engine, tokenizer: boot.tokenizer, mascot,
     lock, poolSlots: opts.poolSlots,
+    stageRange: opts.layerRange,
+    split: opts.split,
     openStrip: opts.openRoom === true,
   })).catch((e) => console.warn('[landing] room tool failed to mount:', e))
 

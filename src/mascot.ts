@@ -134,9 +134,11 @@ fn map2(pIn: vec3<f32>) -> vec2<f32> {
   // Ear tufts, from the KV head count. They sit ON TOP of the head — the old
   // placement (R*0.88 sideways) was INSIDE the R*1.06 hair shell, so the ears
   // existed in the field and never in the picture. Length still follows
-  // kvHeads and the context ceiling; attention (hover) and thinking perk them.
+  // kvHeads and the context ceiling; thinking perks them. Hover used to as
+  // well, which meant the ears grew every time the pointer crossed the stage
+  // or the roster — a twitch on an idle page, not a reaction to anything.
   {
-    let perk = 1.0 + 0.35 * max(u.hover, thinking);
+    let perk = 1.0 + 0.35 * thinking;
     let eh = R * 0.42 * clamp(u.kvh / 16.0, 0.65, 1.2) * (0.8 + 0.5 * u.earCtx) * perk;
     let t = sdEllip(q - vec3<f32>(R * 0.58, hy + R * 0.92 + eh * 0.35, 0.0),
                     vec3<f32>(R * 0.19, eh, R * 0.16));

@@ -2,14 +2,26 @@
  * SHARE — serve the model running in THIS tab to another device, browser to
  * browser, over a WebRTC data channel.
  *
- * Two modes, decided by the URL fragment:
- *   share.html?model=qwen36q3      HOST — boots the engine (same composition
- *                                  as chat.ts), opens a room, serves requests
- *   share.html#<roomId>            GUEST — the chat page's own conversational
- *                                  surface (chat-ui.ts + chat-ui.css) over a
- *                                  DataChannel; needs no WebGPU, downloads
- *                                  nothing, learns the model's identity over
- *                                  the channel
+ * Three roles, decided by the URL (room-url.ts's grammar):
+ *   share.html?model=qwen36q3            HOST   — boots the engine, opens a
+ *                                                 room, serves requests
+ *   share.html?model=X&layers=k-N#<room> HELPER — holds ONE STAGE of a split
+ *                                                 model and answers no chat
+ *   share.html#<roomId>                  GUEST  — the conversation, over a
+ *                                                 DataChannel; needs no WebGPU
+ *                                                 and downloads nothing
+ *
+ * ── The screen ──
+ * This page renders the ENTRANCE'S SCENE, not a second design. index.html's
+ * character select (landing.ts) already contains every component a room needs:
+ * the plate and the summoning ring for the character, `.mb-panel` for its
+ * sheet, `.cs-boot` for the download, `.cs-room-consent` / `.cs-room-live` for
+ * the room itself, `.sw-arc` for a machine's place in a chain, `.cs-chat` for a
+ * conversation. It used to carry ~130 lines of inline CSS re-implementing all
+ * of that, one shade off, under a header bar the game does not have. There is
+ * no stylesheet here now: share.html links tokens.css, chat-ui.css and
+ * landing.css and nothing else, and what changes between the three roles is
+ * which of the entrance's own rows go in the sheet.
  *
  * Privacy model: the signaling worker (workers/share-signal) relays only
  * SDP/ICE JSON; prompts and tokens travel the DataChannel, which WebRTC
@@ -33,18 +45,33 @@
  */
 
 import {
-  setChatIdentity, autoGrow, wireScrollFab,
+  setChatIdentity, autoGrow, wireScrollFab, hideWelcome,
   addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
-import { specForParam } from './model-registry.js'
+import { specForParam, modelBranding, quantLabel, canSplitAcrossDevices } from './model-registry.js'
 import { ENGINE_GPU_FEATURES } from './variants.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
 import { fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
 import { serveStage } from './pipeline-peer.js'
+// The scene's own vocabulary, shared with the entrance: the class sigil, the
+// lore line and the lane accent a character wears. All pure functions over a
+// spec — no WebGPU is touched until mountMascot actually asks for a device,
+// which returns null and hides the canvas on a browser that has none.
+import { mascotPalette, mountMascot, type MascotHandle } from '../mascot.js'
+import { LANE_SIGIL, laneOf, loreOf } from '../landing-lore.js'
+// The swarm builder hands out helper links; a helper that opened one draws the
+// same arc on its own ring and repeats the same promise about its job.
+import { ROLE_NOTE, drawArcs, lightArcs } from '../landing-swarm.js'
 // The URL grammar lives in room-url.ts — shared with the entrance's swarm
 // link builder, so a URL that page hands out is routed by the same three-way
 // branch that reads it here.
-import { roomIdFrom, stageRangeFrom, roleFor } from './room-url.js'
+import { roomIdFrom, stageRangeFrom, roleFor, roomLink } from './room-url.js'
+// …and the bound that parser cannot apply, because bounding a range needs the
+// spec it is a range OF, plus the words a gate is allowed to say about a
+// bounded one. See stage-range.ts for what an unbounded one did, and for what
+// a bounded one bought before the gate stopped taking a stage as a size-free
+// pass.
+import { stageFor, stageGateCopy } from './stage-range.js'
 // The host loop, the wire protocol, and the signaling constants live in
 // room-host.ts — shared with the landing entrance's in-place room
 // (landing-room.ts), so the two hosting surfaces cannot drift.
@@ -52,10 +79,30 @@ import {
   hostRoom, signalEnv, ICE,
   type HostMsg, type ChatReq, type StopReq, type StageOffer,
 } from './room-host.js'
+// The keep-awake toggle used to be defined right here, and the entrance's room
+// had a bare wake lock instead — two answers to one question. It imports
+// nothing, so it is safe on the guest role's path too.
+import { KEEP_AWAKE_NOTE, wireKeepAwake } from './keep-awake.js'
 
 const { base: SIGNAL_BASE, override: SIG_OVERRIDE } = signalEnv()
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement
+
+// The composer/FAB glyphs, the same three the entrance's chat panel draws.
+const ICON_SEND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>'
+const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>'
+const ICON_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>'
+
+/**
+ * THE REACH CAVEAT, one sentence, one copy.
+ *
+ * The entrance states it in `.sw-reach-note` and this page shows the same note
+ * in the same corner-line register. When a connection stalls, the status line
+ * says THIS sentence rather than a second, differently-worded one — a page that
+ * explains the same limit twice in two voices has two chances to be wrong.
+ */
+const REACH_STUN = 'STUN only, no TURN — same network or an ordinary home router; '
+  + 'corporate and hotel usually will not'
 
 // URL grammar, four cases (room-url.ts):
 //   ?model=X                    host a NEW room
@@ -66,52 +113,225 @@ const $ = (id: string) => document.getElementById(id) as HTMLElement
 // what turns a room into a swarm: a guest that copied the weights adds
 // ?model= to the link it already has and starts serving.
 const room = roomIdFrom(location.hash)
-const stage = stageRangeFrom(location.search)
 // The assertions hold by roleFor's own definition: it returns 'helper' only
 // when both parses succeeded and 'guest' only when the room did.
 const role = roleFor(location.search, location.hash)
-if (role === 'helper') void runHelper(room!, stage!)
-else if (role === 'guest') void runGuest(room!)
+// BOUNDED HERE, before any role is handed a range. `stageRangeFrom` takes any
+// `\d+-\d+` — it has no spec — so `?layers=0-64` on a 64-layer checkpoint used
+// to describe the WHOLE model as "a slice of the full ~14.1 GB, not all of it"
+// and take the RAM warning down with it, and `?layers=0-9999` planned past the
+// end of the model and died in the loader. Every consumer of a range on this
+// page (the title, the sheet's Layers row, the consent paragraph, the download
+// gate, the loader's layerRange, the helper links) reads what these two
+// functions are handed, so this is the one place that makes them agree.
+//
+// `canSplitAcrossDevices` is the registry's own predicate — the one
+// landing.ts's `splitFor` asks about `?split=` — and NULL LAYERS is how a
+// checkpoint that cannot be cut says so: `?model=&layers=0-31` on Phi-3 built
+// a whole consent screen for a split that cannot exist and then died in
+// loadWeights. The predicate needs a spec, which this module deliberately does
+// not take, so it is asked here and answered there.
+const urlSpec = specForParam(new URLSearchParams(location.search).get('model') ?? '')
+const stage = stageFor(
+  stageRangeFrom(location.search),
+  canSplitAcrossDevices(urlSpec) ? urlSpec.layers : null,
+  role === 'helper' ? 'helper' : 'host',
+)
+if (role === 'helper') {
+  // A helper whose range does not bound cannot hold the slice it was sent for,
+  // and there is no honest fallback that SERVES: taking on the whole model in
+  // someone else's room is a larger commitment than the link asked for. So it
+  // joins as a guest, which needs no WebGPU and downloads nothing.
+  if (stage) void runHelper(room!, stage)
+  else void runGuest(room!)
+} else if (role === 'guest') void runGuest(room!)
 else void runHost(room, stage)
 
+// ============================================================
+// THE SCENE — the entrance's own screen, one character on it
+// ============================================================
+
 /**
- * Keep-awake toggle — screen wake-lock plus a silent audio track. The wake
- * lock stops the machine sleeping; the audio track is the standard exemption
- * from background-tab throttling (measured: a backgrounded host generated at
- * ~23 tok/s where the focused tab does ~65, and served weights at ~1 MB/s).
- * Honestly labeled: the browser shows its audio indicator on the tab.
+ * Everything landing.ts renders except what this page has no use for: no
+ * roster (the model arrived in the URL — there is nothing to pick), no stage
+ * arrows, no ENTER slab, no splash.
  *
- * Both serving roles need it — a helper stage especially, since it is a
- * background tab for its whole life.
+ * `serving` puts the root in `cs-swarm`, the entrance's stage-mode for
+ * "this character is being served across machines": it pins the scene to the
+ * viewport and lets the sheet scroll inside it, dims the base ring so a
+ * stage's arc reads over it, and shows the reach note in the note row. The
+ * guest gets `cs-chatting`, which is the mode a conversation already has.
  */
-function wireKeepAwake(): void {
-  const awake = $('awake') as HTMLInputElement | null
-  if (!awake) return
-  let wakeLock: WakeLockSentinel | null = null
-  let audioCtx: AudioContext | null = null
-  const apply = async (on: boolean): Promise<void> => {
-    if (on) {
-      try { wakeLock = await navigator.wakeLock.request('screen') } catch { /* unsupported / not visible */ }
-      if (!audioCtx) {
-        audioCtx = new AudioContext()
-        const osc = audioCtx.createOscillator()
-        const gain = audioCtx.createGain()
-        gain.gain.value = 0.0001   // inaudible, but "playing" as far as the scheduler cares
-        osc.connect(gain).connect(audioCtx.destination)
-        osc.start()
-      }
-      void audioCtx.resume()
-    } else {
-      void wakeLock?.release().catch(() => {})
-      wakeLock = null
-      void audioCtx?.suspend()
-    }
+function mountScene(o: { serving: boolean; sheet: string }): HTMLElement {
+  const root = $('share-root')
+  root.innerHTML = `
+    <div class="cs-spires" aria-hidden="true"></div>
+    <div class="cs-col cs-col-l" aria-hidden="true"></div>
+    <div class="cs-col cs-col-r" aria-hidden="true"></div>
+    <!-- The constellation is a MASKED shape; until paintCharacter gives it a
+         lane sigil to be masked by, an unmasked box is a pale rectangle across
+         half the scene (which is what a guest saw while connecting). -->
+    <div class="cs-sigilbg" aria-hidden="true" hidden></div>
+    <div class="cs-fog" aria-hidden="true"><i></i><i></i></div>
+    <div class="cs-dust" aria-hidden="true"></div>
+    <div class="mb-plate">
+      <div class="cs-banner" aria-hidden="true"></div>
+      <div class="mb-name"></div>
+      <div class="mb-params"><span class="mb-sigil" aria-hidden="true"></span><span class="mb-params-text"></span></div>
+      <div class="cs-lore"></div>
+    </div>
+    <div class="mb-stage">
+      <div class="mb-art">
+        <div class="mb-pedestal" aria-hidden="true"></div>
+        <canvas class="mb-mascot" aria-hidden="true"></canvas>
+      </div>
+    </div>
+    ${o.sheet}
+    <div class="sw-reach-note" role="note">
+      <span>Reach · ${REACH_STUN}</span>
+      <span>Splitting needs an MLX checkpoint · every serving tab has to stay awake</span>
+    </div>
+    <div class="cs-live" aria-live="polite"></div>
+    <div class="cs-wipe" aria-hidden="true"></div>
+    <div class="cs-borderline-t" aria-hidden="true"></div>
+    <div class="cs-borderline-b" aria-hidden="true"></div>`
+  root.classList.add(o.serving ? 'cs-swarm' : 'cs-chatting')
+  return root
+}
+
+/** The entrance's SELECTION transition — the stage flash, the plate walking in
+ *  and the sheet's row stagger, re-armed by yanking `cs-in` off for a frame.
+ *  Identical to landing.ts's selectFx; reduced motion disables the keyframes
+ *  in the stylesheet, so there is nothing to branch on here. */
+function selectFx(root: HTMLElement): void {
+  const wipe = root.querySelector<HTMLElement>('.cs-wipe')
+  if (wipe) { wipe.classList.remove('cs-go'); void wipe.offsetWidth; wipe.classList.add('cs-go') }
+  for (const sel of ['.mb-art', '.mb-plate', '.mb-panel']) {
+    const n = root.querySelector<HTMLElement>(sel)
+    if (!n) continue
+    n.classList.remove('cs-in')
+    void n.offsetWidth
+    n.classList.add('cs-in')
   }
-  awake.addEventListener('change', () => void apply(awake.checked))
-  document.addEventListener('visibilitychange', () => {
-    // The UA releases wake locks on hide; re-acquire when we come back.
-    if (awake.checked && document.visibilityState === 'visible') void apply(true)
-  })
+}
+
+/** Name, class line, lore, constellation and the lane accent — the same five
+ *  things landing.ts's paint() writes when a character takes the stage. The
+ *  accent lands on the root as `--cs-accent` (the scene) and on the document
+ *  as `--accent` (chat-ui's controls), exactly as landing-chat.ts does it. */
+function paintCharacter(root: HTMLElement, spec: ModelSpec, name: string, params: string): void {
+  const q = <T extends Element>(sel: string): T | null => root.querySelector<T>(sel)
+  const sigil = LANE_SIGIL[laneOf(spec)] ?? ''
+  const nameEl = q<HTMLElement>('.mb-name')
+  if (nameEl) nameEl.textContent = name
+  const paramsEl = q<HTMLElement>('.mb-params-text')
+  if (paramsEl) paramsEl.textContent = params
+  const sigilEl = q<HTMLElement>('.mb-sigil')
+  if (sigilEl) sigilEl.innerHTML = sigil
+  const lore = q<HTMLElement>('.cs-lore')
+  if (lore) lore.textContent = loreOf(spec)
+  const bg = q<HTMLElement>('.cs-sigilbg')
+  if (bg && sigil) {
+    const uri = `url("data:image/svg+xml,${encodeURIComponent(sigil)}")`
+    bg.style.webkitMaskImage = uri
+    bg.style.maskImage = uri
+    bg.hidden = false
+  }
+  const { accent, accentHi } = mascotPalette(spec)
+  root.style.setProperty('--cs-accent', accent)
+  root.style.setProperty('--cs-accent-hi', accentHi)
+  const st = document.documentElement.style
+  st.setProperty('--accent', accent)
+  st.setProperty('--accent-hi', accentHi)
+  st.setProperty('--accent-2', accentHi)
+  st.setProperty('--accent-dim', `${accent}22`)
+  st.setProperty('--accent-tint', `${accent}1f`)
+}
+
+/** The character itself. Returns null where there is no WebGPU device to draw
+ *  it with — a guest's browser routinely has none — and hides the canvas then,
+ *  the same fallback landing.ts takes.
+ *
+ *  `serving` means the weights are on THIS machine: the figure is lit and its
+ *  circle is ARMED, the same two states the entrance gives a cached character.
+ *  A guest's is neither — nothing of the model is here. */
+async function mountFigure(root: HTMLElement, spec: ModelSpec, serving: boolean): Promise<MascotHandle | null> {
+  const canvas = root.querySelector<HTMLCanvasElement>('.mb-mascot')
+  const art = root.querySelector<HTMLElement>('.mb-art')
+  if (!canvas) return null
+  const m = await mountMascot(canvas, spec)
+  if (!m) { canvas.style.display = 'none'; return null }
+  m.setSpec(spec, serving)
+  art?.toggleAttribute('data-armed', serving)
+  return m
+}
+
+/**
+ * The panel header: sigil, identity, live badge. The row the page's old `.top`
+ * bar was pretending to be.
+ *
+ * On a serving sheet the identity is the ROLE, not the model's name: the plate
+ * carries the name at display size directly above, and the sheet column is
+ * 280px on a phone — measured at 390x844, `Llama-3.2-1B-Instruct` set nowrap in
+ * here forced the panel 439px wide (`.mb-info` is `align-items: center` under
+ * 780px, so the panel sizes to its own min-content) and it hung off both edges
+ * of the screen. The guest's head keeps the name: its panel is 420-600px and
+ * has no plate to read it off until the room answers.
+ */
+function chatHead(spec: ModelSpec, who: string, build: string): string {
+  return `
+    <div class="cs-chat-head sw-row" style="--i:0">
+      <span class="cs-chat-sigil" aria-hidden="true">${LANE_SIGIL[laneOf(spec)] ?? ''}</span>
+      <div class="cs-chat-id"><b>${who}</b><i>${build}</i></div>
+      <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">Waiting</span></span>
+    </div>`
+}
+
+/** The rite card, verbatim from landing-chat.ts's panel — loading-ui.ts writes
+ *  every id in it. Hidden until consent: a progress card sitting at "Preparing…"
+ *  above a question nobody has answered yet reads as a stall. */
+function bootCard(i: number, title: string, detail: string): string {
+  return `
+    <div class="cs-boot sw-row" style="--i:${i}" id="progress-wrap" hidden>
+      <div class="cs-boot-title" id="loading-title">${title}</div>
+      <div class="cs-boot-status" id="progress-status" aria-live="polite">Preparing…</div>
+      <div class="cs-boot-track"><i id="progress-bar"></i></div>
+      <div class="cs-boot-detail" id="progress-detail">${detail}</div>
+      <details class="cs-boot-log"><summary>Rite log</summary><pre id="progress-log"></pre></details>
+      <div class="cs-boot-error" id="loading-error"></div>
+    </div>`
+}
+
+/** A refusal, in the rite card rather than in a hidden container. The old page
+ *  wrote boot failures into `#progress-wrap`, which was display:none until a
+ *  download started — so a boot refused BEFORE any download (no WebGPU, MoE
+ *  without subgroups) left the page sitting silently on a badge. */
+function bootFail(reason: string, badge: string): void {
+  const wrap = document.getElementById('progress-wrap')
+  if (wrap) wrap.hidden = false
+  const err = document.getElementById('loading-error')
+  if (err) { err.textContent = reason; err.classList.add('visible') }
+  const b = document.getElementById('badge')
+  if (b) b.className = 'badge error'
+  const t = document.getElementById('badge-text')
+  if (t) t.textContent = badge
+}
+
+/** The keep-awake control and the sentence under it, as sheet rows. Both
+ *  serving roles need it — a helper stage especially, since it is a background
+ *  tab for its whole life. It is a `.cs-chat-tool` toggle rather than a
+ *  checkbox, so it wears the scene's own control chrome and lights with
+ *  `.cs-tool-live` when it is on, the way the entrance's ⟁ Room tool does.
+ *  The wiring and the sentence are keep-awake.ts's; only the rows are here. */
+function keepAwakeRows(i: number): string {
+  return `
+    <button type="button" class="cs-chat-tool sw-row" style="--i:${i}" id="awake" aria-pressed="false">⟁ Keep this tab awake</button>
+    <p class="sw-note sw-row" style="--i:${i + 1}">${KEEP_AWAKE_NOTE}</p>`
+}
+
+/** The `#awake` row this page just wrote, handed to the shared wiring. */
+function wireKeepAwakeRow(): void {
+  wireKeepAwake(document.getElementById('awake'))
 }
 
 // ============================================================
@@ -126,10 +346,16 @@ function wireKeepAwake(): void {
  * word about it — no button pressed, no size shown. The chat page has gated
  * this since it shipped; the host path never did.
  *
- * Resolves immediately when the weights are already on this device: there is
- * nothing to consent to then, and a returning host should not be asked twice.
- * cache-probe pulls in the loaders, which read GPUBufferUsage at module scope,
- * so it is imported dynamically like everything else GPU-touching here.
+ * The gate is the room's FIRST STEP now, not a dialog over the page: the same
+ * `.cs-room-consent` block the entrance's ⟁ Room tool opens on, with the same
+ * voice. `#share-gate-go` keeps its id — it is the e2e's handle on this click.
+ *
+ * The weights sentence resolves against the cache: nothing to consent to when
+ * the bytes are already here, and a returning host should not be asked twice
+ * about a download. Cached used to mean no gate at all — so a returning
+ * visitor who clicked "Rooms" in the nav was serving a room to anyone with the
+ * link the moment the page finished loading. The download question disappears
+ * when the weights are local; the HOSTING question never does.
  */
 async function confirmDownload(
   spec: ModelSpec,
@@ -144,90 +370,167 @@ async function confirmDownload(
   const { isModelCached } = await import('./cache-probe.js')
   const { stage } = role
   const cached = await isModelCached(spec, stage)
-  // Cached used to mean no dialog at all — so a returning visitor who clicked
-  // "Rooms" in the nav was serving a room to anyone with the link the moment
-  // the page finished loading. The download question disappears when the
-  // weights are local; the HOSTING question never does.
 
-  // WHAT THIS DEVICE FETCHES — one sentence, both roles, because both can be
-  // a stage. The gate used to quote brand.sizeLabel unconditionally: the
-  // iPhone that held one layer of the 27B was asked to approve "~14.1 GB" for
-  // a slice worth a fraction of that (real device, 2026-08-29). A stage's
-  // exact bytes are not knowable here — they come from the safetensors
-  // headers, read after consent — so this states the RANGE and leaves the
-  // size to the progress panel. It does not guess a number.
-  const weightsLine = cached
-    ? (stage
-        ? `Layers ${stage.start}-${stage.end} are already cached on this device.`
-        : 'The weights are already cached on this device.')
-    : (stage
-        ? `Layers ${stage.start}-${stage.end} of ${spec.layers} download once — a slice of the `
-          + `full ${brand.sizeLabel}, not all of it — and are cached locally; the progress panel `
-          + 'below shows the real size as it arrives.'
-        : `The weights download once (${brand.sizeLabel}) and are cached locally; every later visit starts from disk.`)
-  // brand.ramNote is a whole-checkpoint figure ("needs ~20 GB free RAM") and
-  // is false for a stage. Nothing replaces it: a per-stage number would have
-  // to be invented.
-  const ramLine = !stage && brand.ramNote ? `<p class="warn">${brand.ramNote}</p>` : ''
+  // WHAT THIS DEVICE FETCHES, AND WHAT IT NEEDS TO HOLD IT — both sentences
+  // from stage-range.ts, which is also where the entrance's gate gets them, so
+  // the two surfaces cannot say different things about the same range.
+  //
+  // The gate used to quote brand.sizeLabel unconditionally: the iPhone that
+  // held one layer of the 27B was asked to approve "~14.1 GB" for a slice
+  // worth a fraction of that (real device, 2026-08-29). The repair for that
+  // then went one step too far and DELETED the RAM note for any stage, so
+  // `?layers=0-63` of 64 — ~13.9 of 14.1 GB — read exactly like `0-8`. Neither
+  // sentence guesses a per-stage byte count; a stage's real size is not known
+  // until the safetensors headers are read, after consent.
+  const copy = stageGateCopy({
+    stage: stage ?? null,
+    layers: spec.layers,
+    cached,
+    sizeLabel: brand.sizeLabel,
+    ramNote: brand.ramNote ?? '',
+  })
+  const ram = document.getElementById('gate-ram')
+  if (ram) {
+    if (copy.ram) ram.textContent = copy.ram
+    else ram.hidden = true
+  }
+  const weights = document.getElementById('gate-weights')
+  // The progress panel is this page's own — the entrance's gate has no such
+  // row under it, so the pointer at it is added here rather than in the
+  // shared sentence.
+  if (weights) {
+    weights.textContent = !cached && stage
+      ? `${copy.weights} The progress panel below shows the real size as it arrives.`
+      : copy.weights
+  }
 
-  const dlg = document.createElement('dialog')
-  dlg.id = 'share-gate'
-  dlg.innerHTML = role.kind === 'helper' && stage
-    ? `
-    <h2>Serve ${brand.name} layers ${stage.start}-${stage.end} from this tab</h2>
-    <p>
-      This device holds ONE STAGE of the model — layers ${stage.start} to
-      ${stage.end} of ${spec.layers}, not the whole checkpoint. ${weightsLine}
-    </p>
-    <p class="fine">The machine that starts the model sends this stage a hidden
-      state for every token and gets one back. It keeps the room and the
-      conversation; this tab holds only its layers.</p>
-    <div class="acts">
-      <a href="/">Not now</a>
-      <button type="button" id="share-gate-go" autofocus>${cached ? 'Serve these layers →' : 'Download the layers &amp; serve →'}</button>
-    </div>`
-    : `
-    <h2>Host ${brand.name} from this tab</h2>
-    <p>
-      Hosting runs the model on THIS machine and serves it to whoever opens
-      your room link. ${weightsLine}
-    </p>
-    ${ramLine}
-    <p class="fine">Guests' prompts run on your GPU. You see every request as it arrives.</p>
-    <div class="acts">
-      <a href="/">Not now</a>
-      <button type="button" id="share-gate-go" autofocus>${cached ? 'Start hosting →' : 'Download &amp; host →'}</button>
-    </div>`
-  document.body.appendChild(dlg)
-  dlg.showModal()
+  const go = document.getElementById('share-gate-go') as HTMLButtonElement
+  go.textContent = role.kind === 'helper'
+    ? (cached ? 'Serve these layers →' : 'Download the layers & serve →')
+    : (cached ? 'Start hosting →' : 'Download & host →')
+  go.disabled = false
   await new Promise<void>((resolve) => {
-    dlg.querySelector<HTMLButtonElement>('#share-gate-go')?.addEventListener('click', () => {
-      dlg.close()
-      dlg.remove()
+    go.addEventListener('click', () => {
+      go.disabled = true
       resolve()
     }, { once: true })
   })
 }
 
+/* CONSENT:BEGIN — one paragraph, two files: src/landing-room.ts (the entrance's
+   ⟁ Room tool) and src/zero-tvm/share.ts (share.html's host role). They cannot
+   share one import: share.html's guest needs no WebGPU and downloads nothing,
+   while landing-room.ts reaches model-select → weight-loader. So this block is
+   kept BYTE-IDENTICAL in both files and tests/unit/stage-honesty.test.ts
+   compares them. Edit both. */
+/**
+ * What opening a room actually commits this machine to.
+ *
+ * The whole-model paragraph was written when a serving tab could only hold the
+ * whole model, and all three of its promises are false under a split: a stage's
+ * tab does not run the reply (room-chain.ts's stepAll runs this tab's layers and
+ * then awaits every downstream stage on OTHER machines), and a guest copying
+ * weights from a stage host gets one layer range rather than a model it can run
+ * (loadWeights writes only that range into the model's OPFS dir, and
+ * peer-weights.ts streams that dir as it stands). So the copy branches.
+ */
+export function roomConsentCopy(
+  name: string,
+  stage: { start: number; end: number } | null,
+  layers: number,
+): string {
+  if (stage) {
+    return `Open a room and whoever has the link chats with <b>${name}</b>, split across the `
+      + `machines in this room. This tab holds layers ${stage.start}–${stage.end} of ${layers}: `
+      + 'every guest token runs its share on your GPU and the rest on the other machines. '
+      + 'Every request is listed here as it arrives. Weights copied from this tab are those '
+      + 'layers only, not a model that runs on its own. Keep this tab in the foreground while serving.'
+  }
+  return `Open a room and whoever has the link chats with <b>${name}</b> running on `
+    + 'THIS machine. Their prompts run on your GPU; every request is listed here as it '
+    + "arrives. Guests can also copy the model's cached weights from this machine to "
+    + 'run it locally. Keep this tab in the foreground while serving.'
+}
+/* CONSENT:END */
+
 async function runHost(existingRoom: string | null, stageRange: { start: number; end: number } | null): Promise<void> {
-  $('host-view').classList.remove('hidden')
+  // The registry spec is enough to paint the character (name, lane, lore,
+  // accent) and it needs no WebGPU — so the scene is on screen before the
+  // loader chain is even imported, and stays there if the import is refused.
+  // `?ctx=` only moves maxContext, which the sheet reads from the BOOTED spec
+  // below rather than from this one.
+  const param = new URLSearchParams(location.search).get('model') ?? ''
+  const baseSpec = specForParam(param)
+  const brand = modelBranding(baseSpec)
+  const stageLine = stageRange ? `layers ${stageRange.start}–${stageRange.end} of ${baseSpec.layers}` : ''
+  document.title = stageRange
+    ? `${brand.name} · ${stageLine} · zero-tvm`
+    : `${brand.name} · room · zero-tvm`
+
+  const root = mountScene({
+    serving: true,
+    sheet: `
+    <aside class="mb-info">
+      <div class="mb-panel">
+        ${chatHead(baseSpec, stageRange ? 'Hosting a stage' : 'Hosting', brand.params)}
+        <div class="mb-row-label sw-row" style="--i:1">Room</div>
+        <div class="cs-room sw-row" style="--i:2">
+          <div class="cs-room-consent">
+            <p>${roomConsentCopy(brand.name, stageRange, baseSpec.layers)}</p>
+            <p id="gate-weights"></p>
+            <p class="mb-ram" id="gate-ram"></p>
+            <button type="button" class="cs-chat-tool" id="share-gate-go" disabled>Checking this device…</button>
+          </div>
+          <div class="cs-room-live" hidden>
+            <div class="cs-room-linkrow">
+              <input id="share-link" readonly aria-label="Room link">
+              <button type="button" class="cs-chat-tool" id="copy-link">Copy</button>
+            </div>
+            <div class="cs-room-members" id="room-stats" aria-live="polite"></div>
+            <div class="mb-row-label">Link for a machine that will serve too</div>
+            <div class="cs-room-linkrow">
+              <input id="helper-link" readonly aria-label="Link for another serving machine">
+              <button type="button" class="cs-chat-tool" id="copy-helper">Copy</button>
+            </div>
+            <div class="mb-row-label">Requests</div>
+            <ul class="cs-room-log" id="req-log" role="log" aria-live="polite" aria-label="Guest requests"></ul>
+          </div>
+        </div>
+        ${bootCard(3, `Summoning ${brand.name}`,
+          stageRange
+            ? `${stageLine} · cached after first load`
+            : `${brand.sizeLabel} · cached after first load — next visit starts in seconds`)}
+        ${keepAwakeRows(4)}
+        <div class="mb-row-label sw-row" style="--i:6">This machine</div>
+        <dl class="mb-stats sw-row" style="--i:7"></dl>
+      </div>
+    </aside>`,
+  })
+  // A stage's nameplate states the SLICE, the same line the helper's does:
+  // what this machine holds is the one thing about it that is not the model's.
+  paintCharacter(root, baseSpec, brand.name, stageLine || brand.params)
+  selectFx(root)
+  void mountFigure(root, baseSpec, true)
+  wireKeepAwakeRow()
+
   // Before the gate, not after it. Without this a Firefox or old-Safari
   // visitor was shown "Download & host →" for a download whose engine could
   // never boot — the refusal existed, but only on the far side of the consent
   // dialog. The guest path stays open: guests need no WebGPU.
   if (!('gpu' in navigator)) {
-    const top = $('loading-error-top')
-    top.style.display = 'block'
-    top.textContent = 'Hosting needs WebGPU with shader-f16 — Chrome and Edge ship it; Safari from 26. '
-      + 'This browser can still JOIN a room as a guest: guests run nothing locally.'
-    $('badge').className = 'badge error'
-    $('badge-text').textContent = 'No WebGPU'
+    // Nothing will boot, so the room question and the sheet of figures about
+    // what would have run are both moot — the refusal is the whole screen.
+    for (const sel of ['.cs-room', '.mb-stats', '.mb-row-label']) {
+      for (const n of root.querySelectorAll<HTMLElement>(sel)) n.remove()
+    }
+    bootFail('Hosting needs WebGPU with shader-f16 — Chrome and Edge ship it; Safari from 26. '
+      + 'This browser can still JOIN a room as a guest: guests run nothing locally.', 'No WebGPU')
     return
   }
   // Everything GPU-touching is imported HERE, not at module scope — the guest
   // path must run on machines without WebGPU, and weight-loader.ts reads
   // GPUBufferUsage the moment it is imported.
-  const [{ specFromSearch, modelBranding, buildChatPromptFor }, loadingUi, variantsMod, engineMod] =
+  const [{ specFromSearch, buildChatPromptFor }, loadingUi, variantsMod, engineMod] =
     await Promise.all([
       import('./model-select.js'),
       import('./loading-ui.js'),
@@ -235,21 +538,26 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       import('./engine-core.js'),
     ])
 
+  // A hosting stage that skipped layer 0 used to throw HERE — from inside the
+  // boot, with the title, the nameplate and the consent paragraph already
+  // painted with the stage it was about to refuse, and the raw message on
+  // screen. stageFor holds that rule now, at the routing point, where a
+  // refusal means "no stage" and this page falls back to the whole model and
+  // the honest whole-model gate. Nothing left to check by the time we are
+  // here: `stageRange` is what that function returned.
   const spec = specFromSearch(location.search)
-  const brand = modelBranding(spec)
-  $('page-title').textContent = stageRange
-    ? `Sharing ${brand.name} — layers ${stageRange.start}-${stageRange.end} here`
-    : `Sharing ${brand.name}`
-  if (stageRange && stageRange.start !== 0) {
-    throw new Error(`share: a hosting stage must start at layer 0 (got ${stageRange.start}); later stages join a room as helpers`)
-  }
 
-  wireKeepAwake()
-
-  // Consent BEFORE the first byte, not after. A host with ?layers=0-k holds a
-  // stage too — it fetches that slice, not the whole checkpoint.
-  await confirmDownload(spec, brand, { kind: 'host', ...(stageRange ? { stage: stageRange } : {}) })
-
+  // The sheet, from the spec that will actually boot. A stage replaces the
+  // Weights row: the download is a SLICE, and quoting the whole checkpoint's
+  // size next to "layers 0-13" is the figure that sent an iPhone a 14.1 GB
+  // promise for a fraction of it.
+  const rows: Array<[string, string]> = [
+    stageRange
+      ? ['Layers', `${stageRange.start}–${stageRange.end} of ${spec.layers}`]
+      : ['Weights', brand.sizeLabel],
+    ['Quantisation', quantLabel(spec)],
+    ['Context', `${spec.maxContext.toLocaleString()} tokens`],
+  ]
   // ?pool= — the same memory-build knob as the chat page, so the entrance's
   // "Enter & open a room" fallback link carries the chosen build honestly.
   const poolSlots = ((): number => {
@@ -260,6 +568,17 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     const n = v === 'half' ? Math.round(E / 2) : v === 'quarter' ? Math.round(E / 4) : Number(v)
     return Number.isFinite(n) && n > 0 ? n : 0
   })()
+  // No rate row. The entrance carries measured throughput because that is a
+  // screen where you CHOOSE a model; here the model arrived in the URL and a
+  // number nobody can act on is decoration.
+  root.querySelector<HTMLElement>('.mb-stats')!.innerHTML = rows
+    .map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('')
+
+  // Consent BEFORE the first byte. A host with ?layers=0-k holds a stage too —
+  // it fetches that slice, not the whole checkpoint.
+  await confirmDownload(spec, brand, { kind: 'host', ...(stageRange ? { stage: stageRange } : {}) })
+  $('progress-wrap').hidden = false
+  root.classList.add('cs-summoning')
 
   // Same engine composition as chat.ts — this is the throughput path, not the
   // scalar validation path.
@@ -290,44 +609,51 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     // real prefill overwrites position 0 anyway.
     warmup: stageRange ? async (e) => { await e.pipelineStep({ tokenId: 1 }, 0) } : undefined,
   })
+  root.classList.remove('cs-summoning')
   if (!boot.ok) {
-    // OUTSIDE #progress-wrap: that container is display:none until a download
-    // starts, so a boot refused before any download (no WebGPU, MoE without
-    // subgroups) wrote its reason into a hidden element and the page just sat
-    // there with a "No WebGPU" badge and an empty room card.
-    const top = $('loading-error-top')
-    top.style.display = 'block'
-    top.textContent = boot.reason
-    $('loading-error').textContent = boot.reason
+    root.classList.add('cs-boot-failed')
+    const title = document.getElementById('loading-title')
+    if (title) title.textContent = 'The summoning failed'
+    bootFail(boot.reason, 'Failed')
     return
   }
   const { engine, tokenizer } = boot
+  // Summoned: the rite card folds away exactly as it does in the entrance.
+  $('progress-wrap').classList.add('cs-done')
 
   const logRow = (guest: string, text: string): HTMLElement => {
-    $('req-empty')?.remove()
+    const log = $('req-log')
     const li = document.createElement('li')
     // The guest id comes from the RELAY — like everything remote it goes in
     // through textContent, never markup (lens 2026-08-17).
-    li.innerHTML = '<span class="who"></span> · <span class="body"></span> <span class="st"></span>'
-    ;(li.querySelector('.who') as HTMLElement).textContent = guest
-    ;(li.querySelector('.body') as HTMLElement).textContent = text
-    $('req-log').prepend(li)
-    return li.querySelector('.st') as HTMLElement
+    li.innerHTML = '<b></b><span></span><i></i>'
+    ;(li.querySelector('b') as HTMLElement).textContent = guest.slice(0, 8)
+    ;(li.querySelector('span') as HTMLElement).textContent = text
+    log.prepend(li)
+    while (log.children.length > 8) log.lastChild?.remove()
+    return li.querySelector('i') as HTMLElement
   }
 
   // Membership + chain text must not overwrite each other — one renderer,
-  // one source for each half (the lesson from the two-writer #room-stats bug).
-  let roomMembers = '1 machine serving \u00b7 0 guests connected'
+  // one source for each SEGMENT (the lesson from the two-writer #room-stats
+  // bug). `shape` is the third: what this tab actually is, which the room
+  // card never said — a host could not read its own model, its own slice or
+  // its own context off the screen, and neither could anyone it showed it to.
+  // Fixed for the tab's life, so it is a constant rather than a callback.
+  const shape = stageRange
+    ? `layers ${stageRange.start}-${stageRange.end} of ${spec.layers} here`
+    : `all ${spec.layers} layers here`
+  let roomMembers = '1 machine serving · 0 guests connected'
   let chainText = ''
   function renderStats(): void {
-    $('room-stats').textContent = chainText ? `${chainText} \u00b7 ${roomMembers}` : roomMembers
+    $('room-stats').textContent = [shape, chainText, roomMembers].filter(Boolean).join(' · ')
   }
 
-  const room = hostRoom({
+  const roomHandle = hostRoom({
     spec,
     // A pooled host must not tell guests the full model's measured rate.
     brand: poolSlots ? { ...brand, rateLabel: '' } : brand,
-    param: new URLSearchParams(location.search).get('model') ?? '',
+    param,
     engine, tokenizer,
     encode: (messages) => buildChatPromptFor(spec, messages, tokenizer),
     existingRoom, stageRange,
@@ -338,7 +664,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
         return (s) => { st.textContent = s }
       },
       onMembers: ({ hosts, guests }) => {
-        roomMembers = `${hosts} ${hosts === 1 ? 'machine' : 'machines'} serving \u00b7 `
+        roomMembers = `${hosts} ${hosts === 1 ? 'machine' : 'machines'} serving · `
           + `${guests} ${guests === 1 ? 'guest' : 'guests'} connected`
         renderStats()
       },
@@ -346,16 +672,30 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       onPaired: (ok) => { (window as unknown as Record<string, unknown>).__stagePaired = ok },
     },
   })
-  if (existingRoom) $('page-title').textContent = `Serving ${brand.name} in a shared room`
-  ;($('share-link') as HTMLInputElement).value = room.link
-  $('copy-link').addEventListener('click', () => {
-    void navigator.clipboard.writeText(room.link)
-    $('copy-link').textContent = 'Copied'
-    setTimeout(() => { $('copy-link').textContent = 'Copy' }, 1200)
-  })
+  renderStats()
+  root.querySelector<HTMLElement>('.cs-room-consent')!.hidden = true
+  root.querySelector<HTMLElement>('.cs-room-live')!.hidden = false
+
+  const wireCopy = (btnId: string, inputId: string, value: string): void => {
+    ;(document.getElementById(inputId) as HTMLInputElement).value = value
+    const btn = $(btnId)
+    btn.addEventListener('click', () => {
+      void navigator.clipboard.writeText(value)
+      btn.textContent = 'Copied'
+      setTimeout(() => { btn.textContent = 'Copy' }, 1200)
+    })
+  }
+  wireCopy('copy-link', 'share-link', roomHandle.link)
+  // The link a SECOND machine opens to serve this room — model, context and
+  // (when this host holds only the first layers) the layers still missing,
+  // all in the query, room id in the fragment. It used to be hand-edited out
+  // of the guest link above, which is how a stage ended up on a different
+  // ?ctx= than the host.
+  wireCopy('copy-helper', 'helper-link', roomHandle.helperLink)
 
   // e2e hooks
-  ;(window as unknown as Record<string, unknown>).__shareLink = room.link
+  ;(window as unknown as Record<string, unknown>).__shareLink = roomHandle.link
+  ;(window as unknown as Record<string, unknown>).__helperLink = roomHandle.helperLink
   ;(window as unknown as Record<string, unknown>).__shareReady = true
 }
 
@@ -371,50 +711,101 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
  * instead of asking a question. Reusing the guest role rather than teaching
  * the relay a third one is what keeps this feature small — the room only ever
  * routes, and what a peer DOES with its channels is between the peers.
+ *
+ * The screen says exactly that and nothing more: a helper answers no chat, so
+ * there is no composer, no message log and nothing to type into. One stat —
+ * the layers it holds — the keep-awake switch it depends on for its whole
+ * life, and the one arc it occupies on the ring the swarm builder drew.
  */
 async function runHelper(roomId: string, range: { start: number; end: number }): Promise<void> {
-  $('host-view').classList.remove('hidden')
-  // A helper hands out no link of its own — it joined someone else's room.
-  // (The keep-awake card is deliberately a SEPARATE section, so removing this
-  // one does not take the toggle with it.)
-  $('share-link').closest('section')?.remove()
+  const param = new URLSearchParams(location.search).get('model') ?? ''
+  const baseSpec = specForParam(param)
+  const brand = modelBranding(baseSpec)
+  const layersLine = `layers ${range.start}–${range.end} of ${baseSpec.layers}`
+  document.title = `${brand.name} · ${layersLine} · zero-tvm`
+
+  const root = mountScene({
+    serving: true,
+    sheet: `
+    <aside class="mb-info">
+      <div class="mb-panel">
+        ${chatHead(baseSpec, 'Helper stage', brand.params)}
+        <div class="cs-room sw-row" style="--i:1">
+          <div class="cs-room-consent">
+            <p>This device holds ONE STAGE of <b>${brand.name}</b> — layers ${range.start} to
+            ${range.end} of ${baseSpec.layers}, not the whole checkpoint. <span id="gate-weights"></span></p>
+            <p>The machine that starts the model sends this stage a hidden state for every
+            token and gets one back. It keeps the room and the conversation; this tab holds
+            only its layers.</p>
+            <p class="mb-ram" id="gate-ram"></p>
+            <button type="button" class="cs-chat-tool" id="share-gate-go" disabled>Checking this device…</button>
+          </div>
+        </div>
+        ${bootCard(2, `Summoning ${layersLine}`, `${layersLine} · cached after first load`)}
+        <div class="sw-stop sw-row" style="--i:3" data-role="helper">
+          <div class="sw-stop-head"><b>${layersLine}</b><span>helper</span></div>
+        </div>
+        ${keepAwakeRows(4)}
+        <div class="cs-room-members sw-row" style="--i:6" id="room-stats" aria-live="polite"></div>
+        <p class="sw-note sw-row" style="--i:7">${ROLE_NOTE.helper}</p>
+      </div>
+    </aside>`,
+  })
+  paintCharacter(root, baseSpec, brand.name, layersLine)
+  selectFx(root)
+  void mountFigure(root, baseSpec, true)
+  wireKeepAwakeRow()
+
+  // ONE arc on the ring — this machine's place in the chain the swarm builder
+  // drew. Lit when the host accepts the stage, which is the only moment this
+  // tab is actually part of a model.
+  const arcs: HTMLElement[] = []
+  const pedestal = root.querySelector<HTMLElement>('.mb-pedestal')
+  const art = root.querySelector<HTMLElement>('.mb-art')
+  drawArcs(pedestal, arcs, 1)
+  const setArc = (lit: boolean): void => lightArcs(art, arcs, [lit])
+  setArc(false)
+
+  const stats = $('room-stats')
+  // "loading layers X-Y…" set once and never again was the only thing an
+  // iPhone helper ever showed for the whole download (2026-08-29): it reads as
+  // "loading" whether the tab is working, finished, or dead. Every line below
+  // states only what is true at that point, and the rite card carries the rest.
+  // The context is the host's, adopted from the link (ctxFrom) — printed because
+  // a stage silently sizing its KV cache off its own default is exactly the
+  // failure that rule prevents, and an unprinted number cannot be checked
+  // against the host's.
+  stats.textContent = 'not started yet'
+
   // The same refusal the host path does, and for the same reason: without it
-  // the consent dialog asks a browser that can never boot the engine to
-  // approve a download. It matters more here than there — a helper link is
-  // something you paste to a phone, and every iOS browser is WebKit, so
-  // anything before Safari 26 lands on this branch.
+  // the consent step asks a browser that can never boot the engine to approve
+  // a download. It matters more here than there — a helper link is something
+  // you paste to a phone, and every iOS browser is WebKit, so anything before
+  // Safari 26 lands on this branch.
   if (!('gpu' in navigator)) {
-    const top = $('loading-error-top')
-    top.style.display = 'block'
-    top.textContent = 'Serving a stage needs WebGPU with shader-f16 — Chrome and Edge ship it; Safari from 26. '
-      + 'This browser can still JOIN the room as a guest: open the link without the ?layers= part.'
-    $('badge').className = 'badge error'
-    $('badge-text').textContent = 'No WebGPU'
+    root.querySelector<HTMLElement>('.cs-room')?.remove()
+    stats.textContent = 'this browser cannot serve a stage'
+    bootFail('Serving a stage needs WebGPU with shader-f16 — Chrome and Edge ship it; Safari from 26. '
+      + 'This browser can still JOIN the room as a guest: open the link without the ?layers= part.', 'No WebGPU')
     return
   }
-  wireKeepAwake()
-  const [{ specFromSearch, modelBranding }, loadingUi, variantsMod, engineMod] = await Promise.all([
+  const [{ specFromSearch }, loadingUi, variantsMod, engineMod] = await Promise.all([
     import('./model-select.js'),
     import('./loading-ui.js'),
     import('./variants.js'),
     import('./engine-core.js'),
   ])
   const spec = specFromSearch(location.search)
-  const brand = modelBranding(spec)
-  $('page-title').textContent = `Serving ${brand.name} layers ${range.start}-${range.end}`
-  const stats = $('room-stats')
-  // "loading layers X-Y…" set HERE, before the gate, was the only thing an
-  // iPhone helper ever showed for the whole download (2026-08-29): it is
-  // written once and never again until the chain pairs, so it reads as
-  // "loading" whether the tab is working, finished, or dead. It now states
-  // only what is true at each point, and the progress panel carries the rest.
-  stats.textContent = `layers ${range.start}-${range.end} of ${spec.layers} — not started yet`
+  stats.textContent = `${spec.maxContext.toLocaleString()}-token context — not started yet`
 
   // Consent BEFORE the first byte — same gate as the host. A helper link in
   // a chat message used to boot the download and enrol the GPU in a
   // stranger's room with no click at all (lens 2026-08-17).
   await confirmDownload(spec, brand, { kind: 'helper', stage: range })
-  stats.textContent = `loading layers ${range.start}-${range.end} of ${spec.layers}…`
+  root.querySelector<HTMLElement>('.cs-room-consent')!.hidden = true
+  $('progress-wrap').hidden = false
+  root.classList.add('cs-summoning')
+  stats.textContent = `loading ${layersLine}…`
 
   const boot = await loadingUi.bootEngine({
     spec,
@@ -435,15 +826,17 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
     // at position 0 again and overwrites it.
     warmup: async (e) => { await e.pipelineStep({ residual: new ArrayBuffer(spec.d * 2) }, 0) },
   })
+  root.classList.remove('cs-summoning')
   if (!boot.ok) {
-    const top = $('loading-error-top'); top.style.display = 'block'; top.textContent = boot.reason
-    $('loading-error').textContent = boot.reason; return
+    root.classList.add('cs-boot-failed')
+    bootFail(boot.reason, 'Failed')
+    return
   }
+  $('progress-wrap').classList.add('cs-done')
   // Loaded and idle is a real state, and the page used to have no word for it:
   // the line above still read "loading layers 2-6 of 48…" long after the badge
   // said Ready, which on a phone is indistinguishable from a stall.
-  stats.textContent = `layers ${range.start}-${range.end} of ${spec.layers} loaded — `
-    + 'looking for the machine that starts the model'
+  stats.textContent = 'loaded — looking for the machine that starts the model'
 
   const ws = new WebSocket(`${SIGNAL_BASE}/room/${roomId}?role=guest`)
   const pc = new RTCPeerConnection(ICE)
@@ -453,7 +846,7 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
   }
   pc.ondatachannel = (e) => {
     if (e.channel.label === 'pipeline') {
-      serveStage(e.channel, boot.engine, (m) => { stats.textContent = `layers ${range.start}-${range.end} · ${m}` })
+      serveStage(e.channel, boot.engine, (m) => { stats.textContent = m })
       return
     }
     if (e.channel.label !== 'chat') return
@@ -464,12 +857,14 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
     chat.onmessage = (ev) => {
       const msg = JSON.parse(String(ev.data)) as HostMsg
       if (msg.type === 'stage-accept') {
-        stats.textContent = `in the chain — this device runs layers ${range.start}-${range.end} of ${spec.layers}`
+        stats.textContent = 'in the chain — this device runs its layers'
+        setArc(true)
         ;(window as unknown as Record<string, unknown>).__helperPaired = true
       } else if (msg.type === 'stage-wait') {
         // Not a refusal: this stage fits, the chain just has not reached it.
-        stats.textContent = `holding layers ${range.start}-${range.end} — ${msg.message}`
+        stats.textContent = `holding — ${msg.message}`
       } else if (msg.type === 'stage-reject') {
+        setArc(false)
         stats.textContent = `the host refused this stage: ${msg.message}`
       }
     }
@@ -484,18 +879,74 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
     } else if (msg.type === 'ice' && msg.candidate) {
       await pc.addIceCandidate(msg.candidate)
     } else if (msg.type === 'no-host' || msg.type === 'host-left') {
-      stats.textContent = 'no host in this room to pair with — open the room link on the machine holding the first layers'
+      setArc(false)
+      // The reach caveat, surfaced where the stall is — the SAME sentence the
+      // note in the corner already carries, never a second wording of it.
+      stats.textContent = 'no host in this room to pair with — open the room link on the machine '
+        + `holding the first layers. Reach: ${REACH_STUN}.`
     }
   }
   ;(window as unknown as Record<string, unknown>).__helperReady = true
 }
 
 // ============================================================
-// GUEST — chat-ui.ts's surface over a DataChannel
+// GUEST — the entrance's chat panel over a DataChannel
 // ============================================================
 
 async function runGuest(roomId: string): Promise<void> {
-  $('guest-view').classList.remove('hidden')
+  // The stranger who never saw the entrance. The scene mounts IMMEDIATELY,
+  // over a connecting state: no model is known yet — the room tells us which
+  // character this is — but the room, the ring and the panel are the project's
+  // first impression and must not wait on a WebSocket.
+  const root = mountScene({
+    serving: false,
+    sheet: `
+    <section class="cs-chat" role="region" aria-label="Chat with the model in this room">
+      <div class="cs-chat-head">
+        <span class="cs-chat-sigil" id="guest-sigil" aria-hidden="true"></span>
+        <div class="cs-chat-id"><b id="guest-model">This room</b><i id="guest-build">remote</i></div>
+        <span class="badge loading" id="guest-badge"><span class="dot"></span><span id="guest-badge-text">Connecting</span></span>
+        <a class="cs-chat-tool" href="/" title="Back to the character select">⟨ Roster</a>
+      </div>
+      <!-- Shown only when the host has a weight cache this device could copy.
+           The hidden CLASS is kept in step with the hidden ATTRIBUTE: the
+           attribute does the hiding, the class is what peer-weights-e2e
+           watches for. -->
+      <div class="cs-room hidden" id="local-copy" hidden>
+        <div class="cs-room-consent">
+          <p id="lc-status"></p>
+          <button type="button" class="cs-chat-tool" id="lc-btn"></button>
+        </div>
+      </div>
+      <main class="chat-main" id="chat-main">
+        <div class="chat-inner">
+          <div class="welcome cs-welcome cs-wait" id="welcome">
+            <div class="cs-welcome-title" id="welcome-title"></div>
+            <div class="cs-welcome-lore" id="welcome-lore"></div>
+          </div>
+          <div id="messages"></div>
+        </div>
+        <button class="scroll-fab" id="scroll-fab" title="Scroll to bottom" aria-label="Scroll to bottom">${ICON_DOWN}</button>
+      </main>
+      <div class="composer-wrap">
+        <form class="composer" id="composer">
+          <textarea id="inp" rows="1" placeholder="Connecting to the host…" aria-label="Message" disabled></textarea>
+          <button class="composer-btn" data-variant="send" id="btn" type="submit" disabled aria-label="Send">${ICON_SEND}</button>
+          <button class="composer-btn" data-variant="stop" id="stop-btn" type="button" hidden aria-label="Stop">${ICON_STOP}</button>
+        </form>
+        <div class="composer-hint">
+          <span id="room-count"></span>
+          <span id="guest-status">Waiting for the host.</span>
+        </div>
+      </div>
+    </section>`,
+  })
+  // The nameplate waits with what is actually known — the room, and nothing
+  // about the character in it. `info` replaces both lines through the
+  // entrance's own plateIn, so the reveal reads as a character arriving.
+  root.querySelector<HTMLElement>('.mb-name')!.textContent = 'This room'
+  root.querySelector<HTMLElement>('.mb-params-text')!.textContent = 'connecting'
+
   const setStatus = (t: string) => { $('guest-status').textContent = t }
   const setBadge = (t: string, cls: 'loading' | 'ready' | 'error') => {
     $('guest-badge').className = `badge ${cls}`
@@ -522,6 +973,7 @@ async function runGuest(roomId: string): Promise<void> {
   let reqId = 0
   let live: AiMsgHandle | null = null
   let liveFull = ''
+  let mascot: MascotHandle | null = null
 
   const inp = $('inp') as HTMLTextAreaElement
   const sendBtn = $('btn') as HTMLButtonElement
@@ -530,31 +982,79 @@ async function runGuest(roomId: string): Promise<void> {
     sendBtn.hidden = on
     stopBtn.hidden = !on
     sendBtn.disabled = on
+    root.classList.toggle('cs-generating', on)
   }
 
   const settle = (): void => {
     live = null
     setGenerating(false)
+    root.classList.remove('cs-thinking')
+  }
+
+  /**
+   * The room named its character. Paint it with the SAME sequence the entrance
+   * runs on selection — charIn on the figure, ringFlash on the circle, plateIn
+   * on the nameplate, all off the `cs-in` class — because that is what this is:
+   * a character taking the stage, for someone who never saw the roster.
+   */
+  const reveal = (msg: Extract<HostMsg, { type: 'info' }>): void => {
+    setChatIdentity(msg.name, msg.tag)
+    document.title = `${msg.name} · room · zero-tvm`
+    $('guest-model').textContent = msg.name
+    $('guest-build').textContent = `${msg.params} · remote`
+    const spec = specForParam(msg.param)
+    // The OPFS directory and everything drawn from the spec are chosen LOCALLY;
+    // a host whose spec id this build does not know gets the name it sent and
+    // no character, rather than someone else's portrait.
+    if (spec.id !== msg.specId) {
+      $('welcome-title').textContent = `Speak with ${msg.name}`
+      return
+    }
+    $('guest-sigil').innerHTML = LANE_SIGIL[laneOf(spec)] ?? ''
+    paintCharacter(root, spec, msg.name, msg.params)
+    $('welcome-title').textContent = `Speak with ${msg.name}`
+    // "It runs on the machine that opened this room" was written before a room
+    // could be split. Under a split the reply is assembled across every machine
+    // in the chain, and this page cannot tell which it is: room-host.ts's info
+    // frame carries name/params/tag/param/specId/ctx and no stage or chain
+    // field. Rather than invent one, the sentence is true either way.
+    $('welcome-lore').textContent = `${loreOf(spec)} It runs on the machine that opened this room, `
+      + 'and on any machine it has split the model across; this page holds only the conversation.'
+    selectFx(root)
+    void mountFigure(root, spec, false).then((m) => { mascot = m })
   }
 
   const onHostMsg = (msg: HostMsg): void => {
     if (msg.type === 'info') {
-      setChatIdentity(msg.name, msg.tag)
-      $('guest-model').textContent = `${msg.name} — remote`
-      setStatus(`${msg.params}${msg.rateLabel ? ` · ${msg.rateLabel}` : ''} · runs on the host machine — the host can read what you send; this page holds only the conversation.`)
+      reveal(msg)
+      // The host's advertised rate is deliberately not shown: a guest cannot
+      // act on it, and the one thing a guest DOES need to know about this room
+      // is whose machine the words land on. Under a split that is more than one
+      // machine — so the exposure is stated once, and not overstated: the host
+      // renders the chat template and tokenizes, so it holds the TEXT; a machine
+      // holding a later stage never does (pipeline-peer.ts hands it a residual
+      // and it hands one back). Both clauses are true either way, which they
+      // have to be — the info frame carries no stage or chain field.
+      setStatus(`${msg.params}${msg.ctx ? ` · ${msg.ctx.toLocaleString()}-token context` : ''}`
+        + ' · the host machine can read what you send; machines it splits the model with see only'
+        + ' the numbers passing between layers, not your text. This page holds only the conversation.')
       setBadge('Ready', 'ready')
+      $('welcome').classList.remove('cs-wait')
       inp.disabled = false
-      inp.placeholder = 'Message the remote model…'
+      inp.placeholder = `Message ${msg.name}…`
       sendBtn.disabled = false
-      void offerLocalCopy(msg.param, msg.specId)
+      void offerLocalCopy(msg.param, msg.specId, msg.ctx)
     } else if (msg.type === 'text') {
       liveFull = msg.full
       live?.render(liveFull)
+      root.classList.remove('cs-thinking')
+      mascot?.pulse()
     } else if (msg.type === 'done') {
       if (live) {
         live.finish({ fullText: liveFull, tokens: msg.tokens, tokPerS: msg.tps })
         history.push({ role: 'assistant', content: liveFull })
       }
+      mascot?.setMood('idle')
       settle()
     } else if (msg.type === 'busy') {
       setStatus(`Host is generating for someone else — queue position ${msg.pos}.`)
@@ -563,6 +1063,11 @@ async function runGuest(roomId: string): Promise<void> {
       settle()
     }
   }
+
+  // e2e/dev hook: the same frames the chat channel delivers, so the guest's
+  // revealed state (portrait, plate, ring, welcome) can be driven and looked
+  // at without standing up a relay and a host with real weights behind it.
+  ;(window as unknown as Record<string, unknown>).__guestFrame = onHostMsg
 
   /** Wire a freshly-created RTCPeerConnection to this page. */
   function wirePeer(): void {
@@ -599,7 +1104,11 @@ async function runGuest(roomId: string): Promise<void> {
     }
     if (msg.type === 'no-host') {
       setBadge('No host', 'error')
-      setStatus('Nobody is serving a model in this room — every host tab is closed, or the link expired.')
+      // The reach caveat where the stall happens, in the note's own words —
+      // "nobody is serving" and "your two machines cannot see each other" look
+      // identical from here, and only one of them is worth waiting out.
+      setStatus('Nobody is serving a model in this room — every host tab is closed, or the link '
+        + `expired. Reach: ${REACH_STUN}.`)
     } else if (msg.type === 'host-left') {
       setBadge('Host left', 'error')
       setStatus('Every machine serving this room went away. The conversation stays here; it resumes if one comes back.')
@@ -641,7 +1150,7 @@ async function runGuest(roomId: string): Promise<void> {
    * against the host's spec id: the OPFS directory this writes into is chosen
    * LOCALLY, never from a string the host sent.
    */
-  async function offerLocalCopy(param: string, specId: string): Promise<void> {
+  async function offerLocalCopy(param: string, specId: string, ctx?: number): Promise<void> {
     const panel = $('local-copy')
     const spec = specForParam(param)
     if (spec.id !== specId) return   // this build doesn't know the host's model — offer nothing
@@ -661,7 +1170,16 @@ async function runGuest(roomId: string): Promise<void> {
     if (!inv.files) return
     const gb = (inv.bytes / 1e9).toFixed(2)
     panel.classList.remove('hidden')
-    status.textContent = `The host has ${gb} GB cached. Copying it here lets this device run ${spec.id} on its own GPU.`
+    panel.hidden = false
+    // What the host has cached is its OPFS directory AS IT STANDS — the whole
+    // model if it holds the whole model, one layer range if it is a stage of a
+    // split (loadWeights writes only that range; peer-weights.ts streams the
+    // dir). The info frame carries no stage field, so this page cannot tell the
+    // two apart and must not promise the second one runs on its own GPU. What
+    // it CAN say without qualification is that the copy saves the download.
+    status.textContent = `The host has ${gb} GB cached — copying it saves this device the download. `
+      + `If that is the whole of ${spec.id} this device can then run it on its own GPU; if the host `
+      + "is holding one stage of a split model, it is that stage's layers."
     btn.textContent = `Copy ${gb} GB to this device`
     btn.addEventListener('click', () => {
       btn.disabled = true
@@ -669,17 +1187,29 @@ async function runGuest(roomId: string): Promise<void> {
       void pullWeights(weightsDc, spec, (p) => {
         const pct = p.bytesTotal ? Math.round((p.bytesDone / p.bytesTotal) * 100) : 0
         status.textContent = `${pct}% · ${(p.bytesDone / 1e9).toFixed(2)}/${gb} GB · `
-          + `${p.filesDone}/${p.filesTotal} files · ${(p.rate / 1e6).toFixed(0)} MB/s`
+          + `${p.filesDone}/${p.filesTotal} files`
       }, inv)
         .then((res) => {
           const secs = ((performance.now() - t) / 1000).toFixed(0)
           const p = encodeURIComponent(param)
-          const sig = SIG_OVERRIDE ? `&sig=${encodeURIComponent(SIG_OVERRIDE)}` : ''
+          // The swarm-forming link: this device has the weights now, so it
+          // can serve the SAME room instead of only consuming it. Built by
+          // roomLink so the query lands BEFORE the fragment, and carrying the
+          // host's ctx so this machine runs the room's context rather than
+          // its own compiled default (ctxFrom).
+          const serve = roomLink({
+            origin: '', path: '/share.html', room: roomId,
+            model: param, ctx: ctx ?? null, sig: SIG_OVERRIDE,
+          })
+          // Both links boot the WHOLE model on this device, so both assume the
+          // host was holding the whole model. It may have been holding one stage
+          // of a split, and nothing on the wire says which — so the condition is
+          // stated rather than hidden behind a link that would simply fail.
           status.innerHTML = `Done — ${(res.bytes / 1e9).toFixed(2)} GB in ${secs}s. `
+            + 'Both links below need the whole model on this device; if the host was holding '
+            + "one stage of a split, what arrived is that stage's layers.<br>"
             + `<a href="/zero-tvm.html?model=${p}">Open the chat on this device →</a><br>`
-            // The swarm-forming link: this device has the weights now, so it
-            // can serve the SAME room instead of only consuming it.
-            + `<a href="/share.html?model=${p}${sig}#${roomId}">…or serve this room from here too →</a>`
+            + `<a href="${serve}">…or serve this room from here too →</a>`
           btn.remove()
           ;(window as unknown as Record<string, unknown>).__pullDone = res
         })
@@ -695,12 +1225,17 @@ async function runGuest(roomId: string): Promise<void> {
     if (!text || live || !dc || dc.readyState !== 'open') return
     inp.value = ''
     autoGrow(inp)
+    hideWelcome()
     history.push({ role: 'user', content: text })
     addUserMsg(text)
     live = addAiMsg()
     live.showThinking()
     liveFull = ''
     setGenerating(true)
+    // The character on stage waits with you: the ring tightens while the host
+    // prefills, then every frame of text is a pulse in its mouth.
+    root.classList.add('cs-thinking')
+    mascot?.setMood('thinking')
     dc.send(JSON.stringify({ type: 'chat', id: ++reqId, messages: [...history] } satisfies ChatReq))
   }
   ;($('composer') as HTMLFormElement).addEventListener('submit', (e) => { e.preventDefault(); submit() })

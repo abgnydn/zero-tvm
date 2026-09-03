@@ -612,7 +612,7 @@
   <li><strong>Decode loop</strong> — each step takes the previous token as input, runs the full forward pass with the KV cache providing attention context, produces the next token</li>
 </ol>
 
-<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — the int8 KV cache adds a <code>kv_quantize</code> pass per layer, making 8 (<code>engine-core.ts</code>: fused f16 is 7, fused int8 is 8). Split-K attention also costs a dispatch per layer, but it has no int8 variant, so the default turns it off — the 228-dispatch reference chain needs <code>?kv8=0&amp;splitk=0</code> — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token — around 11 distinct shaders on that path, of 85 captured across a whole session.</p>
+<p>Each forward pass runs <strong>10 kernel roles</strong> through 32 transformer layers — <strong>260 dispatches per token</strong> on the default path — the int8 KV cache adds a <code>kv_quantize</code> pass per layer, making 8 (<code>engine-core.ts</code>: fused f16 is 7, fused int8 is 8). Split-K attention also costs a dispatch per layer, but it has no int8 variant, so the default turns it off — the 228-dispatch reference chain needs <code>?kv8=0&amp;splitk=0</code> — then reads one i32 token ID back from the GPU. For comparison, WebLLM's TVM-generated decode path fires 342 dispatches per token — around 11 distinct shaders on that path.</p>
 
 <!-- ARCHITECTURE -->
 <h2 id="overview">Architecture overview</h2>
@@ -1251,7 +1251,7 @@ dispatch(addNorm, [delta, resIn, gamma, hidden1, resOut])
     <tr><td>Time to first token (~35-token prompt)</td><td>291 ms</td><td><strong>~150 ms</strong> (implied from 251 tok/s prefill) — WebLLM ahead</td></tr>
     <tr><td>Gap</td><td colspan="2"><!--bench:gap-->-16<!--/bench:gap-->% on total relative to WebLLM (negative = Zero-TVM ahead), i.e. +16.0% total and +31.4% decode-only. Same-session pair; cross-session absolute tok/s drifts and the old "−28…−31% stable band" was retired on 2026-07-30 (see BENCH.md).</td></tr>
     <tr><td>Dispatches / token</td><td>260 default (228 with <code>?kv8=0&amp;splitk=0</code>)</td><td>342</td></tr>
-    <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>~11 TVM-generated on the decode path (85 captured across a session)</td></tr>
+    <tr><td>Distinct shaders</td><td>10 hand-written kernel roles</td><td>~11 TVM-generated on the decode path</td></tr>
     <tr><td>Shipped JS bundle</td><td>~460 kB / ~126 kB gz (<code>zero-tvm.html</code>)</td><td>~6.0 MB / ~2.2 MB gz (@mlc-ai/web-llm 0.2.84)</td></tr>
     <tr><td>Bandwidth utilization (total / decode)</td><td>~36% / ~44% of the 191 tok/s ceiling</td><td>~31% / ~33% of the same ceiling</td></tr>
     <tr><td>Paged attention</td><td>✓ Hand-written</td><td>✓ TVM compiled</td></tr>

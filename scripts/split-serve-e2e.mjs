@@ -13,6 +13,7 @@
 //   node scripts/split-serve-e2e.mjs            # llama32, 2 stages at 8/16
 //   STAGES=6 node scripts/split-serve-e2e.mjs   # six of them
 //   MODEL=qwen3mlx SPLIT=18 node scripts/split-serve-e2e.mjs
+//   SIGNAL_PORT=8795 VITE_PORT=5294 node scripts/split-serve-e2e.mjs   # movable
 //
 // Helpers join in REVERSE order on purpose. Six tabs opened at once connect in
 // whatever order they finish loading, so the host must hold a stage that does
@@ -29,11 +30,19 @@ import puppeteer from 'puppeteer'
 import { specForParam } from '../src/zero-tvm/model-registry.ts'
 
 const ROOT = resolve(import.meta.dirname, '..')
-const VITE_PORT = 5194
-const SIGNAL_PORT = 8791
+// BOTH ports are overridable: the guard below turns an occupied port into a
+// refusal, so a harness with no way to move off one cannot run at all.
+// VITE_PORT had this hatch and SIGNAL_PORT did not — the shape that made
+// share-e2e.mjs unrunnable on any machine with a `wrangler dev` up, since its
+// signal port was 8787, wrangler's own default. 8791 was never that port, so
+// the hatch here is for symmetry and for a second concurrent run.
+const VITE_PORT = Number(process.env.VITE_PORT ?? 5194)
+const SIGNAL_PORT = Number(process.env.SIGNAL_PORT ?? 8791)
 const MODEL = process.env.MODEL ?? 'llama32'
 const spec = specForParam(MODEL)
 const STAGES = Number(process.env.STAGES ?? 2)
+/** PHONE=1 — run the guest tab as an emulated iPhone (see the guest block). */
+const PHONE = process.env.PHONE === '1'
 // With STAGES=2 the cut stays wherever SPLIT says, so the two-stage run keeps
 // its old shape; beyond that the layers are divided evenly.
 const BOUNDS = STAGES === 2
@@ -45,16 +54,119 @@ const BASE = `http://localhost:${VITE_PORT}`
 const procs = []
 function run(cmd, args, cwd) {
   const p = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WRANGLER_SEND_METRICS: 'false' } })
-  p.stderr.on('data', (b) => { if (/error|EADDRINUSE/i.test(String(b))) process.stderr.write(`[${cmd}] ${b}`) })
+  // Keep the tail of BOTH streams. stdout is where vite announces the port it
+  // actually bound — the only evidence available that the thing answering is
+  // the thing we started — and it was being piped and then never read, which
+  // is also how a chatty child eventually blocks on a full pipe.
+  p.log = ''
+  const keep = (b) => { p.log = (p.log + b).slice(-4000) }
+  p.stdout.on('data', keep)
+  p.stderr.on('data', (b) => { keep(b); if (/error|EADDRINUSE/i.test(String(b))) process.stderr.write(`[${cmd}] ${b}`) })
+  // A child that never started is a child that died. Without the 'error'
+  // handler an ENOENT here is an unhandled event that takes the whole harness
+  // down with a stack trace instead of a sentence.
+  p.on('error', (e) => { p.dead = `failed to start (${e.code ?? e.message})` })
+  p.on('exit', (code, sig) => { p.dead = `exited ${code ?? sig}` })
   procs.push(p)
   return p
 }
-async function waitHttp(url, timeoutMs) {
+
+/**
+ * A SERVER THIS HARNESS DID NOT START IS NOT THIS HARNESS'S SERVER.
+ *
+ * `fetch(url)` proves that SOMETHING answers on the port. It does not prove it
+ * is ours. On 2026-08-25 an orphaned vite held 5194 serving source two commits
+ * behind; this file spawned its own vite, that vite died, and the wait
+ * resolved against the STRANGER in 103 ms — after which every browser, every
+ * assertion and the final PASS were about code the run never loaded. That is
+ * this repo's signature defect: something occupying the position of a check
+ * without performing one.
+ *
+ * `--strictPort` was already on and did not save it, for two measured reasons
+ * (both reproduced on this machine, vite 6.4.1, macOS):
+ *
+ *   1. When the squatter binds the SAME loopback family, vite does print
+ *      `Error: Port N is already in use` and exit 1 — but nothing here read
+ *      the child's exit code, and it loses the race anyway: the squatter is
+ *      already listening, so it answers the very first poll. Measured: the old
+ *      `waitHttp` resolved against a decoy in 28 ms, well inside vite's
+ *      startup.
+ *   2. When the squatter binds the OTHER loopback family there is no
+ *      EADDRINUSE AT ALL. vite binds `localhost`, which resolves to `[::1]`
+ *      here; a squatter on `127.0.0.1` coexists with it happily, both report
+ *      themselves up, and which one a client reaches is decided by whatever
+ *      that client's resolver does with "localhost". Verified: `curl
+ *      localhost:P` reached vite while `curl 127.0.0.1:P` reached the
+ *      squatter, at the same instant.
+ *
+ * So EADDRINUSE cannot be the check. Two things replace it, and both are
+ * needed: refuse a port that ALREADY answers (either family, since either can
+ * be the one Chrome picks), and then wait for OUR child to announce itself
+ * rather than for the port to respond.
+ */
+async function requirePortFree(port, what) {
+  for (const host of ['127.0.0.1', '[::1]']) {
+    const answered = await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(2000) })
+      .then(() => true, () => false)
+    if (!answered) continue
+    throw new Error(
+      `http://${host}:${port}/ already answers — something this harness did not start is `
+      + `serving ${what}. Refusing to run: a previous version of this file would have tested `
+      + `that server instead and printed PASS. Stop it (lsof -nP -iTCP:${port} -sTCP:LISTEN) `
+      + `and rerun.`)
+  }
+}
+
+/**
+ * A child's output with ANSI escapes stripped, for MATCHING only — the error
+ * dumps below keep the colour.
+ *
+ * The ready regexes below are written for plain text, and vite's line is not
+ * plain text when anything forces colour on. Under FORCE_COLOR=1 it reads
+ * `<esc>[1mLocal<esc>[22m:   <esc>[36mhttp://localhost:<esc>[1m5294<esc>[22m/`
+ * — escapes between `Local` and `:` AND inside the port digits, so the match
+ * never fires and the wait runs to its full timeout. Measured on the sibling
+ * harness before this landed: `VITE_PORT=5294 FORCE_COLOR=1 node
+ * scripts/peer-weights-e2e.mjs` took 31.9 s and exited 1 against a vite that
+ * had printed "ready in 125 ms". Piped stdout turns colour off by default,
+ * which is why the happy path never saw it — a CI, or a shell that exports
+ * FORCE_COLOR, turns a working harness into a mystery timeout.
+ */
+const plain = (s) => s.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '')
+
+/** vite's own ready line, pinned to the port we asked for. Matching this is
+ *  what makes the server ours rather than merely present. */
+const VITE_READY = new RegExp(`Local:\\s+https?://localhost:${VITE_PORT}/`)
+/**
+ * wrangler's, held to the SAME standard: `[wrangler:info] Ready on
+ * http://localhost:<port>`, pinned to the port we asked for.
+ *
+ * The relay was the one server here still waited for with `ready = null` —
+ * which is precisely the "the port answers" test the paragraph above exists to
+ * reject, left in place because nothing had been written for wrangler. It
+ * prints the line; nothing was reading it.
+ */
+const SIGNAL_READY = new RegExp(`Ready on https?://(localhost|127\\.0\\.0\\.1|\\[::1\\]):${SIGNAL_PORT}\\b`)
+
+/**
+ * Wait for the server WE STARTED, not for the port to answer.
+ *
+ * `ready` is a regex over the child's own output; when it is given, no HTTP
+ * response counts until the child has said the words itself. A child that
+ * dies is fatal here rather than something to keep polling past.
+ */
+async function waitServer(proc, url, timeoutMs, what, ready) {
   const t0 = Date.now()
   while (Date.now() - t0 < timeoutMs) {
-    try { await fetch(url); return } catch { await new Promise((r) => setTimeout(r, 250)) }
+    if (proc.dead) {
+      throw new Error(`${what} ${proc.dead} before serving ${url}\n--- its output ---\n${proc.log.trim()}`)
+    }
+    if (!ready || ready.test(plain(proc.log))) {
+      try { await fetch(url); return } catch { /* bound but not serving yet */ }
+    }
+    await new Promise((r) => setTimeout(r, 250))
   }
-  throw new Error(`timed out waiting for ${url}`)
+  throw new Error(`timed out waiting for ${what} at ${url}\n--- its output ---\n${proc.log.trim()}`)
 }
 const launch = (userDataDir) => puppeteer.launch({
   headless: false,
@@ -63,6 +175,27 @@ const launch = (userDataDir) => puppeteer.launch({
   defaultViewport: { width: 900, height: 700 },
   protocolTimeout: 15 * 60 * 1000,
 })
+
+/**
+ * Every serving role asks before it downloads anything — #share-gate-go, the
+ * same button share-e2e.mjs clicks. This script never did, and since it wipes
+ * its profiles on the way out (line ~195) the weights are always cold, so the
+ * gate always waits: stage 0 sat on "Checking this device…" until the 10
+ * minute timeout. The run has been failing here rather than in anything it
+ * was written to test.
+ *
+ * The button starts disabled while the device is probed, so wait for it to be
+ * enabled rather than merely present.
+ */
+async function passGate(page, who) {
+  await page.waitForSelector('#share-gate-go', { visible: true, timeout: 60_000 })
+  await page.waitForFunction(() => {
+    const b = document.getElementById('share-gate-go')
+    return !!b && !b.disabled
+  }, { timeout: 60_000, polling: 200 })
+  await page.click('#share-gate-go')
+  console.log(`${who}: download confirmed`)
+}
 
 let failed = false
 /** browsers[0] hosts; the rest are helper stages. */
@@ -78,10 +211,13 @@ try {
   }
   console.log(`${spec.id}: ${spec.layers} layers across ${STAGES} stages — `
     + BOUNDS.slice(0, -1).map((b, i) => `${b}-${BOUNDS[i + 1]}`).join(' → '))
-  run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
-  run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
-  await waitHttp(`http://localhost:${SIGNAL_PORT}/`, 30_000)
-  await waitHttp(`${BASE}/share.html`, 30_000)
+  // Before anything is spawned: neither port may already be serving.
+  await requirePortFree(SIGNAL_PORT, 'the signaling relay')
+  await requirePortFree(VITE_PORT, 'the dev server')
+  const signal = run('npx', ['wrangler', 'dev', '--port', String(SIGNAL_PORT)], resolve(ROOT, 'workers/share-signal'))
+  const vite = run(resolve(ROOT, 'node_modules/.bin/vite'), ['--port', String(VITE_PORT), '--strictPort', '--clearScreen', 'false'], ROOT)
+  await waitServer(signal, `http://localhost:${SIGNAL_PORT}/`, 30_000, 'wrangler dev', SIGNAL_READY)
+  await waitServer(vite, `${BASE}/share.html`, 30_000, 'vite', VITE_READY)
   for (let i = 0; i < STAGES; i++) mkdirSync(PROFILE(i), { recursive: true })
 
   // ── stage 0: layers [0, BOUNDS[1]), hosts the room ──
@@ -90,6 +226,7 @@ try {
   const stage0 = await b0.newPage()
   stage0.on('pageerror', (e) => console.error(`[stage 0] ${e.message}`))
   await stage0.goto(`${BASE}/share.html?model=${MODEL}&layers=0-${BOUNDS[1]}&sig=${SIGNAL_PORT}`, { waitUntil: 'domcontentloaded' })
+  await passGate(stage0, 'stage 0')
   await stage0.waitForFunction(() => window.__shareReady === true, { timeout: 10 * 60_000, polling: 1000 })
   await stage0.click('#awake')
   const link = await stage0.evaluate(() => window.__shareLink)
@@ -105,6 +242,7 @@ try {
     pg.on('pageerror', (e) => console.error(`[stage ${i}] ${e.message}`))
     await pg.goto(`${BASE}/share.html?model=${MODEL}&layers=${BOUNDS[i]}-${BOUNDS[i + 1]}&sig=${SIGNAL_PORT}#${roomId}`,
       { waitUntil: 'domcontentloaded' })
+    await passGate(pg, `stage ${i}`)
     await pg.waitForFunction(() => window.__helperReady === true, { timeout: 10 * 60_000, polling: 1000 })
     await pg.click('#awake')
     console.log(`stage ${i} up (layers ${BOUNDS[i]}-${BOUNDS[i + 1]})`)
@@ -114,7 +252,25 @@ try {
   check('chain assembled', true, await stage0.$eval('#room-stats', (el) => el.textContent ?? ''))
 
   // ── a guest asks the N-machine model a question ──
+  //
+  // PHONE=1 emulates the guest as an iPhone: viewport, touch, and the mobile
+  // user agent, on the real Chrome engine. That is the honest scope of it —
+  // it exercises the guest's LAYOUT and the WebRTC path from a phone-shaped
+  // client. It does NOT reproduce a phone's GPU, and it cannot: the guest
+  // role is the one that needs no WebGPU and downloads nothing, which is
+  // exactly why it is the role worth emulating. Whether a given phone can
+  // HOLD a stage is a question about maxBufferSize and free RAM on the
+  // device, and only the device can answer it.
   const guest = await b0.newPage()
+  if (PHONE) {
+    await guest.emulate({
+      name: 'iPhone 15 Pro',
+      userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15'
+        + ' (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+      viewport: { width: 393, height: 852, deviceScaleFactor: 3,
+                  isMobile: true, hasTouch: true, isLandscape: false },
+    })
+  }
   guest.on('pageerror', (e) => console.error(`[guest] ${e.message}`))
   await guest.goto(link, { waitUntil: 'domcontentloaded' })
   await guest.waitForFunction(() => !document.getElementById('inp').disabled, { timeout: 90_000, polling: 200 })
@@ -126,6 +282,23 @@ try {
     const btn = document.getElementById('btn')
     return !!last && (last.textContent ?? '').length > 5 && !btn.hidden && !btn.disabled
   }, { timeout: 5 * 60_000, polling: 300 })
+
+  if (PHONE) {
+    // The thing that actually breaks a phone guest: a page wider than the
+    // screen, or a composer the keyboard would sit on top of. Both are
+    // measurable here even though the GPU is not.
+    const m = await guest.evaluate(() => ({
+      overflowX: document.documentElement.scrollWidth - window.innerWidth,
+      composerVisible: (() => {
+        const c = document.getElementById('inp')
+        if (!c) return false
+        const r = c.getBoundingClientRect()
+        return r.width > 0 && r.top < window.innerHeight
+      })(),
+    }))
+    check('phone guest: no sideways scroll', m.overflowX <= 0, `${m.overflowX}px overflow`)
+    check('phone guest: composer on screen', m.composerVisible, 'the input is reachable')
+  }
 
   const reply = await guest.$eval('.msg.ai:last-of-type', (el) => el.textContent ?? '')
   console.log(`reply: ${JSON.stringify(reply.slice(-90))}`)

@@ -18,6 +18,7 @@
 
 import type { ModelSpec } from '../compiler/model-spec.js'
 import { specForParam, specWithCtx } from './model-registry.js'
+import { ctxFrom } from './room-url.js'
 import { resolveModelBase } from './weight-loader.js'
 import { loadTokenizer, buildChatPrompt as buildPhi3ChatPrompt, type Tokenizer } from './tokenizer.js'
 import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt, buildDeepSeekChatPrompt, buildLlama3ChatPrompt, buildMistralChatPrompt, buildTuluChatPrompt } from './tokenizer-bpe.js'
@@ -28,9 +29,29 @@ export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: stri
  *  there is what creates its URL. Default (and anything unknown) is Phi-3. */
 export function specFromSearch(search: string): ModelSpec {
   const q = new URLSearchParams(search)
+  const base = specForParam(q.get('model'))
   // `?ctx=` is documented on specWithCtx (model-registry.ts) — the logic lives
   // there so it can be unit-tested without this file's weight-loader import.
-  return specWithCtx(specForParam(q.get('model')), Number(q.get('ctx')))
+  // The link is read with room-url.ts's ctxFrom, the same parser share.ts
+  // routes on, so a helper booting from a host's link cannot size its KV cache
+  // off a different rule.
+  //
+  // NO ctx in the link → the spec UNTOUCHED, not a round-trip through
+  // specWithCtx. This was `specWithCtx(base, ctxFor(search, base.maxContext))`
+  // — feeding a spec's own maxContext back through its clamp, which is a no-op
+  // on every spec whose maxContext sits below maxSeq, and a SHRINK on the one
+  // where it does not. KV pages round UP: Phi-3's 257 pages hold 4112 tokens
+  // against a 4096-token trained window, so clamping to floor(maxSeq/pageSize)
+  // took a page off the DEFAULT model of zero-tvm.html and validate.html
+  // silently. scripts/station.mjs states the rule ("a naive clamp to maxSeq
+  // would SHRINK the shipped default") and computes its ceiling as
+  // max(maxSeq, maxContext) for exactly this reason.
+  //
+  // An EXPLICIT ctx still goes through specWithCtx and is still clamped —
+  // asking for a budget is a request to re-size, and past maxSeq the model
+  // degrades without erroring. Not asking is not a request.
+  const ctx = ctxFrom(search)
+  return ctx === null ? base : specWithCtx(base, ctx)
 }
 
 export { modelBranding, SHIPPED_MODELS } from './model-registry.js'

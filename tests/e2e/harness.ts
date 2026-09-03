@@ -12,83 +12,74 @@
  */
 
 import { spawn, ChildProcess } from 'node:child_process'
-import { mkdirSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { existsSync, mkdirSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import puppeteer, { Browser, Page } from 'puppeteer'
+import { requirePortFree, viteReady, waitForChild, watch } from './port-guard.ts'
 
 // 5173 is the developer's own vite, 5174 is the user's neural-pulse project,
 // so we pick a port well away from the common vite range.
-const PORT = 5189
+//
+// MOVABLE, for the same reason the guard below exists: a harness that cannot
+// step off an occupied port is a harness that cannot run, and the guard turns
+// "occupied" into a refusal. Same variable name as the three scripts/ harnesses
+// — one knob, one grammar.
+const PORT = Number(process.env.VITE_PORT ?? 5189)
 export const BASE = `http://localhost:${PORT}`
 const REPO_ROOT = process.cwd()
 export const USER_DATA_DIR = resolve(REPO_ROOT, '.tests-cache/chrome-profile')
-const VITE_BIN = resolve(REPO_ROOT, 'node_modules/.bin/vite')
+
+/** Walked up, not joined — gate-holds.mjs's `findBin`, for the same reason:
+ *  this repo is worked on from git worktrees, which have no node_modules of
+ *  their own, so `<cwd>/node_modules/.bin/vite` is ENOENT there.
+ *
+ *  This was INVISIBLE until the guard below landed. `spawn` reported ENOENT on
+ *  the `error` event, but the old wait raced that against "does the port
+ *  answer" and the port answered first whenever anything else was listening —
+ *  so from a worktree this harness never started a vite AT ALL, and either
+ *  timed out or graded a stranger's server. It surfaced the moment the wait
+ *  started asking for OUR child's ready line. */
+function findBin(name: string): string {
+  for (let d = REPO_ROOT; d !== dirname(d); d = dirname(d)) {
+    const p = join(d, 'node_modules/.bin', name)
+    if (existsSync(p)) return p
+  }
+  throw new Error(`${name} not found in any node_modules/.bin above ${REPO_ROOT}`)
+}
+const VITE_BIN = findBin('vite')
 
 let viteProc: ChildProcess | null = null
 let browser: Browser | null = null
 
-async function waitForUrl(url: string, timeoutMs: number): Promise<void> {
-  const start = Date.now()
-  let lastErr: unknown = null
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const r = await fetch(url)
-      if (r.ok) return
-      lastErr = new Error(`HTTP ${r.status}`)
-    } catch (e) {
-      lastErr = e
-    }
-    await new Promise((r) => setTimeout(r, 200))
-  }
-  throw new Error(`timed out waiting for ${url}: ${lastErr}`)
-}
-
 export async function startHarness(): Promise<void> {
   mkdirSync(USER_DATA_DIR, { recursive: true })
 
+  // BEFORE THE SPAWN. `--strictPort` is kept below because it stops vite from
+  // wandering to another port, but it was never the check this needed: its
+  // EADDRINUSE lands on stderr ~0.5-1 s in, while the old wait polled the URL
+  // from t≈0 and a squatter answers instantly. Measured with a foreign server
+  // holding 5301 on both loopback families and the port as the only edit to
+  // the old file: `Tests 2 passed | 7 skipped (9)`, FILE GREEN, for the two
+  // reduce-motion assertions — satisfied by a page that is not this checkout.
+  // Unfiltered the same run read `7 failed | 2 passed`, every failure a
+  // selector this tree has and that server does not. See port-guard.ts.
+  await requirePortFree(PORT, 'the dev server')
+
   // Spawn Vite dev server. We use dev mode (not preview) so the test runs
   // against the same code path the developer sees, with no separate build.
-  // --strictPort ensures we fail loudly if 5174 is already taken (rather than
-  // silently colliding with a leftover server from a previous failed run).
   viteProc = spawn(
     VITE_BIN,
     ['--port', String(PORT), '--strictPort', '--clearScreen', 'false'],
     { stdio: ['ignore', 'pipe', 'pipe'], env: process.env, cwd: REPO_ROOT }
   )
-  let viteFatal: Error | null = null
-  viteProc.on('error', (e) => {
-    viteFatal = e
-  })
-  viteProc.stdout?.on('data', (b) => {
-    const s = b.toString()
-    if (/error|ERROR|EADDRINUSE/.test(s)) process.stderr.write(`[vite] ${s}`)
-  })
-  viteProc.stderr?.on('data', (b) => {
-    const s = b.toString()
-    process.stderr.write(`[vite] ${s}`)
-    if (/EADDRINUSE|already in use/.test(s)) {
-      viteFatal = new Error(`port ${PORT} already in use — kill the leftover process`)
-    }
-  })
-  viteProc.on('exit', (code) => {
-    if (code !== 0 && code !== null && !viteFatal) {
-      viteFatal = new Error(`vite exited with code ${code}`)
-    }
+  const vite = watch(viteProc, (s) => {
+    if (/error|ERROR|EADDRINUSE|already in use/.test(s)) process.stderr.write(`[vite] ${s}`)
   })
 
-  // Race waitForUrl against vite's own startup failure so we don't hang for
-  // 30s waiting on a server that already died.
-  await Promise.race([
-    waitForUrl(`${BASE}/zero-tvm.html`, 30_000),
-    new Promise<never>((_, reject) => {
-      const interval = setInterval(() => {
-        if (viteFatal) {
-          clearInterval(interval)
-          reject(viteFatal)
-        }
-      }, 100)
-    }),
-  ])
+  // …and then wait for OUR CHILD to announce itself on OUR port, not for the
+  // port to answer. A child that dies fails here immediately, with its own
+  // output attached, instead of after the full timeout.
+  await waitForChild(vite, `${BASE}/zero-tvm.html`, 30_000, 'vite', viteReady(PORT))
 
   // Launch real Chrome (not headless) — shader-f16 is reliably available with
   // the full browser on macOS, less so in headless mode. The flags below are
