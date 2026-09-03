@@ -106,7 +106,21 @@ try {
   const offered = await guest2.expect((m) => m.type === 'offer', 'offer from host B')
   check('host → its guest', offered.sdp.sdp === 'from-host-b', 'offer arrived')
 
+  // ── relay hardening: hosts cannot spoof relay-originated control types ──
+  const hostChangedBefore = early.seen.filter((m) => m.type === 'host-changed').length
+  hostA.send({ to: guest1Id, type: 'host-changed' })
+  await new Promise((r) => setTimeout(r, 400))
+  check('host cannot spoof host-changed',
+    early.seen.filter((m) => m.type === 'host-changed').length === hostChangedBefore,
+    'relay dropped spoofed control message')
+
   // ── churn: host B disappears mid-session ──
+  // NOTE (not a check): assign()'s dead-host fallback cannot be exercised
+  // from outside — the relay is single-threaded, so no host vanishes between
+  // leastLoadedHost() and assign() at any existing call site. It is
+  // defense-in-depth for a future async refactor, verified by reading
+  // worker.js, not by this harness. A test asserting "dead host got no
+  // peer-joined" would pass on code without the fallback and prove nothing.
   hostB.close()
   await guest2.expect((m) => m.type === 'host-changed', 'host-changed after its host died')
   const takenOver = await hostA.expect((m) => m.type === 'peer-joined' && m.from === joined2.from,

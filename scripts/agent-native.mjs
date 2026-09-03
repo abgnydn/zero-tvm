@@ -377,13 +377,13 @@ const scheduleSave = () => {
 
 // ---- HTTP ------------------------------------------------------------------
 
-const json = (res, code, body) => {
+const json = (res, code, body, extraHeaders = {}) => {
   const s = JSON.stringify(body)
-  res.writeHead(code, { 'content-type': 'application/json' })
+  res.writeHead(code, { 'content-type': 'application/json', ...extraHeaders })
   res.end(s)
 }
-const fail = (res, code, message, type = 'invalid_request_error') =>
-  json(res, code, { error: { message, type, param: null, code: null } })
+const fail = (res, code, message, type = 'invalid_request_error', extraHeaders = {}) =>
+  json(res, code, { error: { message, type, param: null, code: null } }, extraHeaders)
 const readBody = (req) => new Promise((resolve, reject) => {
   const chunks = []
   req.on('data', (c) => chunks.push(c))
@@ -429,7 +429,7 @@ createServer(async (req, res) => {
   if (body.model && body.model !== spec.id && body.model !== 'ztvm' && body.model !== 'zero-tvm') {
     return fail(res, 400, `this host runs "${spec.id}", the request asked for "${body.model}"`)
   }
-  if (busy) return fail(res, 400, 'busy: this host serves one request at a time')
+  if (busy) return fail(res, 429, 'busy: this host serves one request at a time', 'invalid_request_error', { 'retry-after': '1' })
   busy = true
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
 

@@ -29,6 +29,9 @@
  *   npx wrangler deploy              # production (user-approved only)
  */
 
+// Message types the relay itself originates; clients must not spoof them.
+const RELAY_TYPES = new Set(['room', 'host-changed', 'host-left', 'no-host', 'peer-joined', 'peer-left'])
+
 export class Room {
   constructor(state) {
     this.state = state
@@ -50,6 +53,10 @@ export class Room {
     const pair = new WebSocketPair()
     const [client, server] = Object.values(pair)
     server.accept()
+    // Per-peer session id. Room ids live in the URL path and are created by
+    // clients as 128 bits of base64url (22 chars), which already satisfies the
+    // 16-64 char range the route accepts; this short id is intentionally not a
+    // room id.
     const id = crypto.randomUUID().slice(0, 8)
 
     if (role === 'host') this.addHost(id, server)
@@ -125,10 +132,20 @@ export class Room {
     return best
   }
 
-  /** Point a guest at a host and ask that host to open the connection. */
+  /** Point a guest at a host and ask that host to open the connection.
+   *  Re-checks liveness immediately before sending: a host can disappear
+   *  between leastLoadedHost() and this call, and a guest must never be
+   *  left assigned to a dead host. */
   assign(guestId, hostId) {
-    this.assigned.set(guestId, hostId)
-    const host = this.hosts.get(hostId)
+    let chosen = this.hosts.has(hostId) ? hostId : this.leastLoadedHost()
+    if (chosen && !this.hosts.has(chosen)) chosen = this.leastLoadedHost()
+    if (!chosen || !this.hosts.has(chosen)) {
+      const guest = this.guests.get(guestId)
+      if (guest) this.send(guest, { type: 'no-host' })
+      return
+    }
+    this.assigned.set(guestId, chosen)
+    const host = this.hosts.get(chosen)
     if (host) this.send(host, { type: 'peer-joined', from: guestId })
   }
 
@@ -143,6 +160,10 @@ export class Room {
   fromHost(data) {
     let msg
     try { msg = JSON.parse(data) } catch { return }
+    if (typeof msg !== 'object' || msg == null) return
+    // Hosts must not emit relay-originated control types (e.g. peer-joined,
+    // host-changed). Drop them rather than forward.
+    if (RELAY_TYPES.has(msg.type)) return
     const ws = this.guests.get(msg.to)
     if (ws) {
       delete msg.to
@@ -153,6 +174,10 @@ export class Room {
   fromGuest(id, data) {
     let msg
     try { msg = JSON.parse(data) } catch { return }
+    if (typeof msg !== 'object' || msg == null) return
+    // Guests must not emit relay-originated control types (e.g. host-changed).
+    // Drop them rather than forward.
+    if (RELAY_TYPES.has(msg.type)) return
     const host = this.hosts.get(this.assigned.get(id))
     if (host) this.send(host, { ...msg, from: id })
   }
