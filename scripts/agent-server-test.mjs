@@ -63,6 +63,25 @@ try {
   check('/v1/models', models.object === 'list' && models.data?.length > 0,
     models.data?.[0]?.id ?? '(none)')
 
+  // 1b. Model mismatch is a hard 400 naming both sides (the LM Studio trap:
+  // never serve the resident model under a foreign name). Needs no tokens —
+  // the tab only has to be connected, which check 1 already proved.
+  const mmRes = await fetch(`${BASE}/v1/chat/completions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'definitely-not-a-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  })
+  const mmBody = await mmRes.json().catch(() => ({}))
+  check('model mismatch is 400', mmRes.status === 400,
+    `HTTP ${mmRes.status} · ${(mmBody.error?.message ?? '').slice(0, 80)}`)
+  check('mismatch names both models',
+    typeof mmBody.error?.message === 'string'
+    && mmBody.error.message.includes('definitely-not-a-model')
+    && mmBody.error.message.includes(health.hosting),
+    (mmBody.error?.message ?? '').slice(0, 80))
+
   // 2. Non-streaming completion.
   const t0 = Date.now()
   const r1 = await (await fetch(`${BASE}/v1/chat/completions`, {

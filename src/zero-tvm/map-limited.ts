@@ -22,6 +22,51 @@ export function backoffMs(attempt: number, base = 500): number {
   return base * Math.pow(2, attempt) * (0.5 + Math.random())
 }
 
+/**
+ * DEGRADED CONCURRENCY TRACKER — sticky session policy for flaky networks.
+ *
+ * Extracted from weight-loader.ts (which touches GPUBufferUsage at module
+ * scope and can't be imported outside a browser) so the streak policy is
+ * unit-testable: degrade on the first transient failure, recover after N
+ * consecutive clean fetches, and never flip-flop on a stray success.
+ */
+export interface DegradedTracker {
+  readonly degraded: boolean
+  markTransient(onNotice?: (msg: string) => void): void
+  markSuccess(onNotice?: (msg: string) => void): void
+  limitOf(): number
+}
+
+export function createDegradedTracker(opts: {
+  full: number
+  degraded: number
+  recoverAfter?: number
+}): DegradedTracker {
+  const recoverAfter = opts.recoverAfter ?? 10
+  let degraded = false
+  let streak = 0
+  return {
+    get degraded() { return degraded },
+    markTransient(onNotice) {
+      streak = 0 // the recovery streak is consecutive, not cumulative
+      if (!degraded) {
+        degraded = true
+        onNotice?.(`network unstable — dropping shard concurrency ${opts.full} → ${opts.degraded}`)
+      }
+    },
+    markSuccess(onNotice) {
+      if (!degraded) return
+      streak++
+      if (streak >= recoverAfter) {
+        degraded = false
+        streak = 0 // or the NEXT degradation would recover after one success
+        onNotice?.(`network stable — restoring shard concurrency ${opts.degraded} → ${opts.full}`)
+      }
+    },
+    limitOf() { return degraded ? opts.degraded : opts.full },
+  }
+}
+
 export interface MapLimitedOptions {
   /** Extra worker runs per item after its first failure (default 0). */
   retries?: number
