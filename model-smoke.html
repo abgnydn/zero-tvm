@@ -13,7 +13,7 @@ try{
   const { specFromSearch } = await import('/src/zero-tvm/model-select.ts')
   const { compile } = await import('/src/compiler/compiler.ts')
   const { loadWeights } = await import('/src/zero-tvm/weight-loader.ts')
-  const { buildDecodeEngine, allocKVPages } = await import('/src/zero-tvm/engine-core.ts')
+  const { buildDecodeEngine, allocKVPages, allocKVPagesInt8 } = await import('/src/zero-tvm/engine-core.ts')
   const { SCALAR_VARIANTS } = await import('/src/zero-tvm/variants.ts')
   const S = specFromSearch(location.search)
   say('spec:', S.id, '| format:', S.weightFormat ?? 'mlc')
@@ -311,6 +311,77 @@ try{
     const out = []
     await engine.generatePipelined(ids, n, (t) => out.push(t), () => false)
     return out
+  }
+  // Direct exportKV/importKV round-trip with STRUCTURE assertions (drives
+  // scripts/kv-export-test.mjs). Arm A blocking-generates genA and exports;
+  // arm B (fresh engine) imports and continues genB; arm C (fresh engine)
+  // runs prompt+pre uninterrupted as control. All arms use the blocking
+  // generate() so absorbed-token accounting is deterministic. Set useInt8
+  // for the int8-KV snapshot shape (per-row scales must be present).
+  window.__kvRoundTrip = async (promptIds, genA, genB, useInt8) => {
+    const V = { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled', int8KV: !!useInt8 }
+    const mk = () => {
+      const kv = useInt8 ? allocKVPagesInt8(dev, S) : allocKVPages(dev, S)
+      // Per-token prefill in ALL arms (mirroring __poolRun): the round trip
+      // must stand on its own, not inherit chunked-vs-per-token equivalence
+      // from a separate gate.
+      return buildDecodeEngine(dev, weights, kv, { spec: S, variants: V, chunkedPrefill: false })
+    }
+    const A = mk()
+    const pre = Array.from(await A.generate(promptIds, 0, genA, () => {}))
+    const snap = await A.exportKV()
+    A.destroy()
+    if (!snap) return { exported: false }
+    const shape = { tokens: snap.tokens, ids: [...snap.ids],
+      layers: snap.layers.map((b) => b.byteLength),
+      scales: snap.scales.map((b) => b.byteLength),
+      gdn: snap.gdn.map((b) => b.byteLength) }
+    const B = mk()
+    const imported = B.importKV(snap)
+    const cont = []
+    await B.generatePipelined([...promptIds, ...pre], genB, (t) => cont.push(t), () => false)
+    B.destroy()
+    const C = mk()
+    const direct = []
+    await C.generatePipelined([...promptIds, ...pre], genB, (t) => direct.push(t), () => false)
+    C.destroy()
+    return { exported: true, imported, shape, cont, direct }
+  }
+  // Sampler switching (drives scripts/sampler-switch-test.mjs). Three fresh
+  // engines on one prompt: pure greedy twice (determinism control), then
+  // sampled → back to greedy. Draws are a pure function of (seed, position),
+  // so the two sampled arms must agree exactly, and null must restore the
+  // greedy path token-for-token. Narrower than mid-conversation switching
+  // (which needs startPos plumbing this probe does not second-guess), but it
+  // exercises the same uniform rewrite twice in each direction.
+  window.__samplerSwitch = async (promptIds, n) => {
+    const mk = () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled' },
+    })
+    const run = async (sampling) => {
+      const e = mk()
+      if (sampling) e.setSampling(sampling)
+      const out = Array.from(await e.generate(promptIds, 0, n, () => {}))
+      e.destroy()
+      return out
+    }
+    const g1 = await run(null)
+    const g2 = await run(null)
+    const samp = { temperature: 1.5, topP: 1, minP: 0, seed: 7 }
+    const s1 = await run(samp)
+    const s2 = await run(samp)
+    // Greedy again after sampling, on a fresh engine: setSampling(null) must
+    // restore the greedy path exactly (same prefix => same tokens as g1).
+    const g3 = await (async () => {
+      const e = mk()
+      e.setSampling(samp)
+      await e.generate(promptIds, 0, 2, () => {})
+      e.setSampling(null)
+      const out = Array.from(await e.generate(promptIds, 0, n, () => {}))
+      e.destroy()
+      return out
+    })()
+    return { g1, g2, s1, s2, g3 }
   }
   window.__phase='loaded'
 }catch(e){
