@@ -497,6 +497,35 @@ function splitReasoning(content: string): { content: string; reasoning: string }
   }
 }
 
+/** Qwen3.8's default (xhigh) reasoning-effort preamble, verbatim from
+ *  chat_template.jinja. The template has low/medium/xhigh branches selected
+ *  by a `reasoning_effort` kwarg this builder does not take, so the default
+ *  is the only honest rendering until effort control exists. */
+export const QWEN38_REASONING_INSTRUCTIONS =
+  'Reasoning effort is set to xhigh. Please think carefully through the task, '
+  + 'validate key assumptions, consider plausible alternatives, and prioritize '
+  + 'correctness, consistency, and clarity in the final answer.'
+
+/** Prepend the reasoning preamble per the qwen38 template rule (thinking mode
+ *  only; the caller gates): non-empty system content gets instructions +
+ *  blank line + trimmed content, otherwise a synthesized instructions-only
+ *  system turn opens the conversation. */
+function withQwen38Instructions(
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
+  const first = messages[0]
+  if (first.role === 'system' && first.content.trim()) {
+    return [
+      { ...first, content: `${QWEN38_REASONING_INSTRUCTIONS}\n\n${first.content.trim()}` },
+      ...messages.slice(1),
+    ]
+  }
+  return [
+    { role: 'system', content: QWEN38_REASONING_INSTRUCTIONS },
+    ...(first.role === 'system' ? messages.slice(1) : messages),
+  ]
+}
+
 export function buildChatPrompt(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   // Only encode() is needed, so the SPM Tokenizer shape (no stopIds) is
@@ -520,15 +549,24 @@ export function buildChatPrompt(
   // answer and then replied in prose instead of calling the tool. Both rules
   // below are read off the checkpoints' own tokenizer_config.json.
   const gen = opts?.generation ?? 'qwen3'
-  const q = lastQueryIndex(messages)
+  const thinking = opts?.thinking !== false
+  // Qwen3.8 reasons under explicit instructions: in thinking mode its template
+  // prepends the default (xhigh) effort preamble to the system turn — or
+  // synthesizes a system turn from it when the conversation opens elsewhere.
+  // Read off chat_template.jinja; pinned by probe in chatml-generations.test.
+  // Static for a conversation, so cross-turn prefix math is unaffected.
+  const msgs = gen === 'qwen38' && thinking && messages.length > 0
+    ? withQwen38Instructions(messages)
+    : messages
+  const q = lastQueryIndex(msgs)
   // Qwen3.5 and later run every message's content through jinja's `|trim`;
   // the Qwen3-era template interpolates `message.content` verbatim. Trimming
   // on the wrong one moves whitespace at a turn boundary, which no test would
   // see and the model answers slightly off distribution for.
   const trims = gen !== 'qwen3'
   let text = ''
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i]
+  for (let i = 0; i < msgs.length; i++) {
+    const msg = msgs[i]
     // The block belongs to the CURRENT round only. It is not gated on thinking
     // mode: the templates emit it from the index rule alone, and `enable_thinking`
     // reaches only the generation prompt below.
@@ -552,7 +590,7 @@ export function buildChatPrompt(
     // 3.8 opens its condition with `preserve_thinking is undefined`, which
     // nothing defines, so it always fires.
     const think = gen === 'qwen38'
-      || (inRound && (gen === 'qwen35' || i === messages.length - 1 || !!split.reasoning))
+      || (inRound && (gen === 'qwen35' || i === msgs.length - 1 || !!split.reasoning))
     // Qwen3 emits `reasoning_content.strip('\n')` + `content.lstrip('\n')`;
     // 3.5+ emits a `|trim`-ed reasoning and the content as-is. Both already
     // stripped above, so these only differ on which stripper ran.
@@ -569,7 +607,17 @@ export function buildChatPrompt(
   // encoding the whole string. (Verified in tokenizer-bpe.test.ts against the
   // single-encode path for every template this builder serves.)
   let genPrompt = '<|im_start|>assistant\n'
-  if (opts?.thinking === false) genPrompt += '<think>\n\n</think>\n\n'
+  if (opts?.thinking === false) {
+    genPrompt += '<think>\n\n</think>\n\n'
+  } else if (gen !== 'qwen3') {
+    // Qwen3.5+ thinks by opening the block: every 3.5-family checkpoint
+    // template ends its thinking branch `{{- '<think>\n' }}` (Qwen3.5-4B
+    // tokenizer_config.json, Qwen3.6-35B likewise, Qwen3.8 chat_template.jinja).
+    // Qwen3's template emits nothing here, so the opener is generation-gated,
+    // not unconditional — sending it on qwen3 would be the same class of
+    // divergence in the other direction.
+    genPrompt += '<think>\n'
+  }
   const history = tokenizer.encode(text)
   // Where the NEXT turn will diverge: it re-renders this turn's reply in place
   // of this generation prompt. The engine takes its GDN rewind snapshot here.

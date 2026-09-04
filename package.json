@@ -43,6 +43,8 @@
     "test:kernels:qwen38": "node tests/kernels/compile-qwen35.mjs QWEN3_8_27B_4BIT",
     "gen:tokenizer-fixtures": "node scripts/gen-tokenizer-fixtures.mjs",
     "gen:tokenizer-fixtures-qwen": "node scripts/gen-tokenizer-fixtures-qwen.mjs",
+    "gen:tokenizer-fixtures-qwen35": "node scripts/gen-tokenizer-fixtures-bpe.mjs --tag qwen35 --repo mlc-ai/Qwen3.5-4B-q4f16_1-MLC --generation qwen35",
+    "gen:tokenizer-fixtures-qwen38": "node scripts/gen-tokenizer-fixtures-bpe.mjs --tag qwen38 --repo mlx-community/Qwen3.8-27B-4bit --generation qwen38",
     "bench": "node bench/run.mjs",
     "bench:sync": "node bench/sync-docs.mjs",
     "check": "npm run typecheck && npm run test",
