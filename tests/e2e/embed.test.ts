@@ -72,8 +72,11 @@ describe.skipIf(!HAVE_EMBED)('qwen3-embedding (?model=embed, smoke probe)', () =
       throw new Error(await page.evaluate(() => (window as unknown as SmokeWindow).__error))
     }
 
-    const idsA = [151644, 198, 3838, 374, 279, 14990, 3361, 248046]
-    const idsB = [151644, 198, 16748, 279, 10146, 248046]
+    // Ids are pinned below the 151669-entry vocab (model-spec.ts); the
+    // terminator is <|endoftext|> (151643), which this checkpoint's
+    // post_processor appends to every sequence.
+    const idsA = [151644, 198, 3838, 374, 279, 14990, 3361, 151643]
+    const idsB = [151644, 198, 16748, 279, 10146, 151643]
     const [vecA, vecB] = await page.evaluate(
       async ([a, b]: [number[], number[]]) => {
         const w = window as unknown as SmokeWindow
