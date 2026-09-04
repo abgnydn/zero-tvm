@@ -135,6 +135,8 @@ jobs:
       - run: xvfb-run -a npx vitest run tests/e2e/gate.test.ts tests/e2e/boot-card-fits-the-panel.test.ts tests/e2e/entrance-motion-and-mobile.test.ts tests/e2e/zero-tvm.test.ts --reporter=default --reporter=json --outputFile=/tmp/e2e-lavapipe.json
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+          # Ubuntu 24.04 runners disable unprivileged user namespaces — see harness.ts.
+          ZTVM_CHROME_NO_SANDBOX: '1'
       # vitest exits 0 on skips, so a suite that runs nothing reports green.
       # Any skip here is either a regression or a new mirror gate — both must
       # be named in scripts/ci-skip-allowlist.json with a reason, or fixed.

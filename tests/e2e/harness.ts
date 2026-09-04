@@ -90,6 +90,13 @@ export async function startHarness(): Promise<void> {
     args: [
       '--enable-unsafe-webgpu',
       '--enable-features=Vulkan',
+      // Ubuntu 23.10+ runners disable unprivileged user namespaces, so
+      // Chrome's sandbox cannot start there at all ("No usable sandbox!").
+      // Opt OUT per-run via ZTVM_CHROME_NO_SANDBOX=1 (CI sets it) rather than
+      // by default: a headed browser without a sandbox runs page JS
+      // unsandboxed, which is fine for localhost test pages but should stay
+      // a deliberate choice, not the default.
+      ...(process.env.ZTVM_CHROME_NO_SANDBOX === '1' ? ['--no-sandbox'] : []),
       // ZTVM_UNSAFE=1 adds disable_robustness: Chrome's mandatory
       // bounds-checking on every buffer access, measured at 14-23% of prefill
       // by LlamaWeb (arXiv 2605.20706). NOT web-shippable — but ztvm launches
