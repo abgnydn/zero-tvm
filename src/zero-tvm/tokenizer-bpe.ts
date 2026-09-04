@@ -558,7 +558,8 @@ export function buildChatPrompt(
   const msgs = gen === 'qwen38' && thinking && messages.length > 0
     ? withQwen38Instructions(messages)
     : messages
-  const q = lastQueryIndex(msgs)  // Qwen3.5 and later run every message's content through jinja's `|trim`;
+  const q = lastQueryIndex(msgs)
+  // Qwen3.5 and later run every message's content through jinja's `|trim`;
   // the Qwen3-era template interpolates `message.content` verbatim. Trimming
   // on the wrong one moves whitespace at a turn boundary, which no test would
   // see and the model answers slightly off distribution for.
