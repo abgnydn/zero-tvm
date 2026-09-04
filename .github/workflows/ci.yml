@@ -123,16 +123,16 @@ jobs:
       # Same software Vulkan as the kernels job, but through real Chrome:
       # headful under xvfb so the GPU process gets a display, ICD pinned to
       # lavapipe so a missing adapter fails loud instead of silently CPU-ing
-      # somewhere unobserved. Subgroup/matrix-unit paths SKIP — they need
-      # Metal, which is what the human-shell suites and a future self-hosted
-      # Mac job are for. Explicit file list: mirror-gated spec suites are not
-      # collected here, so every collected test is expected to RUN.
+      # somewhere unobserved. Deliberately the weightless UI tests only:
+      # entrance-motion's pixel assertions are display-sensitive (0.05px
+      # tolerances fail under software rasterization) and the Phi-3 battery
+      # times out (300s/test on lavapipe) — both stay human-shell with real
+      # GPUs. Mirror-gated spec suites are not collected here, so every
+      # collected test is expected to RUN.
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers xvfb
       # No PUPPETEER_SKIP_DOWNLOAD: this job needs the real Chrome download.
       - run: npm ci
-      # json alone swallows the human-readable output, so a red run shows
-      # nothing but "JSON report written" — run both reporters.
-      - run: xvfb-run -a npx vitest run tests/e2e/gate.test.ts tests/e2e/boot-card-fits-the-panel.test.ts tests/e2e/entrance-motion-and-mobile.test.ts tests/e2e/zero-tvm.test.ts --reporter=default --reporter=json --outputFile=/tmp/e2e-lavapipe.json
+      - run: xvfb-run -a npx vitest run tests/e2e/gate.test.ts tests/e2e/boot-card-fits-the-panel.test.ts --reporter=default --reporter=json --outputFile=/tmp/e2e-lavapipe.json
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
           # Ubuntu 24.04 runners disable unprivileged user namespaces — see harness.ts.
