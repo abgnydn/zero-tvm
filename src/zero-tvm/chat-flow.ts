@@ -167,9 +167,8 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
         bootLog(`Sampling: temperature ${temperature}, top-p ${numFlag('topp', 1)}, min-p ${numFlag('minp', 0)}`)
       }
       return buildDecodeEngine(device, weights, kv, {
-        variants: flags,
+        variants: { ...flags, int8KV },
         fused,
-        int8KV,
         spec: s,
         // The range has to reach the ENGINE, not just the loader. Passing it
         // to bootEngine alone made the loader fetch one stage's layers while
