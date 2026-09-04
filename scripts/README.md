@@ -22,6 +22,7 @@ One line per script. Category first:
 - `chunk-cap-sweep.mjs` — bench-harness. `node --experimental-strip-types scripts/chunk-cap-sweep.mjs [spec] [tokens]`; correctness vs chunk cap.
 - `chunk-prefill-test.mjs` — active-infra. `node scripts/chunk-prefill-test.mjs <spec>`; chunked vs per-token token identity.
 - `clean-deployments.mjs` — site-ops. `node scripts/clean-deployments.mjs [--apply]`; prune CF preview deploys.
+- `compile-all-specs.mjs` — active-infra. `npm run test:kernels:all-specs`; compile gate for every spec export (runs in CI on lavapipe).
 - `ctx-test.mjs` — active-infra. `node scripts/ctx-test.mjs [spec]`; does a big ?ctx= actually boot and generate.
 - `deploy-space.sh` — site-ops. Deploys the HuggingFace Space demo.
 - `download-weights.mjs` — active-infra. `node scripts/download-weights.mjs --model <param>`; prime .weights-local/.
