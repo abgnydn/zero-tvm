@@ -322,7 +322,10 @@ try{
     const V = { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled', int8KV: !!useInt8 }
     const mk = () => {
       const kv = useInt8 ? allocKVPagesInt8(dev, S) : allocKVPages(dev, S)
-      return buildDecodeEngine(dev, weights, kv, { spec: S, variants: V })
+      // Per-token prefill in ALL arms (mirroring __poolRun): the round trip
+      // must stand on its own, not inherit chunked-vs-per-token equivalence
+      // from a separate gate.
+      return buildDecodeEngine(dev, weights, kv, { spec: S, variants: V, chunkedPrefill: false })
     }
     const A = mk()
     const pre = Array.from(await A.generate(promptIds, 0, genA, () => {}))
