@@ -16,7 +16,7 @@ import { openMlxCheckpoint, assembleMlx, planModel, planKey, progressEvery, type
 import {
   fetchSlabSource, opfsSlabSource, type SlabDirectory, type SlabSource,
 } from './slab-source.js'
-import { mapLimited, backoffMs } from './map-limited.js'
+import { mapLimited, backoffMs, createDegradedTracker } from './map-limited.js'
 
 // ============================================================
 // Model URL + cache dir
@@ -58,25 +58,11 @@ const DEGRADED_FETCH_CONCURRENCY = 3
  *  Exponential backoff with jitter: ~0.5s, 1s, 2s, 4s (see backoffMs). */
 const FETCH_RETRIES = 4
 
-/** Set on the first mid-stream network failure; sticky for the page session
- *  so a retried loadWeights also runs at the reduced concurrency. */
-let networkDegraded = false
-
-/** Count of consecutive shard fetches that completed without hitting a
- *  transient failure while in degraded mode. Ten successes reset concurrency
- *  back to full — a single stray reset does not flip-flop the session. */
-let consecutiveSuccesses = 0
-
-/** Called when a shard fetch completes without transients. Resets the session
- *  back to full concurrency after 10 consecutive clean fetches. */
-function markFetchSuccess(onRetry?: (msg: string) => void): void {
-  if (!networkDegraded) return
-  consecutiveSuccesses++
-  if (consecutiveSuccesses >= 10) {
-    networkDegraded = false
-    onRetry?.(`network stable — restoring shard concurrency ${DEGRADED_FETCH_CONCURRENCY} → ${FETCH_CONCURRENCY}`)
-  }
-}
+/** Session network health: sticky degrade on the first mid-stream failure so
+ *  a retried loadWeights runs at the reduced concurrency, recovering after
+ *  ten consecutive clean fetches. Policy lives in map-limited.ts (testable);
+ *  this is the one session instance. */
+const netHealth = createDegradedTracker({ full: FETCH_CONCURRENCY, degraded: DEGRADED_FETCH_CONCURRENCY })
 
 // ============================================================
 // ndarray-cache.json types
@@ -245,8 +231,7 @@ async function opfsWrite(dir: OPFSDir, dataPath: string, data: ArrayBuffer): Pro
  * Range header to continue from the bytes already received when the server
  * honors it (206). A 200 answer to a Range request restarts cleanly.
  *
- * The first mid-stream failure flips the session-wide `networkDegraded` flag
- * (concurrency drops from FETCH_CONCURRENCY to DEGRADED_FETCH_CONCURRENCY).
+ * The first mid-stream failure degrades session concurrency (see netHealth).
  */
 async function fetchBufWithRetry(
   url: string,
@@ -261,11 +246,7 @@ async function fetchBufWithRetry(
   // A mid-stream / connection failure — degrade session concurrency once.
   const transient = (e: unknown) => {
     lastErr = e
-    consecutiveSuccesses = 0 // the streak above is consecutive, not cumulative
-    if (!networkDegraded) {
-      networkDegraded = true
-      onRetry?.(`network unstable — dropping shard concurrency ${FETCH_CONCURRENCY} → ${DEGRADED_FETCH_CONCURRENCY}`)
-    }
+    netHealth.markTransient(onRetry)
   }
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) {
@@ -330,7 +311,7 @@ async function fetchBufWithRetry(
       transient(new Error(`truncated body: got ${received} of ${expectTotal} bytes`))
       continue
     }
-    markFetchSuccess(onRetry)
+    netHealth.markSuccess(onRetry)
     const only = chunks.length === 1 ? chunks[0] : null
     if (only && only.byteOffset === 0 && only.byteLength === only.buffer.byteLength) {
       return only.buffer
@@ -776,14 +757,14 @@ export async function loadWeights(
 
   try {
     // Concurrency is re-read between shards so the first mid-stream network
-    // failure (networkDegraded) drops parallelism for the rest of the session.
+    // failure drops parallelism (netHealth) for the rest of the session.
     // Per-shard failures are non-fatal until that shard exhausts its own
     // retries (FETCH_RETRIES+1 network attempts inside fetchBufWithRetry, ×2
     // full tier walks via mapLimited's retries) — only then does the shared
     // AbortSignal cancel the sibling fetches still in flight.
     await mapLimited(
       shardEntries,
-      () => (networkDegraded ? DEGRADED_FETCH_CONCURRENCY : FETCH_CONCURRENCY),
+      () => netHealth.limitOf(),
       async ([dataPath, records], _idx, signal) => {
         let shard: ArrayBuffer
         try {
