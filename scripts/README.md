@@ -18,6 +18,7 @@ One line per script. Category first:
 - `agent-server-test.mjs` — active-infra. `npm run test:agent-server`; e2e incl. tool round trip.
 - `agentic-eval.mjs` — bench-harness. `node scripts/agentic-eval.mjs qwen36q3`; short agentic task score.
 - `check-numbers.mjs` — active-infra. `node scripts/check-numbers.mjs [--hardware m4max]`; rejects physically impossible throughputs.
+- `check-vitest-skips.mjs` — active-infra. `node scripts/check-vitest-skips.mjs <report.json>`; fails on any skip not named in ci-skip-allowlist.json with a reason.
 - `chunk-cap-sweep.mjs` — bench-harness. `node --experimental-strip-types scripts/chunk-cap-sweep.mjs [spec] [tokens]`; correctness vs chunk cap.
 - `chunk-prefill-test.mjs` — active-infra. `node scripts/chunk-prefill-test.mjs <spec>`; chunked vs per-token token identity.
 - `clean-deployments.mjs` — site-ops. `node scripts/clean-deployments.mjs [--apply]`; prune CF preview deploys.
@@ -40,7 +41,7 @@ One line per script. Category first:
 - `quality-eval.mjs` — active-infra. `npm run quality -- <spec> --tokens 256`; engine perplexity + fidelity.
 - `regression-test-gate.mjs` — active-infra. Pre-push: a fix-claim commit must touch a test.
 - `release-check.mjs` — active-infra. `node scripts/release-check.mjs [--list]`; pre-deploy checklist in one place.
-- `room-routing-test.mjs` — active-infra. `node scripts/room-routing-test.mjs`; relay routing without a browser.
+- `room-routing-test.mjs` — active-infra. `node scripts/room-routing-test.mjs`; relay routing without a browser (runs in CI).
 - `share-e2e.mjs` — active-infra. `node scripts/share-e2e.mjs`; vite + wrangler dev + 2 tabs, real RTC.
 - `split-cost-bench.mjs` — bench-harness. `node scripts/split-cost-bench.mjs`; whole vs split A/B.
 - `split-serve-e2e.mjs` — active-infra. `node scripts/split-serve-e2e.mjs`; two Chrome profiles, real WebRTC pipeline.

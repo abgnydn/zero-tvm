@@ -592,7 +592,12 @@ was it true, and is that still the configuration?
 The GPU suites are NOT all in the hook. CI runs the scalar suite
 (`npm run test:kernels`) on Mesa lavapipe (`.github/workflows/ci.yml:74-92`),
 which compiles the WGSL kernels on a CPU Vulkan device and skips subgroup
-variants loudly. The subgroup, MLX, and qwen35 suites need a real GPU and run
+variants loudly; the `routing` job runs the relay suite (no GPU at all), and
+the `e2e-lavapipe` job runs the weightless UI tests (gate, boot-card)
+through real Chrome on lavapipe under xvfb, with
+`scripts/check-vitest-skips.mjs` failing on any skip the allowlist does not
+name. Entrance-motion stays out (pixel tolerances fail under software
+rasterization) and so does the Phi-3 battery (300s timeouts on lavapipe). The subgroup, MLX, and qwen35 suites need a real GPU and run
 in a human's shell (`lefthook.yml:40-49`):
 
 ```bash

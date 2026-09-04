@@ -57,14 +57,24 @@ function peer(role, label) {
 }
 
 const procs = []
+// wrangler's own output, kept for the timeout error below — a relay that
+// never comes up is otherwise a silent 30s hang (npx fetching wrangler +
+// workerd on a cold machine takes longer than the test itself).
+let wranglerLog = ''
 try {
   console.log('starting wrangler dev …')
   const w = spawn('npx', ['wrangler', 'dev', '--port', String(PORT)],
     { cwd: resolve(ROOT, 'workers/share-signal'), stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WRANGLER_SEND_METRICS: 'false' } })
   procs.push(w)
+  w.stdout.on('data', (b) => { wranglerLog += b })
+  w.stderr.on('data', (b) => { wranglerLog += b; process.stderr.write(`[wrangler] ${b}`) })
+  // Cold CI pays npx's wrangler download plus workerd's first-run binary
+  // fetch before the port answers — budget 4 minutes, not 30 seconds.
   for (let i = 0; ; i++) {
     try { await fetch(`http://localhost:${PORT}/`); break } catch {
-      if (i > 120) throw new Error('wrangler dev never came up')
+      if (i > 960) {
+        throw new Error(`wrangler dev never came up\n--- wrangler output ---\n${wranglerLog.slice(-3000)}`)
+      }
       await new Promise((r) => setTimeout(r, 250))
     }
   }
