@@ -100,9 +100,13 @@ describe('createDegradedTracker', () => {
   })
 
   test('recovery resets the streak: the next degradation needs ten again', () => {
-    // The pre-extraction code left the counter at 10 after recovering, so a
-    // second degradation recovered after ONE success — flip-flopping on the
-    // exact pattern this policy exists to ride out.
+    // Strictly, the reset is hygiene, not a behavior change: every degraded
+    // episode begins with markTransient (the only path that sets degraded),
+    // which zeroes the streak first — so the counter is 0 at each episode
+    // start with or without the reset. It is kept because the invariant
+    // ("streak counts clean fetches in the CURRENT episode") should hold
+    // structurally, not incidentally via call order. This test pins the
+    // ten-again behavior against a future refactor that breaks that order.
     const t = createDegradedTracker({ full: 8, degraded: 3 })
     t.markTransient()
     for (let i = 0; i < 10; i++) t.markSuccess()

@@ -59,7 +59,10 @@ export function createDegradedTracker(opts: {
       streak++
       if (streak >= recoverAfter) {
         degraded = false
-        streak = 0 // or the NEXT degradation would recover after one success
+        streak = 0 // hygiene: every episode starts with markTransient (which
+        // zeroes), so this changes no observable path — it keeps the
+        // invariant ("streak counts this episode's clean fetches")
+        // structural instead of order-dependent.
         onNotice?.(`network stable — restoring shard concurrency ${opts.degraded} → ${opts.full}`)
       }
     },
