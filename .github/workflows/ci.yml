@@ -105,6 +105,11 @@ jobs:
         env:
           # No browser needed — plain WebSocket clients, no Puppeteer Chrome.
           PUPPETEER_SKIP_DOWNLOAD: '1'
+      # Warm npx's wrangler download: cold, npx fetching wrangler plus
+      # workerd's first-run binary fetch exceeds the test's startup budget
+      # and the relay never comes up. Same VM filesystem, so the test's own
+      # `npx wrangler dev` below reuses this cache.
+      - run: npx -y wrangler --version
       # Multi-host assignment/relay/takeover against wrangler dev. Seconds,
       # deterministic, zero hardware excuse — this ran only when a human
       # remembered, and that is how routing regresses silently.
