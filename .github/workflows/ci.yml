@@ -90,6 +90,13 @@ jobs:
       - run: npm run test:kernels
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+      # Every shipped spec's shaders must build under its own dims (prelude
+      # consts, workgroup layouts, u32 address math) — a prelude edit that
+      # breaks another spec fails here, not in a browser. No weights, no
+      # numerics; sg-only shaders skip loudly on lavapipe like run.mjs.
+      - run: npm run test:kernels:all-specs
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
 
   routing:
     name: room routing (no GPU)

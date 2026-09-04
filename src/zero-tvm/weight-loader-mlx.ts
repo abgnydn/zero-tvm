@@ -286,6 +286,38 @@ function slabPlanOf(name: string): [SlabProj, SlabKind] | null {
 }
 
 /**
+ * Tied-embedding invariant: on a tied spec the lm_head IS the embedding
+ * table (same buffers, not copies), on every stage including pipeline
+ * slices. A loader edit that loads them separately — from different
+ * offsets, or only on some stages — produces fluent wrong logits, never
+ * an error, so the assembly asserts the alias instead of trusting it.
+ * Fields are `unknown` on purpose: only identity is checked, and the MLC
+ * path (separate buffers, same bytes via paramNaming) is out of scope.
+ */
+export function assertTiedHead(
+  weights: {
+    embdWeights?: unknown; embdScales?: unknown; embdBiases?: unknown
+    lmHeadWeights?: unknown; lmHeadScales?: unknown; lmHeadBiases?: unknown
+  },
+  spec: { id?: string; tiedEmbeddings?: boolean },
+): void {
+  if (!spec.tiedEmbeddings) return
+  const pairs = [
+    ['embdWeights', 'lmHeadWeights'],
+    ['embdScales', 'lmHeadScales'],
+    ['embdBiases', 'lmHeadBiases'],
+  ] as const
+  for (const [e, l] of pairs) {
+    if (weights[e] !== weights[l]) {
+      throw new Error(
+        `${spec.id ?? 'spec'}: tied embeddings but ${l} is not ${e} — `
+        + 'split-stage loaders must alias, not re-load',
+      )
+    }
+  }
+}
+
+/**
  * Fetch, convert and upload every buffer, then assemble LoadedWeights.
  *
  * Buffers are uploaded one at a time and the host copy dropped immediately:
@@ -410,6 +442,7 @@ export async function assembleMlx(
     root.lmHeadScales = root.embdScales
     root.lmHeadBiases = root.embdBiases
   }
+  assertTiedHead(root, spec)
   // The MLC path exposes the first layer's input_layernorm separately; the
   // engine reads it before the layer loop. On a pipeline stage the first
   // LOADED layer is the one that matters, not layer 0 (which may be a
