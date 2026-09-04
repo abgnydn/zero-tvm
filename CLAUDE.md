@@ -249,8 +249,8 @@ npm run test:kernels:real     # kernels vs mlx_lm's own modules on real weights
 The chunk path picks a GEMM: **`e5` is the default since 2026-08-13** where the
 device has `chromium-experimental-subgroup-matrix`, degrading to `sgmat` (E1 on
 the same unit) when the cap does not tile by 64, else `matvec`. (`tiled` exists
-but is unreachable by default — nothing sets `chunkTiled`, and `wantGemm` never
-resolves to it on its own; it is an explicit `chunkGemm:'tiled'` only.) E5 is
+but is unreachable by default — nothing sets `chunkTiled`, and `pickChunkGemm`
+never selects it on its own; it is an explicit `chunkGemm:'tiled'` only.) E5 is
 that unit at a 64(M)x32(N) tile with a swizzled B — 18-22% over E1 in isolation,
 **13-15% on real prefill** (BENCH.md, "Sweep round 3" and "E5 in the engine").
 It cleared the opt-in bar it was written under — token identity vs per-token

@@ -553,7 +553,7 @@ export interface DecodeEngineOptions {
    *  in BENCH.md. */
   chunkCap?: number
   /** Use the tiled batched GEMM for chunk projections (default false — see
-   *  the tiledOK note in buildChunkPrefill: correct, but not yet measured
+   *  the tiled ladder entry in pickChunkGemm: correct, but not yet measured
    *  faster on a quiet machine). */
   chunkTiled?: boolean
   /** Chunk GEMM selection: 'e5' (the matrix unit at a 64x32 tile with a
