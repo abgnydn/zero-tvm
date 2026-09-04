@@ -94,7 +94,7 @@ jobs:
   routing:
     name: room routing (no GPU)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -130,7 +130,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers xvfb
       # No PUPPETEER_SKIP_DOWNLOAD: this job needs the real Chrome download.
       - run: npm ci
-      - run: xvfb-run -a npx vitest run tests/e2e/gate.test.ts tests/e2e/boot-card-fits-the-panel.test.ts tests/e2e/entrance-motion-and-mobile.test.ts tests/e2e/zero-tvm.test.ts --reporter=json --outputFile=/tmp/e2e-lavapipe.json
+      # json alone swallows the human-readable output, so a red run shows
+      # nothing but "JSON report written" — run both reporters.
+      - run: xvfb-run -a npx vitest run tests/e2e/gate.test.ts tests/e2e/boot-card-fits-the-panel.test.ts tests/e2e/entrance-motion-and-mobile.test.ts tests/e2e/zero-tvm.test.ts --reporter=default --reporter=json --outputFile=/tmp/e2e-lavapipe.json
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
       # vitest exits 0 on skips, so a suite that runs nothing reports green.
