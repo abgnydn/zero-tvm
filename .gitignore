@@ -1,0 +1,29 @@
+node_modules
+.mutation-gate-report.json
+dist/
+dist-lib/
+.claude/
+.tests-cache/
+*.log
+.DS_Store
+.weights-local/
+docs/webgpu-placement/ort-dist/
+docs/webgpu-placement/toy_scan.onnx
+docs/webgpu-placement/real_scan.onnx
+docs/webgpu-placement/decoder_ablated_q4f16.onnx
+docs/webgpu-placement/real_chunked_scan.onnx
+.weights-local/kernel-refs/
+
+# wrangler local dev state (miniflare)
+.wrangler/
+
+# working draft, not for publication
+docs/tjs-1599-comment.md
+docs/gpuweb-6338-comment.md
+# Same class as the two above: an unpublished draft. It was tracked by mistake,
+# and it carries a shader FILE COUNT — the thing CLAUDE.md forbids publishing,
+# which went stale the day it was written.
+docs/reddit-webgpu-moe-draft.md
+.station.json
+.repowise/
+.evals/

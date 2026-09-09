@@ -1,0 +1,392 @@
+<!doctype html><meta charset="utf-8"><title>model smoke probe</title>
+<body style="font:13px ui-monospace,monospace;padding:1rem"><pre id="log">…</pre>
+<script type="module">
+// MODEL SMOKE — dev-only probe scripts/validate-model.mjs drives: boots the
+// chat-config engine for ?model=<param> (registry-resolved, so a generated
+// spec is reachable the moment add-model registers it) and exposes
+// window.__forward / window.__generate for the node side to diff against
+// mlx_lm's reference dump. Not in the Vite build graph; vite dev serves it.
+const L=[],el=document.getElementById('log')
+const say=(...a)=>{L.push(a.join(' '));el.textContent=L.slice(-60).join('\n');console.log('[T]',a.join(' '))}
+window.__phase='boot'; window.__done=false
+try{
+  const { specFromSearch } = await import('/src/zero-tvm/model-select.ts')
+  const { compile } = await import('/src/compiler/compiler.ts')
+  const { loadWeights } = await import('/src/zero-tvm/weight-loader.ts')
+  const { buildDecodeEngine, allocKVPages, allocKVPagesInt8 } = await import('/src/zero-tvm/engine-core.ts')
+  const { SCALAR_VARIANTS } = await import('/src/zero-tvm/variants.ts')
+  const S = specFromSearch(location.search)
+  say('spec:', S.id, '| format:', S.weightFormat ?? 'mlc')
+
+  const ad = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' })
+  const feats = [...ad.features].filter(f=>/shader-f16|subgroups|subgroup-matrix/.test(f))
+  const dev = await ad.requestDevice({ requiredFeatures: feats, requiredLimits: {
+    maxBufferSize: ad.limits.maxBufferSize,
+    maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize,
+  }})
+  let gpuErrs = 0
+  dev.addEventListener('uncapturederror', e => { gpuErrs++; say('GPU ERROR:', e.error.message.split('\n')[0]) })
+  window.__gpuErrs = () => gpuErrs
+
+  const t0 = performance.now()
+  let wholeBytes = 0
+  const weights = await loadWeights(dev, m => { if(/ready|headers|shard/.test(m)) say(m) },
+    (st) => { wholeBytes = st.bytesLoaded }, S)
+  window.__wholeBytes = () => wholeBytes
+  say(`weights ok in ${((performance.now()-t0)/1000).toFixed(0)}s`)
+  const kv = allocKVPages(dev, S)
+  // Chat-shaped composition: subgroups + tiled matmul (what users actually
+  // run); fused stays off — engine-core forces unfused for qkNorm/affine.
+  const engine = buildDecodeEngine(dev, weights, kv, {
+    spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' },
+  })
+  say('engine built')
+
+  // Split the SAME weights into two pipeline stages and drive them by hand.
+  // Both stages live on this one device — the point is the numerics, not the
+  // transport: if A(0..k) + B(k..N) does not reproduce the whole model's
+  // tokens, no amount of WebRTC will fix it.
+  // `v` overrides the variant set. It matters: the default here is a scalar
+  // kernel set the app does not ship, so a split proven exact with it says
+  // nothing about the split the app actually runs.
+  window.__splitCheck = async (ids, k, n, v) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
+    const A = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: V, layerRange: { start: 0, end: k },
+    })
+    const B = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: V, layerRange: { start: k, end: S.layers },
+    })
+    const step = async (tokenId, pos) => {
+      const mid = await A.pipelineStep({ tokenId }, pos)
+      return (await B.pipelineStep({ residual: mid.residual }, pos)).tokenId
+    }
+    // Prefill the prompt one position at a time; the last one yields token #1.
+    let tok = 0
+    for (let i = 0; i < ids.length; i++) tok = await step(ids[i], i)
+    const out = [tok]
+    for (let i = 1; i < n; i++) out.push(tok = await step(tok, ids.length + i - 1))
+    return out
+  }
+
+  // N stages, not two. The room protocol only pairs a host with one helper,
+  // but the engine takes any layer range, so the numerics of a 6-way chain can
+  // be settled here before any of that gets built. `cuts` are the interior
+  // boundaries: [6,12,18] over 24 layers means 4 stages.
+  window.__chainCheck = async (ids, cuts, n, v) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
+    const bounds = [0, ...cuts, S.layers]
+    const stages = bounds.slice(0, -1).map((start, i) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: V, layerRange: { start, end: bounds[i + 1] },
+    }))
+    const step = async (tokenId, pos) => {
+      let carry = await stages[0].pipelineStep({ tokenId }, pos)
+      for (let i = 1; i < stages.length; i++) {
+        carry = await stages[i].pipelineStep({ residual: carry.residual }, pos)
+      }
+      return carry.tokenId
+    }
+    let tok = 0
+    for (let i = 0; i < ids.length; i++) tok = await step(ids[i], i)
+    const out = [tok]
+    const t0 = performance.now()
+    for (let i = 1; i < n; i++) out.push(tok = await step(tok, ids.length + i - 1))
+    return { tokens: out, msPerToken: (performance.now() - t0) / (n - 1), stages: stages.length }
+  }
+
+  // Same split, but each stage LOADS ONLY ITS OWN LAYERS — the arrangement a
+  // real two-machine run uses. Reports the bytes each stage actually holds.
+  window.__splitLoadCheck = async (ids, k, n) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }
+    const mk = async (start, end) => {
+      let bytes = 0
+      const w = await loadWeights(dev, undefined, (s) => { bytes = s.bytesLoaded }, S, { start, end })
+      const e = buildDecodeEngine(dev, w, allocKVPages(dev, S), { spec: S, variants: V, layerRange: { start, end } })
+      return { e, bytes }
+    }
+    const A = await mk(0, k)
+    const B = await mk(k, S.layers)
+    const step = async (tokenId, pos) => {
+      const mid = await A.e.pipelineStep({ tokenId }, pos)
+      return (await B.e.pipelineStep({ residual: mid.residual }, pos)).tokenId
+    }
+    let tok = 0
+    for (let i = 0; i < ids.length; i++) tok = await step(ids[i], i)
+    const out = [tok]
+    for (let i = 1; i < n; i++) out.push(tok = await step(tok, ids.length + i - 1))
+    return { tokens: out, bytesA: A.bytes, bytesB: B.bytes }
+  }
+
+  // The whole model under an ARBITRARY variant set — the control for
+  // __splitCheck(v). Without it, "the split forks under app variants" cannot
+  // be told apart from "app variants fork, split or not".
+  window.__wholeCheck = async (ids, n, v) => {
+    const e = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) },
+    })
+    return Array.from(await e.generate(ids, 0, n, () => {}))
+  }
+  // CHUNKED PREFILL equivalence. Chunking changes the ARITHMETIC ORDER of
+  // prefill — one batched GEMM over n tokens instead of n matvecs — so the only
+  // honest check is that it yields the same tokens as the per-token path on the
+  // same prompt. Two engines over the SAME weights, one with chunking off.
+  window.__chunkCheck = async (ids, n, v, cap) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
+    const mk = (chunkedPrefill, kv) => buildDecodeEngine(dev, weights, kv, {
+      spec: S, variants: V, chunkedPrefill, ...(cap ? { chunkCap: cap } : {}),
+      chunkTiled: new URLSearchParams(location.search).get('tiled') === '1',
+      ...(new URLSearchParams(location.search).get('gemm')
+        ? { chunkGemm: new URLSearchParams(location.search).get('gemm') } : {}),
+    })
+    // ONE ARM RESIDENT AT A TIME. The arms are compared after both finish, but
+    // they never RUN together, and an engine's KV cache is a GiB on the specs
+    // this test most needs to cover — a 30B MoE ran four caches deep (two arms
+    // x two variant configs) beside 17 GB of weights before this freed them.
+    // destroy() is the engine's own buffers; kvPages came from here, so they
+    // are freed here.
+    const run = async (chunkedPrefill) => {
+      const kv = allocKVPages(dev, S)
+      const e = mk(chunkedPrefill, kv)
+      const t0 = performance.now()
+      const out = []
+      let ms = 0
+      // No `return` in the finally: that swallows the exception, and two arms
+      // that both threw would come back as two empty token lists, which the
+      // caller's length-then-elementwise comparison reads as IDENTICAL.
+      try {
+        await e.generatePipelined(ids, n, (t)=>out.push(t), ()=>false)
+        ms = performance.now() - t0
+      } finally {
+        e.destroy()
+        for (const b of kv) b.destroy()
+      }
+      return { out, ms }
+    }
+    const a = await run(true)
+    const b = await run(false)
+    return { chunked: a.out, perToken: b.out, chunkedMs: a.ms, perTokenMs: b.ms }
+  }
+
+  // KV POOL (paging Phase 1). Fresh engine per arm — restore must work into a
+  // brand-new engine with zeroed buffers, because that is what a reload is.
+  // Per-token prefill in every arm: decode- and prefill-written KV are then the
+  // same kernel path, so the gate can demand IDENTICAL tokens. (With chunking,
+  // restored bytes mix chunk- and decode-written positions exactly like the
+  // existing cross-turn reuse does — same tolerance, weaker claim.)
+  window.__poolRun = async (promptIds, genTokens, extendIds, contTokens, tamper) => {
+    const { poolSave, poolTryRestore, poolClear } = await import('/src/zero-tvm/kv-pool.ts')
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }
+    const mk = () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: V, chunkedPrefill: false,
+    })
+    const cfg = (path) => ({
+      spec: S, weightRevision: S.hfRepo, variants: V, fused: false, int8KV: false,
+      prefillPath: path, adapter: { vendor: ad.info?.vendor ?? '?', architecture: ad.info?.architecture ?? '?' },
+    })
+    await poolClear()
+
+    // Arm A: live session — prefill + decode, then save.
+    const A = mk()
+    const gen = []
+    await A.generatePipelined(promptIds, genTokens, (t) => gen.push(t), () => false)
+    const saved = await poolSave(A, cfg('per-token'))
+    A.destroy()
+
+    const full = [...promptIds, ...gen, ...extendIds]
+
+    // Control: a fresh engine prefills the WHOLE extended prompt from zero.
+    const C = mk()
+    const control = []
+    await C.generatePipelined(full, contTokens, (t) => control.push(t), () => false)
+    C.destroy()
+
+    // Restored: a fresh engine attaches the saved prefix, prefills the delta.
+    const R = mk()
+    const res = await poolTryRestore(R, cfg('per-token'), full)
+    const t0 = performance.now()
+    const restored = []
+    await R.generatePipelined(full, contTokens, (t) => restored.push(t), () => false)
+    const restoredMs = performance.now() - t0
+    const reuse = R.getLastPrefill()
+    R.destroy()
+
+    // Negative: a fingerprint that differs in one field must refuse.
+    const T = mk()
+    const bad = await poolTryRestore(T, cfg(tamper ? 'chunked' : 'per-token'), full)
+    T.destroy()
+
+    return { saved, gen, control, restored, restoredMs,
+             restoredCount: res.restored, reuseInfo: reuse,
+             tamperRestored: tamper ? bad.restored : null, tamperReason: tamper ? (bad.reason ?? '') : null }
+  }
+
+  // PAGE TABLE falsifier (docs/PAGING_PLAN.md §0.4). Runs the same ids twice on
+  // a FRESH engine each time — identity table, then `perm` — and returns both
+  // logit vectors. The readers (attention*.wgsl) go through the table; the
+  // writers do not, so today the permuted run must differ. When the writers are
+  // taught the table the two must become bit-identical.
+  //
+  // A fresh engine per arm is load-bearing: the KV cache written under one
+  // table would otherwise still be sitting there under the next.
+  window.__pageTableCheck = async (ids, perm, v) => {
+    const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
+    const run = async (table) => {
+      const e = buildDecodeEngine(dev, weights, allocKVPages(dev, S), { spec: S, variants: V })
+      if (table) e.setPageTable(Int32Array.from(table))
+      return Array.from(await e.forwardLogits(ids))
+    }
+    return { identity: await run(null), permuted: await run(perm) }
+  }
+  window.__maxPages = () => S.maxPages
+
+  // Per-token NLL — the perplexity primitive scripts/quality-eval.mjs drives.
+  // The only measurement here that can see a model quantized into uselessness;
+  // every other gate compares against the same quantized checkpoint.
+  window.__score = async (ids) => Array.from(await engine.scoreSequence(ids,
+    (d, t) => { if (d % 64 === 0) say(`scored ${d}/${t}`) }))
+
+  // One raw step at an arbitrary position — the ctx test uses it to touch the
+  // LAST KV slot of a ?ctx= engine. Addressing probe only: the cache below the
+  // position is whatever the buffer held, so the returned token means nothing.
+  window.__pipelineStep = async (tokenId, pos) => (await engine.pipelineStep({ tokenId }, pos)).tokenId
+
+  window.__forward = async (ids) => Array.from(await engine.forwardLogits(ids))
+  // Embedding models stop one dispatch earlier: the pooled, L2-normalised
+  // hidden state instead of logits. scripts/embed-ref.py is the reference.
+  window.__embed = async (ids) => Array.from(await engine.forwardEmbedding(ids))
+  // Timed pipelined generate — the chat path with instrumentation. TTFT is
+  // wall-clock to the FIRST onToken callback, which includes prefill; decode
+  // rate is the remaining tokens over the remaining time.
+  // The CHAT-SHAPED engine — variantsFromSearch(''), i.e. every default-on
+  // tuning flag (splitK, vec4h, sgFfn, fuseqk where legal, chunked prefill).
+  // The smoke engine above deliberately runs a plainer composition; timing THAT
+  // against another runtime sandbagged us 2.4x on decode (30.5 vs 73 tok/s).
+  let chatEngine = null
+  window.__timedGenerateChat = async (ids, n) => {
+    if (!chatEngine) {
+      const { parseVariantFlags } = await import('/src/zero-tvm/variants.ts')
+      // Same construction as chat.ts:200 — location.search so ?sg=0-style
+      // overrides still apply, and the subgroups feature gate from the device.
+      chatEngine = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+        spec: S,
+        variants: parseVariantFlags(location.search, {
+          hasSubgroupsFeature: dev.features.has('subgroups'),
+          sgSizeOk: true,
+        }),
+      })
+    }
+    const t0 = performance.now()
+    let tFirst = 0
+    const out = []
+    await chatEngine.generatePipelined(ids, n, (t) => { if (!out.length) tFirst = performance.now(); out.push(t) }, () => false)
+    const tEnd = performance.now()
+    return { promptTokens: ids.length, tokens: out.length,
+             ttftMs: tFirst - t0, totalMs: tEnd - t0,
+             decodeTokS: out.length > 1 ? (out.length - 1) / ((tEnd - tFirst) / 1000) : 0,
+             prefillTokS: (ids.length - 1) / ((tFirst - t0) / 1000) }
+  }
+
+  window.__timedGenerate = async (ids, n) => {
+    const t0 = performance.now()
+    let tFirst = 0
+    const out = []
+    await engine.generatePipelined(ids, n, (t) => { if (!out.length) tFirst = performance.now(); out.push(t) }, () => false)
+    const tEnd = performance.now()
+    return { promptTokens: ids.length, tokens: out.length,
+             ttftMs: tFirst - t0, totalMs: tEnd - t0,
+             decodeTokS: out.length > 1 ? (out.length - 1) / ((tEnd - tFirst) / 1000) : 0,
+             prefillTokS: (ids.length - 1) / ((tFirst - t0) / 1000) }
+  }
+
+  window.__generate = async (ids, n) => {
+    const out = await engine.generate(ids, 0, n, () => {})
+    return Array.from(out)
+  }
+  // The path share.ts uses to serve a WHOLE model. It differs from generate()
+  // in one way that matters to anyone comparing sequences: chunked prefill.
+  // A split model cannot use it (a stage holds only some layers and prefills
+  // one position at a time), so this is what a whole-vs-split text diff is
+  // really comparing against.
+  window.__generatePipelined = async (ids, n) => {
+    const out = []
+    await engine.generatePipelined(ids, n, (t) => out.push(t), () => false)
+    return out
+  }
+  // Direct exportKV/importKV round-trip with STRUCTURE assertions (drives
+  // scripts/kv-export-test.mjs). Arm A blocking-generates genA and exports;
+  // arm B (fresh engine) imports and continues genB; arm C (fresh engine)
+  // runs prompt+pre uninterrupted as control. All arms use the blocking
+  // generate() so absorbed-token accounting is deterministic. Set useInt8
+  // for the int8-KV snapshot shape (per-row scales must be present).
+  window.__kvRoundTrip = async (promptIds, genA, genB, useInt8) => {
+    const V = { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled', int8KV: !!useInt8 }
+    const mk = () => {
+      const kv = useInt8 ? allocKVPagesInt8(dev, S) : allocKVPages(dev, S)
+      // Per-token prefill in ALL arms (mirroring __poolRun): the round trip
+      // must stand on its own, not inherit chunked-vs-per-token equivalence
+      // from a separate gate.
+      return buildDecodeEngine(dev, weights, kv, { spec: S, variants: V, chunkedPrefill: false })
+    }
+    const A = mk()
+    const pre = Array.from(await A.generate(promptIds, 0, genA, () => {}))
+    const snap = await A.exportKV()
+    A.destroy()
+    if (!snap) return { exported: false }
+    const shape = { tokens: snap.tokens, ids: [...snap.ids],
+      layers: snap.layers.map((b) => b.byteLength),
+      scales: snap.scales.map((b) => b.byteLength),
+      gdn: snap.gdn.map((b) => b.byteLength) }
+    const B = mk()
+    const imported = B.importKV(snap)
+    const cont = []
+    await B.generatePipelined([...promptIds, ...pre], genB, (t) => cont.push(t), () => false)
+    B.destroy()
+    const C = mk()
+    const direct = []
+    await C.generatePipelined([...promptIds, ...pre], genB, (t) => direct.push(t), () => false)
+    C.destroy()
+    return { exported: true, imported, shape, cont, direct }
+  }
+  // Sampler switching (drives scripts/sampler-switch-test.mjs). Three fresh
+  // engines on one prompt: pure greedy twice (determinism control), then
+  // sampled → back to greedy. Draws are a pure function of (seed, position),
+  // so the two sampled arms must agree exactly, and null must restore the
+  // greedy path token-for-token. Narrower than mid-conversation switching
+  // (which needs startPos plumbing this probe does not second-guess), but it
+  // exercises the same uniform rewrite twice in each direction.
+  window.__samplerSwitch = async (promptIds, n) => {
+    const mk = () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      spec: S, variants: { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled' },
+    })
+    const run = async (sampling) => {
+      const e = mk()
+      if (sampling) e.setSampling(sampling)
+      const out = Array.from(await e.generate(promptIds, 0, n, () => {}))
+      e.destroy()
+      return out
+    }
+    const g1 = await run(null)
+    const g2 = await run(null)
+    const samp = { temperature: 1.5, topP: 1, minP: 0, seed: 7 }
+    const s1 = await run(samp)
+    const s2 = await run(samp)
+    // Greedy again after sampling, on a fresh engine: setSampling(null) must
+    // restore the greedy path exactly (same prefix => same tokens as g1).
+    const g3 = await (async () => {
+      const e = mk()
+      e.setSampling(samp)
+      await e.generate(promptIds, 0, 2, () => {})
+      e.setSampling(null)
+      const out = Array.from(await e.generate(promptIds, 0, n, () => {}))
+      e.destroy()
+      return out
+    })()
+    return { g1, g2, s1, s2, g3 }
+  }
+  window.__phase='loaded'
+}catch(e){
+  say('ERROR:', e && e.stack ? e.stack.split('\n').slice(0,4).join(' | ') : String(e))
+  window.__phase='error'; window.__error=String(e && e.message || e)
+}
+window.__done=true
+</script>

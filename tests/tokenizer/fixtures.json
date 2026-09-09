@@ -1,0 +1,558 @@
+[
+ {
+  "text": "Hello world",
+  "ids": [
+   15043,
+   3186
+  ],
+  "decoded": "Hello world"
+ },
+ {
+  "text": "The quick brown fox jumps over the lazy dog.",
+  "ids": [
+   450,
+   4996,
+   17354,
+   1701,
+   29916,
+   432,
+   17204,
+   975,
+   278,
+   17366,
+   11203,
+   29889
+  ],
+  "decoded": "The quick brown fox jumps over the lazy dog."
+ },
+ {
+  "text": " leading space",
+  "ids": [
+   29871,
+   8236,
+   2913
+  ],
+  "decoded": " leading space"
+ },
+ {
+  "text": "trailing space ",
+  "ids": [
+   25053,
+   2913,
+   29871
+  ],
+  "decoded": "trailing space "
+ },
+ {
+  "text": "multiple   spaces   between",
+  "ids": [
+   2999,
+   259,
+   8162,
+   259,
+   1546
+  ],
+  "decoded": "multiple   spaces   between"
+ },
+ {
+  "text": "    four-space indent",
+  "ids": [
+   268,
+   3023,
+   29899,
+   3493,
+   29536
+  ],
+  "decoded": "    four-space indent"
+ },
+ {
+  "text": "line one\nline two",
+  "ids": [
+   1196,
+   697,
+   13,
+   1220,
+   1023
+  ],
+  "decoded": "line one\nline two"
+ },
+ {
+  "text": "paragraph one\n\nparagraph two",
+  "ids": [
+   14880,
+   697,
+   13,
+   13,
+   26956,
+   1023
+  ],
+  "decoded": "paragraph one\n\nparagraph two"
+ },
+ {
+  "text": "def f(x):\n    return x * 2\n",
+  "ids": [
+   822,
+   285,
+   29898,
+   29916,
+   1125,
+   13,
+   1678,
+   736,
+   921,
+   334,
+   29871,
+   29906,
+   13
+  ],
+  "decoded": "def f(x):\n    return x * 2\n"
+ },
+ {
+  "text": "```\ncode block\n\tindented line\n```",
+  "ids": [
+   7521,
+   13,
+   401,
+   2908,
+   13,
+   12,
+   12860,
+   287,
+   1196,
+   13,
+   28956
+  ],
+  "decoded": "```\ncode block\n\tindented line\n```"
+ },
+ {
+  "text": "\n",
+  "ids": [
+   29871,
+   13
+  ],
+  "decoded": "\n"
+ },
+ {
+  "text": "\n\n",
+  "ids": [
+   29871,
+   13,
+   13
+  ],
+  "decoded": "\n\n"
+ },
+ {
+  "text": "tab\there",
+  "ids": [
+   4434,
+   12,
+   4150
+  ],
+  "decoded": "tab\there"
+ },
+ {
+  "text": "\t\n mixed \r\n endings",
+  "ids": [
+   29871,
+   12,
+   13,
+   12849,
+   6756,
+   13,
+   1095,
+   886
+  ],
+  "decoded": "\t\n mixed \r\n endings"
+ },
+ {
+  "text": "emoji 😀 test",
+  "ids": [
+   953,
+   29877,
+   2397,
+   29871,
+   243,
+   162,
+   155,
+   131,
+   1243
+  ],
+  "decoded": "emoji 😀 test"
+ },
+ {
+  "text": "rockets 🚀🔥 and flags 🇹🇷",
+  "ids": [
+   7679,
+   1691,
+   29871,
+   243,
+   162,
+   157,
+   131,
+   243,
+   162,
+   151,
+   168,
+   322,
+   13449,
+   29871,
+   243,
+   162,
+   138,
+   188,
+   243,
+   162,
+   138,
+   186
+  ],
+  "decoded": "rockets 🚀🔥 and flags 🇹🇷"
+ },
+ {
+  "text": "中文分词测试",
+  "ids": [
+   29871,
+   30275,
+   30333,
+   30748,
+   235,
+   178,
+   144,
+   31851,
+   31787
+  ],
+  "decoded": "中文分词测试"
+ },
+ {
+  "text": "こんにちは世界",
+  "ids": [
+   29871,
+   30589,
+   30389,
+   30353,
+   30644,
+   30449,
+   30793,
+   30967
+  ],
+  "decoded": "こんにちは世界"
+ },
+ {
+  "text": "Türkçe karakterler: ğüşıöçİĞÜŞÖÇ",
+  "ids": [
+   25424,
+   29895,
+   30019,
+   29872,
+   10856,
+   14266,
+   1358,
+   29901,
+   29871,
+   30200,
+   29993,
+   30169,
+   30130,
+   29997,
+   30019,
+   30243,
+   199,
+   161,
+   30104,
+   30309,
+   30094,
+   30219
+  ],
+  "decoded": "Türkçe karakterler: ğüşıöçİĞÜŞÖÇ"
+ },
+ {
+  "text": "İstanbul'da yağmur yağıyor",
+  "ids": [
+   29871,
+   30243,
+   14411,
+   8645,
+   29915,
+   1388,
+   9343,
+   30200,
+   29885,
+   332,
+   9343,
+   30200,
+   30130,
+   29891,
+   272
+  ],
+  "decoded": "İstanbul'da yağmur yağıyor"
+ },
+ {
+  "text": "naïve café résumé",
+  "ids": [
+   1055,
+   30085,
+   345,
+   274,
+   28059,
+   6896,
+   398,
+   29948
+  ],
+  "decoded": "naïve café résumé"
+ },
+ {
+  "text": "wait... what?!?! (really); [yes] {no} <maybe>",
+  "ids": [
+   4480,
+   856,
+   825,
+   29973,
+   29991,
+   29973,
+   29991,
+   313,
+   276,
+   635,
+   416,
+   518,
+   3582,
+   29962,
+   426,
+   1217,
+   29913,
+   529,
+   26026,
+   29958
+  ],
+  "decoded": "wait... what?!?! (really); [yes] {no} <maybe>"
+ },
+ {
+  "text": "!!!???,,,;;;:::",
+  "ids": [
+   1738,
+   6824,
+   28772,
+   12985,
+   29892,
+   7859,
+   29936,
+   1057,
+   29901
+  ],
+  "decoded": "!!!???,,,;;;:::"
+ },
+ {
+  "text": "pi is 3.14159 and the answer is 42",
+  "ids": [
+   2930,
+   338,
+   29871,
+   29941,
+   29889,
+   29896,
+   29946,
+   29896,
+   29945,
+   29929,
+   322,
+   278,
+   1234,
+   338,
+   29871,
+   29946,
+   29906
+  ],
+  "decoded": "pi is 3.14159 and the answer is 42"
+ },
+ {
+  "text": "MixedCASE camelCase snake_case kebab-case",
+  "ids": [
+   341,
+   11925,
+   23487,
+   3949,
+   295,
+   8259,
+   269,
+   21040,
+   29918,
+   4878,
+   413,
+   774,
+   370,
+   29899,
+   4878
+  ],
+  "decoded": "MixedCASE camelCase snake_case kebab-case"
+ },
+ {
+  "text": "she said \"hi\" and 'bye'",
+  "ids": [
+   1183,
+   1497,
+   376,
+   2918,
+   29908,
+   322,
+   525,
+   26966,
+   29915
+  ],
+  "decoded": "she said \"hi\" and 'bye'"
+ },
+ {
+  "text": "𝕌nicode math 𝕍",
+  "ids": [
+   29871,
+   243,
+   160,
+   152,
+   143,
+   7823,
+   356,
+   5844,
+   29871,
+   243,
+   160,
+   152,
+   144
+  ],
+  "decoded": "𝕌nicode math 𝕍"
+ },
+ {
+  "text": "null \u0000 byte and bell \u0007",
+  "ids": [
+   1870,
+   29871,
+   3,
+   7023,
+   322,
+   22623,
+   29871,
+   10
+  ],
+  "decoded": "null \u0000 byte and bell \u0007"
+ },
+ {
+  "text": "<s>bos then text</s>",
+  "ids": [
+   1,
+   27737,
+   769,
+   1426,
+   2
+  ],
+  "decoded": "bos then text</s>"
+ },
+ {
+  "text": "before <|end|> after",
+  "ids": [
+   1434,
+   29871,
+   32007,
+   7045
+  ],
+  "decoded": "before after"
+ },
+ {
+  "text": "<|user|>\nHi<|end|>\n<|assistant|>\n",
+  "ids": [
+   32010,
+   18567,
+   32007,
+   32001
+  ],
+  "decoded": "Hi"
+ },
+ {
+  "text": "a",
+  "ids": [
+   263
+  ],
+  "decoded": "a"
+ },
+ {
+  "text": " ",
+  "ids": [
+   259
+  ],
+  "decoded": " "
+ },
+ {
+  "text": "",
+  "ids": [],
+  "decoded": ""
+ },
+ {
+  "text": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nWhat is the capital of France?<|end|>\n<|assistant|>\n",
+  "ids": [
+   32006,
+   3492,
+   526,
+   263,
+   8444,
+   20255,
+   29889,
+   32007,
+   32010,
+   5618,
+   338,
+   278,
+   7483,
+   310,
+   3444,
+   29973,
+   32007,
+   32001
+  ],
+  "decoded": "You are a helpful assistant.What is the capital of France?"
+ },
+ {
+  "text": "<|user|>\nWrite a haiku about GPUs.<|end|>\n<|assistant|>\nWarm silicon hums<|end|>\n<|user|>\nContinue it<|end|>\n<|assistant|>\n",
+  "ids": [
+   32010,
+   6113,
+   263,
+   447,
+   18282,
+   1048,
+   22796,
+   29879,
+   29889,
+   32007,
+   32001,
+   29956,
+   2817,
+   4047,
+   4144,
+   3165,
+   29879,
+   32007,
+   32010,
+   1323,
+   14150,
+   372,
+   32007,
+   32001
+  ],
+  "decoded": "Write a haiku about GPUs.Warm silicon humsContinue it"
+ },
+ {
+  "text": "<|user|>\nmulti\nline\n\nuser content with  spaces<|end|>\n<|assistant|>\n",
+  "ids": [
+   32010,
+   9910,
+   13,
+   1220,
+   13,
+   13,
+   1792,
+   2793,
+   411,
+   29871,
+   8162,
+   32007,
+   32001
+  ],
+  "decoded": "multi\nline\n\nuser content with  spaces"
+ }
+]

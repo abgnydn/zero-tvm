@@ -1,0 +1,24 @@
+{
+  "model": "Phi-3-mini-4k-instruct-q4f16_1",
+  "archReleased": 2024,
+  "date": "2026-07-30",
+  "hardware": "Apple M2 Max",
+  "browser": "Chrome 150",
+  "protocol": "same-session interleaved pair, identical local q4f16_1 weight bytes, greedy; Zero-TVM 128-token target x 5 runs + warmup, WebLLM 3 x 120-token completions + warmup; medians",
+  "zeroTvm": {
+    "totalTokPerS": 69.55,
+    "ttftMs": 291,
+    "decodeTokPerS": 83.10,
+    "totalRuns": [69.55, 69.67, 69.44, 69.29, 69.71]
+  },
+  "webllm": {
+    "version": "0.2.80",
+    "totalTokPerS": 59.95,
+    "selfReportedDecodeTokPerS": 63.23,
+    "selfReportedPrefillTokPerS": 251,
+    "totalRuns": null
+  },
+  "deltaTotalPct": 16.0,
+  "deltaDecodePct": 31.4,
+  "notes": "Same pair as bench/results.json, with the metric split spelled out (that file's ztDecode/webllmDecode keys hold these totalTokPerS values). WebLLM per-run totals are not recorded by the harness for this half. Supersedes the 2026-07-25/27 pair (62.90 / 47.92) — not defective, but total wall-clock labelled 'decode' and no TTFT split. See BENCH.md."
+}

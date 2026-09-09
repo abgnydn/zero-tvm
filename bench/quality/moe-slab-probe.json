@@ -1,0 +1,8 @@
+{
+  "slabBytes": 2652897.28,
+  "reads": 200,
+  "readMs": 0.167366875,
+  "uploadMs": 0.29934478999999997,
+  "missMs": 0.5297175,
+  "note": "read arm ran at RAM speed (page cache); on a machine too small to hold the checkpoint — the case streaming exists for — it will be slower"
+}

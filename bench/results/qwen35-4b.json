@@ -1,0 +1,25 @@
+{
+  "model": "Qwen3.5-4B-q4f16_1",
+  "archReleased": 2026,
+  "date": "2026-07-30",
+  "hardware": "Apple M2 Max",
+  "browser": "Chrome 150",
+  "protocol": "same-session interleaved pair, identical local q4f16_1 weight bytes, greedy; Zero-TVM 128-token target x 5 runs + warmup (BENCH_QUERY=\"?model=qwen35\"), WebLLM 3 x 120-token completions + warmup on its prebuilt Qwen3.5-4B lib; medians",
+  "zeroTvm": {
+    "totalTokPerS": 65.28,
+    "ttftMs": 171,
+    "decodeTokPerS": 73.30,
+    "totalRuns": [65.32, 65.28, 65.25, 65.41, 65.19]
+  },
+  "webllm": {
+    "version": "0.2.84",
+    "totalTokPerS": 32.56,
+    "selfReportedDecodeTokPerS": 34.32,
+    "selfReportedPrefillTokPerS": [175, 177],
+    "totalRuns": [32.56, 32.52, 33.72]
+  },
+  "deltaTotalPct": 100.5,
+  "deltaDecodePct": 113.6,
+  "supersedes": "2026-07-29 cross-check pair 65.67 / 34.04 (\"+92.9%\") — WITHDRAWN: measured after cross-turn prefix reuse (PR #24) and before bench() reset it, so the Zero-TVM half prefilled one token per run while the WebLLM half prefilled the whole prompt. Not like-for-like. Also supersedes the pre-reuse pairs 53.07 / 32.36 (\"+64.0%\", 2026-07-29 perf round) and 47.99 / 31.99 (\"+50.0%\", 2026-07-28 v1 floor), which were like-for-like but are older.",
+  "notes": "bench/results.json is untouched by cross-engine A/B mode; this file is the durable record. The only pair where TTFT is roughly a wash: our 171 ms against an implied ~0.2 s from WebLLM's 175-177 tok/s prefill. The 24 GDN decode kernels are still scalar (non-subgroup), so the decode number remains a floor."
+}

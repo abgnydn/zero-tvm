@@ -1,0 +1,79 @@
+{
+  "name": "zero-tvm",
+  "version": "0.3.0",
+  "description": "Browser LLM inference on hand-written WGSL kernels \u2014 models from a 3.8B dense to a 35B sparse MoE, no TVM, no WebLLM runtime, no compiler. Measured against WebLLM on identical weights; every number in BENCH.md.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Ahmet Baris Gunaydin",
+  "keywords": [
+    "webgpu",
+    "wgsl",
+    "llm",
+    "phi-3",
+    "inference",
+    "browser",
+    "from-scratch",
+    "no-tvm"
+  ],
+  "types": "./dist-lib/types/lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist-lib/types/lib/index.d.ts",
+      "default": "./dist-lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist-lib"
+  ],
+  "scripts": {
+    "evals": "node scripts/evals.mjs",
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "build:lib": "vite build --config vite.lib.config.ts && tsc --emitDeclarationOnly --outDir dist-lib/types",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
+    "test": "npm run test:unit",
+    "test:unit": "vitest run tests/tokenizer tests/unit",
+    "test:e2e": "vitest run tests/e2e",
+    "test:kernels": "node tests/kernels/run.mjs",
+    "test:kernels:mlx": "node tests/kernels/mlx-repack.mjs",
+    "test:kernels:qwen": "node tests/kernels/compile-qwen.mjs",
+    "test:kernels:qwen35": "node tests/kernels/compile-qwen35.mjs",
+    "test:kernels:qwen38": "node tests/kernels/compile-qwen35.mjs QWEN3_8_27B_4BIT",
+    "gen:tokenizer-fixtures": "node scripts/gen-tokenizer-fixtures.mjs",
+    "gen:tokenizer-fixtures-qwen": "node scripts/gen-tokenizer-fixtures-qwen.mjs",
+    "gen:tokenizer-fixtures-qwen35": "node scripts/gen-tokenizer-fixtures-bpe.mjs --tag qwen35 --repo mlc-ai/Qwen3.5-4B-q4f16_1-MLC --generation qwen35",
+    "gen:tokenizer-fixtures-qwen38": "node scripts/gen-tokenizer-fixtures-bpe.mjs --tag qwen38 --repo mlx-community/Qwen3.8-27B-4bit --generation qwen38",
+    "bench": "node bench/run.mjs",
+    "bench:sync": "node bench/sync-docs.mjs",
+    "check": "npm run typecheck && npm run test",
+    "test:kernels:real": "node tests/kernels/real-weights.mjs",
+    "test:mla-engine": "node scripts/mla-engine-test.mjs",
+    "test:prefix-stability": "node scripts/prefix-stability-test.mjs",
+    "paging:measure": "node scripts/paging-measure.mjs",
+    "paging:test": "node scripts/paging-test.mjs",
+    "quality": "node scripts/quality-eval.mjs",
+    "agent": "node scripts/agent.mjs",
+    "agent-server": "node scripts/agent-server.mjs",
+    "test:agent-server": "node scripts/agent-server-test.mjs",
+    "add-model": "node scripts/add-model.mjs",
+    "test:kernels:spec": "node tests/kernels/compile-spec.mjs",
+    "test:kernels:all-specs": "node scripts/compile-all-specs.mjs",
+    "test:kernels:sgmat": "node --experimental-strip-types scripts/gemm-sweep-native.mjs --gate-only",
+    "station": "node scripts/station.mjs"
+  },
+  "devDependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@kmamal/gpu": "^0.2.1",
+    "@mlc-ai/web-llm": "^0.2.84",
+    "@types/node": "^22.13.0",
+    "@webgpu/types": "^0.1.69",
+    "@wllama/wllama": "^3.5.1",
+    "puppeteer": "^24.40.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.3.0",
+    "vitest": "^4.1.2",
+    "webgpu": "^0.4.0"
+  }
+}

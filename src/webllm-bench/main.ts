@@ -1,0 +1,184 @@
+/**
+ * WebLLM head-to-head bench.
+ *
+ * Loads @mlc-ai/web-llm against the EXACT same q4f16_1 weights Zero-TVM
+ * uses, served from our local mirror at /local-weights/*. This is a true
+ * apples-to-apples: identical bytes on disk, identical prompt, identical
+ * hardware (whatever machine runs the bench — the recorded head-to-head is
+ * on an Apple M2 Max, see BENCH.md). Only the inference engine differs.
+ *
+ * Default is Phi-3-mini (exact original behavior, bare /local-weights/*
+ * mirror route). `?model=qwen3` benches WebLLM's Qwen3-4B-q4f16_1 against
+ * the per-model mirror route /local-weights/<repo>/ instead; `?model=qwen35`
+ * does the same for Qwen3.5-4B-q4f16_1 (hybrid GDN+attention — first shipped
+ * in WebLLM's v0_2_84 prebuilt lib set, hence the dep bump to 0.2.84).
+ *
+ * The WASM `model_lib` (compiled Relax compute graph) still comes from
+ * WebLLM's CDN — architecture-matched, URLs taken from WebLLM's own
+ * prebuiltAppConfig entries.
+ */
+
+import * as webllm from '@mlc-ai/web-llm'
+
+// ?model=qwen3 → WebLLM Qwen3-4B, ?model=qwen35 → WebLLM Qwen3.5-4B, both on
+// the per-model mirror route. Anything else (including no flag) keeps the
+// exact Phi-3 default path.
+const MODEL = new URLSearchParams(location.search).get('model')
+const QWEN = MODEL === 'qwen3'
+const QWEN35 = MODEL === 'qwen35'
+
+const $ = (id: string) => document.getElementById(id)!
+function log(msg: string) {
+  const el = $('log') as HTMLPreElement
+  el.textContent += msg + '\n'
+  el.scrollTop = el.scrollHeight
+  console.log(msg)
+}
+function setBadge(text: string, loading = false) {
+  const b = $('badge')
+  b.textContent = text
+  b.className = loading ? 'badge loading' : 'badge'
+}
+function setStats(text: string) {
+  $('stats').textContent = text
+}
+
+const MODEL_ID = QWEN35
+  ? 'Qwen3.5-4B-q4f16_1-MLC-local'
+  : QWEN
+    ? 'Qwen3-4B-q4f16_1-MLC-local'
+    : 'Phi-3-mini-4k-instruct-q4f16_1-MLC-local'
+
+const BENCH_PROMPT = 'Write a four-sentence explanation of how photosynthesis works.'
+const TARGET_TOKENS = 120
+const NUM_RUNS = 3
+
+// Point WebLLM at our already-on-disk q4f16_1 mirror. The `resolve/main/`
+// suffix matches HF-hub shape so WebLLM's cleanModelUrl() leaves it alone;
+// the vite middleware strips it server-side (on the bare Phi-3 route AND
+// after the /<repo>/ segment on per-model routes). WASM model_lib names are
+// copied from WebLLM's own prebuiltAppConfig entries for these model_ids
+// (v0_2_84 lib set — the `ctx4k_` name segment was dropped upstream).
+const LOCAL_MODEL_URL = QWEN35
+  ? `${location.origin}/local-weights/Qwen3.5-4B-q4f16_1-MLC/resolve/main/`
+  : QWEN
+    ? `${location.origin}/local-weights/Qwen3-4B-q4f16_1-MLC/resolve/main/`
+    : `${location.origin}/local-weights/resolve/main/`
+const WASM_URL =
+  webllm.modelLibURLPrefix +
+  webllm.modelVersion +
+  (QWEN35
+    ? '/Qwen3.5-4B-q4f16_1_cs1k-webgpu.wasm'
+    : QWEN
+      ? '/Qwen3-4B-q4f16_1_cs1k-webgpu.wasm'
+      : '/Phi-3-mini-4k-instruct-q4f16_1_cs1k-webgpu.wasm')
+
+const appConfig: webllm.AppConfig = {
+  // 0.2.84 renamed useIndexedDBCache → cacheBackend (same IndexedDB backend).
+  cacheBackend: 'indexeddb',
+  model_list: [
+    {
+      model: LOCAL_MODEL_URL,
+      model_id: MODEL_ID,
+      model_lib: WASM_URL,
+      vram_required_MB: QWEN35 ? 3867.82 : QWEN ? 3431.59 : 3672.07,
+      low_resource_required: false,
+      overrides: QWEN35
+        ? { context_window_size: 4096, max_history_size: 1 }
+        : { context_window_size: 4096 },
+    },
+  ],
+}
+
+async function main() {
+  setBadge('Initializing WebLLM...', true)
+  log(`[webllm-bench] model: ${MODEL_ID}`)
+  log(`[webllm-bench] weights: ${LOCAL_MODEL_URL}`)
+  log(`[webllm-bench] wasm:    ${WASM_URL}`)
+  log(`[webllm-bench] prompt:  ${BENCH_PROMPT}`)
+  log(`[webllm-bench] target tokens: ${TARGET_TOKENS}`)
+  log(`[webllm-bench] runs: ${NUM_RUNS} (first is warmup)`)
+  log('')
+
+  const engine = await webllm.CreateMLCEngine(MODEL_ID, {
+    appConfig,
+    initProgressCallback: (p) => {
+      setBadge(`Loading ${Math.floor(p.progress * 100)}%...`, true)
+      const txt = p.text.replace(/\s+/g, ' ').trim()
+      if (txt) log(`[progress] ${txt}`)
+    },
+  })
+
+  setBadge('Ready', false)
+  log('[webllm-bench] engine ready, running benches')
+  log('')
+
+  const runs: { tokens: number; seconds: number; tokPerS: number; selfDecode: number }[] = []
+  for (let r = 0; r <= NUM_RUNS; r++) {
+    const label = r === 0 ? 'warmup' : `run${r}/${NUM_RUNS}`
+    const t0 = performance.now()
+    const reply = await engine.chat.completions.create({
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: BENCH_PROMPT },
+      ],
+      max_tokens: TARGET_TOKENS,
+      temperature: 0,
+    })
+    const seconds = (performance.now() - t0) / 1000
+    const usage = reply.usage
+    // WebLLM reports completion_tokens; use its own count for decode rate
+    const completionTokens = usage?.completion_tokens ?? 0
+    const totalTokens = usage?.total_tokens ?? 0
+    const tokPerS = completionTokens / seconds
+    // WebLLM reports its own prefill/decode split; capture it EVERY run so the
+    // comparison against our half (which now also splits TTFT from decode) is
+    // auditable rather than wall-clock-vs-decode apples to oranges.
+    const extra = (usage as unknown as { extra?: Record<string, number> } | undefined)?.extra
+    const selfDecode = extra?.decode_tokens_per_s ?? 0
+    const selfPrefill = extra?.prefill_tokens_per_s ?? 0
+    log(
+      `[bench] ${label}: ${completionTokens} gen tok / ${seconds.toFixed(2)}s = ${tokPerS.toFixed(2)} tok/s total` +
+      (selfDecode ? ` · webllm self-reported decode ${selfDecode.toFixed(2)} tok/s · prefill ${selfPrefill.toFixed(2)} tok/s` : '') +
+      ` (total ${totalTokens})`
+    )
+    if (r > 0) runs.push({ tokens: completionTokens, seconds, tokPerS, selfDecode })
+  }
+
+  const sorted = runs.map(r => r.tokPerS).sort((a, b) => a - b)
+  const median = sorted[Math.floor(sorted.length / 2)]
+  const mean = sorted.reduce((a, b) => a + b, 0) / sorted.length
+  const min = sorted[0]
+  const max = sorted[sorted.length - 1]
+  log('')
+  log(`[summary] WebLLM on ${MODEL_ID}`)
+  const selfDecodes = runs.map(r => r.selfDecode).filter(x => x > 0).sort((a, b) => a - b)
+  const medianSelfDecode = selfDecodes.length ? selfDecodes[Math.floor(selfDecodes.length / 2)] : 0
+  log(`  median=${median.toFixed(2)} mean=${mean.toFixed(2)} min=${min.toFixed(2)} max=${max.toFixed(2)} tok/s (wall-clock incl. prefill)`)
+  if (medianSelfDecode) log(`  webllm self-reported decode median=${medianSelfDecode.toFixed(2)} tok/s`)
+  log('')
+  if (QWEN || QWEN35) {
+    // No stored comparison constant for the Qwen models — run the Zero-TVM
+    // half in the same session (bench/run.mjs BENCH_QUERY="?model=qwen3" or
+    // "?model=qwen35") and compare there; cross-session absolute numbers
+    // aren't comparable.
+    setStats(`WebLLM ${median.toFixed(1)} tok/s (${QWEN35 ? 'Qwen3.5-4B' : 'Qwen3-4B'})`)
+  } else {
+    const ztvm = 69.55 // bench:zt — Zero-TVM TOTAL wall-clock median (tok/s), updated by `npm run bench`
+    log(`[comparison] Zero-TVM (this repo) total median: ${ztvm} tok/s on Phi-3-mini q4f16_1 (Apple M2 Max, 2026-07-30 — see bench/results.json)`)
+    const delta = ((median - ztvm) / ztvm) * 100
+    log(`  → Zero-TVM is ${delta < 0 ? '+' : '-'}${Math.abs(delta).toFixed(1)}% ${delta < 0 ? 'faster' : 'slower'} than WebLLM on this machine`)
+    setStats(`WebLLM ${median.toFixed(1)} tok/s · Zero-TVM ${ztvm} tok/s`)
+  }
+
+  ;(window as Window & typeof globalThis & { webllmResult?: unknown }).webllmResult = {
+    model: MODEL_ID,
+    runs, median, mean, min, max, medianSelfDecode,
+  }
+}
+
+main().catch(e => {
+  log(`[error] ${e?.message || e}`)
+  console.error(e)
+  setBadge('Error', false)
+})

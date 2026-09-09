@@ -1,0 +1,15 @@
+{
+  "ztDecode": 69.55,
+  "ztRuns": [
+    69.55,
+    69.67,
+    69.44,
+    69.29,
+    69.71
+  ],
+  "webllmDecode": 59.95,
+  "hardware": "Apple M2 Max",
+  "date": "2026-07-30",
+  "nTokens": 128,
+  "nRuns": 5
+}

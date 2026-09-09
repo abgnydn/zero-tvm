@@ -1,0 +1,32 @@
+<!doctype html><meta charset="utf-8"><title>real Scan on WebGPU</title>
+<body><pre id="log">…</pre>
+<script type="module">
+import * as ort from '/ort-dist/ort.webgpu.bundle.min.mjs';
+const L=[]; const say=(...a)=>{L.push(a.join(' '));document.getElementById('log').textContent=L.join('\n');console.log('[T]',a.join(' '))};
+window.__done=false;
+ort.env.wasm.wasmPaths='/ort-dist/'; ort.env.wasm.numThreads=1; ort.env.logLevel='error';
+const H=32,DK=128,DV=128;
+const rnd=(n,s=0.05)=>{const a=new Float32Array(n);for(let i=0;i<n;i++)a[i]=(Math.sin(i*12.9898)*43758.5453%1)*s;return a};
+try{
+  const sess=await ort.InferenceSession.create('/real_scan.onnx',{executionProviders:['webgpu'],graphOptimizationLevel:'all'});
+  say('session ok. inputs:',sess.inputNames.join(','));
+  const T=(d)=>new ort.Tensor('float32',rnd(d.reduce((a,b)=>a*b,1)),d);
+  const results=[];
+  for(const S of [1,8,16,32,64,128,252]){
+    const feeds={state0:T([1,H,DK,DV]),q:T([1,H,S,DK]),k:T([1,H,S,DK]),
+                 v:T([1,H,S,DV]),beta:T([1,H,S]),g:T([1,H,S])};
+    await sess.run(feeds);                                  // warm-up (compile/upload)
+    const reps=S<=32?5:3, ts=[];
+    for(let r=0;r<reps;r++){const t0=performance.now();await sess.run(feeds);ts.push(performance.now()-t0)}
+    ts.sort((a,b)=>a-b); const med=ts[Math.floor(ts.length/2)];
+    results.push([S,med]);
+    say(`S=${String(S).padStart(4)}  median ${med.toFixed(1)} ms   (${(med/S).toFixed(2)} ms/position)`);
+  }
+  window.__results=results;
+  const last=results[results.length-1];
+  say('');
+  say(`ONE layer, ${last[0]} positions: ${last[1].toFixed(0)} ms`);
+  say(`x24 GDN layers            : ${(last[1]*24/1000).toFixed(2)} s   <- predicted GDN prefill`);
+}catch(e){say('ERROR:',e&&e.message?e.message:String(e))}
+window.__done=true;
+</script>

@@ -1,0 +1,162 @@
+{
+ "model": "Qwen3.5-4B",
+ "engine": "transformers.js",
+ "date": "2026-07-31",
+ "hardware": "Apple M2 Max",
+ "points": [
+  {
+   "targetTokens": 64,
+   "promptTokens": 60,
+   "ttftMsRuns": [
+    4312.5999999940395,
+    4270.0999999940395,
+    4496.5999999940395
+   ],
+   "ttftMs": 4312.5999999940395,
+   "decodeTokPerS": 25.716385012147548
+  },
+  {
+   "targetTokens": 256,
+   "promptTokens": 252,
+   "ttftMsRuns": [
+    18220.90000000596,
+    18641.5,
+    18763.09999999404
+   ],
+   "ttftMs": 18641.5,
+   "decodeTokPerS": 24.875621890020366
+  },
+  {
+   "targetTokens": 1024,
+   "promptTokens": 1024,
+   "ttftMsRuns": [
+    85097.90000000596,
+    122321.69999998808,
+    109622.5
+   ],
+   "ttftMs": 109622.5,
+   "decodeTokPerS": 19.920318724761714
+  },
+  {
+   "targetTokens": 2048,
+   "promptTokens": 2044,
+   "ttftMsRuns": [
+    167892.40000000596,
+    170522.59999999404,
+    169286.09999999404
+   ],
+   "ttftMs": 169286.09999999404,
+   "decodeTokPerS": 7.872244714455515
+  },
+  {
+   "targetTokens": 64,
+   "promptTokens": 60,
+   "ttftMsRuns": [
+    4532.5,
+    4970.899999976158,
+    4590.199999988079
+   ],
+   "ttftMs": 4590.199999988079,
+   "decodeTokPerS": 21.62496138280295
+  },
+  {
+   "targetTokens": 256,
+   "promptTokens": 252,
+   "ttftMsRuns": [
+    19448.70000001788,
+    19093.40000000596,
+    19216.69999998808
+   ],
+   "ttftMs": 19216.69999998808,
+   "decodeTokPerS": 17.957927141574974
+  },
+  {
+   "targetTokens": 1024,
+   "promptTokens": 1024,
+   "ttftMsRuns": [
+    89298.5,
+    81380,
+    79358.09999999404
+   ],
+   "ttftMs": 81380,
+   "decodeTokPerS": 12.974976830398518
+  },
+  {
+   "targetTokens": 2048,
+   "promptTokens": 2044,
+   "ttftMsRuns": [
+    162050.30000001192,
+    164108,
+    166722.09999999404
+   ],
+   "ttftMs": 164108,
+   "decodeTokPerS": 9.97435166697221
+  },
+  {
+   "targetTokens": 64,
+   "promptTokens": 60,
+   "ttftMsRuns": [
+    4585.700000017881,
+    4562.300000011921,
+    4499.700000017881
+   ],
+   "ttftMs": 4562.300000011921,
+   "decodeTokPerS": 22.853411689221844
+  },
+  {
+   "targetTokens": 256,
+   "promptTokens": 252,
+   "ttftMsRuns": [
+    19218.19999998808,
+    22930.90000000596,
+    22925.70000001788
+   ],
+   "ttftMs": 22925.70000001788,
+   "decodeTokPerS": 21.354484440956174
+  },
+  {
+   "targetTokens": 1024,
+   "promptTokens": 1024,
+   "ttftMsRuns": [
+    79429.19999998808,
+    78783,
+    83844
+   ],
+   "ttftMs": 79429.19999998808,
+   "decodeTokPerS": 22.349936141763575
+  },
+  {
+   "targetTokens": 2048,
+   "promptTokens": 2044,
+   "ttftMsRuns": [
+    183168.70000001788,
+    163717.60000002384,
+    160153.59999999404
+   ],
+   "ttftMs": 163717.60000002384,
+   "decodeTokPerS": 9.66316951992047
+  }
+ ],
+ "crashes": [
+  {
+   "targetTokens": 2048,
+   "error": "Waiting failed: 1500000ms exceeded",
+   "log": [
+    "  ⇒ ACTIVE BACKEND: WEBGPU",
+    "[ttft] prompt=60 tok (target 64) run1: ttft 4803ms · 8 gen tok · decode 23.72 tok/s",
+    "[ttft] prompt=60 tok (target 64) run2: ttft 4642ms · 8 gen tok · decode 24.20 tok/s",
+    "[ttft] prompt=60 tok (target 64) run3: ttft 4805ms · 8 gen tok · decode 22.10 tok/s",
+    "[ttft] prompt=252 tok (target 256) run1: ttft 21574ms · 8 gen tok · decode 23.54 tok/s",
+    "[ttft] prompt=252 tok (target 256) run2: ttft 19702ms · 8 gen tok · decode 24.48 tok/s",
+    "[ttft] prompt=252 tok (target 256) run3: ttft 19655ms · 8 gen tok · decode 22.49 tok/s",
+    "[ttft] prompt=1024 tok (target 1024) run1: ttft 86393ms · 8 gen tok · decode 22.86 tok/s",
+    "[ttft] prompt=1024 tok (target 1024) run2: ttft 87663ms · 8 gen tok · decode 7.20 tok/s",
+    "[ttft] prompt=1024 tok (target 1024) run3: ttft 87615ms · 8 gen tok · decode 6.45 tok/s",
+    "[ttft] prompt=2044 tok (target 2048) run1: ttft 206578ms · 8 gen tok · decode 7.26 tok/s",
+    "[ttft] prompt=2044 tok (target 2048) run2: ttft 172198ms · 8 gen tok · decode 6.06 tok/s"
+   ]
+  }
+ ],
+ "webgpu": true,
+ "quant": "ONNX q4f16 · onnx-community/Qwen3.5-4B-ONNX"
+}

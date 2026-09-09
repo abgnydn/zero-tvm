@@ -1,0 +1,157 @@
+#!/usr/bin/env node
+/**
+ * Download MLC q4f16_1 weights from HuggingFace to .weights-local/ so Vite
+ * serves them locally. Run once, never re-download.
+ *
+ * Usage:
+ *   node scripts/download-weights.mjs                 # Phi-3-mini (default)
+ *   node scripts/download-weights.mjs --model qwen3   # Qwen3-4B
+ *   node scripts/download-weights.mjs --model qwen35  # Qwen3.5-4B
+ *
+ * Downloads to: .weights-local/<repo-name>/
+ * Served at:    http://localhost:5173/local-weights/<repo-name>/
+ */
+
+import fs from 'fs'
+import path from 'path'
+import { pipeline } from 'stream/promises'
+
+const MODELS = {
+  phi3:  'mlc-ai/Phi-3-mini-4k-instruct-q4f16_1-MLC',
+  qwen3: 'mlc-ai/Qwen3-4B-q4f16_1-MLC',
+  qwen35: 'mlc-ai/Qwen3.5-4B-q4f16_1-MLC',
+}
+
+// Weight-manifest filename: newer MLC repos (Qwen3.5) renamed
+// ndarray-cache.json → tensor-cache.json.
+const MANIFEST_NAMES = {
+  phi3:  'ndarray-cache.json',
+  qwen3: 'ndarray-cache.json',
+  qwen35: 'tensor-cache.json',
+}
+
+function parseModelArg(argv) {
+  const args = argv.slice(2)
+  let key = 'phi3'
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--model') key = args[i + 1]
+    else if (args[i].startsWith('--model=')) key = args[i].slice('--model='.length)
+  }
+  if (!MODELS[key]) {
+    console.error(`Unknown --model "${key}". Valid: ${Object.keys(MODELS).join(', ')}`)
+    process.exit(1)
+  }
+  return key
+}
+
+const MODEL_KEY  = parseModelArg(process.argv)
+const MODEL_ID   = MODELS[MODEL_KEY]
+const REPO_NAME  = MODEL_ID.split('/')[1]
+const BASE_URL   = `https://huggingface.co/${MODEL_ID}/resolve/main`
+const OUT_DIR    = `.weights-local/${REPO_NAME}`
+const MANIFEST   = MANIFEST_NAMES[MODEL_KEY]
+
+// Extra files needed besides the shards
+const EXTRA_FILES = [
+  MANIFEST,
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'mlc-chat-config.json',
+]
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function fmtMB(bytes) { return (bytes / 1024 / 1024).toFixed(1) + ' MB' }
+
+async function downloadFile(url, destPath) {
+  if (fs.existsSync(destPath)) {
+    const size = fs.statSync(destPath).size
+    if (size > 0) {
+      console.log(`  [skip]  ${path.basename(destPath)} (${fmtMB(size)})`)
+      return false
+    }
+    fs.unlinkSync(destPath) // zero-byte file — redownload
+  }
+
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`)
+
+  const total   = Number(res.headers.get('content-length') || 0)
+  const tmpPath = destPath + '.tmp'
+  const out     = fs.createWriteStream(tmpPath)
+
+  let downloaded = 0
+  const reader   = res.body.getReader()
+
+  process.stdout.write(`  [fetch] ${path.basename(destPath)} `)
+
+  // Stream with progress dots
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    out.write(Buffer.from(value))
+    downloaded += value.length
+    if (total > 0) {
+      const pct = Math.floor((downloaded / total) * 20)
+      process.stdout.write(`\r  [fetch] ${path.basename(destPath)} ${fmtMB(downloaded)}/${fmtMB(total)} [${'='.repeat(pct)}${' '.repeat(20 - pct)}]`)
+    }
+  }
+
+  await new Promise((res, rej) => out.end(err => err ? rej(err) : res()))
+  fs.renameSync(tmpPath, destPath)
+  console.log(`\r  [done]  ${path.basename(destPath)} (${fmtMB(downloaded)})                          `)
+  return true
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log(`\nDownloading ${MODEL_ID}`)
+  console.log(`→ ${OUT_DIR}\n`)
+
+  fs.mkdirSync(OUT_DIR, { recursive: true })
+
+  // 1) Fetch the weight manifest first (needed to know shard list)
+  const cacheJsonPath = path.join(OUT_DIR, MANIFEST)
+  await downloadFile(`${BASE_URL}/${MANIFEST}`, cacheJsonPath)
+  const ndarray = JSON.parse(fs.readFileSync(cacheJsonPath, 'utf8'))
+
+  // 2) Collect unique shard filenames
+  const shards = new Set()
+  for (const entry of ndarray.records) {
+    if (entry.dataPath) shards.add(entry.dataPath)
+  }
+  const shardList = [...shards].sort()
+  console.log(`Found ${shardList.length} unique shards\n`)
+
+  // 3) Download shards
+  let fetched = 0
+  let skipped = 0
+  for (let i = 0; i < shardList.length; i++) {
+    const shard = shardList[i]
+    console.log(`[${i + 1}/${shardList.length}] ${shard}`)
+    const dest = path.join(OUT_DIR, shard)
+    const downloaded = await downloadFile(`${BASE_URL}/${shard}`, dest)
+    downloaded ? fetched++ : skipped++
+  }
+
+  // 4) Download extra files
+  console.log('\nExtra files:')
+  for (const f of EXTRA_FILES) {
+    if (f === MANIFEST) continue // already done
+    const dest = path.join(OUT_DIR, f)
+    await downloadFile(`${BASE_URL}/${f}`, dest)
+  }
+
+  // 5) Summary
+  const totalBytes = [...shardList, ...EXTRA_FILES]
+    .map(f => path.join(OUT_DIR, f))
+    .filter(p => fs.existsSync(p))
+    .reduce((s, p) => s + fs.statSync(p).size, 0)
+
+  console.log(`\n✓ Done — ${fetched} fetched, ${skipped} skipped`)
+  console.log(`  Total on disk: ${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB`)
+  console.log(`  Served at:     /local-weights/${REPO_NAME}/\n`)
+}
+
+main().catch(e => { console.error('\nFATAL:', e.message); process.exit(1) })

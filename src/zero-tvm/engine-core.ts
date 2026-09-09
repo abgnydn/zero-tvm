@@ -1,0 +1,4878 @@
+/**
+ * ZERO-TVM ENGINE CORE
+ *
+ * Pure GPU pipeline: takes a loaded device + weights + KV cache, returns THE
+ * DecodeEngine. No DOM, no UI. Both shipped pages drive this one engine:
+ *
+ *   - validate.ts (via loading-ui.ts's bootEngine) runs the default
+ *     configuration — unfused reference path (9 dispatches/layer; 10 for
+ *     qkNorm specs like Qwen3, which insert a per-head Q/K RMSNorm between
+ *     the QKV matmul and RoPE), scalar shaders, blocking
+ *     generate()/forwardLogits() with deterministic per-token positions and
+ *     logits access.
+ *   - chat.ts runs the throughput configuration — fused QKV+RoPE+KV-append
+ *     (7 dispatches/layer, 8 with int8 KV), URL-flag shader variants
+ *     (src/zero-tvm/variants.ts), and generatePipelined()'s readback ring
+ *     with on-GPU argmax→inputIds chaining.
+ *
+ * Both paths share the same buffers, uniforms, bind-group construction and
+ * recordForward() dispatch recorder; they differ only in the per-layer QKV
+ * stage (mode flags) and in how tokens are read back.
+ */
+
+import { LoadedWeights } from './weight-loader.js'
+import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
+import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
+import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
+import { reuseStart, rewindSlot, dropSnapshotsAbove, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
+import { ExpertPool } from './expert-pool.js'
+import type { SlabKind, SlabProj } from './slab-source.js'
+
+// ============================================================
+// GPU helpers
+// ============================================================
+
+function createBuf(device: GPUDevice, size: number, usage: number, label?: string): GPUBuffer {
+  return device.createBuffer({ size: Math.max(size, 4), usage, label })
+}
+
+// Lazy: GPUBufferUsage is a WebGPU IDL global and does not exist on a browser
+// without WebGPU. Reading it at module scope threw during evaluation and took
+// down every static importer before their own code ran — see weight-loader.ts.
+const storage = (): number =>
+  GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+
+function makeBuf(device: GPUDevice, size: number, label: string): GPUBuffer {
+  return createBuf(device, size, storage(), label)
+}
+
+function uniformBuf(device: GPUDevice, data: (number | ArrayBuffer)[]): GPUBuffer {
+  const parts: ArrayBuffer[] = data.map(d =>
+    d instanceof ArrayBuffer ? d : (() => { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, d, true); return a })()
+  )
+  const size = parts.reduce((s, p) => s + p.byteLength, 0)
+  const padded = Math.ceil(size / 16) * 16
+  const buf = device.createBuffer({ size: Math.max(padded, 16), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+  const arr = new Uint8Array(padded)
+  let off = 0
+  for (const p of parts) { arr.set(new Uint8Array(p), off); off += p.byteLength }
+  device.queue.writeBuffer(buf, 0, arr)
+  return buf
+}
+
+function u32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setUint32(0, v, true); return a }
+function i32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setInt32(0, v, true); return a }
+function f32(v: number): ArrayBuffer { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, v, true); return a }
+
+// Each entry is a whole buffer or a { buffer, offset, size } region view
+// (offset must respect minStorageBufferOffsetAlignment — the GDN packed-
+// projection regions the engine binds are all 256-aligned by construction).
+type BindEntry = GPUBuffer | { buffer: GPUBuffer; offset: number; size: number }
+
+function bg(device: GPUDevice, pipeline: GPUComputePipeline, bufs: BindEntry[]): GPUBindGroup {
+  return device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: bufs.map((b, i) => {
+      if (!b) {
+        // A null here is ALWAYS a wiring bug (an optional buffer bound on a
+        // path that never allocates it) — name the slot instead of letting
+        // `'buffer' in null` throw a TypeError that points at nothing.
+        throw new Error(`bg: null buffer at binding ${i} of pipeline '${pipeline.label || '?'}'`)
+      }
+      return {
+        binding: i,
+        resource: 'buffer' in b ? (b as GPUBufferBinding) : { buffer: b as GPUBuffer },
+      }
+    }),
+  })
+}
+
+// Profile state is closed over by buildDecodeEngine's `dispatch` helper.
+// When active, every compute pass gets begin/end timestamp writes into a
+// shared GPUQuerySet and the label is recorded alongside the slot pair.
+interface ProfileState {
+  querySet: GPUQuerySet
+  capacity: number
+  labels: string[]       // parallel to slot index; length === labels.length
+  nextSlot: number       // next available slot (each pass consumes 2)
+}
+
+// ============================================================
+// KV cache allocation (one pages buffer per layer)
+// ============================================================
+
+export function allocKVPages(device: GPUDevice, spec: ModelSpec = PHI3): GPUBuffer[] {
+  const attnLayerCount = spec.layerKinds.filter((k) => k === 'attn').length
+  // MLA caches ONE latent plus ONE shared RoPE key per token — no head axis, no
+  // separate V — so it needs a differently shaped buffer, not a differently
+  // sized one. The branch lives HERE rather than at the call sites (chat.ts,
+  // loading-ui.ts, share.ts x2, lib/index.ts) so all five are right by
+  // construction; a forgotten one allocates 7x the memory and still produces
+  // correct tokens, which is the kind of wrong nobody notices.
+  if (spec.mla) {
+    return Array.from({ length: attnLayerCount }, (_, i) =>
+      makeBuf(device, spec.mlaCacheBytes, `mlaKV_${i}`))
+  }
+  const bytesPerPage = spec.kvPageStride * 2  // kvHeads * pageSize slots * headDim * 2 (K+V) * 2 bytes
+  const pages = spec.maxPages * bytesPerPage  // Phi-3: 257 * 196608 ≈ 50MB
+  // One pages buffer per ATTENTION layer: hybrid specs (Qwen3.5) have KV only
+  // on their 'attn' layers and the engine indexes by attention-layer ordinal.
+  // Pure-attention specs have layerKinds all 'attn' → one per layer, as before.
+  return Array.from({ length: attnLayerCount }, (_, i) =>
+    makeBuf(device, pages, `kvPages_${i}`)
+  )
+}
+
+// int8 layout: kvHeads × pageSize slots × 2 sides × headDim/4 u32-words per page
+// (Phi-3: 24576 u32). Halves KV memory from ~1.6GB to ~800MB for 4K context, at
+// the cost of one extra dispatch per layer (quantize). Opt-in (?kv8=1 on the
+// chat page) — validate output parity against the f16 baseline on your target
+// hardware.
+/**
+ * The KV cache the FLAGS ask for. Use this instead of picking an allocator by
+ * hand.
+ *
+ * int8KV was expressed twice — once as VariantFlags.int8KV (parsed from ?kv8,
+ * DEFAULT ON) and once as DecodeEngineOptions.int8KV — and the engine read only
+ * the option. Threading the two together was a hand-written step at every
+ * construction site, and four of the five got it wrong: the agent host, both
+ * room paths and the validate boot allocated an f16 cache while their own flags
+ * reported int8.
+ *
+ * That was silent and it mattered three ways. `?kv8=0` was a NO-OP on those
+ * surfaces, so a bisection could "clear" int8 KV as a cause on a surface that
+ * never ran it. They ran different attention kernels from the chat page for the
+ * same model (`splitK = int8Mode ? 0 : R.splitK`), so a number measured on one
+ * describes kernels the other does not execute. And they allocated twice the KV
+ * the entrance publishes.
+ */
+/**
+ * Does this engine run an int8 KV cache? The ONE place that decides.
+ *
+ * Extracted because a test that re-implements this decision cannot see it
+ * change — which happened: the first test for this pairing asserted a local
+ * copy of the branch, and the mutation gate showed it stayed green when the
+ * engine was reverted to the buggy version.
+ *
+ * The explicit option wins when given; otherwise the VARIANT flag decides,
+ * which is the fix for four surfaces that parsed ?kv8 and then never threaded
+ * it, silently running f16 while reporting int8. MLA is excluded either way —
+ * it caches a latent rather than per-head K/V and has no int8 path.
+ */
+export function resolveInt8Mode(
+  opts: { int8KV?: boolean },
+  variants: { int8KV?: boolean },
+  spec: { mla?: unknown },
+): boolean {
+  if (spec.mla) return false
+  return opts.int8KV ?? variants.int8KV ?? false
+}
+
+/**
+ * How many prompt tokens go in one prefill chunk. The one place a DEFAULT cap
+ * is derived — but not the last word on the shipped one: a pooled MoE build is
+ * clamped again to 16 downstream (`const C = pooling ? ...`), and the chunk loop
+ * slices by THAT. Downstream only ever lowers the cap.
+ *
+ * Extracted for the same reason resolveInt8Mode was the day before: a test that
+ * restates a branch cannot see the branch change. That happened twice in one
+ * day on two different functions — resolveInt8Mode here, and the KV figure in
+ * landing.ts, whose first test copied the formula out of it. This extraction is
+ * preventive rather than a third incident. The mutation gate reinstates the
+ * pre-quarantine version of this function and the unit test must go red.
+ *
+ * `maxChunkCap` is a per-spec QUARANTINE, not tuning. Chunked prefill has never
+ * been bit-equal to per-token; what it is held to is empirical TOKEN IDENTITY,
+ * and on qwen38 that fails at ~16k (correct per-token and at 256, invents tool
+ * names at 1024, loses the task at 4096). It clamps the DEFAULT only — an
+ * explicit cap is honoured as asked, because the sweep that located the
+ * threshold has to be able to cross it, and silently clamping a diagnostic is
+ * how an A/B ends up measuring the same code twice.
+ *
+ * It is not free. The cap sweep CLOSEST to this configuration (BENCH.md,
+ * llama32, 4,096-token prompt, medians of 3 — there are two earlier ones at 800
+ * tokens) reads 844.7 tok/s at 256 against 972.1 at 1024, so the clamp costs
+ * about 13% of prefill on THAT spec at THAT length; qwen38's own cost is
+ * unmeasured. It also cuts the GDN rewind ring's lookback, 4 x CHUNK_CAP, from
+ * ~4k tokens to ~1k. What that ring buys was measured on a different spec — a
+ * qwen36q3 agent session, 392.50s cold to 12.76s (CHANGELOG) and 26.30s on the
+ * turns after (BENCH.md) —
+ * and qwen36q3 is not quarantined, so its lookback is untouched. qwen38's reuse
+ * cost under the clamp is unmeasured too.
+ */
+export function resolveChunkCap(
+  opts: { chunkCap?: number },
+  spec: { maxChunkCap?: number },
+  sgmatAvail: boolean,
+): number {
+  if (opts.chunkCap != null) return opts.chunkCap
+  return Math.min(sgmatAvail ? 1024 : 64, spec.maxChunkCap ?? Infinity)
+}
+
+export type ChunkGemmName = 'e5' | 'sgmat' | 'tiled' | 'matvec'
+
+/**
+ * Chunk-prefill GEMM selection as a pure function, so the ordering is
+ * unit-testable without a GPU: E5 (matrix unit, 64-row tile) > sgmat >
+ * tiled (explicit `chunkGemm:'tiled'` or `chunkTiled` only) > matvec.
+ *
+ * An EXPLICIT `want` that cannot run is a rejection (`rejected` carries the
+ * throw text), never a silent substitution — silently substituting is how a
+ * kernel A/B measures the same code twice. The ladder still applies when
+ * nothing was asked for (`want` undefined).
+ *
+ * `capTiles64`: E5's A stage reads a full 64 rows whatever M is, so the
+ * activation buffers — which are exactly CHUNK_CAP rows — must tile by 64,
+ * not 32.
+ */
+export function pickChunkGemm(caps: {
+  want?: ChunkGemmName
+  chunkTiled: boolean
+  dimsOK: boolean
+  capTiles64: boolean
+  e5Ready: boolean
+  sgmatReady: boolean
+  cap: number
+}): { used: ChunkGemmName; rejected: string | null } {
+  const want = caps.want ?? (caps.e5Ready ? 'e5' : caps.sgmatReady ? 'sgmat' : 'matvec')
+  const ladder: Array<{ name: ChunkGemmName; ok: () => boolean }> = [
+    { name: 'e5', ok: () => want === 'e5' && caps.dimsOK && caps.capTiles64 && caps.e5Ready },
+    { name: 'sgmat', ok: () => (want === 'sgmat' || want === 'e5') && caps.dimsOK && caps.sgmatReady },
+    { name: 'tiled', ok: () => (want === 'tiled' || caps.chunkTiled) && caps.dimsOK },
+    { name: 'matvec', ok: () => true },
+  ]
+  const used = ladder.find((e) => e.ok())!.name
+  if (caps.want && used !== caps.want) {
+    const why = !caps.dimsOK ? `dims do not tile (cap ${caps.cap}, d/qDim/ffn must be %64 and cap %32)`
+      : caps.want === 'e5' && !caps.capTiles64 ? `E5 stages a 64-row tile, so cap must be %64 (got ${caps.cap})`
+      : caps.want === 'e5' || caps.want === 'sgmat' ? 'its pipeline was not built — usually a device without chromium-experimental-subgroup-matrix'
+      : 'that pipeline was not built'
+    return { used, rejected: `chunkGemm: asked for '${caps.want}', can only run '${used}' — ${why}` }
+  }
+  return { used, rejected: null }
+}
+
+export function allocKVFor(
+  device: GPUDevice,
+  spec: ModelSpec,
+  flags: { int8KV?: boolean },
+): GPUBuffer[] | { pages: GPUBuffer[]; scales: GPUBuffer[] } {
+  // MLA caches a latent rather than per-head K/V and has no int8 path;
+  // buildDecodeEngine throws for it, so it must keep the f16 allocator.
+  return resolveInt8Mode({}, flags, spec) ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
+}
+
+export function allocKVPagesInt8(device: GPUDevice, spec: ModelSpec = PHI3): { pages: GPUBuffer[]; scales: GPUBuffer[] } {
+  const bytesPerPage = spec.kvI8PageWords * 4       // Phi-3: 96 KB
+  const scalesPerPage = spec.kvScalesPerPage        // Phi-3: 1024 f16 per page
+  const pagesBytes = spec.maxPages * bytesPerPage
+  const scalesBytes = spec.maxPages * scalesPerPage * 2
+  // One pair per ATTENTION layer, matching allocKVPages and the engine's
+  // attention-ordinal indexing. This counted spec.layers while int8 was
+  // fused-only, where the two are equal — on a hybrid it would allocate 40
+  // buffers for 10 KV layers and quadruple the memory this exists to halve.
+  const attnLayerCount = spec.layerKinds.filter((k) => k === 'attn').length
+  return {
+    pages: Array.from({ length: attnLayerCount }, (_, i) =>
+      makeBuf(device, pagesBytes, `kvPagesI8_${i}`)
+    ),
+    scales: Array.from({ length: attnLayerCount }, (_, i) =>
+      makeBuf(device, scalesBytes, `kvScales_${i}`)
+    ),
+  }
+}
+
+// ============================================================
+// Decode engine
+// ============================================================
+
+// Quantization layout constants (Q4f16_1):
+//   8 int4 values packed into one u32
+//   group size of 32 weights shares one f16 scale
+const PACK = 8
+const GROUP = 32
+
+// Workgroup width shared by the elementwise shaders — derived from their
+// @workgroup_size: embedding/rms_norm/add_norm/kv_append/rope use 256
+// threads, one wg per 256 hidden units. Matmul shaders get one wg per
+// output element (M), divided by the variant's rows/WG.
+const WG_SIZE_D = 256
+
+export interface KernelProfile {
+  kernels: Array<{ label: string; totalMs: number; calls: number; pctOfTotal: number }>
+  totalMs: number
+}
+
+export interface BatchedBenchResult {
+  msBatched: number
+  msTiledTotal: number
+  msPerMBatched: number
+  msPerMTiled: number
+  speedup: number
+  /** Weight bytes ONE dispatch of this matmul must read. Decode is
+   *  memory-bound, so this over the measured time is the number that says
+   *  whether a kernel has headroom left. */
+  weightBytes: number
+  /** Achieved bandwidth for the M=1 tiled kernel — the one decode dispatches. */
+  gbPerSecTiled: number
+  /** Same for the M=4 batched kernel, which reads the same weights for 4x the
+   *  work; above the tiled figure means the amortization is real. */
+  gbPerSecBatched: number
+}
+
+export interface DecodeEngine {
+  /**
+   * Change sampling without rebuilding the engine. `null` (or temperature <= 0)
+   * returns to greedy — which is argmax.wgsl again, not a degenerate sampler,
+   * because every reference comparison in this repo pins greedy to that kernel.
+   * Takes effect on the next token. Without this, a settings control would have
+   * to reload the page and re-download the weights to move a slider.
+   */
+  setSampling(next: DecodeEngineOptions['sampling'] | null): void
+  /**
+   * TEST SEAM — overwrite the KV page table with a permutation.
+   * The table is the identity everywhere in the shipping engine; this exists so
+   * scripts/paging-test.mjs can prove the readers honour it and the writers
+   * currently do not (docs/PAGING_PLAN.md §0.4). Do not call from app code.
+   */
+  setPageTable(pageVals: Int32Array<ArrayBuffer>): void
+  /** Paging Phase 1 — read the absorbed prefix's KV (+ GDN state) out as
+   *  bytes, or null when this engine's state is not poolable (MLA, int8,
+   *  pipeline stage, invalid record, mid-chunk hybrid state). */
+  exportKV(): Promise<{ tokens: number; ids: number[]; layers: ArrayBuffer[]; scales: ArrayBuffer[]; gdn: ArrayBuffer[] } | null>
+  /** Write a saved prefix back and claim it in the absorbed record. The
+   *  CALLER guarantees fingerprint equality (kv-pool.ts); these bytes carry
+   *  no self-identification. */
+  importKV(snap: { tokens: number; ids: number[]; layers: ArrayBuffer[]; scales?: ArrayBuffer[]; gdn: ArrayBuffer[] }): boolean
+  /**
+   * Per-token NLL over a sequence — the perplexity primitive. `nll[p]` is
+   * `-log P(ids[p+1] | ids[0..p])`, so the result has `ids.length - 1` entries.
+   * This is the only measurement here that can detect a model quantized into
+   * uselessness; every other gate compares against the same quantized
+   * checkpoint and would stay green. See scripts/quality-eval.mjs.
+   */
+  scoreSequence(ids: number[], onProgress?: (done: number, total: number) => void): Promise<Float32Array>
+  /**
+   * Blocking generate: one submit + one readback per token, deterministic
+   * per-token positions, KV reuse via `startPos`. The validation harness path.
+   */
+  generate(
+    promptIds: number[],
+    startPos: number,
+    maxTokens: number,
+    onToken: (id: number) => void
+  ): Promise<number[]>
+  /**
+   * Pipelined generate: readback-free prefill, then PIPELINE_DEPTH tokens of
+   * work kept in flight with argmax→inputIds chained on-GPU. The chat path.
+   * `shouldStop` is polled between pipeline submissions (cooperative stop).
+   */
+  generatePipelined(
+    promptIds: number[],
+    maxTokens: number,
+    onToken: (id: number) => void,
+    shouldStop?: () => boolean,
+    onPrefill?: (done: number, total: number) => void,
+    /** Token index where the trailing generation prompt begins — the point the
+     *  NEXT turn's prompt will diverge from this one. The engine puts a GDN
+     *  rewind snapshot exactly there. Optional and advisory; out-of-range
+     *  values and non-hybrid specs ignore it. */
+    rewindAt?: number,
+  ): Promise<number[]>
+  /** Run a forward pass through prefill of `promptIds` and return f32 logits at the final position. */
+  forwardLogits(promptIds: number[]): Promise<Float32Array>
+  /**
+   * Same prefill as forwardLogits, but returns the L2-normalised f32 HIDDEN
+   * state at the final position instead of logits — a sentence embedding.
+   * Last-token pooling; the caller owns every other pooling convention.
+   */
+  forwardEmbedding(promptIds: number[]): Promise<Float32Array>
+  /**
+   * One token through ONE pipeline stage (see DecodeEngineOptions.layerRange).
+   * First stage: token id in, residual out. Last: residual in, token out.
+   * A whole-model engine accepts a token id and returns the token, which is
+   * decodeToken with an extra copy — the split is what this exists for.
+   */
+  pipelineStep(
+    input: { tokenId: number } | { residual: ArrayBuffer },
+    position: number,
+  ): Promise<{ residual: ArrayBuffer } | { tokenId: number }>
+  /** Reset KV-cache invalidation tracking (call when starting a fresh conversation). */
+  resetKVTracking(): void
+  /**
+   * Debug assertion for cross-turn prefix reuse: compute the reusable prefix
+   * for `promptIds` against the engine's absorbed-token record, run the
+   * REUSED-prefix prefill and read the final-position logits, then run a
+   * FRESH full prefill of the same prompt and diff the two logit vectors.
+   * Both paths are deterministic dispatch-for-dispatch, so the expected diff
+   * is exactly 0. Blocking path; leaves the engine state at end-of-prompt.
+   */
+  debugCompareReuse(promptIds: number[]): Promise<{
+    startPos: number
+    promptLen: number
+    maxAbsDiff: number
+    meanAbsDiff: number
+  }>
+  /** Stats from the most recent generatePipelined prefill (reuse + chunking). */
+  getLastPrefill(): { promptLen: number; reused: number; chunks: number } | null
+  /** What ended the last turn — the id, how many tokens preceded it, and
+   *  whether it was a stop id or an out-of-vocab readback (an engine fault). */
+  getLastStop(): { id: number; generated: number; stop: boolean; inVocab: boolean } | null
+  /** The expert ids the router chose on the LAST forward pass, laid out
+   *  [layer][slot]. Null unless the engine was built with `traceMoe`. */
+  readMoeTrace(): Promise<{ ids: Uint32Array; steps: number; stride: number } | null>
+  /** Expert-slot pool counters summed over every MoE layer (see
+   *  DecodeEngineOptions.expertPool). Null unless the engine is pooling.
+   *  A pinned shared expert is charged as a request and a hit on every token,
+   *  which is what ExpertPool counts — read the rate with that in mind. */
+  getPoolStats(): PoolStats | null
+  /**
+   * Free every GPU buffer this engine ALLOCATED — activations, GDN state,
+   * uniforms, readbacks, chunk-prefill scratch. Deliberately not the two things
+   * that arrived as arguments: `weights` and the KV pages are the CALLER's, and
+   * both are routinely shared between live engines (model-smoke.html builds a
+   * chain of them over one set of weights; a pipeline split runs two stages off
+   * the same one), so this engine cannot know it is the last reader. Free those
+   * yourself once every engine over them is destroyed.
+   *
+   * Every method above throws after this — an engine's buffers being gone is
+   * worth an error at the call, not a validation failure inside Dawn.
+   */
+  destroy(): void
+  /** Hard KV ceiling in tokens: spec.maxPages × spec.pageSize. */
+  maxContext: number
+  /** The ModelSpec this engine was built for. */
+  spec: ModelSpec
+  /** Timestamp-query profile of one steady-state decode step (null if the feature is off). */
+  profileStep(warmupIds: number[]): Promise<KernelProfile | null>
+  benchBatchedFfnDown(
+    M: number,
+    iters: number,
+    target?: 'ffnDown' | 'oproj',
+  ): Promise<BatchedBenchResult | null>
+}
+
+export interface PoolStats {
+  hits: number
+  requests: number
+  hitRate: number
+  /**
+   * Next-layer router speculation (DecodeEngineOptions.expertSpeculate), null
+   * when it is off. `accuracy` is over ROUTED slots — how often a predicted
+   * expert really was in the next layer's top-K — and `top1Rate` is the
+   * quantity HOBBIT reports 96% for. Exposed so that number can be CHECKED on
+   * the model in front of you rather than assumed from the paper: the whole
+   * value of speculating is that the prediction is usually right, and a
+   * prefetch that is usually wrong is pure waste that still looks correct.
+   */
+  speculation: {
+    /** Predictions that reached the layer they were made for. */
+    steps: number
+    /** Routed slots predicted, summed over those steps. */
+    predicted: number
+    matched: number
+    accuracy: number
+    /** Steps whose highest-scored expert matched the real highest-scored one. */
+    top1: number
+    /** Steps whose predicted routed SET equals the real one — the fraction of
+     *  layers a speculative-recording design would NOT replay. */
+    setMatch: number
+    setRate: number
+    top1Rate: number
+  } | null
+}
+
+export interface DecodeEngineOptions {
+  /** Resolved shader-variant flags (see variants.ts). Default: SCALAR_VARIANTS. */
+  variants?: VariantFlags
+  /**
+   * true  → fused QKV+RoPE+KV-append (qkv_fused writes kvPages directly;
+   *         7 dispatches/layer, 8 with int8 KV) — the chat path.
+   *         Incompatible with qkNorm specs (Qwen3) — throws.
+   * false → unfused reference: qkv matmul → [qk_norm →] rope → kv_append
+   *         (9/layer; 10 with qkNorm).
+   */
+  fused?: boolean
+  /** int8 KV cache. Requires `fused` and a kv argument carrying `scales`. */
+  int8KV?: boolean
+  /** Model shape to build for. Default: PHI3. Must match the loaded weights. */
+  spec?: ModelSpec
+  /**
+   * Turn on the sampler (src/compiler/shaders/sampler.wgsl). Absent, or
+   * `temperature <= 0`, leaves the argmax dispatch exactly as it was — greedy
+   * is not "the sampler at temperature 0" here, it is still argmax.wgsl,
+   * because every reference comparison in this repo pins greedy decoding and
+   * this path must not change at all. (The sampler's own greedy branch agrees
+   * with argmax token-for-token; tests/kernels/run.mjs checks that.)
+   *
+   * The draw is a pure function of (seed, position) — no GPU randomness — so a
+   * conversation replays identically, and a prefill replay or a prefix-reuse
+   * turn re-runs a position without changing its token.
+   */
+  sampling?: {
+    temperature: number
+    /** Nucleus mass. 1 (default) skips the threshold search entirely. */
+    topP?: number
+    /** Floor relative to the top token's probability. 0 (default) is off. */
+    minP?: number
+    seed?: number
+  }
+  /**
+   * Cross-turn prefix reuse in generatePipelined (default true; ?reuse=0 on
+   * the chat page disables). The engine tracks the exact (position, token)
+   * record of every submitted forward pass; a new prompt that extends the
+   * absorbed prefix prefills only the delta. Trust rules: pure-attention
+   * specs reuse the longest common prefix (KV rewrite is idempotent); hybrid
+   * specs additionally require the GDN state boundary to sit exactly at the
+   * end of the absorbed record, because the recurrence cannot be rewound a
+   * token at a time. When that fails they no longer pay a full re-prefill:
+   * four snapshots of the recurrent state are kept at chunk boundaries, and a
+   * divergence replays from the nearest one at or below it (~4k tokens of
+   * lookback). Only a divergence older than the ring falls back to prefilling
+   * from zero.
+   */
+  prefixReuse?: boolean
+  /**
+   * Chunked GDN prefill (hybrid specs; default true; ?chunk=0 disables).
+   * Requires the subgroups pipelines (int4_matmul_batched_dyn). Prompt
+   * tokens before the last are processed in chunks of up to CHUNK_CAP
+   * (resolveChunkCap): batched projections + one gdn_recur dispatch per layer
+   * per chunk.
+   */
+  chunkedPrefill?: boolean
+  /** Pooled engines only: chunk the prefill through the per-layer union cut.
+   *  DEFAULT OFF — token-identical to per-token (162-chunk gate, 2026-08-15)
+   *  but its speed is UNMEASURED on mains power; the one timing pair taken so
+   *  far ran on battery and is void. Opt in with ?chunk=1 until the AC pair
+   *  exists. Unpooled chunking is unaffected (measured, default on). */
+  pooledChunkedPrefill?: boolean
+  /** Chunk capacity in tokens. Default 1024 with the subgroup-matrix unit and
+   *  64 without, then clamped by the spec's `maxChunkCap` if it has one; an
+   *  EXPLICIT value here is honoured above that clamp. resolveChunkCap derives
+   *  the default; a pooled MoE build lowers it again downstream. Sweep results
+   *  in BENCH.md. */
+  chunkCap?: number
+  /** Use the tiled batched GEMM for chunk projections (default false — see
+   *  the tiled ladder entry in pickChunkGemm: correct, but not yet measured
+   *  faster on a quiet machine). */
+  chunkTiled?: boolean
+  /** Chunk GEMM selection: 'e5' (the matrix unit at a 64x32 tile with a
+   *  swizzled B), 'sgmat' (E1 on the same unit), 'tiled', 'matvec'. Both
+   *  matrix-unit kernels need the experimental subgroup-matrix feature.
+   *  Default: E5 since 2026-08-13 where its pipelines exist and the cap tiles
+   *  by 64, else sgmat, else matvec — see the ladder in buildChunkPrefill,
+   *  which is the authority. This comment said "opt-in pending an in-engine
+   *  A/B" for nine days after that A/B promoted it. */
+  chunkGemm?: 'sgmat' | 'e5' | 'tiled' | 'matvec'
+  /** Capture the router's expert choice per layer per token, for
+   *  scripts/moe-trace.mjs. Costs one small buffer copy per MoE layer and one
+   *  readback per token, so it is opt-in and never on in a served engine. */
+  traceMoe?: boolean
+  /**
+   * Expert-slot pooling: hold this many experts PER LAYER instead of all
+   * `experts + 1`, and resolve the rest on demand (src/zero-tvm/expert-pool.ts).
+   * Off by default; MoE specs only, and a value below top-K + 1 throws rather
+   * than corrupting a token whose experts cannot all be resident at once.
+   *
+   * The kernel does not change: int4_matmul's moe variant already reads its row
+   * base from `ids[]` × the row stride, so a buffer of SLOTS experts with
+   * `ids[]` holding SLOT indices is the code path it already runs.
+   *
+   * The cost is one ROUND TRIP per MoE layer per token — the router's ids must
+   * reach JS before its experts can be fetched, and WebGPU has no GPU-side
+   * wait — so the forward pass splits into one submit per MoE layer. See
+   * docs/MOE_CHUNK_PLAN.md "Expert residency": at a half pool the miss rate is
+   * 6% and the transfer hides under compute; small pools do not survive.
+   *
+   * THE WEIGHTS MUST BE LOADED THE SAME WAY (`loadWeights(…, expertPool)`).
+   * That is what leaves the [experts+1, N, K] stacks unallocated and hands over
+   * the SlabSource a miss reads from; the engine refuses to pool without it,
+   * because pooling beside resident stacks costs memory rather than saving it.
+   *
+   * Chunked prefill is off while pooling — it binds these same buffers with no
+   * per-token slot resolution, and one chunk routes to more experts than any
+   * pool of this size holds.
+   */
+  expertPool?: number
+  /**
+   * Run each MoE layer's router ONE LAYER EARLY, on the previous layer's hidden
+   * state, and prefetch the experts it names into the pool (requires
+   * expertPool). HOBBIT measures that prediction at 96% top-1; getPoolStats()
+   * reports what it is measuring here, because the paper's number is about the
+   * paper's model.
+   *
+   * It buys the one thing the pool cannot: a miss otherwise cannot start until
+   * its own layer's router has come back, which is why the readback is ~9.6 ms
+   * of every token and pooling caps near 32 tok/s instead of 78.
+   *
+   * A wrong prediction costs a wasted read and nothing else. The predicted ids
+   * never reach a dispatch — every layer resolves against its own real ids —
+   * so speculation cannot change a token, only when its weights arrived.
+   */
+  expertSpeculate?: boolean
+  /** The optimistic pooled recorder (docs/MOE_CHUNK_PLAN.md 2026-08-15): one
+   *  submit per token, expert→slot translation on the GPU, routing read back
+   *  as a fire-and-forget wave, checkpoint+replay on the tokens whose wave
+   *  reveals a miss. Requires expertPool; does not compose with
+   *  expertSpeculate (prefetch is per-layer CPU work this design removes). */
+  poolOptimistic?: boolean
+  /** Width of the speculative router's top-M (default: the spec's top-K).
+   *  MEASUREMENT KNOB for the coverage-recording design: exact set-match came
+   *  in at 25-32% on qwen30b — dead for speculative recording — but per-slot
+   *  accuracy was 85-88%, so the live question is whether the real top-K is
+   *  CONTAINED in a wider predicted top-M. scoreSpeculation reports coverage
+   *  when this exceeds the spec's K. Capped at 32 (the kernel ceiling) and at
+   *  E. Prediction stays warm-only: nothing it writes reaches a dispatch. */
+  specWidth?: number
+  /**
+   * Run only layers [start, end) — pipeline parallelism, one stage per device.
+   *
+   * A stage with start > 0 has no embedding: its input is the RESIDUAL the
+   * previous stage handed over (d f16 values — 4 KB for Qwen3.6, one round
+   * trip per token). A stage with end < layers has no final norm, LM head or
+   * argmax; its output is that residual. Only the last stage produces tokens.
+   *
+   * The hand-off is the residual ALONE, not the normed activation beside it:
+   * every stage re-normalises with its own first layer's gamma (the same
+   * dispatch a whole-model pass runs before layer 0), so a stage needs no
+   * weight from its neighbours.
+   *
+   * Each stage keeps the KV cache and GDN state of ITS layers, which is what
+   * makes the split worth doing — two 16 GB machines hold a model neither can.
+   */
+  layerRange?: { start: number; end: number }
+}
+
+export function buildDecodeEngine(
+  device: GPUDevice,
+  weights: LoadedWeights,
+  kv: GPUBuffer[] | { pages: GPUBuffer[]; scales?: GPUBuffer[] },
+  opts: DecodeEngineOptions = {},
+): DecodeEngine {
+  const variants = opts.variants ?? SCALAR_VARIANTS
+  const fused = opts.fused ?? false
+  const int8Mode = resolveInt8Mode(opts, variants, opts.spec ?? PHI3)
+  const S = opts.spec ?? PHI3
+  const kvPages = Array.isArray(kv) ? kv : kv.pages
+  const kvScales = Array.isArray(kv) ? undefined : kv.scales
+  if (int8Mode && !kvScales) {
+    throw new Error('buildDecodeEngine: int8KV needs a KV cache carrying scales buffers (allocKVPagesInt8)')
+  }
+  // int8 KV used to demand the FUSED path, which meant Phi-3 and nothing else
+  // — so the one quantized-KV feature here ran on no model where context is
+  // the constraint. The quantize kernel never actually needed fusion: it reads
+  // a plain (k_slot, v_slot) pair, and the unfused chain has exactly that in
+  // B.kOut/B.vOut once RoPE has run. Measured before lifting it, on the model
+  // that wanted it: 8-bit KV costs -0.09% perplexity at 1k and +0.10% at 4k,
+  // both within noise (docs/TURBOQUANT_PLAN.md).
+  if (int8Mode && S.mla) {
+    throw new Error('buildDecodeEngine: int8KV does not cover MLA — it caches a latent, not per-head K/V')
+  }
+  // Hybrid specs (Qwen3.5): layerKinds mixes 'gdn' and 'attn' layers. GDN
+  // layers run the GatedDeltaNet chain; attention layers run the unfused
+  // gated-attention chain (c_attn → split → qk_norm → rope → append →
+  // attention → sigmoid gate). KV pages exist only for 'attn' layers,
+  // indexed by attention-layer ordinal.
+  const hybrid = S.layerKinds.includes('gdn')
+  if (hybrid && fused) {
+    throw new Error('buildDecodeEngine: hybrid (GDN) specs require the unfused composition')
+  }
+  // Pipeline stage bounds. Default is the whole model, which is what every
+  // existing caller gets — L0 === 0 and L1 === S.layers make every branch
+  // below collapse to the single-device behaviour.
+  const L0 = opts.layerRange?.start ?? 0
+  const L1 = opts.layerRange?.end ?? S.layers
+  const partial = L0 !== 0 || L1 !== S.layers
+  if (L0 < 0 || L1 > S.layers || L0 >= L1) {
+    throw new Error(`buildDecodeEngine: layerRange [${L0}, ${L1}) is not a range inside [0, ${S.layers})`)
+  }
+  const kvIndex: number[] = []
+  {
+    let ord = 0
+    for (const k of S.layerKinds) kvIndex.push(k === 'attn' ? ord++ : -1)
+  }
+  // QK-norm specs (Qwen3) must run the unfused composition: qkv_fused folds
+  // RoPE+KV-append into the projection, leaving nowhere to normalize Q/K
+  // between the matmul and the rotation. Pages gate `fused` off per spec.
+  if (S.qkNorm && fused) {
+    throw new Error(
+      'buildDecodeEngine: fused QKV is incompatible with qkNorm specs (Qwen3) — ' +
+      'the per-head Q/K RMSNorm must run between the QKV matmul and RoPE. Use unfused mode.'
+    )
+  }
+  // Scaled-RoPE specs (llama3 rope_scaling) must run rope.wgsl: it is the only
+  // kernel that binds the precomputed inv_freq table — qkv_fused and
+  // qk_norm_rope_append still compute plain theta^(-2i/d) frequencies inline,
+  // so routing a scaled spec through either would silently rotate with the
+  // wrong frequencies.
+  if (S.ropeScaling && fused) {
+    throw new Error(
+      'buildDecodeEngine: fused QKV is incompatible with rope_scaling specs — ' +
+      'qkv_fused computes unscaled RoPE frequencies inline. Use unfused mode.'
+    )
+  }
+  // Fused qk_norm+RoPE+KV-append (?fuseqk, default on via parseVariantFlags):
+  // on the unfused qkNorm path the 3 post-matmul dispatches collapse into 1
+  // (10 → 8 per layer). Pure-attention specs only — the hybrid gated-attention
+  // chain keeps the reference composition (its rope input comes from
+  // gated_qkv_split and the win is 2 of 12 dispatches on 8 of 32 layers).
+  // Scaled-RoPE specs keep the reference chain too (see the guard above).
+  // ?fuseqk folds qk_norm+RoPE+append into one kernel that writes f16 DIRECTLY
+  // into the pages, so it has no seam for a quantizer. int8 takes the explicit
+  // rope → quantize chain instead; the two are numerically equivalent, this
+  // only costs a dispatch.
+  const fuseQk = S.qkNorm && !hybrid && !fused && variants.fuseQkNorm && !S.ropeScaling && !int8Mode
+
+  // MLX-affine checkpoints run a restricted composition: every fused kernel
+  // that dequantises inline (qkv_fused, qkv_fused_scratch, fused_ffn) is
+  // symmetric group-32 only, so affine specs must take the unfused paths.
+  // The qkNorm guard above already forces this for Qwen-family specs; this
+  // one exists so an affine spec WITHOUT qkNorm fails loudly instead of
+  // running symmetric dequant math over affine nibbles.
+  const AFFINE = S.weightFormat === 'mlx-safetensors'
+  if (AFFINE && fused) {
+    throw new Error(
+      'buildDecodeEngine: fused QKV is incompatible with MLX-affine weights — '
+      + 'qkv_fused dequantises symmetric group-32 inline. Use unfused mode.'
+    )
+  }
+
+  // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and
+  // SCALES = K/QGROUP. K = d for the QKV/gate_up projections, qDim for o_proj
+  // (== d when heads == kvHeads), ffn for down_proj.
+  //
+  // QGROUP, not the module's GROUP: MLC quantises in groups of 32, MLX-affine
+  // in groups of 64. The kernels read SCALES_PER_ROW straight out of these
+  // uniforms and index the scale array with it, so a 32 here against 64-wide
+  // groups reads the WRONG SCALE for everything past the first group. It runs
+  // clean, every value is finite, and the logits are nonsense.
+  const QGROUP = AFFINE ? 64 : GROUP
+  const QKV_K_PACKED    = S.d / PACK          // Phi-3: 384  (K=3072)
+  const QKV_SCALES      = S.d / QGROUP        // Phi-3: 96
+  const OPROJ_K_PACKED  = S.qDim / PACK       // Phi-3: 384 (qDim == d)
+  const OPROJ_SCALES    = S.qDim / QGROUP     // Phi-3: 96
+  const FFN_DN_K_PACKED = S.ffn / PACK        // Phi-3: 1024 (K=8192)
+  const FFN_DN_SCALES   = S.ffn / QGROUP      // Phi-3: 256
+
+  // Elementwise workgroup counts (one wg per WG_SIZE_D elements).
+  const D_WGS   = S.d / WG_SIZE_D             // Phi-3: 12   (3072/256)
+  const QKV_WGS = S.qkvDim / WG_SIZE_D        // Phi-3: 36   (9216/256)
+  const KV_WGS  = S.kvDim / WG_SIZE_D         // kv_append grid — Phi-3: 12, Qwen3: 4
+
+  const { pipelines } = compile(device, { subgroups: variants.subgroups }, S)
+  const P = pipelines
+  // The MoE expert matmul is compiled at rowsPerWG 4 and only that.
+  const MOE_RPW = 4
+  // A sparse-MoE spec has no scalar path. moe_router_topk.wgsl is 32 lanes ×
+  // 8 experts held in registers and the expert matmul is {subgroups,
+  // rowsPerWG:4}; neither has a non-subgroup sibling and neither is planned.
+  // Without this the pipelines are null, the MoE branch is skipped, and the
+  // engine runs the DENSE FFN against weights that are not laid out for it —
+  // which produces tokens, just not the model's. buildDecodeEngine defaults to
+  // SCALAR_VARIANTS, so this is the configuration validate.ts uses.
+  // Which expert-matmul serves this spec is a property of the CHECKPOINT
+  // (MoeDims.bits), resolved once — bind groups and dispatches must use the
+  // same object, since layout:'auto' pipelines each own a distinct layout.
+  const moeMM = S.moe?.bits === 3 ? P.moeMatmulQ3 : P.moeMatmul
+  // Wide loads per MATMUL, not per model: gate/up contract over K = d, down
+  // over K = ffn (per-expert), and the vec4h body needs K % 512. qwen36 takes
+  // all three wide; qwen30b's down (K=768) stays narrow beside wide gate/up.
+  // Opt-in (?vec4moe=1) until the paired A/B runs on AC. Bind groups are
+  // created against the pipeline that dispatches them — layout:'auto'.
+  const moeWideOK = (k: number): boolean =>
+    variants.vec4Moe && S.moe?.bits !== 3 && k % 512 === 0 && !!P.moeMatmulWide
+  const moeMMGate = S.moe && moeWideOK(S.d) ? P.moeMatmulWide! : moeMM
+  const moeMMDown = S.moe && moeWideOK(S.ffn) ? P.moeMatmulWide! : moeMM
+  if (S.moe && !(P.moeRouterTopk && moeMM)) {
+    throw new Error(
+      'buildDecodeEngine: a MoE spec requires the subgroups feature — moe_router_topk '
+      + 'and the grid-z expert matmul have no scalar variant. Pass { subgroups: true } to compile().',
+    )
+  }
+  const R = resolveVariantPipelines(variants, P, S)
+  // Split-K attention (?splitk=N) exists only for the f16 KV layout;
+  // attention_int8 has no split-K variant.
+  if (int8Mode && R.splitK) {
+    console.warn('[engine] ?splitk ignored with int8 KV (attention_int8 has no split-K variant)')
+  }
+  const splitK = int8Mode ? 0 : R.splitK
+  console.log(
+    `[engine] attention=${R.attentionLabel} argmax=${R.argmaxLabel} qkv=${R.qkvLabel} ` +
+    `ffn=${R.ffnLabel} matmul=${R.matmulLabel} rowsPerWG=${R.matmulRowsPerWG} ` +
+    `mode=${fused ? (int8Mode ? 'fused+int8KV' : 'fused') : hybrid ? 'hybrid-unfused' : 'unfused'}` +
+    (S.qkNorm && !hybrid ? ` fuseqk=${fuseQk ? 'on' : 'off'}` : '')
+  )
+
+  // Activation buffers. The per-layer QKV stage differs by mode:
+  //   unfused    — qkv matmul → qkvOut, rope splits it into qOut/kOut/vOut,
+  //                kv_append copies kOut/vOut into kvPages
+  //   fused f16  — qkv_fused writes qOut + kvPages[L] directly
+  //   fused int8 — qkv_fused_scratch writes qOut + kSlot/vSlot, kv_quantize
+  //                packs them into int8 pages + f16 scales
+  const B = {
+    residual:  makeBuf(device, S.d * 2, 'residual'),      // running residual (ping)
+    residual2: makeBuf(device, S.d * 2, 'residual2'),     // running residual (pong)
+    hidden1:   makeBuf(device, S.d * 2, 'hidden1'),       // normed scratch
+    hidden2:   makeBuf(device, S.d * 2, 'hidden2'),       // matmul output scratch
+    qOut:      makeBuf(device, S.qDim * 2, 'qOut'),
+    attnOut:   makeBuf(device, S.qDim * 2, 'attnOut'),
+    ffnOut:    makeBuf(device, S.ffn * 2, 'ffnOut'),
+    logits:    makeBuf(device, S.vocab * 4, 'logits'),
+    tokenOut:  makeBuf(device, 4, 'tokenOut'),
+    inputIds:  makeBuf(device, 4, 'inputIds'),
+    posMap:    makeBuf(device, 4, 'posMap'),
+    pageIndptr: makeBuf(device, 8, 'pageIndptr'),
+    pageValues: makeBuf(device, S.maxPages * 4, 'pageValues'),
+    lengthInfo: makeBuf(device, 12, 'lengthInfo'),
+    // Mode-conditional entries (see above)
+    qkvOut: null as GPUBuffer | null,
+    kOut:   null as GPUBuffer | null,
+    vOut:   null as GPUBuffer | null,
+    kSlot:  null as GPUBuffer | null,
+    vSlot:  null as GPUBuffer | null,
+    // ?fuseprologue=1: ffnDown writes here so add3_norm can still see the
+    // o-proj delta in hidden2 (addNorm1's residual sum never materializes).
+    hidden3: null as GPUBuffer | null,
+    // ?splitk=N: per-(head, partition) online-softmax partials
+    // [m, d, o[HEAD_DIM]] in f32, merged by attention_combine.
+    attnPartials: null as GPUBuffer | null,
+    // Hybrid (Qwen3.5) activation scratch — allocated only for hybrid specs.
+    cAttnOut:   null as GPUBuffer | null,  // c_attn projection [C_ATTN_DIM f16]
+    attnGateRaw: null as GPUBuffer | null, // raw per-head gate rows [Q_DIM f16]
+    // Fused GDN input projection output [GDN_PROJ_ROWS f16]: regions
+    // [qkv_raw | z | a | b] at row offsets 0 / gdnQkvDim / +gdnVDim / +vHeads.
+    // gdn_conv reads the qkv region (offset 0, binds the whole buffer);
+    // gdn_norm_out binds the z region and gdn_gates the [a|b] pair via
+    // 256-aligned bind-group offsets — no per-kernel copies.
+    gdnProjOut: null as GPUBuffer | null,
+    gdnConvOut: null as GPUBuffer | null,  // conv+SiLU output [GDN_QKV_DIM f16]
+    gdnGates:   null as GPUBuffer | null,  // [exp(g) | beta] [2*GDN_V_HEADS f32]
+    gdnRecurOut: null as GPUBuffer | null, // recurrence readout [GDN_V_DIM f32]
+    gdnNormed:  null as GPUBuffer | null,  // gated-norm output [GDN_V_DIM f16]
+    // Sparse MoE scratch — shared across layers, the block is stateless.
+    // ── MLA scratch (null on every other spec) ──
+    mlaQ: null as GPUBuffer | null,       // [heads*(nope+rope)] f16 — q_proj out
+    mlaKva: null as GPUBuffer | null,     // [kvLora+rope] f16 — kv_a_proj out
+    mlaQNope: null as GPUBuffer | null,   // [heads, nope] f16
+    mlaQPe: null as GPUBuffer | null,     // [heads, rope] f16, rotated
+    mlaQLat: null as GPUBuffer | null,    // [heads, kvLora] f16 — query in latent space
+    mlaScores: null as GPUBuffer | null,  // [heads, maxContext] f32
+    mlaOLat: null as GPUBuffer | null,    // [heads, kvLora] f32 — combine writes f32
+    mlaOLat16: null as GPUBuffer | null,  // the same, narrowed for mla_proj
+    routerLogits: null as GPUBuffer | null,  // [experts+1] f32
+    moeIds:       null as GPUBuffer | null,  // [slots] u32 — expert per slot
+    moeScores:    null as GPUBuffer | null,  // [slots] f32
+    moeGateUp:    null as GPUBuffer | null,  // [slots][2*ffn] f16
+    moeH:         null as GPUBuffer | null,  // [slots][ffn] f16
+    moeDown:      null as GPUBuffer | null,  // [slots][d] f16
+  }
+  if (!fused) {
+    B.qkvOut = makeBuf(device, S.qkvDim * 2, 'qkvOut')
+    B.kOut   = makeBuf(device, S.kvDim * 2, 'kOut')
+    B.vOut   = makeBuf(device, S.kvDim * 2, 'vOut')
+  }
+  if (int8Mode) {
+    B.kSlot = makeBuf(device, S.kvDim * 2, 'kSlot')
+    B.vSlot = makeBuf(device, S.kvDim * 2, 'vSlot')
+  }
+  if (R.ffnPrologue) {
+    B.hidden3 = makeBuf(device, S.d * 2, 'hidden3')
+  }
+  if (splitK) {
+    B.attnPartials = makeBuf(device, S.heads * splitK * (S.headDim + 2) * 4, 'attnPartials')
+  }
+  // Per-GDN-layer persistent state: conv ring ((convK-1) × GDN_QKV_DIM f16)
+  // and the recurrent state matrix (GDN_V_HEADS × headK × headV f32 ≈ 2 MB).
+  // Both are zeroed on the GPU whenever a forward pass runs at position 0
+  // (fresh conversation / fresh prefill) — see clearGdnState().
+  const gdnConvState: (GPUBuffer | null)[] = []
+  const gdnRecurState: (GPUBuffer | null)[] = []
+  const gdnStateBufs: GPUBuffer[] = []
+  if (hybrid) {
+    B.cAttnOut   = makeBuf(device, S.cAttnDim * 2, 'cAttnOut')
+    B.attnGateRaw = makeBuf(device, S.qDim * 2, 'attnGateRaw')
+    B.gdnProjOut = makeBuf(device, S.gdnProjRows * 2, 'gdnProjOut')
+    B.gdnConvOut = makeBuf(device, S.gdnQkvDim * 2, 'gdnConvOut')
+    B.gdnGates   = makeBuf(device, 2 * S.gdnVHeads * 4, 'gdnGates')
+    B.gdnRecurOut = makeBuf(device, S.gdnVDim * 4, 'gdnRecurOut')
+    B.gdnNormed  = makeBuf(device, S.gdnVDim * 2, 'gdnNormed')
+    for (let L = 0; L < S.layers; L++) {
+      if (S.layerKinds[L] === 'gdn') {
+        const conv = makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `gdnConvState_${L}`)
+        const recur = makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `gdnRecurState_${L}`)
+        gdnConvState.push(conv)
+        gdnRecurState.push(recur)
+        gdnStateBufs.push(conv, recur)
+      } else {
+        gdnConvState.push(null)
+        gdnRecurState.push(null)
+      }
+    }
+  }
+
+  // ---- GDN rewind points -------------------------------------------------
+  // Without these, hybrid prefix reuse is all-or-nothing: the recurrent state
+  // cannot be rewound, so `reuseStart` demands the new prompt extend EVERY
+  // absorbed token and re-reads the whole conversation otherwise. Measured on
+  // a real agent client: 16 changed tokens near the end of a 43,709-token
+  // prompt (the client regenerates a trailing metadata block every turn)
+  // discarded all 43,693 that still matched — 339 s of GPU, every turn.
+  //
+  // A ring of snapshots taken at chunk boundaries turns that into "replay from
+  // the nearest boundary at or before the divergence". On that same case the
+  // newest usable point is 43,008, so the replay is 753 tokens instead of
+  // 43,761. Four slots is ~4k tokens of lookback, which covers a client
+  // rewriting its own trailing turn; a divergence older than the ring simply
+  // falls back to the full re-prefill it does today.
+  // NB: read the option directly — `prefixReuse` is declared further down, so
+  // referencing it here is a temporal dead zone, not a value.
+  const GDN_CKPT_SLOTS = hybrid && (opts.prefixReuse ?? true) ? 4 : 0
+  const gdnCkptConv: (GPUBuffer | null)[][] = []
+  const gdnCkptRecur: (GPUBuffer | null)[][] = []
+  /** Absorbed-token position each slot's state sits at; -1 = empty. */
+  const gdnCkptPos: number[] = new Array(GDN_CKPT_SLOTS).fill(-1)
+  let gdnCkptNext = 0
+
+  /**
+   * Allocate the ring on FIRST USE, not at build time.
+   *
+   * Only the chunked-prefill loop ever writes a snapshot, and whether chunking
+   * exists is decided thousands of lines below this — from subgroup support,
+   * `?chunk=0` and the pooled-expert path. Allocating up front burned 0.19 GB
+   * (qwen35) to 0.57 GB (qwen38) on every engine that can never fill it:
+   * devices without subgroups, anyone passing ?chunk=0, and the pooled builds
+   * whose whole purpose is using less memory. Worst on the weakest hardware,
+   * which is exactly backwards.
+   */
+  function ensureGdnCkptBuffers(): void {
+    if (GDN_CKPT_SLOTS === 0 || gdnCkptConv.length > 0) return
+    for (let slot = 0; slot < GDN_CKPT_SLOTS; slot++) {
+      const conv: (GPUBuffer | null)[] = []
+      const recur: (GPUBuffer | null)[] = []
+      for (let L = 0; L < S.layers; L++) {
+        if (gdnConvState[L]) {
+          conv.push(makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `gdnCkptConv_${slot}_${L}`))
+          recur.push(makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `gdnCkptRecur_${slot}_${L}`))
+        } else { conv.push(null); recur.push(null) }
+      }
+      gdnCkptConv.push(conv)
+      gdnCkptRecur.push(recur)
+    }
+  }
+
+  /** Snapshot the live GDN state as the rewind point for `pos`. */
+  function saveGdnCkpt(pos: number): void {
+    if (GDN_CKPT_SLOTS === 0) return
+    ensureGdnCkptBuffers()
+    const slot = gdnCkptNext
+    const enc = device.createCommandEncoder()
+    for (let L = 0; L < S.layers; L++) {
+      const c = gdnConvState[L], r = gdnRecurState[L]
+      if (!c || !r) continue
+      enc.copyBufferToBuffer(c, 0, gdnCkptConv[slot][L]!, 0, c.size)
+      enc.copyBufferToBuffer(r, 0, gdnCkptRecur[slot][L]!, 0, r.size)
+    }
+    device.queue.submit([enc.finish()])
+    gdnCkptPos[slot] = pos
+    gdnCkptNext = (gdnCkptNext + 1) % GDN_CKPT_SLOTS
+  }
+
+  /** @returns false if the ring holds nothing to restore — the caller MUST
+   *  then abandon the rewind. Returning void here was a latent trap: the call
+   *  site goes on to set gdnStatePos, truncate `absorbed` and skip the
+   *  prefill, so a guard that fired silently would produce fluent wrong output
+   *  rather than a loud failure. Unreachable today (positions only leave -1
+   *  inside saveGdnCkpt, after allocation), which is exactly why it should not
+   *  depend on staying unreachable. */
+  function restoreGdnCkpt(slot: number): boolean {
+    if (gdnCkptConv.length === 0) return false
+    const enc = device.createCommandEncoder()
+    for (let L = 0; L < S.layers; L++) {
+      const c = gdnConvState[L], r = gdnRecurState[L]
+      if (!c || !r) continue
+      enc.copyBufferToBuffer(gdnCkptConv[slot][L]!, 0, c, 0, c.size)
+      enc.copyBufferToBuffer(gdnCkptRecur[slot][L]!, 0, r, 0, r.size)
+    }
+    device.queue.submit([enc.finish()])
+    return true
+  }
+
+  /** Anything that moves the state without replaying tokens voids every slot.
+   *  A stale rewind point is not a slow path, it is a wrong answer. */
+  function invalidateGdnCkpts(): void {
+    gdnCkptPos.fill(-1)
+    gdnCkptNext = 0
+  }
+
+  // A MoE block is STATELESS — unlike the GDN recurrence above, nothing carries
+  // between tokens — so every buffer here is shared across all 40 layers.
+  // moeH and moeDown are allocated fresh rather than reusing B.ffnOut (ffn*2 =
+  // 1 KB, but 9 slots need 9 KB) or B.hidden2 (d*2 = 4 KB against 36 KB): a
+  // stray dense dispatch should fail loudly, not corrupt slot 0.
+  // ── MLA scratch, all SHARED across layers ───────────────────────────────
+  // MLA carries no per-layer state (the cache is per-layer, these are not), so
+  // one set serves the whole stack — the same arrangement as the MoE scratch
+  // below.
+  if (S.mla) {
+    const M = S.mla
+    B.mlaQ = makeBuf(device, S.mlaQProjRows * 2, 'mlaQ')
+    B.mlaKva = makeBuf(device, S.mlaKvaRows * 2, 'mlaKva')
+    B.mlaQNope = makeBuf(device, S.heads * M.qkNopeHeadDim * 2, 'mlaQNope')
+    B.mlaQPe = makeBuf(device, S.heads * M.qkRopeHeadDim * 2, 'mlaQPe')
+    B.mlaQLat = makeBuf(device, S.heads * M.kvLoraRank * 2, 'mlaQLat')
+    // maxContext, NOT the current T. Bind groups are hoisted out of the token
+    // loop and cannot be resized per token; undersized, WGSL clamps the
+    // out-of-bounds store and the tail of every long conversation silently
+    // attends to zeros.
+    B.mlaScores = makeBuf(device, S.heads * S.maxContext * 4, 'mlaScores')
+    B.mlaOLat = makeBuf(device, S.heads * M.kvLoraRank * 4, 'mlaOLat')
+    B.mlaOLat16 = makeBuf(device, S.heads * M.kvLoraRank * 2, 'mlaOLat16')
+  }
+
+  if (S.moe) {
+    const M = S.moe
+    // Router rows: one per routed expert, plus the shared expert's gate when
+    // the checkpoint has one (the loader stacks it as row E).
+    B.routerLogits = makeBuf(device, (M.experts + (S.sharedExpertIndex >= 0 ? 1 : 0)) * 4, 'routerLogits')
+    B.moeIds       = makeBuf(device, S.moeSlots * 4, 'moeIds')
+    B.moeScores    = makeBuf(device, S.moeSlots * 4, 'moeScores')
+    B.moeGateUp    = makeBuf(device, S.moeSlots * 2 * S.ffn * 2, 'moeGateUp')
+    B.moeH         = makeBuf(device, S.moeSlots * S.ffn * 2, 'moeH')
+    B.moeDown      = makeBuf(device, S.moeSlots * S.d * 2, 'moeDown')
+  }
+  // Dense FFN on an affine spec: fused_ffn dequantises symmetric group-32
+  // inline and has no affine sibling, so gate_up runs as ONE 2·ffn-row K=d
+  // affine matmul into this buffer (rows 0..ffn-1 = gate, ffn.. = up — the
+  // loader concatenates gate_proj ++ up_proj, and that is exactly the [gate|up]
+  // layout silu_mul reads at SLOTS = 1), then silu_mul writes B.ffnOut and the
+  // down matmul proceeds as in the MLC chain.
+  const ffnGateUp = AFFINE && !S.moe ? makeBuf(device, 2 * S.ffn * 2, 'ffnGateUp') : null
+
+  // Static uniforms — matmul shapes (K_packed, scales_per_row, M)
+  const qkvU   = fused ? null : uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(S.qkvDim)])
+  const oProjU = uniformBuf(device, [u32(OPROJ_K_PACKED),  u32(OPROJ_SCALES),  u32(S.d)])
+  // MoE uniforms. The matmul PODArgs is EIGHT u32 here, not three: the moe
+  // variant adds IN_SLOT_STRIDE and OUT_SLOT_STRIDE, then the three TOKEN
+  // strides chunked prefill rides on. IN_SLOT_STRIDE 0 means every slot reads
+  // the SAME activation (gate/up); down strides both.
+  // Decode is a one-token chunk — grid y is 1, so the token strides multiply by
+  // zero and are inert — but they are written with their real values anyway, so
+  // there is one layout, not a decode one and a prefill one.
+  // Affine groups are 64, so scales-per-row is K/64, not K/32.
+  const MOE_ROUTER_ROWS = S.moe ? S.moe.experts + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
+  // 4-bit vs 8-bit router: two entry points, chosen once. Picking the wrong one
+  // is silent — the 8-bit reader walks a 4-bit row at twice the stride and the
+  // model emits noise — so this is resolved from the spec, never guessed.
+  const routerBits = S.moe?.routerBits ?? 8
+  const moeRouterPipe = routerBits === 16 ? P.moeRouterLogitsF16
+    : routerBits === 4 ? P.moeRouterLogitsQ4
+    : P.moeRouterLogits
+  const moeRouterU = S.moe ? uniformBuf(device, [u32(S.d), u32(MOE_ROUTER_ROWS)]) : null
+  const moeTopkU = S.moe
+    ? uniformBuf(device, [u32(S.moe.experts), u32(S.moe.topK), u32(S.moe.normTopkProb ? 1 : 0),
+                          u32(S.sharedExpertIndex >= 0 ? 1 : 0)])
+    : null
+  /** The speculative pass's own top-k uniform: same shape, K = SPEC_M. Created
+   *  lazily below because SPEC_M is derived after the option block. */
+  let specTopkU: GPUBuffer | null = null
+  // K_PACKED is words per weight row: K*bits/32 (4-bit: K/8, 3-bit: 3K/32).
+  const moeBits = S.moe?.bits ?? 4
+  const moeGateU = S.moe
+    ? uniformBuf(device, [u32((S.d * moeBits) / 32), u32(S.d / 64), u32(S.ffn), u32(0), u32(2 * S.ffn),
+                          u32(S.d), u32(S.moeSlots * 2 * S.ffn), u32(S.moeSlots)])
+    : null
+  const moeDownU = S.moe
+    ? uniformBuf(device, [u32((S.ffn * moeBits) / 32), u32(S.ffn / 64), u32(S.d), u32(S.ffn), u32(S.d),
+                          u32(S.moeSlots * S.ffn), u32(S.moeSlots * S.d), u32(S.moeSlots)])
+    : null
+  const moeSiluU = S.moe
+    ? uniformBuf(device, [i32(S.moeSlots), i32(Math.ceil(S.moeSlots * S.ffn / 256))])
+    : null
+  const moeCombU = S.moe ? uniformBuf(device, [u32(S.d), u32(S.moeSlots)]) : null
+
+  // ============================================================
+  // Expert-slot pool (opts.expertPool) — docs/MOE_CHUNK_PLAN.md
+  //
+  // Nine stacked tensors per MoE layer (gate/up/down × weights/scales/biases)
+  // hold SLOTS expert rows instead of all `experts + 1`, and `ids[]` carries
+  // slot indices instead of expert indices. The expert matmul is untouched: it
+  // computes its row base as id × N × K_PACKED for weights and id × N ×
+  // SCALES_PER_ROW for scales and biases, which is exactly the per-expert byte
+  // stride of each stack — so those two products are the only layout knowledge
+  // this needs, and they are the same ones moeGateU/moeDownU already carry.
+  //
+  // THE FULL STACKS ARE NEVER ALLOCATED. loadWeights(..., expertPool) hands
+  // back SLOTS-row buffers and a SlabSource; a miss reads one expert's slab
+  // (1.3-2.5 MiB) and writeBuffers it into the slot. The first version of this
+  // feature kept the stacks resident as a GPU-side backing store and copied
+  // from them, which proved token identity and priced the split but saved
+  // nothing — the pool was pure overhead on top of the model.
+  //
+  // Only the DECODE path pools, and with the stacks gone that is now a
+  // REQUIREMENT rather than a preference: chunked prefill binds these same
+  // buffers with no per-token slot resolution, and a 256-token chunk routes to
+  // most of the experts anyway — far more than any pool of this size holds. So
+  // pooling turns chunked prefill off (see the chunkPrefill construction).
+  // ============================================================
+  const EXPERT_ROWS = S.moe ? S.moe.experts + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
+  const POOL_SLOTS = opts.expertPool ?? 0
+  if (POOL_SLOTS > 0 && !S.moe) {
+    throw new Error(`buildDecodeEngine: expertPool is a sparse-MoE feature and spec ${S.id} has no experts`)
+  }
+  // The floor comes from the pool, not from arithmetic restated here. A pinned
+  // shared expert occupies a slot the request cannot use, so `topK + 1` is only
+  // enough while the shared expert is always IN the request — true of every
+  // shipped spec, and an accident rather than a guarantee.
+  const POOL_MIN = S.moe
+    ? ExpertPool.minSlots(S.moeSlots, S.sharedExpertIndex >= 0 ? 1 : 0)
+    : 0
+  if (POOL_SLOTS > 0 && S.moe && POOL_SLOTS < POOL_MIN) {
+    // Below this a single token needs more slots than the pool has, and the
+    // pool would evict an expert it is about to read — wrong output, not a
+    // slow one. ExpertPool throws in that case; refusing here names the option.
+    throw new Error(
+      `buildDecodeEngine: expertPool ${POOL_SLOTS} is below the pool's minimum ` +
+      `${POOL_MIN} (${S.moeSlots} slots per token` +
+      `${S.sharedExpertIndex >= 0 ? ' + 1 pinned shared expert' : ''}) — ` +
+      `one token's experts could not all be resident at once`)
+  }
+  const pooling = POOL_SLOTS > 0 && !!S.moe
+  const optimistic = pooling && !!opts.poolOptimistic
+  if (opts.poolOptimistic && !pooling) {
+    throw new Error('buildDecodeEngine: poolOptimistic is the pooled recorder — set expertPool as well')
+  }
+  if (optimistic && opts.traceMoe) {
+    throw new Error('buildDecodeEngine: poolOptimistic replays layers, which would double-write the MoE trace — run traceMoe on the serial pooled path')
+  }
+  if (optimistic && opts.expertSpeculate) {
+    throw new Error('buildDecodeEngine: poolOptimistic does not compose with expertSpeculate — '
+      + 'prefetch is per-layer CPU work the one-submit design removes; the post-token uploads are its warmth')
+  }
+  // Next-layer router speculation. Only ever warms the pool — every layer still
+  // resolves its own REAL ids — so it is meaningless without one.
+  if (opts.expertSpeculate && !pooling) {
+    throw new Error('buildDecodeEngine: expertSpeculate prefetches into an expert pool — set expertPool as well')
+  }
+  const speculate = pooling && !!opts.expertSpeculate
+  const slabSource = weights.moeSlabs?.source ?? null
+  if (pooling && !slabSource) {
+    throw new Error(
+      'buildDecodeEngine: expertPool needs weights loaded with the same option — ' +
+      'loadWeights(device, …, spec, layerRange, expertPool) is what leaves the stacked ' +
+      'expert tensors out of GPU memory and returns the slab source a miss reads from. ' +
+      'Pooling over full stacks would cost memory rather than save it.')
+  }
+  // The mirror image, and it is the dangerous one: these weights hold SLOTS
+  // expert rows, so an engine that does not pool would bind them as full stacks
+  // and read whichever slot the router's expert index happened to land on —
+  // fluent text, wrong model, no error anywhere.
+  if (!pooling && weights.moeSlabs) {
+    throw new Error(
+      `buildDecodeEngine: these weights were loaded with expertPool ${weights.moeSlabs.slots} ` +
+      'and hold that many expert rows per layer — this engine must pool too')
+  }
+  if (pooling && weights.moeSlabs!.slots !== POOL_SLOTS) {
+    throw new Error(
+      `buildDecodeEngine: weights were loaded with ${weights.moeSlabs!.slots} expert slots ` +
+      `and this engine asks for ${POOL_SLOTS} — the buffers are the loader's size`)
+  }
+  type MoeWeights = NonNullable<LoadedWeights['layers'][number]['moe']>
+  type SlabField = 'gateWeights' | 'gateScales' | 'gateBiases'
+    | 'upWeights' | 'upScales' | 'upBiases'
+    | 'downWeights' | 'downScales' | 'downBiases'
+  interface LayerPool {
+    pool: ExpertPool
+    /** Absolute layer index — what SlabSource.read() is keyed by. */
+    layer: number
+    /** One entry per stacked tensor: the SLOTS-row buffer the MoE bind groups
+     *  bind, its per-expert stride, and which slab a miss reads. */
+    slabs: { buf: GPUBuffer; stride: number; proj: SlabProj; kind: SlabKind }[]
+    /** Optimistic recorder only: the device-resident expert→slot map the
+     *  translate kernel reads, and its CPU mirror. 0xffffffff = not resident.
+     *  The mirror is the source of truth; the buffer is a copy pushed by
+     *  writeBuffer whenever a resolve changes it. */
+    mapBuf: GPUBuffer | null
+    cpuMap: Uint32Array<ArrayBuffer> | null
+  }
+  // Bytes one expert occupies in each stack. Weights are u32 words, scales and
+  // biases f16 — one per quantization group of 64.
+  const SLAB_TENSORS: readonly { field: SlabField; proj: SlabProj; kind: SlabKind; stride: number }[] = S.moe
+    ? (() => {
+        const wGateUp = S.ffn * ((S.d * moeBits) / 32) * 4
+        const sGateUp = S.ffn * (S.d / 64) * 2
+        const wDown = S.d * ((S.ffn * moeBits) / 32) * 4
+        const sDown = S.d * (S.ffn / 64) * 2
+        return [
+          { field: 'gateWeights', proj: 'gate', kind: 'w', stride: wGateUp },
+          { field: 'gateScales', proj: 'gate', kind: 's', stride: sGateUp },
+          { field: 'gateBiases', proj: 'gate', kind: 'b', stride: sGateUp },
+          { field: 'upWeights', proj: 'up', kind: 'w', stride: wGateUp },
+          { field: 'upScales', proj: 'up', kind: 's', stride: sGateUp },
+          { field: 'upBiases', proj: 'up', kind: 'b', stride: sGateUp },
+          { field: 'downWeights', proj: 'down', kind: 'w', stride: wDown },
+          { field: 'downScales', proj: 'down', kind: 's', stride: sDown },
+          { field: 'downBiases', proj: 'down', kind: 'b', stride: sDown },
+        ] as const
+      })()
+    : []
+  function makeLayerPool(m: MoeWeights, L: number): LayerPool {
+    const slabs: LayerPool['slabs'] = []
+    for (const t of SLAB_TENSORS) {
+      const buf = m[t.field]
+      // Two independent derivations of one number, checked against each other
+      // because a wrong stride does not fault: it uploads a real expert's real
+      // bytes at the wrong offset and the model keeps generating fluent text.
+      // `stride` comes from the SPEC; slabBytes comes from the CHECKPOINT's own
+      // safetensors header.
+      const declared = slabSource!.slabBytes(L, t.proj, t.kind)
+      if (declared !== t.stride) {
+        throw new Error(
+          `buildDecodeEngine: layer ${L} ${t.field} is ${t.stride} B per expert by the spec ` +
+          `and ${declared} B in the checkpoint`)
+      }
+      if (buf.size !== POOL_SLOTS * t.stride) {
+        throw new Error(
+          `buildDecodeEngine: layer ${L} ${t.field} is ${buf.size} B, not ${POOL_SLOTS} slots × ` +
+          `${t.stride} B` + (buf.size === EXPERT_ROWS * t.stride
+            ? ' — that is the FULL stack, so these weights were loaded without expertPool'
+            : ' — the loader and the engine disagree about the layout'))
+      }
+      if (t.stride % 4 !== 0) throw new Error(`buildDecodeEngine: ${t.field} stride ${t.stride} is not a multiple of 4`)
+      slabs.push({ buf, stride: t.stride, proj: t.proj, kind: t.kind })
+    }
+    // The shared expert runs on EVERY token, so it is pinned rather than left
+    // to the LRU. Pinning means resolve() never reports it as a miss, so its
+    // rows are uploaded once, at construction, instead of on first use.
+    const pin = S.sharedExpertIndex >= 0 ? [S.sharedExpertIndex] : []
+    const pool = new ExpertPool(POOL_SLOTS, { pin })
+    let mapBuf: GPUBuffer | null = null
+    let cpuMap: Uint32Array<ArrayBuffer> | null = null
+    if (optimistic) {
+      cpuMap = new Uint32Array(new ArrayBuffer(EXPERT_ROWS * 4)).fill(0xffffffff)
+      for (const e of pin) cpuMap[e] = pool.slotFor(e)
+      mapBuf = makeBuf(device, EXPERT_ROWS * 4, `moeSlotMap_${L}`)
+      device.queue.writeBuffer(mapBuf, 0, cpuMap)
+    }
+    return { pool, slabs, layer: L, mapBuf, cpuMap }
+  }
+
+  /**
+   * Fill one layer's missed slots from the checkpoint.
+   *
+   * ONE PASS PER LAYER, and what that does and does not overlap:
+   *   - OVERLAPPED: the reads of every slab of every miss in this layer are
+   *     issued together, so a fetch source has all of them in flight at once,
+   *     and all of them run against the submit already executing on the GPU
+   *     (the pooled recorder submits BEFORE it awaits the router ids).
+   *   - NOT OVERLAPPED: a read with its own upload. `writeBuffer` snapshots its
+   *     source, so the copy cannot begin until the bytes exist and the next
+   *     read cannot reuse that memory until the copy returns — measured at
+   *     1.007 ms chained against 0.174 + 0.318 apart (docs/MOE_CHUNK_PLAN.md,
+   *     "Repriced 2026-08-14"). Uploading only after every read has landed is
+   *     what keeps the reads from being serialized behind copies.
+   *   - NOT OVERLAPPED, and this one is structural: the misses of layer L+1
+   *     cannot start until its router has run. That is what `expertSpeculate`
+   *     attacks, and it is the difference between ~32 and ~78 tok/s.
+   * Peak host memory is one layer's misses — 9 slabs per miss, so ~22 MB at a
+   * full 8-way miss on qwen30b, not the model.
+   */
+  async function fillSlots(lp: LayerPool, misses: readonly { expert: number; slot: number }[]): Promise<void> {
+    if (misses.length === 0) return
+    const reads = misses.flatMap(({ expert, slot }) => lp.slabs.map(
+      (s) => slabSource!.read(lp.layer, s.proj, s.kind, expert).then((bytes) => ({ s, slot, bytes }))))
+    for (const { s, slot, bytes } of await Promise.all(reads)) {
+      // SlabSource.read is declared over a plain Uint8Array, which TS widens to
+      // "possibly SharedArrayBuffer-backed"; both sources allocate their own.
+      device.queue.writeBuffer(s.buf, slot * s.stride, bytes as Uint8Array<ArrayBuffer>)
+    }
+  }
+
+  const layerPools: (LayerPool | null)[] = []
+  /** The pinned shared expert's upload. Every pooled pass awaits it — this
+   *  constructor is synchronous and a slab read is not. */
+  let poolReady: Promise<void> = Promise.resolve()
+  if (pooling) {
+    for (let L = L0; L < L1; L++) {
+      const m = weights.layers[L].moe
+      layerPools.push(m ? makeLayerPool(m, L) : null)
+    }
+    if (S.sharedExpertIndex >= 0) {
+      poolReady = Promise.all(layerPools.map((lp) => lp
+        ? fillSlots(lp, [{ expert: S.sharedExpertIndex, slot: lp.pool.slotFor(S.sharedExpertIndex) }])
+        : null)).then(() => {})
+      // The await in recordForwardPooled is what reports a failure; this only
+      // keeps a boot that is never generated from printing an unhandled
+      // rejection instead.
+      poolReady.catch(() => {})
+    }
+    // RESIDENT BYTES SAVED, which is the whole point of the feature and so is
+    // printed rather than claimed: every MoE layer holds POOL_SLOTS rows of
+    // each of the nine stacked tensors where it used to hold EXPERT_ROWS.
+    const perExpert = SLAB_TENSORS.reduce((n, t) => n + t.stride, 0)
+    const moeLayers = layerPools.filter(Boolean).length
+    const saved = moeLayers * (EXPERT_ROWS - POOL_SLOTS) * perExpert
+    console.log(
+      `[engine] expert pool: ${POOL_SLOTS}/${EXPERT_ROWS} slots per layer` +
+      `${speculate ? ', next-layer speculation on' : ''} — ` +
+      `${((moeLayers * POOL_SLOTS * perExpert) / 1e9).toFixed(2)} GB resident, ` +
+      `${(saved / 1e9).toFixed(2)} GB never allocated ` +
+      `(${moeLayers} layers × ${EXPERT_ROWS - POOL_SLOTS} experts × ${(perExpert / 1024 ** 2).toFixed(2)} MiB)`)
+  }
+  // One round trip per MoE layer per token, so the staging buffers are a RING:
+  // a mapped buffer must never be a copy destination, and the next layer's copy
+  // is recorded while the previous slot may still be unmapping.
+  const MOE_ID_BYTES = S.moeSlots * 4
+  // The speculative top-M may be WIDER than the real top-K (specWidth) — the
+  // coverage measurement. Its ids ride the same staging slot, so the slot is
+  // sized for the wider of the two.
+  const SPEC_M = speculate
+    ? Math.min(Math.max(opts.specWidth ?? (S.moe!.topK), S.moe!.topK), 32, S.moe!.experts)
+    : 0
+  const SPEC_SLOTS = speculate ? SPEC_M + (S.sharedExpertIndex >= 0 ? 1 : 0) : 0
+  const SPEC_ID_BYTES = SPEC_SLOTS * 4
+  // Speculation rides the SAME round trip: layer L's real ids in the first
+  // part of the slot, layer L+1's predicted ids after. Two copies, one map.
+  const MOE_READ_BYTES = MOE_ID_BYTES + (speculate ? SPEC_ID_BYTES : 0)
+  const moeIdRing: GPUBuffer[] = pooling
+    ? [0, 1].map((i) => device.createBuffer({
+        size: MOE_READ_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: `moeIdsRead_${i}`,
+      }))
+    : []
+  let moeIdCursor = 0
+  /** Slot ids on their way back to B.moeIds — one buffer, rewritten per layer. */
+  const moeSlotScratch = new Uint32Array(S.moeSlots)
+  // The speculative router's own outputs. Separate buffers, never bound by the
+  // expert matmuls: a prediction must not be able to reach a dispatch.
+  const specLogits = speculate ? makeBuf(device, MOE_ROUTER_ROWS * 4, 'specRouterLogits') : null
+  const specIds = speculate ? makeBuf(device, SPEC_ID_BYTES, 'specIds') : null
+  const specScores = speculate ? makeBuf(device, SPEC_ID_BYTES, 'specScores') : null
+  // ── Optimistic recorder state ─────────────────────────────────────────────
+  // optSlotIds: the translate kernel's output, bound by the expert matmuls in
+  // place of B.moeIds. One buffer reused across layers — the encoder orders
+  // the overwrites. optStaging: one MAP_READ buffer per pooled layer; the
+  // whole token's routing is copied out inside the single submit and awaited
+  // as a wave afterwards (measured 1.57 ms for 40 layers against 7.98 serial —
+  // scripts/moe-optimistic-probe.mjs). Checkpoints: what a replay from layer L
+  // must restore — the residual/hidden pair at L's entry, and every GDN
+  // layer's conv+recur state from before ITS mutation this token (30 × 1 MiB
+  // measured at 0.25 ms). KV appends are idempotent on replay: same inputs,
+  // same positions.
+  const optSlotIds = optimistic ? makeBuf(device, S.moeSlots * 4, 'optSlotIds') : null
+  const optTranslateU = optimistic ? uniformBuf(device, [u32(S.moeSlots)]) : null
+  const optStaging: (GPUBuffer | null)[] = []
+  const ckptResidual: (GPUBuffer | null)[] = []
+  const ckptHidden: (GPUBuffer | null)[] = []
+  const ckptConv: (GPUBuffer | null)[] = []
+  const ckptRecur: (GPUBuffer | null)[] = []
+  if (optimistic) {
+    for (let L = 0; L < S.layers; L++) {
+      const inRange = L >= L0 && L < L1
+      const lp = inRange ? layerPools[L - L0] : null
+      optStaging.push(lp ? device.createBuffer({
+        size: MOE_ID_BYTES, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        label: `optIdsRead_${L}`,
+      }) : null)
+      ckptResidual.push(inRange ? makeBuf(device, S.d * 2, `ckptResidual_${L}`) : null)
+      ckptHidden.push(inRange ? makeBuf(device, S.d * 2, `ckptHidden_${L}`) : null)
+      if (inRange && gdnConvState[L]) {
+        ckptConv.push(makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `ckptConv_${L}`))
+        ckptRecur.push(makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `ckptRecur_${L}`))
+      } else { ckptConv.push(null); ckptRecur.push(null) }
+    }
+  }
+
+  // MoE routing trace. One row per layer, written straight after that layer's
+  // top-k so the record is exactly what the expert matmul then read.
+  // A RING over many decode steps, not one pass. The buffer is overwritten
+  // every token, so a single-pass trace yields one sample per generation —
+  // nowhere near enough to score a cache policy. Capacity is tokens; the
+  // forward recorder advances the write slot.
+  const TRACE_ROW = S.moeSlots * 4
+  const TRACE_CAP = opts.traceMoe ? 2048 : 0
+  const traceStride = TRACE_ROW * S.layers
+  let moeTraceIdx = 0
+  const moeTraceBuf = (opts.traceMoe && S.moe)
+    ? makeBuf(device, traceStride * TRACE_CAP, 'moeTrace') : null
+  const moeTraceRead = moeTraceBuf
+    ? device.createBuffer({ size: traceStride * TRACE_CAP, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    : null
+
+  const ffnDnU = uniformBuf(device, [u32(FFN_DN_K_PACKED), u32(FFN_DN_SCALES), u32(S.d)])
+
+  // Affine dense gate_up: a K=d matmul instance over 2·ffn rows (same shape
+  // family as qkvU), plus silu_mul pinned to a single slot.
+  const ffnGateUpU = ffnGateUp ? uniformBuf(device, [u32(QKV_K_PACKED), u32(QKV_SCALES), u32(2 * S.ffn)]) : null
+  const ffnSiluU = ffnGateUp ? uniformBuf(device, [i32(1), i32(Math.ceil(S.ffn / 256))]) : null
+  const lmHdU  = uniformBuf(device, [u32(QKV_K_PACKED),    u32(QKV_SCALES),    u32(S.vocab)])
+  const embU   = uniformBuf(device, [u32(1), u32(D_WGS)])
+  const normU  = uniformBuf(device, [u32(1)])
+  const ffnU   = uniformBuf(device, [u32(S.ffn)])
+  const argmaxU = uniformBuf(device, [u32(S.vocab)])
+  // Sampling. Temperature 0 resolves to null, which is what keeps the greedy
+  // path dispatch-for-dispatch what it was.
+  //
+  // MUTABLE, and both paths are built: a settings control that changed
+  // temperature would otherwise have to rebuild the engine, i.e. reload the
+  // page and re-download the weights on every slider move. The choice is made
+  // per token in recordForward (a fresh encoder each time), so switching is
+  // free and greedy still dispatches argmax.wgsl rather than becoming "the
+  // sampler at temperature 0" — every reference comparison in this repo pins
+  // greedy decoding to that kernel.
+  let sampling = opts.sampling && opts.sampling.temperature > 0 ? opts.sampling : null
+  // Partitions in the sampler's reduce pass — a width, not a tuning knob: 64
+  // workgroups fill a GPU for every shipped vocabulary (32064 → 501 logits per
+  // partition, 248320 → 3880) and the select pass merges them serially.
+  const SAMPLE_PARTS = 64
+  // Allocated whether or not sampling is on right now — 32 bytes of uniform and
+  // a 512-byte partials buffer, against being able to turn it on without a
+  // reload.
+  const samplerU = L1 === S.layers ? uniformBuf(device, [
+    u32(S.vocab), u32(SAMPLE_PARTS), f32(sampling?.temperature ?? 0),
+    f32(sampling?.topP ?? 1), f32(sampling?.minP ?? 0), u32(sampling?.seed ?? 0), u32(0),
+  ]) : null
+  // (max, denominator) per partition — sampler.wgsl's PARTIAL_STRIDE.
+  const samplePartials = L1 === S.layers ? makeBuf(device, SAMPLE_PARTS * 2 * 4, 'samplePartials') : null
+  if (sampling) {
+    console.log(
+      `[engine] sampling: temperature=${sampling.temperature} topP=${sampling.topP ?? 1} ` +
+      `minP=${sampling.minP ?? 0} seed=${sampling.seed ?? 0}`,
+    )
+  }
+
+  // Hoisted per-layer uniforms — all fields are constant across tokens.
+  // Unfused: rope + kv_append. Fused: qkv_fused (f16) or scratch + quantize (int8).
+  const ropeU  = fused ? null : uniformBuf(device, [i32(1), i32(0), i32(1), u32(QKV_WGS)])
+  // RoPE inverse-frequency table (f32, HALF_ROTARY entries) — rope.wgsl
+  // binding 6. Computed on the CPU (model-spec.ts ropeInvFreqTable) so
+  // llama3-style rope_scaling is a table swap, not a kernel variant.
+  //
+  // ALWAYS created, even for fused specs whose DECODE does RoPE inline: the
+  // chunk-prefill path runs the unfused composition (rope_kernel) for every
+  // spec, so `fused ? null` left Phi-3 — the only fused family — binding a
+  // null here at BUILD time. That broke the default model's boot for ten
+  // days (cd4bf95 → 2026-08-16) while every test ran non-fused models. The
+  // table is HALF_ROTARY f32s (~192 B); a dead table is cheaper than a
+  // conditional that has to mirror the chunk builder's reach.
+  const ropeFreqs = (() => {
+    const b = makeBuf(device, S.halfRotary * 4, 'ropeFreqs')
+    device.queue.writeBuffer(b, 0, ropeInvFreqTable(S))
+    return b
+  })()
+  const kvAppU = fused ? null : uniformBuf(device, [i32(1), i32(S.maxPages), i32(0), i32(0), u32(KV_WGS)])
+  // Qwen3 per-head Q/K RMSNorm — one 32-thread WG per (token, head), heads
+  // ordered Q then K: grid = seq_len × (HEADS + KV_HEADS). seq_len is 1 on
+  // the decode path, so the uniform is fully constant.
+  const QK_NORM_WGS = S.heads + S.kvHeads
+  const qkNormU = S.qkNorm ? uniformBuf(device, [i32(1), u32(QK_NORM_WGS)]) : null
+  // Fused qk_norm+RoPE+append (?fuseqk): one 32-thread WG per (token, head)
+  // over Q, K AND V heads. seq_len is 1 on the decode path — fully constant.
+  const QK_FUSE_WGS = S.heads + 2 * S.kvHeads
+  const qkFuseU = fuseQk ? uniformBuf(device, [i32(1), u32(QK_FUSE_WGS)]) : null
+  const qkvFusedU = (fused && !int8Mode) ? uniformBuf(device, [i32(0), i32(0), u32(S.qkvPairs)]) : null      // f16-KV mode
+  const qkvFusedScratchU = int8Mode ? uniformBuf(device, [i32(0), u32(S.qkvPairs)]) : null                   // int8-KV mode
+  const kvQuantU = int8Mode ? uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]) : null  // pos_off, pages_off, scales_off, kvHeads*2 WG
+
+  // Hybrid (Qwen3.5) uniforms + grids. All static except gdnConvU.pos, which
+  // writeStepState rewrites per token (queue-ordered like attnU.nnz_pages).
+  const GDN_CONV_WGS = hybrid ? Math.ceil(S.gdnQkvDim / WG_SIZE_D) : 0
+  const C_ATTN_WGS   = hybrid ? Math.ceil(S.cAttnDim / WG_SIZE_D) : 0
+  const ATTN_GATE_WGS = hybrid ? Math.ceil(S.qDim / WG_SIZE_D) : 0
+  // Fused GDN input projection: one 12352-row (Qwen3.5) K=d matmul replaces
+  // the 4 separate in_proj_qkv/z/a/b dispatches (weights packed by the loader).
+  const gdnProjU = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.gdnProjRows)]) : null
+  const gdnOutU  = hybrid ? uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / QGROUP), u32(S.d)]) : null
+  const cAttnU   = hybrid ? uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.cAttnDim)]) : null
+  const gdnConvU = hybrid ? uniformBuf(device, [i32(0), u32(GDN_CONV_WGS)]) : null  // pos rewritten per token
+  // gdn_gates / gdn_norm_out are seq-capable (chunked prefill): the decode
+  // uniforms pin seq_len=1 with tightly-packed strides (the region views the
+  // decode bind groups carry are single-token).
+  const gdnGatesU = hybrid ? uniformBuf(device, [i32(1), i32(2 * S.gdnVHeads), u32(1)]) : null
+  const gdnRecurU = hybrid ? uniformBuf(device, [i32(1), u32(S.gdnVHeads)]) : null  // seq_len = 1 (decode/step prefill)
+  const gdnNormU  = hybrid ? uniformBuf(device, [i32(1), i32(S.gdnVDim), u32(S.gdnVHeads)]) : null
+  const gatedSplitU = hybrid ? uniformBuf(device, [i32(1), u32(C_ATTN_WGS)]) : null
+  const attnGateU = hybrid ? uniformBuf(device, [u32(ATTN_GATE_WGS)]) : null
+  // GDN out_proj is a K = GDN_V_DIM matmul instance — resolve its own
+  // pipeline so the vec4 K-divisibility gate applies to the right K
+  // (== R.matmulOProj on Qwen3.5, where gdnVDim == qDim == 4096).
+  // Same affine gate as resolveVariantPipelines — this is the fourth K instance
+  // and it is resolved here rather than there, so it has to repeat the test.
+  const matmulGdnOut = hybrid
+    ? resolveMatmul(variants.matmul, P, variants.vec4, S.gdnVDim, variants.vec4Half,
+                    S.weightFormat === 'mlx-safetensors').pipeline
+    : null
+
+  // yarn scales attention LOGITS by mscale^2 on top of 1/sqrt(headDim). It is
+  // not part of RoPE, so nothing in the rope path applies it, and a table that
+  // is right without it is still a model that is wrong at every position.
+  // ropeAttnScale() returns 1 for every non-yarn spec, so this is identity for
+  // everything shipped today.
+  // MLA's score is a dot over [nope | rope] = 192, not over headDim = 128.
+  // Left unbranched this is a uniform 1.2247x on every logit — finite, no NaN,
+  // no test failure outside the reference bundle. mla-spec.test.ts pins the
+  // result against the bundle's own softmax_scale, which is what makes it
+  // impossible to ship.
+  const SM_SCALE = S.mla
+    ? ropeAttnScale(S) / Math.sqrt(S.mla.qkNopeHeadDim + S.mla.qkRopeHeadDim)
+    : ropeAttnScale(S) / Math.sqrt(S.headDim)
+
+  // ── MLA uniforms ────────────────────────────────────────────────────────
+  // The two projections are ordinary affine-matmul triples. The two mla_proj
+  // uniforms differ ONLY in {N, K}, which is the whole reason one pipeline
+  // serves both directions.
+  const MLA = S.mla
+  const mlaQU = MLA ? uniformBuf(device, [u32(S.d / PACK), u32(S.d / QGROUP), u32(S.mlaQProjRows)]) : null
+  const mlaKvaU = MLA ? uniformBuf(device, [u32(S.d / PACK), u32(S.d / QGROUP), u32(S.mlaKvaRows)]) : null
+  const mlaSplitU = MLA ? uniformBuf(device, [u32(MLA.qkNopeHeadDim), u32(MLA.qkRopeHeadDim)]) : null
+  const mlaWriteU = MLA ? uniformBuf(device, [u32(MLA.kvLoraRank), u32(MLA.qkRopeHeadDim)]) : null
+  const mlaProjKU = MLA ? uniformBuf(device, [u32(MLA.kvLoraRank), u32(MLA.qkNopeHeadDim)]) : null
+  const mlaProjVU = MLA ? uniformBuf(device, [u32(MLA.vHeadDim), u32(MLA.kvLoraRank)]) : null
+  const mlaNarrowU = MLA ? uniformBuf(device, [u32(S.heads * MLA.kvLoraRank)]) : null
+  // {L, R, T, scale} — T is rewritten per token at byte offset 8, beside the
+  // existing nnzPages write, because the cache grows by one row per position.
+  const mlaScoresU = MLA ? (() => {
+    const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'mlaScoresU' })
+    const init = new ArrayBuffer(16); const dv = new DataView(init)
+    dv.setUint32(0, MLA.kvLoraRank, true); dv.setUint32(4, MLA.qkRopeHeadDim, true)
+    dv.setUint32(8, 0, true); dv.setFloat32(12, SM_SCALE, true)
+    device.queue.writeBuffer(b, 0, init)
+    return b
+  })() : null
+  // {L, T} — T at offset 4, same per-token patch.
+  const mlaCombineU = MLA ? uniformBuf(device, [u32(MLA.kvLoraRank), u32(0)]) : null
+  const mlaTScratch = new Uint32Array(1)
+
+  // Hard KV ceiling — writing a slot at or past this position would run off
+  // the last page and silently corrupt the cache.
+  const MAX_CONTEXT = S.maxContext
+
+  // Attention uniform (f16-KV mode): 9 fields, 36 bytes, padded to 48.
+  // nnz_pages at offset 8 is the only per-token field; the rest are constant.
+  const attnU = device.createBuffer({
+    size: 48,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    label: 'attnU',
+  })
+  {
+    const init = new ArrayBuffer(48)
+    const dv = new DataView(init)
+    dv.setInt32(0, 1, true)                    // batch
+    dv.setInt32(4, S.maxPages, true)           // max_num_pages
+    // offset 8: nnz_pages — updated per token via writeBuffer
+    dv.setInt32(12, 0, true)                   // pages_elem_offset
+    dv.setInt32(16, 0, true)                   // page_indptr_elem_offset
+    dv.setInt32(20, 0, true)                   // page_values_elem_offset
+    dv.setInt32(24, 0, true)                   // length_info_elem_offset
+    dv.setFloat32(28, SM_SCALE, true)          // sm_scale
+    dv.setUint32(32, 1, true)                  // packGridDimX
+    device.queue.writeBuffer(attnU, 0, init)
+  }
+
+  // Split-K attention uniforms (?splitk=N): the partial pass mirrors the
+  // f16 attention PODArgs with packGridDimX replaced by num_splits (same
+  // nnz_pages slot at byte offset 8, updated per token alongside attnU);
+  // the combine pass needs only num_splits.
+  let attnSkU: GPUBuffer | null = null
+  let combineU: GPUBuffer | null = null
+  if (splitK) {
+    attnSkU = device.createBuffer({
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'attnSkU',
+    })
+    const init = new ArrayBuffer(48)
+    const dv = new DataView(init)
+    dv.setInt32(0, 1, true)                    // B
+    dv.setInt32(4, S.maxPages, true)           // max_num_pages
+    // offset 8: nnz_pages — updated per token via writeBuffer
+    dv.setInt32(12, 0, true)                   // pages_elem_offset
+    dv.setInt32(16, 0, true)                   // page_indptr_elem_offset
+    dv.setInt32(20, 0, true)                   // page_values_elem_offset
+    dv.setInt32(24, 0, true)                   // length_info_elem_offset
+    dv.setFloat32(28, SM_SCALE, true)          // sm_scale
+    dv.setUint32(32, splitK, true)             // num_splits
+    device.queue.writeBuffer(attnSkU, 0, init)
+    combineU = uniformBuf(device, [u32(splitK)])
+  }
+
+  // Attention uniform (int8-KV mode): extra scales_elem_offset field; 10 fields,
+  // 40 bytes, padded to 48.
+  let attnI8U: GPUBuffer | null = null
+  if (int8Mode) {
+    attnI8U = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'attnI8U' })
+    const tmpl = new ArrayBuffer(48)
+    const dv = new DataView(tmpl)
+    dv.setInt32(0, 1, true)                    // B
+    dv.setInt32(4, S.maxPages, true)           // max_num_pages
+    // offset 8: nnz_pages — rewritten per token
+    dv.setInt32(12, 0, true)                   // pages_elem_offset
+    dv.setInt32(16, 0, true)                   // page_indptr_elem_offset
+    dv.setInt32(20, 0, true)                   // page_values_elem_offset
+    dv.setInt32(24, 0, true)                   // length_info_elem_offset
+    dv.setInt32(28, 0, true)                   // scales_elem_offset
+    dv.setFloat32(32, SM_SCALE, true)          // sm_scale
+    dv.setUint32(36, 1, true)                  // packGridDimX
+    device.queue.writeBuffer(attnI8U, 0, tmpl)
+  }
+  const nnzPagesScratch = new Uint32Array(1)   // reused per token for writeBuffer
+  const gdnPosScratch = new Int32Array(1)      // reused per token for gdnConvU.pos
+  const sampleCounterScratch = new Uint32Array(1)  // reused per token for samplerU.counter
+
+  // Residual hand-off readback (pipeline stages that do not end the model).
+  const residualReadBuf = L1 === S.layers ? null : device.createBuffer({
+    size: S.d * 2,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    label: 'residualHandoff',
+  })
+
+  // Token readback buffer for the blocking path — allocated once, reused
+  // every decode step.
+  const readBuf = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    label: 'tokenReadback',
+  })
+
+  // ── GDN state-position tracker (hybrid specs) ─────────────────────────────
+  // Number of tokens the persistent GDN state (conv rings + recurrent S)
+  // currently has absorbed — i.e. the next position a forward pass may run at
+  // without corrupting the recurrence. Every submitted forward pass at
+  // position p advances it to p+1 (a pass at position 0 first zeroes the
+  // state, so the counter is exact from a fresh prefill onward).
+  //
+  // This is what lets the blocking generate() skip the prompt replay: unlike
+  // the KV cache (idempotent — rewriting a slot with the same K/V is
+  // harmless), a GDN step MUTATES S and rotates the conv ring, so re-running
+  // any already-absorbed token double-applies it. generate() therefore only
+  // trusts `startPos` when gdnStatePos proves the state actually sits at that
+  // boundary; anything else falls back to a full replay from 0 (which
+  // re-zeroes the state). The pipelined path may leave gdnStatePos past the
+  // consumed sequence (up to PIPELINE_DEPTH-1 speculative steps submitted
+  // after a stop token) — those extra mutations are harmless precisely
+  // because no later call trusts state it can't match: pipelined generation
+  // always re-prefills from 0, and the blocking path checks this counter.
+  let gdnStatePos = 0
+
+  // ── Absorbed-token record (cross-turn prefix reuse) ───────────────────────
+  // absorbed[p] is the token id whose forward pass was the LAST submitted at
+  // position p — i.e. what KV slot p currently encodes and (for hybrid) what
+  // the GDN state absorbed at step p. Every submission path maintains it:
+  // blocking decodeToken and prefill submitSteps note tokens directly;
+  // generatePipelined patches the chained-argmax positions from its readbacks
+  // (the input of the step at position p is the readback of step p-1), so the
+  // record stays exact even for the ≤ PIPELINE_DEPTH-1 overrun steps
+  // submitted after a stop token. A readback failure (device loss) marks the
+  // record invalid, which disables reuse until resetKVTracking().
+  let absorbed: number[] = []
+  let absorbedValid = true
+  const prefixReuse = opts.prefixReuse ?? true
+  /** What ended the last turn. `stop` false with `inVocab` false means the
+   *  readback produced no valid token — an engine fault, not a decision. */
+  let lastStop: { id: number; generated: number; stop: boolean; inVocab: boolean } | null = null
+  let lastPrefill: {
+    promptLen: number; reused: number; chunks: number
+    /** Why reuse did not cover more: how far the new prompt agreed with the
+     *  absorbed record (`lcp`), how much was absorbed, and — for hybrids —
+     *  where the recurrent state actually sits. A turn that re-prefills
+     *  everything is the single most expensive thing this engine can do, so
+     *  it says why rather than leaving it to be inferred from a stopwatch. */
+    lcp: number; absorbed: number; gdnStatePos: number; hybrid: boolean; valid: boolean
+  } | null = null
+
+  // The rules themselves live in prefix-reuse.ts, pinned by
+  // tests/unit/prefix-reuse.test.ts against a table hand-derived from the
+  // stated rule. They were closures here, and their only assertion was
+  // checkReuse() in bench-console.ts — a browser, a loaded model, 48 decoded
+  // tokens and ?chunk=0. These two wrappers keep the local `let`s as the
+  // single source of truth: gdnStatePos is written from six places in this
+  // file, so it is read at call time rather than mirrored.
+  function reuseState(): ReuseState {
+    return { absorbed, absorbedValid, prefixReuse, hybrid, gdnStatePos }
+  }
+
+  function noteAbsorbed(position: number, id: number): void {
+    const s = reuseState()
+    pureNoteAbsorbed(s, position, id)
+    absorbed = s.absorbed
+    absorbedValid = s.absorbedValid
+  }
+
+  function computeReuseStart(promptIds: number[]): number {
+    return reuseStart(reuseState(), promptIds)
+  }
+
+  /** How far the new prompt agrees with what the cache holds. Reported, never
+   *  used to decide — reuseStart owns the decision. */
+  function absorbedLcp(promptIds: number[]): number {
+    const max = Math.min(absorbed.length, promptIds.length)
+    let lcp = 0
+    while (lcp < max && absorbed[lcp] === promptIds[lcp]) lcp++
+    return lcp
+  }
+
+  // Logit readback buffer — used by forwardLogits() for the validation harness only.
+  // Allocated lazily on first call.
+  let logitsReadBuf: GPUBuffer | null = null
+
+  // Initialize identity page table (page i → physical page i)
+  {
+    const pageVals = new Int32Array(S.maxPages)
+    for (let i = 0; i < S.maxPages; i++) pageVals[i] = i
+    device.queue.writeBuffer(B.pageValues, 0, pageVals)
+  }
+
+  /**
+   * TEST SEAM. Overwrite the page table with an arbitrary permutation.
+   *
+   * The table has been the identity since the day it was written, so nothing
+   * in this repo has ever run with a non-identity one end to end — and the
+   * kernels that WRITE the cache (`kv_append`, `qkv_fused`,
+   * `qk_norm_rope_append`, `kv_quantize_int8`, `mla_kv_write`) do not take the
+   * table at all; they compute `position / PAGE_SIZE` directly. So today a
+   * permutation is expected to produce WRONG output, and
+   * scripts/paging-test.mjs asserts exactly that before any of them is taught
+   * the table (docs/PAGING_PLAN.md §0.4). Once they are, the same script
+   * flips to asserting bit-identical logits.
+   *
+   * Not part of any shipping path. `B` is closed over, so without this seam
+   * the falsifier cannot be written at all.
+   */
+  function setPageTable(pageVals: Int32Array<ArrayBuffer>): void {
+    if (pageVals.length !== S.maxPages) {
+      throw new Error(`setPageTable: expected ${S.maxPages} entries, got ${pageVals.length}`)
+    }
+    device.queue.writeBuffer(B.pageValues, 0, pageVals)
+  }
+
+  // ============================================================
+  // Pre-computed bind groups
+  //
+  // Bind group contents are deterministic (same buffers, same layout) so we
+  // hoist them out of the hot loop — ~10 per layer × spec.layers otherwise.
+  //
+  // The residual ping-pong is also deterministic: every layer reads `residual`
+  // and writes `residual2` in addNorm1 (post-attention), then reads `residual2`
+  // and writes `residual` in addNorm2 (post-FFN). Two swaps per layer return to
+  // the same state, so the bind groups are identical for every layer.
+  // ============================================================
+
+  // Affine (MLX) matmuls bind a per-group bias at @binding(5); the symmetric
+  // kernels have no such binding. Appending it exactly when the spec is affine
+  // is what keeps ONE bind-group construction serving both families — and a
+  // mismatch is a loud bind-group validation error ("5 entries, expected 6"),
+  // not a wrong number, which is the only reason this is safe to centralise.
+  const withBias = (entries: BindEntry[], bias: GPUBuffer | undefined, what: string): BindEntry[] => {
+    if (!AFFINE) return entries
+    if (!bias) throw new Error(`buildDecodeEngine: ${S.id} is affine but ${what} has no bias buffer`)
+    return [...entries, bias]
+  }
+
+  // Global (non-per-layer) bind groups
+  // embedding.wgsl is hard-symmetric — (nibble-7)*scale over groups of 32, no
+  // bias — so an affine table needs the other kernel, not just an extra entry.
+  // One name for both the bind group and the dispatch: with layout:'auto' each
+  // pipeline owns a DISTINCT layout object even when structurally identical, so
+  // binding against one and dispatching the other is a validation error.
+  // Embedding and LM head belong to the FIRST and LAST stage respectively;
+  // a middle stage builds neither, so it can run without ever having loaded
+  // the two largest tensors in the model.
+  const embeddingPipeline = AFFINE ? P.embeddingAffine : P.embedding
+  const bgEmbedding = L0 !== 0 ? null : bg(device, embeddingPipeline, withBias(
+    [B.residual, B.inputIds, weights.embdScales, weights.embdWeights, embU],
+    weights.embdBiases, 'embed_tokens'))
+  // The pre-layer norm of this stage's FIRST layer — layer 0 for a whole-model
+  // engine, layer L0 for a later pipeline stage, which is exactly why the
+  // hand-off can be the bare residual.
+  const bgInitNorm = bg(device, P.rmsNorm, [
+    B.hidden1, B.residual, weights.layers[L0].normGamma1, normU,
+  ])
+  const bgRope = fused ? null : bg(device, P.rope, [
+    B.qOut, B.kOut!, B.vOut!, B.qkvOut!, B.posMap, ropeU!, ropeFreqs!,
+  ])
+  const bgLmHead = L1 !== S.layers ? null : bg(device, R.matmulF32, withBias(
+    [B.logits, B.hidden1, weights.lmHeadScales, weights.lmHeadWeights, lmHdU],
+    weights.lmHeadBiases, 'lm_head'))
+  const bgArgmax = L1 !== S.layers ? null : bg(device, R.argmax, [
+    B.logits, B.tokenOut, argmaxU,
+  ])
+  // Sampler bind groups. Both passes bind the same four buffers, which is why
+  // sample_reduce also writes `result` (see the sentinel note in sampler.wgsl)
+  // — a binding a pass never touches would be dropped from its layout:'auto'
+  // layout and the shared entry list would then fail validation on one of them.
+  const bgSampleReduce = L1 === S.layers
+    ? bg(device, P.sampleReduce, [B.logits, samplePartials!, B.tokenOut, samplerU!]) : null
+  const bgSampleSelect = L1 === S.layers
+    ? bg(device, P.sampleSelect, [B.logits, samplePartials!, B.tokenOut, samplerU!]) : null
+  // Split-K combine reads the shared partials scratch and writes attnOut —
+  // identical for every layer, so one bind group serves every layer.
+  const bgAttnCombine = splitK
+    ? bg(device, R.attentionCombine!, [B.attnPartials!, B.attnOut, combineU!])
+    : null
+
+  // Per-layer bind groups
+  interface LayerBG {
+    qkv?: GPUBindGroup          // unfused: qkv matmul | fused: qkv_fused / qkv_fused_scratch | hybrid attn: c_attn matmul
+    qkNorm?: GPUBindGroup       // qkNorm specs (Qwen3/Qwen3.5) only — in-place Q/K RMSNorm on qkvOut
+    qkFused?: GPUBindGroup      // ?fuseqk (qkNorm specs): fused qk_norm+RoPE+append replaces qkNorm/rope/kvApp
+    gatedSplit?: GPUBindGroup   // hybrid attn layers: c_attn → qkvOut + attnGateRaw unpack
+    attnGate?: GPUBindGroup     // hybrid attn layers: attnOut *= sigmoid(gate), in place
+    kvApp?: GPUBindGroup        // unfused only
+    kvQuantize?: GPUBindGroup   // int8 mode only
+    attn?: GPUBindGroup         // splitK: the partial pass (writes attnPartials)
+    // Hybrid GDN layers: the whole GatedDeltaNet chain replaces qkv/attn.
+    gdn?: {
+      proj: GPUBindGroup        // fused in_proj qkv‖z‖a‖b matmul → gdnProjOut
+      conv: GPUBindGroup        // causal conv + SiLU (ring state; reads the qkv region)
+      gates: GPUBindGroup       // exp(g) decay + beta (reads the [a|b] region)
+      recur: GPUBindGroup       // gated delta rule (f32 state)
+      normOut: GPUBindGroup     // gated RMSNorm · silu(z region) → gdnNormed
+    }
+    oProj: GPUBindGroup         // attn: o_proj | gdn: out_proj (both → hidden2)
+    addNorm1?: GPUBindGroup     // post-attention: reads residual, writes residual2 (absent w/ ?fuseprologue=1)
+    ffn?: GPUBindGroup          // dense FFN; absent on a MoE spec. Affine: the 2·ffn-row gate_up matmul
+    ffnSilu?: GPUBindGroup      // affine dense only: silu_mul(ffnGateUp) → ffnOut (fused_ffn has no affine sibling)
+    ffnDown?: GPUBindGroup      // prologue mode: writes hidden3 (hidden2 must survive for add3_norm)
+    /** The MLA chain's bind groups, present iff spec.mla. Replaces qkv/attn
+     *  entirely — there is no per-head K/V and no kv_append. */
+    mla?: {
+      qProj: GPUBindGroup       // q_proj (pe rows already permuted at load)
+      kvaProj: GPUBindGroup     // kv_a_proj_with_mqa
+      qSplit: GPUBindGroup      // → q_nope + half-split-RoPE'd q_pe
+      kvWrite: GPUBindGroup     // RMSNorm'd latent + RoPE'd shared key, into the cache
+      qLat: GPUBindGroup        // q_nope through kv_b's K half → latent space
+      scores: GPUBindGroup      // score against the cache
+      combine: GPUBindGroup     // softmax + weighted sum of the latent
+      narrow: GPUBindGroup      // f32 → f16 for the trip back out
+      oHead: GPUBindGroup       // latent context through kv_b's V half
+    }
+    /** The MoE block's seven bind groups, present iff spec.moe. Replaces
+     *  ffn/ffnDown between addNorm1 and addNorm2 — the surrounding residual
+     *  chain is identical, which is why the block is a drop-in. */
+    moe?: {
+      routerLogits: GPUBindGroup
+      routerTopk: GPUBindGroup
+      gate: GPUBindGroup
+      up: GPUBindGroup
+      silu: GPUBindGroup
+      down: GPUBindGroup
+      combine: GPUBindGroup
+      /** Optimistic recorder only: the translate dispatch and the expert
+       *  matmuls re-bound to its OUTPUT (optSlotIds). B.moeIds keeps the raw
+       *  expert ids for the staging copy the CPU resolves after the token. */
+      translate?: GPUBindGroup
+      gateO?: GPUBindGroup
+      upO?: GPUBindGroup
+      downO?: GPUBindGroup
+    }
+    addNorm2: GPUBindGroup      // post-FFN: reads residual2, writes residual (prologue mode: add3_norm)
+  }
+  if (S.moe && R.ffnPrologue) {
+    throw new Error('buildDecodeEngine: ?fuseprologue=1 folds add_norm into the DENSE FFN; a MoE spec has no dense FFN')
+  }
+  if (hybrid && R.ffnPrologue) {
+    throw new Error('buildDecodeEngine: ?fuseprologue=1 is not supported for hybrid (GDN) specs')
+  }
+  if (AFFINE && R.ffnPrologue) {
+    throw new Error('buildDecodeEngine: ?fuseprologue=1 uses the symmetric fused FFN kernel — MLX-affine specs run the unfused gate_up/silu/down chain')
+  }
+  // Only this stage's layers get bind groups — a partial stage may hold no
+  // weights at all for the others. Indexed by L - L0 (see recordForward).
+  const layerBGs: LayerBG[] = []
+  for (let L = L0; L < L1; L++) {
+    const lw = weights.layers[L]
+    const isGdn = S.layerKinds[L] === 'gdn'
+    const isMla = !!S.mla
+    // addNorm2 folds the NEXT layer's pre-norm into this layer's epilogue. At
+    // the end of a partial stage there is no next layer here, and the value is
+    // discarded anyway (the receiving stage re-norms from the residual), so it
+    // binds a gamma this stage certainly owns rather than reaching for one it
+    // may not have loaded.
+    const nextGamma = L + 1 < L1
+      ? weights.layers[L + 1].normGamma1
+      : L1 === S.layers ? weights.finalNormGamma : lw.normGamma2
+
+    let qkvBG: GPUBindGroup | undefined
+    let attnBG: GPUBindGroup | undefined
+    let qkNormBG: GPUBindGroup | undefined
+    let qkFusedBG: GPUBindGroup | undefined
+    let gatedSplitBG: GPUBindGroup | undefined
+    let attnGateBG: GPUBindGroup | undefined
+    let kvAppBG: GPUBindGroup | undefined
+    let kvQuantizeBG: GPUBindGroup | undefined
+    let gdnBG: LayerBG['gdn']
+    let mlaBG: LayerBG['mla']
+    let oProjBG: GPUBindGroup
+    // KV pages for this layer's attention-layer ordinal (== L for
+    // pure-attention specs).
+    const kvL = () => kvPages[kvIndex[L]]
+    // Split-K partial pass replaces the single-WG-per-head attention bind
+    // group in the f16-KV modes (int8 has no split-K variant).
+    const attnF16BG = () => splitK
+      ? bg(device, R.attentionSplitK!, [
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), B.lengthInfo, B.attnPartials!, attnSkU!,
+        ])
+      : bg(device, R.attention, [
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), B.lengthInfo, B.attnOut, attnU,
+        ])
+    const qkNormBGFor = () => {
+      // q_norm/k_norm gammas are HEAD_DIM f16 vectors in the MLC layout —
+      // same dtype as every other norm gamma, uploaded raw by the loader.
+      if (!lw.qNormGamma || !lw.kNormGamma) {
+        throw new Error(`buildDecodeEngine: spec ${S.id} sets qkNorm but layer ${L} has no q_norm/k_norm weights`)
+      }
+      return bg(device, P.qkNorm, [B.qkvOut!, lw.qNormGamma, lw.kNormGamma, qkNormU!])
+    }
+    if (isGdn) {
+      const gw = lw.gdn
+      if (!gw) throw new Error(`buildDecodeEngine: spec ${S.id} marks layer ${L} 'gdn' but the loader has no GDN weights for it`)
+      // Region views into the packed projection output [qkv | z | a | b].
+      // Offsets are f16-element row offsets × 2 bytes; both are multiples of
+      // 256 (z at 16384, a|b at 24576 for Qwen3.5) so they satisfy
+      // minStorageBufferOffsetAlignment on every conformant device.
+      const zRegion  = { buffer: B.gdnProjOut!, offset: S.gdnQkvDim * 2, size: S.gdnVDim * 2 }
+      const abRegion = { buffer: B.gdnProjOut!, offset: (S.gdnQkvDim + S.gdnVDim) * 2, size: 2 * S.gdnVHeads * 2 }
+      gdnBG = {
+        proj: bg(device, R.matmul, withBias(
+          [B.gdnProjOut!, B.hidden1, gw.projScales, gw.projWeights, gdnProjU!], gw.projBiases, 'gdn in_proj')),
+        // gdn_conv's qkv_raw binding sees the whole packed buffer; it only
+        // reads channels < GDN_QKV_DIM (the qkv region at offset 0).
+        conv: bg(device, P.gdnConv, [B.gdnConvOut!, B.gdnProjOut!, gdnConvState[L]!, gw.convWeight, gdnConvU!]),
+        gates: bg(device, P.gdnGates, [B.gdnGates!, abRegion, gw.aLog, gw.dtBias, gdnGatesU!]),
+        recur: bg(device, P.gdnRecur, [B.gdnRecurOut!, B.gdnConvOut!, B.gdnGates!, gdnRecurState[L]!, gdnRecurU!]),
+        normOut: bg(device, P.gdnNormOut, [B.gdnNormed!, B.gdnRecurOut!, gw.normGamma, zRegion, gdnNormU!]),
+      }
+      oProjBG = bg(device, matmulGdnOut!, withBias(
+        [B.hidden2, B.gdnNormed!, gw.outScales, gw.outWeights, gdnOutU!], gw.outBiases, 'gdn out_proj'))
+    } else if (isMla) {
+      // Without this branch an MLA spec is neither hybrid nor fused, so it
+      // falls to the ordinary qkv/rope/kv_append/attention chain below with
+      // q_proj bound as qkvWeights — a bind group that VALIDATES and a forward
+      // pass that produces tokens. Wrong ones.
+      const mw = lw.mla
+      if (!mw) throw new Error(`buildDecodeEngine: spec ${S.id} is MLA but the loader has no MLA weights for layer ${L}`)
+      const M = S.mla!
+      // The cache buffer holds the latent region then the shared-key region;
+      // the offset is 256-aligned by a makeModelSpec assertion.
+      const cacheBuf = kvL()
+      const latent = { buffer: cacheBuf, offset: 0, size: S.maxContext * M.kvLoraRank * 2 }
+      const kpe = { buffer: cacheBuf, offset: S.mlaLatentBytes, size: S.maxContext * M.qkRopeHeadDim * 2 }
+      // kv_b_proj arrives dequantized as [K^T | V]; each half is a region with
+      // its own {N, K}. K first, V second — the loader's order.
+      const kvbK = { buffer: mw.kvbF16, offset: 0, size: S.heads * M.kvLoraRank * M.qkNopeHeadDim * 2 }
+      const kvbV = { buffer: mw.kvbF16, offset: S.heads * M.kvLoraRank * M.qkNopeHeadDim * 2,
+                     size: S.heads * M.vHeadDim * M.kvLoraRank * 2 }
+      mlaBG = {
+        qProj: bg(device, R.matmul, withBias(
+          [B.mlaQ!, B.hidden1, mw.qScales, mw.qWeights, mlaQU!], mw.qBiases, 'mla q_proj')),
+        kvaProj: bg(device, R.matmul, withBias(
+          [B.mlaKva!, B.hidden1, mw.kvaScales, mw.kvaWeights, mlaKvaU!], mw.kvaBiases, 'mla kv_a_proj')),
+        qSplit: bg(device, P.mlaQSplit, [B.mlaQ!, ropeFreqs!, B.posMap, B.mlaQNope!, B.mlaQPe!, mlaSplitU!]),
+        kvWrite: bg(device, P.mlaKvWrite,
+          [B.mlaKva!, mw.kvaNormGamma, ropeFreqs!, B.posMap, latent, kpe, mlaWriteU!]),
+        qLat: bg(device, P.mlaProj, [B.mlaQLat!, B.mlaQNope!, kvbK, mlaProjKU!]),
+        scores: bg(device, P.mlaScores, [B.mlaScores!, B.mlaQLat!, B.mlaQPe!, latent, kpe, mlaScoresU!]),
+        combine: bg(device, P.mlaCombine, [B.mlaOLat!, B.mlaScores!, latent, mlaCombineU!]),
+        narrow: bg(device, P.mlaNarrow, [B.mlaOLat16!, B.mlaOLat!, mlaNarrowU!]),
+        // attnOut is exactly heads*vHeadDim*2 bytes here, which is S.qDim*2 —
+        // the same buffer o_proj already reads from on every other spec.
+        oHead: bg(device, P.mlaProj, [B.attnOut, B.mlaOLat16!, kvbV, mlaProjVU!]),
+      }
+      // o_proj is the ordinary one: attnOut -> hidden2, exactly as every
+      // attention spec does. MLA changes what FILLS attnOut, not what reads it.
+      oProjBG = bg(device, R.matmulOProj, withBias(
+        [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
+    } else if (hybrid) {
+      // Gated attention layer: c_attn packs per-head [Q|gate] before K‖V.
+      qkvBG = bg(device, R.matmul, withBias(
+        [B.cAttnOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, cAttnU!], lw.qkvBiases, 'c_attn'))
+      gatedSplitBG = bg(device, P.gatedQkvSplit, [B.qkvOut!, B.attnGateRaw!, B.cAttnOut!, gatedSplitU!])
+      if (S.qkNorm) qkNormBG = qkNormBGFor()
+      if (int8Mode) {
+        kvQuantizeBG = bg(device, P.kvQuantizeInt8,
+          [B.kOut!, B.vOut!, kvL(), kvScales![kvIndex[L]], B.posMap, kvQuantU!])
+      } else {
+        kvAppBG = bg(device, P.kvAppend, [B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!])
+      }
+      attnBG = int8Mode
+        ? bg(device, P.attentionInt8, [
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), kvScales![kvIndex[L]],
+          B.lengthInfo, B.attnOut, attnI8U!,
+        ])
+        : attnF16BG()
+      attnGateBG = bg(device, P.attnGate, [B.attnOut, B.attnGateRaw!, attnGateU!])
+      oProjBG = bg(device, R.matmulOProj, withBias(
+        [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
+    } else if (!fused) {
+      qkvBG = bg(device, R.matmul, withBias(
+        [B.qkvOut!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, qkvU!], lw.qkvBiases, 'qkv_proj'))
+      if (fuseQk) {
+        // ?fuseqk: one fused kernel replaces qk_norm → rope → kv_append.
+        if (!lw.qNormGamma || !lw.kNormGamma) {
+          throw new Error(`buildDecodeEngine: spec ${S.id} sets qkNorm but layer ${L} has no q_norm/k_norm weights`)
+        }
+        qkFusedBG = bg(device, P.qkNormRopeAppend, [
+          B.qOut, kvL(), B.qkvOut!, lw.qNormGamma, lw.kNormGamma, B.posMap, qkFuseU!,
+        ])
+      } else {
+        if (S.qkNorm) qkNormBG = qkNormBGFor()
+        // int8 swaps the APPEND for a quantizing append. Same inputs — RoPE has
+        // already written post-RoPE K and V here, which is exactly what the
+        // cache must hold — and one extra output, the per-row scales.
+        if (int8Mode) {
+          kvQuantizeBG = bg(device, P.kvQuantizeInt8,
+            [B.kOut!, B.vOut!, kvL(), kvScales![L], B.posMap, kvQuantU!])
+        } else {
+          kvAppBG = bg(device, P.kvAppend, [B.kOut!, B.vOut!, kvL(), B.posMap, kvAppU!])
+        }
+      }
+      attnBG = int8Mode
+        ? bg(device, P.attentionInt8, [
+          B.qOut, B.pageIndptr, B.pageValues, kvL(), kvScales![L],
+          B.lengthInfo, B.attnOut, attnI8U!,
+        ])
+        : attnF16BG()
+      oProjBG = bg(device, R.matmulOProj, withBias(
+        [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU], lw.oProjBiases, 'o_proj'))
+    } else if (int8Mode) {
+      qkvBG = bg(device, P.qkvFusedScratch, [
+        B.qOut, B.kSlot!, B.vSlot!, B.hidden1, lw.qkvScales!, lw.qkvWeights!, B.posMap, qkvFusedScratchU!,
+      ])
+      kvQuantizeBG = bg(device, P.kvQuantizeInt8, [
+        B.kSlot!, B.vSlot!, kvL(), kvScales![L], B.posMap, kvQuantU!,
+      ])
+      attnBG = bg(device, P.attentionInt8, [
+        B.qOut, B.pageIndptr, B.pageValues, kvL(), kvScales![L],
+        B.lengthInfo, B.attnOut, attnI8U!,
+      ])
+      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
+    } else {
+      qkvBG = bg(device, R.qkvFused, [
+        B.qOut, kvL(), B.hidden1, lw.qkvScales!, lw.qkvWeights!, B.posMap, qkvFusedU!,
+      ])
+      attnBG = attnF16BG()
+      oProjBG = bg(device, R.matmulOProj, [B.hidden2, B.attnOut, lw.oProjScales!, lw.oProjWeights!, oProjU])
+    }
+
+    if (R.ffnPrologue) {
+      // ?fuseprologue=1: addNorm1 is gone, so there is only ONE residual
+      // hand-off per layer and the ping-pong alternates by layer parity
+      // (two swaps per layer collapse to one). The FFN kernel computes
+      // rIn + hidden2 and its RMSNorm into shared memory itself; add3_norm
+      // reconstructs the residual sum (rIn + oproj + ffnDown) at the tail —
+      // which is why ffnDown must write hidden3, not hidden2.
+      const rIn  = L % 2 === 0 ? B.residual : B.residual2
+      const rOut = L % 2 === 0 ? B.residual2 : B.residual
+      layerBGs.push({
+        qkv: qkvBG,
+        qkNorm: qkNormBG,
+        qkFused: qkFusedBG,
+        kvApp: kvAppBG,
+        kvQuantize: kvQuantizeBG,
+        attn: attnBG,
+        oProj: oProjBG,
+        // ?fuseprologue is dense-only — buildDecodeEngine throws for S.moe.
+        ffn: bg(device, R.ffn, [B.ffnOut, rIn, B.hidden2, lw.normGamma2, lw.ffnScales!, lw.ffnWeights!, ffnU]),
+        ffnDown: bg(device, R.matmulFfnDown, [B.hidden3!, B.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, ffnDnU]),
+        addNorm2: bg(device, P.add3Norm, [rIn, B.hidden2, B.hidden3!, nextGamma, B.hidden1, rOut, normU]),
+      })
+      continue
+    }
+
+    // The MoE block reads B.hidden1 (what addNorm1 just produced) and writes
+    // B.hidden2 (what addNorm2 consumes) — exactly the dense FFN's contract,
+    // which is why nothing around it changes.
+    const m = lw.moe
+    // Pooling changes the SIZE of the nine stacked expert tensors and nothing
+    // else here: the loader allocated them at SLOTS rows, the router is
+    // [experts+1, d] and stays whole, and every uniform is unchanged because
+    // id × stride is the same arithmetic whether the id names an expert or a
+    // slot. Which is why there is no pooled sibling to bind — `m` IS the pool.
+    const mw = m
+    const moeBG = S.moe && m && mw
+      ? {
+          // An unquantized router has no scales or biases to bind, and its
+          // module declares neither — passing six buffers to a four-binding
+          // layout is rejected outright.
+          routerLogits: bg(device, moeRouterPipe, routerBits === 16
+            ? [B.routerLogits!, B.hidden1, m.routerWeights, moeRouterU!]
+            : [B.routerLogits!, B.hidden1, m.routerWeights, m.routerScales, m.routerBiases, moeRouterU!]),
+          routerTopk: bg(device, P.moeRouterTopk!, [B.moeIds!, B.moeScores!, B.routerLogits!, moeTopkU!]),
+          // gate and up write interleaved halves of one [slot][2*ffn] buffer:
+          // same kernel, `up` bound ffn*2 bytes in, which is the layout silu_mul
+          // reads. The bind OFFSET must stay 256-aligned — ffn*2 = 1024 here.
+          gate: bg(device, moeMMGate!, [
+            { buffer: B.moeGateUp!, offset: 0, size: S.moeSlots * 2 * S.ffn * 2 },
+            B.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, B.moeIds!]),
+          up: bg(device, moeMMGate!, [
+            { buffer: B.moeGateUp!, offset: S.ffn * 2, size: S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
+            B.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, B.moeIds!]),
+          silu: bg(device, P.siluMul, [B.moeH!, B.moeGateUp!, moeSiluU!]),
+          down: bg(device, moeMMDown!, [
+            { buffer: B.moeDown!, offset: 0, size: S.moeSlots * S.d * 2 },
+            B.moeH!, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, B.moeIds!]),
+          combine: bg(device, P.moeCombine, [B.hidden2, B.moeDown!, B.moeScores!, moeCombU!]),
+          ...(optimistic ? {
+            translate: bg(device, P.moeSlotTranslate,
+              [optSlotIds!, B.moeIds!, layerPools[L - L0]!.mapBuf!, optTranslateU!]),
+            gateO: bg(device, moeMMGate!, [
+              { buffer: B.moeGateUp!, offset: 0, size: S.moeSlots * 2 * S.ffn * 2 },
+              B.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, optSlotIds!]),
+            upO: bg(device, moeMMGate!, [
+              { buffer: B.moeGateUp!, offset: S.ffn * 2, size: S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
+              B.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, optSlotIds!]),
+            downO: bg(device, moeMMDown!, [
+              { buffer: B.moeDown!, offset: 0, size: S.moeSlots * S.d * 2 },
+              B.moeH!, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, optSlotIds!]),
+          } : {}),
+        }
+      : undefined
+
+    layerBGs.push({
+      qkv: qkvBG,
+      qkNorm: qkNormBG,
+      qkFused: qkFusedBG,
+      gatedSplit: gatedSplitBG,
+      attnGate: attnGateBG,
+      kvApp: kvAppBG,
+      kvQuantize: kvQuantizeBG,
+      attn: attnBG,
+      gdn: gdnBG,
+      mla: mlaBG,
+      oProj: oProjBG,
+      addNorm1: bg(device, P.addNorm, [B.hidden2, B.residual, lw.normGamma2, B.hidden1, B.residual2, normU]),
+      // Affine dense: gate_up as one 2·ffn-row K=d affine matmul (fused_ffn is
+      // symmetric-only), then silu_mul collapses [gate|up] → ffnOut.
+      ffn: S.moe ? undefined : ffnGateUp
+        ? bg(device, R.matmul, withBias(
+            [ffnGateUp, B.hidden1, lw.ffnScales!, lw.ffnWeights!, ffnGateUpU!], lw.ffnBiases, 'gate_up'))
+        : bg(device, R.ffn, [B.ffnOut, B.hidden1, lw.ffnScales!, lw.ffnWeights!, ffnU]),
+      ffnSilu: ffnGateUp ? bg(device, P.siluMul, [B.ffnOut, ffnGateUp, ffnSiluU!]) : undefined,
+      ffnDown: S.moe ? undefined
+        : bg(device, R.matmulFfnDown, withBias(
+            [B.hidden2, B.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, ffnDnU], lw.ffnDownBiases, 'down_proj')),
+      moe: moeBG,
+      addNorm2: bg(device, P.addNorm, [B.hidden2, B.residual2, nextGamma, B.hidden1, B.residual, normU]),
+    })
+  }
+
+  // ============================================================
+  // Next-layer speculation (opts.expertSpeculate) — docs/MOE_CHUNK_PLAN.md
+  //
+  // Layer L+1's router is downstream of layer L's experts, so a pooled pass
+  // cannot submit L+1 while L's readback is in flight: the readback is ~9.6 ms
+  // of every token (48 × 0.199) against 11.3 ms of compute, and that is what
+  // caps pooling near 32 tok/s instead of 78.
+  //
+  // HOBBIT's finding is that layer L+1's router run on layer L's hidden state
+  // agrees with the real thing 96% of the time. So the speculative router runs
+  // one layer EARLY, on the hidden state layer L's own router just read, and
+  // its ids ride layer L's existing round trip. The engine then starts the
+  // predicted layer's misses immediately, a whole layer before it needs them.
+  //
+  // A WRONG PREDICTION CANNOT BE WRONG OUTPUT. These bind groups write their
+  // own buffers, no expert matmul is ever bound to them, and layer L+1 resolves
+  // against its own real ids when it gets there — a mispredicted expert was
+  // simply a wasted read, and one it needed is fetched then, at full price.
+  // Speculation only warms the pool.
+  //
+  // Cost when it is on: two extra dispatches per MoE layer (router matmul +
+  // top-k, ~7.5% of a MoE step by the profile in docs/MOE_CHUNK_PLAN.md) and
+  // one perturbation of LRU order, since a prefetch touches the pool.
+  // ============================================================
+  /** Per layer: the router pair that PREDICTS this layer, run against whatever
+   *  is in B.hidden1 at the time. Indexed like layerBGs. */
+  const specBGs: ({ routerLogits: GPUBindGroup; routerTopk: GPUBindGroup } | null)[] = []
+  /** Per layer: the next layer with a pool to speculate for, or -1. */
+  const nextPooled: number[] = []
+  if (speculate) {
+    for (let L = L0; L < L1; L++) {
+      const m = weights.layers[L].moe
+      specBGs.push(m && layerPools[L - L0]
+        ? {
+            routerLogits: bg(device, moeRouterPipe, routerBits === 16
+              ? [specLogits!, B.hidden1, m.routerWeights, moeRouterU!]
+              : [specLogits!, B.hidden1, m.routerWeights, m.routerScales, m.routerBiases, moeRouterU!]),
+            routerTopk: bg(device, P.moeRouterTopk!, [specIds!, specScores!, specLogits!,
+              (specTopkU ??= uniformBuf(device, [u32(S.moe!.experts), u32(SPEC_M),
+                u32(S.moe!.normTopkProb ? 1 : 0), u32(S.sharedExpertIndex >= 0 ? 1 : 0)]))]),
+          }
+        : null)
+    }
+    // Usually L+1. A stack whose next layer is dense (DeepSeek's layer 0) or
+    // whose next layer is another device's (a pipeline stage) predicts the next
+    // one it will actually run, and the accuracy counter is what says whether
+    // reaching further still pays.
+    let next = -1
+    for (let L = L1 - 1; L >= L0; L--) {
+      nextPooled[L - L0] = next
+      if (specBGs[L - L0]) next = L
+    }
+  }
+
+  // Profile handle — null unless profileStep() is currently running.
+  // `dispatch()` reads this on every call; when set it instruments the pass.
+  let profile: ProfileState | null = null
+
+  function dispatch(
+    enc: GPUCommandEncoder,
+    pipeline: GPUComputePipeline,
+    bindGroup: GPUBindGroup,
+    wgX: number, wgY = 1, wgZ = 1,
+    label?: string,
+  ): void {
+    let desc: GPUComputePassDescriptor | undefined
+    if (profile && label) {
+      const begin = profile.nextSlot
+      const end = begin + 1
+      if (end < profile.capacity) {
+        profile.labels[begin] = label
+        profile.nextSlot = end + 1
+        desc = {
+          timestampWrites: {
+            querySet: profile.querySet,
+            beginningOfPassWriteIndex: begin,
+            endOfPassWriteIndex: end,
+          },
+        }
+      }
+    }
+    const pass = enc.beginComputePass(desc)
+    pass.setPipeline(pipeline)
+    pass.setBindGroup(0, bindGroup)
+    pass.dispatchWorkgroups(wgX, wgY, wgZ)
+    pass.end()
+  }
+
+  /**
+   * Record one full forward pass (embedding → all layers → LM head → argmax)
+   * into `enc`. Both generate styles and profileStep share this recorder, so
+   * dispatch order is identical everywhere.
+   *
+   * The four pieces below exist because the POOLED path (expertPool) has to cut
+   * the pass open at each MoE router and submit — see recordForwardPooled. The
+   * default path composes them in the one order it always ran.
+   */
+  /** `position` is a PARAMETER, not a closure read: mla_scores' grid is the
+   *  one dispatch whose size depends on how much cache exists, and a stale
+   *  closure value would score against the wrong number of positions while
+   *  still filling the buffer. */
+  function recordForward(enc: GPUCommandEncoder, position: number): void {
+    recordPrologue(enc)
+    for (let L = L0; L < L1; L++) {
+      const blk = layerBGs[L - L0]
+      recordAttn(enc, blk, position)
+      recordFfnTail(enc, L, blk)
+    }
+    recordEpilogue(enc)
+  }
+
+  function recordPrologue(enc: GPUCommandEncoder): void {
+    // --- EMBEDDING → B.residual (ping) ---
+    // Pipeline stages past the first have no embedding table and no token to
+    // look up: B.residual already holds the state handed over by the previous
+    // stage (written by pipelineStep before this encoder was built).
+    if (L0 === 0) dispatch(enc, embeddingPipeline, bgEmbedding!, D_WGS, 1, 1, 'embedding')
+    // --- INITIAL RMSNORM: B.residual → B.hidden1 (layer L0's normGamma1) ---
+    dispatch(enc, P.rmsNorm, bgInitNorm, 1, 1, 1, 'rmsNorm_init')
+
+    if (moeTraceBuf) moeTraceIdx++
+  }
+
+  /**
+   * One layer's ATTENTION half (or its GDN / MLA replacement).
+   *
+   * Residual ping-pong is encoded into the cached bind groups: addNorm1 reads
+   * residual / writes residual2; addNorm2 reads residual2 / writes residual.
+   * Unfused: 9 dispatches/layer (10 for qkNorm specs — Qwen3 inserts the
+   * per-head Q/K RMSNorm between qkv matmul and rope; 8 with ?fuseqk, which
+   * fuses qkNorm+rope+kvAppend into one pass). Fused f16: 7. Fused int8: 8
+   * (adds a kv_quantize pass between qkv_fused_scratch and attention_int8).
+   */
+  function recordAttn(enc: GPUCommandEncoder, blk: LayerBG, position: number): void {
+    // Attention on the f16 KV layout — split-K (?splitk=N) turns the one
+    // WG-per-head dispatch into a partial pass over N partitions per head
+    // plus a per-head combine over the partials scratch.
+    const attentionF16 = () => {
+      if (splitK) {
+        dispatch(enc, R.attentionSplitK!, blk.attn!, splitK, S.heads, 1, 'attention')
+        dispatch(enc, R.attentionCombine!, bgAttnCombine!, 1, S.heads, 1, 'attnCombine')
+      } else {
+        dispatch(enc, R.attention, blk.attn!, 1, S.heads, 1, 'attention')
+      }
+    }
+
+    if (blk.mla) {
+      // Ten dispatches, then the shared addNorm1 -> FFN -> addNorm2 tail with
+      // no change. Grid y is the HEAD COUNT on qLat/scores/oHead: swapping x
+      // and y still runs, still fills the buffer, and computes the wrong
+      // (t, head) pairs.
+      const M = S.mla!
+      const m = blk.mla
+      dispatch(enc, R.matmul, m.qProj, S.mlaQProjRows / R.matmulRowsPerWG, 1, 1, 'mlaQProj')
+      dispatch(enc, R.matmul, m.kvaProj, S.mlaKvaRows / R.matmulRowsPerWG, 1, 1, 'mlaKvaProj')
+      dispatch(enc, P.mlaQSplit, m.qSplit, S.heads, 1, 1, 'mlaQSplit')
+      dispatch(enc, P.mlaKvWrite, m.kvWrite, 1, 1, 1, 'mlaKvWrite')
+      dispatch(enc, P.mlaProj, m.qLat, Math.ceil(M.kvLoraRank / 64), S.heads, 1, 'mlaQLat')
+      // The only position-dependent grid in the recorder. A static
+      // maxContext x heads grid is also correct — mla_scores guards t >= T —
+      // but launches ~540k workgroups per layer per token at full context.
+      dispatch(enc, P.mlaScores, m.scores, position + 1, S.heads, 1, 'mlaScores')
+      dispatch(enc, P.mlaCombine, m.combine, S.heads, 1, 1, 'mlaCombine')
+      dispatch(enc, P.mlaNarrow, m.narrow, Math.ceil((S.heads * M.kvLoraRank) / 256), 1, 1, 'mlaNarrow')
+      dispatch(enc, P.mlaProj, m.oHead, Math.ceil(M.vHeadDim / 64), S.heads, 1, 'mlaOHead')
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else if (blk.gdn) {
+      // GatedDeltaNet layer (Qwen3.5 linear_attn): ONE fused input
+      // projection (qkv‖z‖a‖b rows packed at load time — replaces the 4
+      // separate matmul dispatches), then conv → gates → recurrence →
+      // gated norm.
+      const g = blk.gdn
+      dispatch(enc, R.matmul, g.proj, Math.ceil(S.gdnProjRows / R.matmulRowsPerWG), 1, 1, 'gdnProjMatmul')
+      dispatch(enc, P.gdnConv, g.conv, GDN_CONV_WGS, 1, 1, 'gdnConv')
+      dispatch(enc, P.gdnGates, g.gates, 1, 1, 1, 'gdnGates')
+      dispatch(enc, P.gdnRecur, g.recur, S.gdnVHeads, 1, 1, 'gdnRecur')
+      dispatch(enc, P.gdnNormOut, g.normOut, S.gdnVHeads, 1, 1, 'gdnNormOut')
+      // out_proj: B.gdnNormed → B.hidden2 (K = GDN_V_DIM instance)
+      dispatch(enc, matmulGdnOut!, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'gdnOutProj')
+    } else if (hybrid) {
+      // Gated attention layer (Qwen3.5): c_attn → per-head [Q|gate] split →
+      // qk_norm → partial RoPE → KV append → attention → sigmoid gate.
+      dispatch(enc, R.matmul, blk.qkv!, S.cAttnDim / R.matmulRowsPerWG, 1, 1, 'cAttnMatmul')
+      dispatch(enc, P.gatedQkvSplit, blk.gatedSplit!, C_ATTN_WGS, 1, 1, 'gatedQkvSplit')
+      if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
+      dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
+      if (int8Mode) {
+        dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
+        dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
+      } else {
+        dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+        attentionF16()
+      }
+      dispatch(enc, P.attnGate, blk.attnGate!, ATTN_GATE_WGS, 1, 1, 'attnGate')
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else if (!fused) {
+      // QKV matmul: B.hidden1 → B.qkvOut
+      dispatch(enc, R.matmul, blk.qkv!, S.qkvDim / R.matmulRowsPerWG, 1, 1, 'qkvMatmul')
+      if (blk.qkFused) {
+        // ?fuseqk: fused qk_norm+RoPE+append — B.qkvOut → B.qOut + kvPages[L]
+        // in one dispatch (replaces the qkNorm/rope/kvAppend chain below).
+        dispatch(enc, P.qkNormRopeAppend, blk.qkFused, QK_FUSE_WGS, 1, 1, 'qkNormRopeAppend')
+      } else {
+        // QK-norm (Qwen3): per-head Q/K RMSNorm in place on B.qkvOut, pre-RoPE
+        if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, QK_NORM_WGS, 1, 1, 'qkNorm')
+        // RoPE: B.qkvOut → B.qOut, B.kOut, B.vOut
+        dispatch(enc, P.rope, bgRope!, QKV_WGS, 1, 1, 'rope')
+        // KV append: kOut, vOut → kvPages[L] (grid covers KV_DIM elements).
+        // int8 quantizes on the way in: one workgroup per (kv head, side).
+        if (int8Mode) dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
+        else dispatch(enc, P.kvAppend, blk.kvApp!, KV_WGS, 1, 1, 'kvAppend')
+      }
+      // Attention: Q + kvPages[L] → B.attnOut. int8 reads packed codes plus the
+      // per-row scale, so it is a DIFFERENT pipeline — swapping only the bind
+      // group leaves attention_sg bound to an int8 layout, which WebGPU rejects
+      // and then discards the whole submit for, silently. That reads as garbage
+      // output, not as an error.
+      if (int8Mode) dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
+      else attentionF16()
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else if (int8Mode) {
+      dispatch(enc, P.qkvFusedScratch, blk.qkv!, S.qkvPairs, 1, 1, 'qkvFused')
+      dispatch(enc, P.kvQuantizeInt8, blk.kvQuantize!, S.kvHeads * 2, 1, 1, 'kvQuantize')
+      dispatch(enc, P.attentionInt8, blk.attn!, 1, S.heads, 1, 'attention')
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    } else {
+      // Fused QKV+RoPE+KV-append: B.hidden1 → B.qOut + kvPages[L]
+      dispatch(enc, R.qkvFused, blk.qkv!, S.qkvPairs / R.qkvPairsPerWG, 1, 1, 'qkvFused')
+      attentionF16()
+      dispatch(enc, R.matmulOProj, blk.oProj, S.d / R.matmulRowsPerWG, 1, 1, 'oproj')
+    }
+  }
+
+  /** The router's two dispatches — the point at which the pooled path must
+   *  stop and read the chosen experts back. The trace copy sits here so it
+   *  records EXPERT ids: pooling overwrites B.moeIds with slot ids only after
+   *  this encoder is submitted. */
+  function recordMoeRouter(enc: GPUCommandEncoder, L: number, moe: NonNullable<LayerBG['moe']>): void {
+    dispatch(enc, moeRouterPipe, moe.routerLogits, MOE_ROUTER_ROWS, 1, 1, 'moeRouterLogits')
+    dispatch(enc, P.moeRouterTopk!, moe.routerTopk, 1, 1, 1, 'moeRouterTopk')
+    if (moeTraceBuf) {
+      const base = (moeTraceIdx % TRACE_CAP) * traceStride + L * TRACE_ROW
+      enc.copyBufferToBuffer(B.moeIds!, 0, moeTraceBuf, base, TRACE_ROW)
+    }
+  }
+
+  /** The five dispatches after the router. Every slot — the top-K routed
+   *  experts, plus the shared one at index E when the checkpoint has one —
+   *  rides in grid z, so the expert count costs dispatches, not the top-k. */
+  function recordMoeExperts(enc: GPUCommandEncoder, moe: NonNullable<LayerBG['moe']>): void {
+    const rows = S.ffn / MOE_RPW
+    dispatch(enc, moeMMGate!, moe.gate, rows, 1, S.moeSlots, 'moeGate')
+    dispatch(enc, moeMMGate!, moe.up, rows, 1, S.moeSlots, 'moeUp')
+    dispatch(enc, P.siluMul, moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
+    dispatch(enc, moeMMDown!, moe.down, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
+    dispatch(enc, P.moeCombine, moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
+  }
+
+  /** recordMoeExperts with the matmuls re-bound to the translate kernel's
+   *  output — the raw expert ids in B.moeIds stay untouched for the staging
+   *  copy the CPU resolves after the token. */
+  function recordMoeExpertsOpt(enc: GPUCommandEncoder, moe: NonNullable<LayerBG['moe']>): void {
+    const rows = S.ffn / MOE_RPW
+    dispatch(enc, moeMMGate!, moe.gateO!, rows, 1, S.moeSlots, 'moeGate')
+    dispatch(enc, moeMMGate!, moe.upO!, rows, 1, S.moeSlots, 'moeUp')
+    dispatch(enc, P.siluMul, moe.silu, Math.ceil(S.moeSlots * S.ffn / 256), 1, 1, 'moeSilu')
+    dispatch(enc, moeMMDown!, moe.downO!, S.d / MOE_RPW, 1, S.moeSlots, 'moeDown')
+    dispatch(enc, P.moeCombine, moe.combine, Math.ceil(S.d / 256), 1, 1, 'moeCombine')
+  }
+
+  /**
+   * THE OPTIMISTIC RECORDER (docs/MOE_CHUNK_PLAN.md, "The optimistic recorder
+   * — designed and priced 2026-08-15").
+   *
+   * One submit per token. Every MoE layer's router output is translated to
+   * pool slots ON the GPU (moe_slot_translate against the layer's resident
+   * map) and its raw expert ids are copied to a per-layer staging buffer
+   * inside the same encoder. After the submit, ONE wave await delivers the
+   * whole token's routing (measured 1.57 ms for 40 layers vs 7.98 serial);
+   * the CPU then replays the routing against its mirror of each map. A token
+   * whose every id was resident is already correct. A token with a miss is
+   * wrong from that layer on: the missing experts are uploaded, the maps
+   * pushed, the first missed layer's entry state restored from checkpoints
+   * taken in the same encoder (residual+hidden 4 KB each; GDN conv+recur per
+   * layer, 0.25 ms for 30 MiB), and the tail of the token re-recorded. The
+   * replay resolves against the UPDATED maps, so a second replay needs a
+   * fresh eviction inside the replay itself — the per-layer pool holds a full
+   * token by construction (POOL_MIN), so the loop converges; the cap is
+   * paranoia, not policy.
+   */
+  function recordOptimisticRange(enc: GPUCommandEncoder, position: number, from: number): void {
+    for (let L = from; L < L1; L++) {
+      const blk = layerBGs[L - L0]
+      const lp = layerPools[L - L0]
+      // Checkpoints BEFORE the layer mutates anything. Residual/hidden are the
+      // layer's entry state (addNorm2 of L-1 wrote both); the GDN pair is the
+      // recurrent state a replay must rewind, because gdn_recur is the one
+      // dispatch in the pass that is not idempotent.
+      enc.copyBufferToBuffer(B.residual, 0, ckptResidual[L]!, 0, S.d * 2)
+      enc.copyBufferToBuffer(B.hidden1, 0, ckptHidden[L]!, 0, S.d * 2)
+      if (gdnConvState[L]) {
+        enc.copyBufferToBuffer(gdnConvState[L]!, 0, ckptConv[L]!, 0, ckptConv[L]!.size)
+        enc.copyBufferToBuffer(gdnRecurState[L]!, 0, ckptRecur[L]!, 0, ckptRecur[L]!.size)
+      }
+      recordAttn(enc, blk, position)
+      if (!blk.moe || !lp) { recordFfnTail(enc, L, blk); continue }
+      dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
+      recordMoeRouter(enc, L, blk.moe)
+      enc.copyBufferToBuffer(B.moeIds!, 0, optStaging[L]!, 0, MOE_ID_BYTES)
+      dispatch(enc, P.moeSlotTranslate, blk.moe.translate!, 1, 1, 1, 'moeSlotTranslate')
+      recordMoeExpertsOpt(enc, blk.moe)
+      dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    }
+  }
+
+  /** Rewind to layer `from`'s entry: its residual/hidden pair, and every GDN
+   *  state at or past it (each snapshot holds the value from before THIS
+   *  token's mutation). KV appends are idempotent and need no rewind. */
+  function restoreCheckpoints(enc: GPUCommandEncoder, from: number): void {
+    enc.copyBufferToBuffer(ckptResidual[from]!, 0, B.residual, 0, S.d * 2)
+    enc.copyBufferToBuffer(ckptHidden[from]!, 0, B.hidden1, 0, S.d * 2)
+    for (let L = from; L < L1; L++) {
+      if (gdnConvState[L]) {
+        enc.copyBufferToBuffer(ckptConv[L]!, 0, gdnConvState[L]!, 0, ckptConv[L]!.size)
+        enc.copyBufferToBuffer(ckptRecur[L]!, 0, gdnRecurState[L]!, 0, ckptRecur[L]!.size)
+      }
+    }
+  }
+
+  async function stepOptimistic(position: number, tail: (enc: GPUCommandEncoder) => void): Promise<void> {
+    await poolReady
+    let from = L0
+    // A miss CASCADES: the missed layer's garbage output changes every
+    // downstream layer's routing, so a replay that fixes layer L routinely
+    // uncovers fresh misses at L+1 — each attempt is guaranteed strict
+    // progress (the restored entry state makes layer `from` deterministic, so
+    // once uploaded it cannot re-miss), but convergence can need one attempt
+    // per pooled layer. A cold pool pays exactly that once, at the first
+    // prefill token; warm decode settles in 1-3. The cap is the layer count
+    // because that is the mathematical worst case, not a tunable.
+    const maxAttempts = (L1 - L0) + 2
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const enc = device.createCommandEncoder()
+      if (attempt === 0) {
+        if (position === 0) clearGdnState(enc)
+        recordPrologue(enc)
+      } else {
+        restoreCheckpoints(enc, from)
+      }
+      recordOptimisticRange(enc, position, from)
+      recordEpilogue(enc)
+      tail(enc)
+      device.queue.submit([enc.finish()])
+
+      // The wave: every staged copy from `from` on, one await.
+      const layers: number[] = []
+      const maps: Promise<void>[] = []
+      for (let L = from; L < L1; L++) {
+        if (optStaging[L]) { layers.push(L); maps.push(optStaging[L]!.mapAsync(GPUMapMode.READ)) }
+      }
+      await Promise.all(maps)
+
+      // Resolve in layer order. "The GPU was wrong" is membership in the map
+      // AS OF SUBMIT — checked against cpuMap BEFORE this resolve mutates it.
+      // The live resolve's misses are the uploads; its evictions age the maps
+      // for the next token. On a replay pass, layers re-resolve as pure hits —
+      // recency double-counts, which inflates stats and changes no slot.
+      let firstBad = -1
+      const uploads: Promise<void>[] = []
+      const changed: LayerPool[] = []
+      for (const L of layers) {
+        const st = optStaging[L]!
+        const experts = new Uint32Array(st.getMappedRange().slice(0))
+        st.unmap()
+        const lp = layerPools[L - L0]!
+        let bad = false
+        for (let i2 = 0; i2 < S.moeSlots; i2++) {
+          if (lp.cpuMap![experts[i2]] === 0xffffffff) { bad = true; break }
+        }
+        const { misses, evicted } = lp.pool.resolve(experts.subarray(0, S.moeSlots))
+        if (misses.length > 0 || evicted.length > 0) {
+          for (const ev of evicted) lp.cpuMap![ev] = 0xffffffff
+          for (const m of misses) lp.cpuMap![m.expert] = m.slot
+          changed.push(lp)
+        }
+        if (misses.length > 0) uploads.push(fillSlots(lp, misses))
+        if (bad && firstBad < 0) firstBad = L
+      }
+      if (uploads.length > 0) await Promise.all(uploads)
+      // Queue-ordered: these land before any later submit's dispatches.
+      for (const lp of changed) device.queue.writeBuffer(lp.mapBuf!, 0, lp.cpuMap!)
+      if (firstBad < 0) return
+      if (attempt > 0 && firstBad <= from) {
+        // Progress is the convergence proof. A repeat at the same layer means
+        // the restored state or the map push is wrong — fail loudly rather
+        // than burn the cap on a correctness bug.
+        throw new Error(`poolOptimistic: layer ${firstBad} missed twice — replay restore or map push is broken`)
+      }
+      from = firstBad
+    }
+    throw new Error('poolOptimistic: token did not settle — replay thrash past the layer-count cap')
+  }
+
+  /** One layer's FFN half: addNorm1 → dense FFN or the sparse MoE block →
+   *  addNorm2 (or, with ?fuseprologue=1, the three-dispatch fused tail). */
+  function recordFfnTail(enc: GPUCommandEncoder, L: number, blk: LayerBG): void {
+    if (R.ffnPrologue) {
+      // ?fuseprologue=1: no addNorm1 dispatch. The FFN kernel computes
+      // rIn + hidden2 and its RMSNorm in its own prologue; ffnDown lands
+      // in hidden3; add3_norm merges rIn + hidden2 + hidden3 at the tail.
+      dispatch(enc, R.ffn, blk.ffn!, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+      dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+      dispatch(enc, P.add3Norm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    } else {
+      // AddNorm (attention): residual += hidden2; hidden1 = RMSNorm(residual)
+      dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
+      if (blk.moe) {
+        // Sparse MoE, seven dispatches, B.hidden1 → B.hidden2.
+        recordMoeRouter(enc, L, blk.moe)
+        recordMoeExperts(enc, blk.moe)
+      } else if (blk.ffnSilu) {
+        // Affine dense FFN: gate_up matmul (2·ffn rows, K=d) → silu_mul →
+        // down matmul. Three dispatches where MLC runs two — the price of
+        // fused_ffn having no affine sibling.
+        dispatch(enc, R.matmul, blk.ffn!, (2 * S.ffn) / R.matmulRowsPerWG, 1, 1, 'ffnGateUp')
+        dispatch(enc, P.siluMul, blk.ffnSilu, Math.ceil(S.ffn / 256), 1, 1, 'ffnSilu')
+        dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+      } else {
+      // Fused FFN gate+up+SiLU: B.hidden1 → B.ffnOut
+      dispatch(enc, R.ffn, blk.ffn!, S.ffn / R.ffnRowsPerWG, 1, 1, 'fusedFfn')
+      // FFN down: B.ffnOut → B.hidden2 (K = ffn instance)
+      dispatch(enc, R.matmulFfnDown, blk.ffnDown!, S.d / R.matmulRowsPerWG, 1, 1, 'ffnDown')
+      }
+      // AddNorm (FFN): residual += hidden2; hidden1 = RMSNorm(residual)
+      //   For last layer the bind group binds finalNormGamma instead of next
+      //   layer's normGamma1, so hidden1 is ready for the LM head.
+      dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    }
+  }
+
+  function recordEpilogue(enc: GPUCommandEncoder): void {
+    // A stage that does not end the model stops here: B.residual is the
+    // hand-off, and there is no LM head on this device to run.
+    if (L1 !== S.layers) return
+
+    // --- LM HEAD: B.hidden1 (already normalized with model.norm) → B.logits ---
+    // vocab (Phi-3: 32064, Qwen3: 151936) is divisible by 4, so rowsPerWG=4
+    // works exactly. Grids past maxComputeWorkgroupsPerDimension (65535 —
+    // Qwen3's 151936-row scalar case) are folded into z; the kernels index by
+    // blockIdx.z * gridDim.x + blockIdx.x and guard on packGridDimX.
+    const lmWGs = S.vocab / R.matmulRowsPerWG
+    if (lmWGs > 65535) {
+      const lmX = 16384
+      dispatch(enc, R.matmulF32, bgLmHead!, lmX, 1, Math.ceil(lmWGs / lmX), 'lmHead')
+    } else {
+      dispatch(enc, R.matmulF32, bgLmHead!, lmWGs, 1, 1, 'lmHead')
+    }
+    // --- ARGMAX (or SAMPLER): B.logits → B.tokenOut ---
+    // Two dispatches when sampling, because the vocabulary needs a grid-wide
+    // reduction before anything can be thresholded — see sampler.wgsl. This is
+    // the only place a token is produced, so pipelineStep's last stage samples
+    // here too, and the on-GPU tokenOut → inputIds chain is unchanged.
+    if (sampling && bgSampleSelect) {
+      dispatch(enc, P.sampleReduce, bgSampleReduce!, SAMPLE_PARTS, 1, 1, 'sampleReduce')
+      dispatch(enc, P.sampleSelect, bgSampleSelect, 1, 1, 1, 'sampleSelect')
+    } else {
+      dispatch(enc, R.argmax, bgArgmax!, 1, 1, 1, 'argmax')
+    }
+  }
+
+  /** The whole pass in ONE encoder, unsubmitted — what every caller got before
+   *  pooling existed and still gets when it is off. */
+  function recordWholeForward(position: number): GPUCommandEncoder {
+    const enc = device.createCommandEncoder()
+    if (position === 0) clearGdnState(enc)
+    recordForward(enc, position)
+    return enc
+  }
+
+  // Speculation counters. `predicted`/`matched` are over ROUTED slots only: a
+  // pinned shared expert is in both lists by construction and would hand every
+  // layer a free point, which is exactly how a 96% claim gets reproduced by
+  // accident.
+  let specSteps = 0
+  let specSetMatch = 0
+  let specPredicted = 0
+  let specMatched = 0
+  let specTop1 = 0
+
+  function scoreSpeculation(predicted: Uint32Array, real: Uint32Array): void {
+    specSteps++
+    const routed = new Set<number>()
+    for (const e of real) if (e !== S.sharedExpertIndex) routed.add(e)
+    for (const e of predicted) {
+      if (e === S.sharedExpertIndex) continue
+      specPredicted++
+      if (routed.has(e)) specMatched++
+    }
+    // moe_router_topk writes in descending score order, so slot 0 is the top-1
+    // routed expert on both sides — the quantity HOBBIT reports 96% for.
+    if (predicted[0] === real[0]) specTop1++
+    // COVERAGE — the number the coverage-recording design turns on: is every
+    // REAL routed expert inside the PREDICTED set? With M == K this equals
+    // exact set match (equal-cardinality distinct sets); with a widened
+    // speculative top-M it is the weaker condition that actually gates
+    // correctness — a layer whose real top-K is covered by the predicted M
+    // could have had its expert matmuls recorded from the prediction, with
+    // the real router's scores selecting within them, and no replay.
+    const predictedSet = new Set<number>()
+    for (const e of predicted) if (e !== S.sharedExpertIndex) predictedSet.add(e)
+    let covered = true
+    for (const e of routed) if (!predictedSet.has(e)) { covered = false; break }
+    if (covered) specSetMatch++
+  }
+
+  /**
+   * Warm one layer's pool with a PREDICTION, without pretending it was a request.
+   *
+   * The pool's hit/request counters are restored afterwards: a prefetch is not
+   * something the model asked for, and counting it would inflate the very hit
+   * rate the offline replay is being checked against. What it does leave behind
+   * is LRU order — that IS the warming, and it is the one way speculation can
+   * change the hit rate of the layers after it.
+   */
+  function prefetchLayer(lp: LayerPool, predicted: Uint32Array): Promise<void> {
+    const hits = lp.pool.hits
+    const requests = lp.pool.requests
+    const { misses } = lp.pool.resolve(predicted)
+    lp.pool.hits = hits
+    lp.pool.requests = requests
+    return fillSlots(lp, misses)
+  }
+
+  /**
+   * POOLED forward pass: the same dispatches, cut open at every MoE router.
+   *
+   * The router's ids have to reach JS before the expert matmuls can be bound to
+   * slots, and WebGPU has no fence, semaphore or event with which the GPU could
+   * wait on the host — so each MoE layer ends its encoder, submits, and reads
+   * ~36 bytes back. That round trip is the whole cost of this feature
+   * (docs/MOE_CHUNK_PLAN.md prices it at 0.199 ms, ×48 layers = 9.6 ms).
+   *
+   * SUBMIT FIRST, THEN AWAIT. Everything recorded since the previous split —
+   * the layer's whole attention half, and on the first MoE layer the embedding
+   * too — is in the submit that carries the readback copy, so it runs while the
+   * round trip is in flight. The rest of the layer cannot join it: the expert
+   * matmuls are precisely what the ids decide.
+   *
+   * With `expertSpeculate` the NEXT pooled layer's router rides that same
+   * submit and the same map, and its predicted misses start fetching here,
+   * a layer before they are needed. The prediction is awaited before that
+   * layer's real resolve — not for correctness of the ids (the real ones are
+   * always used) but because an upload still in flight could otherwise land in
+   * a slot the real resolve has already given to someone else.
+   *
+   * Returns the encoder holding the tail, still unsubmitted, so the caller
+   * appends its own readback copies exactly as in the unpooled path.
+   */
+  async function recordForwardPooled(position: number): Promise<GPUCommandEncoder> {
+    await poolReady
+    let enc = device.createCommandEncoder()
+    if (position === 0) clearGdnState(enc)
+    recordPrologue(enc)
+    /** The prediction made one pooled layer ago, waiting for its layer. */
+    let pending: { layer: number; ids: Uint32Array; fetched: Promise<void> } | null = null
+    for (let L = L0; L < L1; L++) {
+      const blk = layerBGs[L - L0]
+      const lp = layerPools[L - L0]
+      recordAttn(enc, blk, position)
+      // A dense layer of a MoE stack (DeepSeek's layer 0) has no pool and no
+      // router — it is recorded whole, like every layer of a dense spec.
+      if (!blk.moe || !lp) {
+        recordFfnTail(enc, L, blk)
+        continue
+      }
+      // These two dispatches bracket the MoE block in recordFfnTail; the split
+      // is in the middle of it, so this path names them itself.
+      dispatch(enc, P.addNorm, blk.addNorm1!, 1, 1, 1, 'addNorm1')
+      recordMoeRouter(enc, L, blk.moe)
+      // The speculative router reads the SAME B.hidden1 this layer's own router
+      // just read — that is the whole trick — and writes only its own buffers.
+      const ahead = speculate ? nextPooled[L - L0] : -1
+      if (ahead >= 0) {
+        const sb = specBGs[ahead - L0]!
+        dispatch(enc, moeRouterPipe, sb.routerLogits, MOE_ROUTER_ROWS, 1, 1, 'moeRouterLogits')
+        dispatch(enc, P.moeRouterTopk!, sb.routerTopk, 1, 1, 1, 'moeRouterTopk')
+      }
+      const staging = moeIdRing[moeIdCursor]
+      moeIdCursor = (moeIdCursor + 1) % moeIdRing.length
+      enc.copyBufferToBuffer(B.moeIds!, 0, staging, 0, MOE_ID_BYTES)
+      if (ahead >= 0) enc.copyBufferToBuffer(specIds!, 0, staging, MOE_ID_BYTES, SPEC_ID_BYTES)
+      device.queue.submit([enc.finish()])
+
+      await staging.mapAsync(GPUMapMode.READ)
+      // slice() before unmap — the mapped range dies with it.
+      const back = new Uint32Array(staging.getMappedRange().slice(0))
+      staging.unmap()
+      const experts = back.subarray(0, S.moeSlots)
+      // Every prefetched upload for THIS layer has to have landed before the
+      // real resolve reassigns slots, or a write for a predicted expert arrives
+      // after its slot was given away and puts one expert's bytes under
+      // another's id. That is the one way speculation could change the output,
+      // and it is closed here rather than reasoned about.
+      if (pending) {
+        await pending.fetched
+        // Always awaited, scored only when it was for this layer — nextPooled
+        // makes the mismatch unreachable, and awaiting anyway is what keeps
+        // "unreachable" from meaning "a live upload with no one waiting".
+        if (pending.layer === L) scoreSpeculation(pending.ids, experts)
+        pending = null
+      }
+      const { slots, misses } = lp.pool.resolve(experts)
+      const filled = fillSlots(lp, misses)
+      // Started BEFORE awaiting this layer's own reads, so both layers' slabs
+      // are in flight together.
+      if (ahead >= 0) {
+        const ids = back.slice(S.moeSlots, S.moeSlots + SPEC_SLOTS)
+        const fetched = prefetchLayer(layerPools[ahead - L0]!, ids)
+        // The await that reports a failed prefetch is a layer away; this only
+        // stops Node calling it an unhandled rejection in between.
+        fetched.catch(() => {})
+        pending = { layer: ahead, ids, fetched }
+      }
+      await filled
+
+      enc = device.createCommandEncoder()
+      // Queue-ordered: the slab uploads above and this write land after the
+      // submit that carried the router (which is what the trace copy read) and
+      // before the dispatches recorded below, which is every ordering this
+      // needs. The matmul now reads slot indices out of the same binding the
+      // router wrote expert indices into.
+      moeSlotScratch.set(slots)
+      device.queue.writeBuffer(B.moeIds!, 0, moeSlotScratch)
+      recordMoeExperts(enc, blk.moe)
+      dispatch(enc, P.addNorm, blk.addNorm2, 1, 1, 1, 'addNorm2')
+    }
+    // A prediction for a layer this pass never reached (there is none today —
+    // the last pooled layer predicts nothing) must still be settled before the
+    // pass returns, or its upload would race the next token's resolve.
+    if (pending) await pending.fetched
+    recordEpilogue(enc)
+    return enc
+  }
+
+  function getPoolStats(): PoolStats | null {
+    if (!pooling) return null
+    let hits = 0
+    let requests = 0
+    for (const lp of layerPools) {
+      if (!lp) continue
+      hits += lp.pool.hits
+      requests += lp.pool.requests
+    }
+    return {
+      hits, requests, hitRate: requests ? hits / requests : 0,
+      speculation: speculate
+        ? {
+            steps: specSteps,
+            predicted: specPredicted,
+            matched: specMatched,
+            accuracy: specPredicted ? specMatched / specPredicted : 0,
+            top1: specTop1,
+            top1Rate: specSteps ? specTop1 / specSteps : 0,
+            setMatch: specSetMatch,
+            setRate: specSteps ? specSetMatch / specSteps : 0,
+          }
+        : null,
+    }
+  }
+
+  /**
+   * Write the per-token state buffers. Queue-ordered with the following
+   * submit; the GPU reads these during compute, and any later writeBuffer for
+   * the same buffer is serialized after the current submit — so this is safe
+   * even while previous submits are still in flight.
+   */
+  function writeStepState(inputId: number | null, position: number): void {
+    const nnzPages = Math.floor(position / S.pageSize) + 1
+    if (inputId !== null) {
+      device.queue.writeBuffer(B.inputIds, 0, new Int32Array([inputId]))
+    }
+    device.queue.writeBuffer(B.posMap, 0, new Int32Array([position]))
+    device.queue.writeBuffer(B.pageIndptr, 0, new Int32Array([0, nnzPages]))
+    // length_info: total tokens in sequence = position + 1
+    device.queue.writeBuffer(B.lengthInfo, 0, new Int32Array([position + 1, 0, 0]))
+    // nnz_pages lives at byte offset 8 in both f16 and int8 attention uniforms.
+    nnzPagesScratch[0] = nnzPages
+    device.queue.writeBuffer(int8Mode ? attnI8U! : attnU, 8, nnzPagesScratch)
+    // The split-K partial-pass uniform mirrors the same layout (offset 8).
+    if (attnSkU) device.queue.writeBuffer(attnSkU, 8, nnzPagesScratch)
+    // MLA's cache grows by one row per position, so both kernels that walk it
+    // need T = position + 1. mlaScoresU is {L, R, T, scale} (T at 8),
+    // mlaCombineU is {L, T} (T at 4).
+    if (mlaScoresU) {
+      mlaTScratch[0] = position + 1
+      device.queue.writeBuffer(mlaScoresU, 8, mlaTScratch)
+      device.queue.writeBuffer(mlaCombineU!, 4, mlaTScratch)
+    }
+    // gdn_conv selects its ring slots from the absolute position (pos at
+    // byte offset 0 of its PODArgs).
+    if (gdnConvU) {
+      gdnPosScratch[0] = position
+      device.queue.writeBuffer(gdnConvU, 0, gdnPosScratch)
+    }
+    // The sampler's counter IS the position (byte offset 24 of its Params).
+    // Using the position rather than a running step count is what makes a
+    // re-run of a position — a prefill replay, a prefix-reuse turn,
+    // debugCompareReuse — draw the same token instead of a fresh one.
+    if (samplerU) {
+      sampleCounterScratch[0] = position
+      device.queue.writeBuffer(samplerU, 24, sampleCounterScratch)
+    }
+  }
+
+  /**
+   * Zero every GDN layer's conv ring + recurrent state. Recorded into the
+   * step's own command encoder whenever a forward pass runs at position 0, so
+   * a fresh prefill (new conversation, validation prompt, replay) never sees
+   * stale state — and the clear is queue-ordered before the pass that reads it.
+   */
+  function clearGdnState(enc: GPUCommandEncoder): void {
+    for (const b of gdnStateBufs) enc.clearBuffer(b)
+    // Every rewind point described the state this just erased.
+    invalidateGdnCkpts()
+  }
+
+  // ============================================================
+  // Blocking path — decodeToken / forwardLogits (validation harness)
+  // ============================================================
+
+  /**
+   * One token through THIS pipeline stage.
+   *
+   * The first stage takes a token id and returns the residual to hand on; the
+   * last takes a residual and returns the argmax token; a middle stage does
+   * both. One round trip per token, carrying d f16 values — 4 KB for Qwen3.6,
+   * which is nothing next to the 2-5 ms a LAN hop costs. Latency, not
+   * bandwidth, is what bounds a split model.
+   *
+   * Deliberately NOT wired into generate()/generatePipelined(): those own the
+   * whole loop, and in a split the loop lives above both stages (in share.ts's
+   * pipeline driver, or a test). This is the primitive they drive.
+   */
+  async function pipelineStep(
+    input: { tokenId: number } | { residual: ArrayBuffer },
+    position: number,
+  ): Promise<{ residual: ArrayBuffer } | { tokenId: number }> {
+    if (position < 0 || position >= MAX_CONTEXT) {
+      throw new Error(`zero-tvm: pipelineStep position ${position} outside the ${MAX_CONTEXT}-token context`)
+    }
+    if ('residual' in input) {
+      if (L0 === 0) throw new Error('pipelineStep: the first stage takes a token id, not a residual')
+      device.queue.writeBuffer(B.residual, 0, input.residual)
+      writeStepState(null, position)
+    } else {
+      if (L0 !== 0) throw new Error(`pipelineStep: stage starting at layer ${L0} takes a residual, not a token id`)
+      writeStepState(input.tokenId, position)
+    }
+
+    const enc = pooling ? await recordForwardPooled(position) : recordWholeForward(position)
+    const last = L1 === S.layers
+    if (last) enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
+    else enc.copyBufferToBuffer(B.residual, 0, residualReadBuf!, 0, S.d * 2)
+    device.queue.submit([enc.finish()])
+    gdnStatePos = position + 1
+
+    if (last) {
+      await readBuf.mapAsync(GPUMapMode.READ)
+      const tokenId = new DataView(readBuf.getMappedRange()).getInt32(0, true)
+      readBuf.unmap()
+      return { tokenId }
+    }
+    await residualReadBuf!.mapAsync(GPUMapMode.READ)
+    // slice() copies out of the mapped range — unmap() invalidates it.
+    const residual = residualReadBuf!.getMappedRange().slice(0)
+    residualReadBuf!.unmap()
+    return { residual }
+  }
+
+  async function decodeToken(tokenId: number, position: number): Promise<number> {
+    if (partial) throw new Error('decodeToken: this engine is one pipeline stage — drive it with pipelineStep')
+    if (position < 0 || position >= MAX_CONTEXT) {
+      throw new Error(
+        `zero-tvm: context overflow — position ${position} exceeds max context ` +
+        `${MAX_CONTEXT} tokens (maxPages=${S.maxPages} × pageSize=${S.pageSize}). ` +
+        `Shorten the prompt or raise maxPages in src/compiler/model-spec.ts (costs ~${Math.round(S.layers * S.kvPageStride * 2 / (1024 * 1024))} MB of KV cache per page block).`
+      )
+    }
+    writeStepState(tokenId, position)
+
+    if (optimistic) {
+      await stepOptimistic(position, (e) => e.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4))
+      gdnStatePos = position + 1
+      noteAbsorbed(position, tokenId)
+      await readBuf.mapAsync(GPUMapMode.READ)
+      const r = new DataView(readBuf.getMappedRange()).getInt32(0, true)
+      readBuf.unmap()
+      return r
+    }
+    const enc = pooling ? await recordForwardPooled(position) : recordWholeForward(position)
+    // Fold the argmax readback into the same command encoder → one submit per token.
+    enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
+    device.queue.submit([enc.finish()])
+    gdnStatePos = position + 1
+    noteAbsorbed(position, tokenId)
+
+    await readBuf.mapAsync(GPUMapMode.READ)
+    const result = new DataView(readBuf.getMappedRange()).getInt32(0, true)
+    readBuf.unmap()
+    return result
+  }
+
+  /**
+   * Read back the argmax the LAST submitted forward pass left in B.tokenOut —
+   * no new forward pass. Used by the hybrid generate() when the GDN state
+   * already sits exactly at end-of-prompt (e.g. right after forwardLogits):
+   * the pure-attention path re-runs the final prompt token idempotently to
+   * recover this value, but a GDN re-run would double-apply it to S.
+   */
+  async function readLastToken(): Promise<number> {
+    const enc = device.createCommandEncoder()
+    enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
+    device.queue.submit([enc.finish()])
+    await readBuf.mapAsync(GPUMapMode.READ)
+    const result = new DataView(readBuf.getMappedRange()).getInt32(0, true)
+    readBuf.unmap()
+    return result
+  }
+
+  /**
+   * Run the same forward pass as decodeToken but read back the f32 logits buffer
+   * instead of the argmax token. Used by the validation harness to compare
+   * Zero-TVM logits against WebLLM logits at every token position.
+   */
+  async function readLogits(tokenId: number, position: number): Promise<Float32Array> {
+    // Reuse decodeToken's GPU work — easiest way is to call it (it already
+    // submits the command encoder) and then issue a separate readback of B.logits.
+    // The argmax dispatch is harmless extra work; we ignore its output.
+    await decodeToken(tokenId, position)
+
+    if (!logitsReadBuf) {
+      logitsReadBuf = device.createBuffer({
+        size: S.vocab * 4,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        label: 'logitsReadback',
+      })
+    }
+    const enc = device.createCommandEncoder()
+    enc.copyBufferToBuffer(B.logits, 0, logitsReadBuf, 0, S.vocab * 4)
+    device.queue.submit([enc.finish()])
+
+    await logitsReadBuf.mapAsync(GPUMapMode.READ)
+    const out = new Float32Array(logitsReadBuf.getMappedRange().slice(0))
+    logitsReadBuf.unmap()
+    return out
+  }
+
+  const STOP = new Set(S.stops)
+
+  async function generate(
+    promptIds: number[],
+    startPos: number,
+    maxTokens: number,
+    onToken: (id: number) => void
+  ): Promise<number[]> {
+    const tokens: number[] = []
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+
+    // Prefill from startPos to populate KV cache for the new tokens.
+    // KV slots [0, startPos) already contain valid entries from the previous
+    // turn (caller guarantees prompt[0..startPos] matches what was prefilled
+    // before). The last call's return is the argmax over the final prefill
+    // step's logits — that *is* the first generated token.
+    let tokenId = 0
+    if (hybrid && startPos >= promptIds.length && gdnStatePos === promptIds.length) {
+      // GDN state + KV sit exactly at end-of-prompt (the caller — e.g.
+      // forwardLogits — already ran every prompt token). Re-running the last
+      // token, as the pure-attention branch below does, would double-apply
+      // it to the non-idempotent recurrent state; instead read back the
+      // argmax that final pass already computed. Zero prompt passes.
+      tokenId = await readLastToken()
+    } else if (hybrid && startPos < promptIds.length && startPos > 0 && gdnStatePos === startPos) {
+      // The state provably sits at startPos — extend incrementally, exactly
+      // one forward pass per NEW prompt token (same contract as the
+      // pure-attention KV reuse below).
+      for (let i = startPos; i < promptIds.length; i++) {
+        tokenId = await decodeToken(promptIds[i], i)
+      }
+    } else if (hybrid) {
+      // GDN layers are stateful and NOT idempotent: re-running a token
+      // double-applies it to the recurrent state and rotates the conv ring
+      // past it. When gdnStatePos can't prove the state matches startPos
+      // (fresh prompt, or state left mid-sequence by a previous generation),
+      // replay the whole prompt from position 0 — which also re-zeroes the
+      // GDN state (clearGdnState fires at position 0). Within-call decode
+      // below is always incremental: one forward pass per generated token.
+      for (let i = 0; i < promptIds.length; i++) {
+        tokenId = await decodeToken(promptIds[i], i)
+      }
+    } else if (startPos >= promptIds.length) {
+      // The new prompt is a strict prefix of the previous one (or identical).
+      // No new tokens to prefill — but we still need a valid `tokenId` to
+      // start decoding from. Run the last prompt token through decodeToken at
+      // its existing position to re-read the logits (idempotent for pure
+      // attention: the KV slot is simply rewritten with the same values).
+      tokenId = await decodeToken(promptIds[promptIds.length - 1], promptIds.length - 1)
+    } else {
+      for (let i = startPos; i < promptIds.length; i++) {
+        tokenId = await decodeToken(promptIds[i], i)
+      }
+    }
+
+    // Decode loop. Each emitted token is fed back at the next free KV slot:
+    // the first generated token decodes at position promptIds.length (the
+    // slot right after the prompt), then the position advances by one.
+    let pos = promptIds.length
+    for (let i = 0; i < maxTokens; i++) {
+      if (tokenId < 0 || tokenId >= S.vocab || STOP.has(tokenId)) break
+      tokens.push(tokenId)
+      onToken(tokenId)
+      tokenId = await decodeToken(tokenId, pos)
+      pos++
+    }
+
+    return tokens
+  }
+
+  /**
+   * Forward pass for validation. Always prefills from position 0 (no KV reuse)
+   * and returns the f32 logits at the final prompt position. The argmax of
+   * these logits is the model's next-token prediction for the prompt.
+   */
+  async function forwardLogits(promptIds: number[]): Promise<Float32Array> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    if (promptIds.length === 0) throw new Error('forwardLogits: empty prompt')
+    // Prefill all but the last token.
+    for (let i = 0; i < promptIds.length - 1; i++) {
+      await decodeToken(promptIds[i], i)
+    }
+    // Final token — read back logits instead of argmax.
+    return readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
+  }
+
+  /**
+   * Per-token negative log-likelihood over a sequence — the primitive a
+   * perplexity harness needs, and the only measurement in this engine that can
+   * see a model quantized into uselessness.
+   *
+   * Everything else here is a FIDELITY check: it compares the engine against
+   * mlx_lm running THE SAME quantized checkpoint (scripts/mlx-ref.py:29 is
+   * `mlx_lm.load(args.model)`), so a checkpoint quantized into nonsense scores
+   * cosine 0.9999 against an equally nonsensical reference and every gate goes
+   * green. Perplexity is absolute: it needs no reference model, only held-out
+   * text.
+   *
+   * Returns `ids.length - 1` values; `nll[p]` is `-log P(ids[p+1] | ids[0..p])`.
+   *
+   * Cost is one decode step and one full-vocab readback per position, so it
+   * runs at roughly decode speed, not prefill speed — 512 positions on a
+   * 128k-vocab model is ~256 MB of readback. Deliberately not fused into a GPU
+   * reduction: a scoring kernel that is subtly wrong would corrupt the one
+   * number nothing else can cross-check.
+   */
+  async function scoreSequence(
+    ids: number[],
+    onProgress?: (done: number, total: number) => void,
+  ): Promise<Float32Array> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep')
+    if (ids.length < 2) throw new Error('scoreSequence: need at least 2 tokens')
+    if (ids.length > MAX_CONTEXT) {
+      throw new Error(`scoreSequence: ${ids.length} tokens exceeds the ${MAX_CONTEXT}-token context`)
+    }
+    const nll = new Float32Array(ids.length - 1)
+    for (let p = 0; p < ids.length - 1; p++) {
+      const logits = await readLogits(ids[p], p)
+      // log_softmax at the TRUE next token, max-subtracted. Done in f64 on the
+      // CPU: the sum runs over the whole vocabulary (248,320 on Qwen3.5) and
+      // an f32 accumulation there loses the tail that perplexity is measuring.
+      let max = -Infinity
+      for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i]
+      let sum = 0
+      for (let i = 0; i < logits.length; i++) sum += Math.exp(logits[i] - max)
+      nll[p] = -(logits[ids[p + 1]] - max - Math.log(sum))
+      onProgress?.(p + 1, ids.length - 1)
+    }
+    return nll
+  }
+
+  // ── Embedding tail ────────────────────────────────────────────────────────
+  // Hidden-state readback buffer, allocated lazily like logitsReadBuf.
+  let hiddenReadBuf: GPUBuffer | null = null
+  const halfScratchF32 = new Float32Array(1)
+  const halfScratchU32 = new Uint32Array(halfScratchF32.buffer)
+  /** u16 IEEE-754 half bit pattern → f32. Float16Array postdates WebGPU in
+   *  Chrome (113 shipped WebGPU, 135 shipped Float16Array), so decode by hand. */
+  function halfToF32(h: number): number {
+    const sign = (h & 0x8000) << 16
+    const exp = (h >>> 10) & 0x1f
+    const mant = h & 0x3ff
+    let bits: number
+    if (exp === 0) {
+      if (mant === 0) bits = sign
+      else {
+        let e = -1
+        let m = mant
+        do { e++; m <<= 1 } while (!(m & 0x400))
+        bits = sign | ((127 - 15 - e) << 23) | ((m & 0x3ff) << 13)
+      }
+    } else if (exp === 0x1f) bits = sign | 0x7f800000 | (mant << 13)
+    else bits = sign | ((exp - 15 + 127) << 23) | (mant << 13)
+    halfScratchU32[0] = bits >>> 0
+    return halfScratchF32[0]
+  }
+
+  /**
+   * Prefill `promptIds` and return the L2-normalised f32 hidden state at the
+   * FINAL prompt position — a sentence embedding.
+   *
+   * This is forwardLogits one dispatch earlier. B.hidden1 is what the LM head
+   * reads, and the last layer's addNorm2 binds `finalNormGamma` as its
+   * next-layer gamma (see the layerBGs loop), so B.hidden1 after recordForward
+   * holds RMSNorm(residual, model.norm) — exactly HF's `last_hidden_state`.
+   * No new kernel, no change to any dispatch; the LM head and argmax still run
+   * and their output is ignored, the same deal readLogits already accepts.
+   *
+   * POOLING IS THE CALLER'S JOB beyond "last token". The decoder is causal, so
+   * position len-1 sees the whole sequence and this equals last-token pooling
+   * for an unpadded sequence — the rule Qwen3-Embedding's own
+   * 1_Pooling/config.json states (pooling_mode_lasttoken: true) ahead of its
+   * 2_Normalize module. That family's tokenizer also appends <|endoftext|> to
+   * every sequence via a TemplateProcessing post-processor, and its queries
+   * carry an "Instruct: …\nQuery:" prefix; both change which token lands last
+   * and neither is something this function can see. A mean-pooled model needs
+   * a different hook, not a different argument.
+   */
+  async function forwardEmbedding(promptIds: number[]): Promise<Float32Array> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    if (promptIds.length === 0) throw new Error('forwardEmbedding: empty prompt')
+    for (let i = 0; i < promptIds.length; i++) await decodeToken(promptIds[i], i)
+
+    if (!hiddenReadBuf) {
+      hiddenReadBuf = device.createBuffer({
+        size: S.d * 2,
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        label: 'hiddenReadback',
+      })
+    }
+    const enc = device.createCommandEncoder()
+    enc.copyBufferToBuffer(B.hidden1, 0, hiddenReadBuf, 0, S.d * 2)
+    device.queue.submit([enc.finish()])
+
+    await hiddenReadBuf.mapAsync(GPUMapMode.READ)
+    const half = new Uint16Array(hiddenReadBuf.getMappedRange().slice(0))
+    hiddenReadBuf.unmap()
+
+    // Pool (already done — this IS the last position) then L2-normalise, so
+    // cosine similarity is a plain dot product downstream.
+    const out = new Float32Array(S.d)
+    let sumSq = 0
+    for (let i = 0; i < S.d; i++) { const v = halfToF32(half[i]); out[i] = v; sumSq += v * v }
+    const inv = 1 / Math.sqrt(sumSq)
+    for (let i = 0; i < S.d; i++) out[i] *= inv
+    return out
+  }
+
+  /**
+   * Opt-in debug assertion for prefix reuse (?checkreuse=1 / window.checkReuse):
+   * runs the REUSED-prefix prefill of `promptIds` and reads the final-position
+   * logits, then a FRESH full prefill of the same prompt, and diffs the two
+   * f32 logit vectors. Every dispatch is deterministic and the reused prefix's
+   * KV/GDN state is bit-identical to what the fresh replay recomputes, so the
+   * expected maxAbsDiff is exactly 0. Blocking path (scalar-config dispatch
+   * chain); leaves KV + GDN state at end-of-prompt, absorbed record intact.
+   */
+  async function debugCompareReuse(promptIds: number[]): Promise<{
+    startPos: number
+    promptLen: number
+    maxAbsDiff: number
+    meanAbsDiff: number
+  }> {
+    if (promptIds.length < 2) throw new Error('debugCompareReuse: prompt too short')
+    const startPos = computeReuseStart(promptIds)
+    // Reused-prefix pass: prefill only the delta, then read logits.
+    for (let i = startPos; i < promptIds.length - 1; i++) {
+      await decodeToken(promptIds[i], i)
+    }
+    const reused = await readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
+    // Fresh pass: full prefill from 0 (re-zeroes GDN state at position 0).
+    for (let i = 0; i < promptIds.length - 1; i++) {
+      await decodeToken(promptIds[i], i)
+    }
+    const fresh = await readLogits(promptIds[promptIds.length - 1], promptIds.length - 1)
+    let maxAbs = 0
+    let sumAbs = 0
+    for (let i = 0; i < fresh.length; i++) {
+      const d = Math.abs(reused[i] - fresh[i])
+      if (d > maxAbs) maxAbs = d
+      sumAbs += d
+    }
+    return { startPos, promptLen: promptIds.length, maxAbsDiff: maxAbs, meanAbsDiff: sumAbs / fresh.length }
+  }
+
+  /** Copy the trace out. One readback per call, after the submit that filled
+   *  it — callers await a generated token first, which guarantees ordering. */
+  async function readMoeTrace(): Promise<{ ids: Uint32Array; steps: number; stride: number } | null> {
+    if (!moeTraceBuf || !moeTraceRead) return null
+    const enc = device.createCommandEncoder()
+    enc.copyBufferToBuffer(moeTraceBuf, 0, moeTraceRead, 0, moeTraceRead.size)
+    device.queue.submit([enc.finish()])
+    await moeTraceRead.mapAsync(GPUMapMode.READ)
+    const out = new Uint32Array(moeTraceRead.getMappedRange().slice(0))
+    moeTraceRead.unmap()
+    // Report how many slots actually hold data, so a short run is not read as
+    // 2048 steps of zeros routing everything to expert 0.
+    return { ids: out, steps: Math.min(moeTraceIdx, TRACE_CAP), stride: traceStride / 4 }
+  }
+
+  function getLastPrefill(): typeof lastPrefill {
+    return lastPrefill
+  }
+
+  function getLastStop(): typeof lastStop {
+    return lastStop
+  }
+
+  /**
+   * PAGING PHASE 1 (docs/PAGING_PLAN.md) — export the KV state that encodes
+   * `absorbed`, as bytes a later engine can swallow.
+   *
+   * The whole trick is the plan's §1 insight: a prefix always restores to its
+   * OWN positions, so under the identity page table this is a contiguous slice
+   * off the front of each attention layer's buffer — no page table, no kernel
+   * change, no address translation. Chunked at 64 MiB, the measured readback
+   * sweet spot (BENCH.md, KV paging feasibility; 16 MiB costs ~30%).
+   *
+   * Hybrid specs carry the GDN recurrence too: fixed-size conv+recur blobs,
+   * valid ONLY at exactly `absorbed.length` tokens — the recurrence cannot be
+   * rewound, so a restored hybrid entry is exact-length attach only (the
+   * reuseStart rules already enforce that).
+   *
+   * Refused for MLA (flat position*L cache, unpooled in Phase 1) and pipeline
+   * stages.
+   *
+   * int8 USED to be refused here too, and it cost more than it looked: with
+   * int8 the default, that exclusion would have silently disabled the
+   * prefill-survives-a-restart cache for everyone. The reason was never
+   * fundamental — the snapshot had nowhere to put the per-row scales — and the
+   * pool fingerprint already keys on int8kv (prefix-pool.ts), so an f16 entry
+   * can never be handed to an int8 engine. The scales ride along now.
+   */
+  async function exportKV(): Promise<
+    { tokens: number; ids: number[]; layers: ArrayBuffer[]; scales: ArrayBuffer[]; gdn: ArrayBuffer[] } | null
+  > {
+    if (partial || MLA) return null
+    if (!absorbedValid || absorbed.length === 0) return null
+    if (hybrid && gdnStatePos !== absorbed.length) return null   // mid-chunk state: not attachable
+    const tokens = absorbed.length
+    const pages = Math.ceil(tokens / S.pageSize)
+    // int8 pages are packed u32 words, not f16 values — a different width, so
+    // the length must follow the mode rather than the f16 stride.
+    const byteLen = pages * (int8Mode ? S.kvI8PageWords * 4 : S.kvPageStride * 2)
+    const scaleLen = pages * S.kvScalesPerPage * 2
+    const CHUNK = 64 * 1024 * 1024
+    const readBack = async (src: GPUBuffer, len: number): Promise<ArrayBuffer> => {
+      const out = new Uint8Array(len)
+      for (let off = 0; off < len; off += CHUNK) {
+        const n = Math.min(CHUNK, len - off)
+        const staging = device.createBuffer({ size: n, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+        const enc = device.createCommandEncoder()
+        enc.copyBufferToBuffer(src, off, staging, 0, n)
+        device.queue.submit([enc.finish()])
+        await staging.mapAsync(GPUMapMode.READ)
+        out.set(new Uint8Array(staging.getMappedRange()), off)
+        staging.unmap()
+        staging.destroy()
+      }
+      return out.buffer
+    }
+    const layers: ArrayBuffer[] = []
+    for (const buf of kvPages) layers.push(await readBack(buf, byteLen))
+    const scales: ArrayBuffer[] = []
+    if (int8Mode && kvScales) for (const buf of kvScales) scales.push(await readBack(buf, scaleLen))
+    const gdn: ArrayBuffer[] = []
+    if (hybrid) {
+      for (let L = 0; L < S.layers; L++) {
+        if (!gdnConvState[L]) continue
+        gdn.push(await readBack(gdnConvState[L]!, gdnConvState[L]!.size))
+        gdn.push(await readBack(gdnRecurState[L]!, gdnRecurState[L]!.size))
+      }
+    }
+    return { tokens, ids: [...absorbed], layers, scales, gdn }
+  }
+
+  /**
+   * The other half: write a saved prefix back and CLAIM it in the absorbed
+   * record, so the next prefill's computeReuseStart sees `tokens` already in
+   * the cache and prefills only the delta. The caller (kv-pool.ts) is
+   * responsible for fingerprint equality — bytes from a different variant set
+   * or weight revision are a different model, and nothing here can tell.
+   */
+  function importKV(snap: {
+    tokens: number; ids: number[]; layers: ArrayBuffer[]; scales?: ArrayBuffer[]; gdn: ArrayBuffer[]
+  }): boolean {
+    if (partial || MLA) return false
+    if (snap.layers.length !== kvPages.length) return false
+    // An int8 engine needs one scales buffer per layer. A snapshot without them
+    // is an f16 entry, which the fingerprint should already have excluded —
+    // refuse rather than restore codes with nobody's scale.
+    if (int8Mode && (!kvScales || (snap.scales?.length ?? 0) !== kvScales.length)) return false
+    if (!int8Mode && (snap.scales?.length ?? 0) > 0) return false
+    if (snap.tokens > MAX_CONTEXT || snap.ids.length !== snap.tokens) return false
+    for (let i = 0; i < kvPages.length; i++) {
+      device.queue.writeBuffer(kvPages[i], 0, snap.layers[i])
+    }
+    if (int8Mode && kvScales && snap.scales) {
+      for (let i = 0; i < kvScales.length; i++) device.queue.writeBuffer(kvScales[i], 0, snap.scales[i])
+    }
+    if (hybrid) {
+      let g = 0
+      for (let L = 0; L < S.layers; L++) {
+        if (!gdnConvState[L]) continue
+        device.queue.writeBuffer(gdnConvState[L]!, 0, snap.gdn[g++])
+        device.queue.writeBuffer(gdnRecurState[L]!, 0, snap.gdn[g++])
+      }
+      gdnStatePos = snap.tokens
+    }
+    // A restored snapshot jumps the state to snap.tokens without replaying
+    // anything, so no earlier rewind point describes it any more.
+    invalidateGdnCkpts()
+    absorbed = [...snap.ids]
+    absorbedValid = true
+    return true
+  }
+
+  function resetKVTracking(): void {
+    // Drop the absorbed-token record so the next generatePipelined performs a
+    // full prefill (the KV pages themselves need no clearing — stale slots
+    // are overwritten in order, and a from-0 prefill re-zeroes GDN state).
+    // Blocking-path callers additionally track their own prefix length and
+    // pass startPos to generate().
+    absorbed = []
+    absorbedValid = true
+  }
+
+  // ============================================================
+  // Pipelined path — submitStep / generatePipelined (chat)
+  // ============================================================
+
+  // Persistent readback ring (size = decode pipeline depth).
+  // Each slot is a 4-byte MAP_READ buffer receiving a copy of B.tokenOut.
+  const PIPELINE_DEPTH = 2
+  const readRing: GPUBuffer[] = []
+  for (let i = 0; i < PIPELINE_DEPTH; i++) {
+    readRing.push(device.createBuffer({
+      size: 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    }))
+  }
+  let readCursor = 0
+
+  // ============================================================
+  // Chunked GDN prefill (hybrid specs, subgroups path)
+  //
+  // Prompt tokens before the last are processed in chunks of up to CHUNK_CAP:
+  // every projection (fused GDN in_proj, out_proj, c_attn, o_proj, gate_up,
+  // down) becomes ONE int4_matmul_batched_dyn dispatch with M = chunk length
+  // (4× weight-traffic amortization from the m=4 register block), the GDN
+  // conv/gates/norm run batched over the chunk, and the recurrence — already
+  // seq-capable — runs as ONE gdn_recur dispatch per layer per chunk.
+  // Attention layers run fully batched too: rope/kv_append are seq-capable,
+  // and attention_prefill enforces causality with per-token kv_len. One
+  // submit per chunk; per-chunk uniforms are rewritten between submits
+  // (queue-ordered). ~394 dispatches per 64-token chunk vs 340/token before.
+  // ============================================================
+
+  // Chunk capacity in tokens (buffer sizing). The right value depends on the
+  // GEMM: the matvec cannot exploit M beyond its 4-row block (the 2026-08-11
+  // sweep was flat), but the matrix-unit GEMM scales with M — measured
+  // 3.26s / 2.80s / 2.70s at cap 64/256/512 on qwen3mlx's 800-token prompt,
+  // tokens identical at every cap. That measurement set the default at 256;
+  // the 4k-prompt sweep later raised it to 1024 (see the CHUNK_CAP note below),
+  // and a spec may now clamp it back down via maxChunkCap. 64 remains the
+  // default for the FMA kernels it was tuned on. Both matrix-unit kernels get
+  // the matrix-unit cap; asking for 'e5' must not silently drop the engine to
+  // the 64 the non-subgroup fallback uses.
+  const sgmatAvail = (AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat) != null
+    && ['sgmat', 'e5'].includes(opts.chunkGemm ?? 'sgmat')
+  // 1024 since 2026-08-15: the cap was chosen at an 800-token prompt, where
+  // 512 read +3.6% and was left unshipped — but agent prompts run 4k-24k, and
+  // at 4,096 tokens the sweep reads monotonic gains (64: -25%, 512: +10.2%,
+  // 1024: +15.1% over 256; scripts/chunk-cap-sweep.mjs, AC, medians of 3).
+  // Token-identical vs cap 256 on all three chunk families (llama32 dense
+  // affine, qwen35 hybrid GDN, qwen30b MoE; 2,600-token prompts). Chunk
+  // workspace is C-linear — worst buffer ~38 MB at 1024 — with no C×context
+  // term. The non-matrix-unit fallback stays at 64: the sweep ran on E5, and
+  // that path was never measured at these caps.
+  //
+  // Read the token-identity claim above with its DOMAIN attached: three specs,
+  // 2,600-token prompts, and qwen38 did not exist yet. It fails at ~16k, where
+  // cap 1024 invents tool names that cap 256 and the per-token path get right.
+  // A spec may therefore carry `maxChunkCap` — a quarantine that clamps the
+  // DEFAULT here. An explicit chunkCap is still honoured exactly as asked,
+  // because the sweep that found the threshold has to be able to cross it and
+  // silently clamping a diagnostic is how an A/B measures the same code twice;
+  // it warns instead.
+  if (opts.chunkCap != null && opts.chunkCap > (S.maxChunkCap ?? Infinity)) {
+    console.warn(`[chunk] cap ${opts.chunkCap} is above ${S.id}'s maxChunkCap ${S.maxChunkCap}. `
+      + 'Honouring it because it was asked for explicitly, but chunked prefill is KNOWN to corrupt '
+      + 'this spec above that cap at long context — treat the output as suspect.')
+  }
+  const CHUNK_CAP = resolveChunkCap(opts, S, sgmatAvail)
+  const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
+
+  interface ChunkPrefill {
+    record(promptIds: number[], start: number, seqLen: number): void | Promise<void>
+    /** Tokens per chunk this instance was built for — pooled chunks are capped
+     *  at 16 (see the pooled-cut note in record), so the caller must slice by
+     *  THIS, not by CHUNK_CAP. */
+    cap: number
+    /** These buffers are CHUNK_CAP times the width of the decode ones, so on a
+     *  hybrid spec they are the largest thing the engine allocates for itself —
+     *  worth freeing, and only reachable from inside this closure. */
+    destroy(): void
+  }
+
+  let chunkGemmUsed = 'matvec'
+  function buildChunkPrefill(): ChunkPrefill {
+    // Pooled chunks are capped at 16 tokens: the chunk's expert UNION must be
+    // resident simultaneously, and the 1827-step routing trace puts the p100
+    // union at C=16 at 84 of 128 experts — under a 96-slot pool with zero
+    // overflows in 87k windows (scratch feasibility analysis, 2026-08-15).
+    // Bigger C at these pool sizes overflows; the construction gate below
+    // refuses pools under 96 slots outright.
+    const C = pooling ? Math.min(CHUNK_CAP, 16) : CHUNK_CAP
+    // MLC symmetric and MLX affine are different kernels with different
+    // bindings — affine takes a 6th buffer (biases at @binding(5)) and reads
+    // its scales in groups of 64 rather than 32.
+    //
+    // TWO GEMM shapes exist. The TILED one (32x32 output tile, staged
+    // activations in workgroup memory, no subgroups needed) is the fast path —
+    // it is why prefill stopped being a 4-row matvec. It requires K%64 on
+    // every contraction this chunk path dispatches and a chunk capacity that
+    // tiles by 32; anything else falls back to batched_dyn, correct but slow.
+    // OPT-IN, not default — and that is a measurement decision, not caution.
+    // The tiled kernel is correct (22/22 at ragged edges, token-identical
+    // in-engine on llama32 and qwen35), but on the day it landed every timing
+    // was noise-dominated (the machine had just recovered from a memory
+    // freeze; per-token baselines drifted 11.5s -> 38.7s within hours), and
+    // the clean-ish runs read parity with batched_dyn, not a win — at M<=64
+    // Apple's L2 apparently covers most of the matvec's activation re-reads.
+    // It becomes the default when a quiet-machine A/B says so, not before.
+    // NOT a complete list of the N dimensions this GEMM runs. On a hybrid it
+    // also runs the fused GDN input projection at N = gdnProjRows, which this
+    // does not look at. Among the shipped HYBRIDS, qwen38 is the only one whose
+    // gdnProjRows is not a multiple of 64 (16480 = 64*257 + 32; qwen35, qwen36,
+    // qwen36q3 and qwen35mlx are all 12352 = 64*193). Scope that to hybrids:
+    // makeModelSpec derives gdnProjRows for every spec, so the embedding build
+    // also reports a non-multiple (8224) while running no GDN at all.
+    //
+    // This is NOT known to be a defect and is deliberately not being "fixed" on
+    // a guess. E5 tiles N by 32, 16480 % 32 === 0, and int4_matmul.gen.ts
+    // guards the ragged column with `if (n2 < N)` — three reasons to expect it
+    // is fine. It is written down only because it is the one CHUNK-GEMM
+    // dimension whose 64-divisibility differs between qwen38 and the four other
+    // shipped hybrids. They also differ in d, ffn, gdnVHeads and layer count,
+    // so this is a lead, not a difference.
+    const dimsOK = CHUNK_CAP % 32 === 0
+      && [S.d, S.qDim, S.ffn, ...(hybrid ? [S.gdnVDim] : [])].every((k) => k % 64 === 0)
+    // GEMM ladder: e5 > sgmat > matvec (tiled-v2 only on an explicit
+    // chunkGemm:'tiled'). E5 and sgmat are both 'auto' when their pipelines
+    // exist — the device advertised the feature — and each holds the SAME bar
+    // every chunk kernel holds: chunked prefill was
+    // never bit-equal to per-token (that is why checkReuse needs ?chunk=0);
+    // the gate is empirical token identity in chunk-prefill-test.mjs, and
+    // sgmat passes it on every chunking spec before it may default here.
+    const sgmatPipes = AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat
+    const e5Pipes = AFFINE ? P.int4MatmulSgE5Affine : P.int4MatmulSgE5
+    // E5 is the default as of 2026-08-13. It cleared the bar this file has held
+    // since sgmat — token identity vs per-token prefill on EVERY chunking spec
+    // family, not just the convenient one: llama32 and qwen3mlx (dense MLX
+    // affine), and qwen35, which is both MLC-symmetric and hybrid GDN. Measured
+    // in-engine on all three: +13.1% / +14.7% / +39.7% prefill.
+    // It degrades to sgmat by itself when the cap does not tile by 64.
+    const pick = pickChunkGemm({
+      want: opts.chunkGemm,
+      chunkTiled: opts.chunkTiled === true,
+      dimsOK,
+      capTiles64: CHUNK_CAP % 64 === 0,
+      e5Ready: e5Pipes != null,
+      sgmatReady: sgmatPipes != null,
+      cap: CHUNK_CAP,
+    })
+    const gemm = pick.used === 'e5' ? e5Pipes!
+      : pick.used === 'sgmat' ? sgmatPipes!
+      : pick.used === 'tiled' ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
+      : (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
+    const gemmTiledGrid = pick.used === 'sgmat' || pick.used === 'tiled'
+    chunkGemmUsed = pick.used
+    // Kept as names (not re-derived at use): the dispatch grid below tiles
+    // E5 64x32, E1 32x64, tiled 32x32 — the geometry follows the pick.
+    const e5OK = pick.used === 'e5'
+    const sgmatOK = pick.used === 'sgmat'
+    // An EXPLICIT request that cannot be honoured is an error, not a fallback.
+    // Silently substituting is how a kernel A/B measures the same code twice:
+    // ask for 'e5', get sgmat, read two identical numbers, conclude the kernels
+    // are equivalent. The ladder still applies when nothing was asked for.
+    if (pick.rejected) throw new Error(pick.rejected)
+    const dyn = gemm
+    /** A batched-GEMM bind group. bg() maps array position to binding index, so
+     *  the bias buffer must come LAST and only when the affine kernel is in
+     *  use — a 6-buffer group against a 5-binding layout is rejected outright,
+     *  which is the loud failure we want rather than a silent misbind. */
+    const dynBg = (
+      out: BindEntry,
+      inp: BindEntry,
+      scales: GPUBuffer,
+      wts: GPUBuffer,
+      uni: GPUBuffer,
+      biases?: GPUBuffer,
+    ) => bg(device, dyn, AFFINE ? [out, inp, scales, wts, uni, biases!] : [out, inp, scales, wts, uni])
+    // Batched activation buffers ([C, dim] row-major).
+    const CB = {
+      inputIds: makeBuf(device, C * 4, 'c.inputIds'),
+      posMap:   makeBuf(device, C * 4, 'c.posMap'),
+      residual: makeBuf(device, C * S.d * 2, 'c.residual'),
+      residual2: makeBuf(device, C * S.d * 2, 'c.residual2'),
+      hidden1:  makeBuf(device, C * S.d * 2, 'c.hidden1'),
+      hidden2:  makeBuf(device, C * S.d * 2, 'c.hidden2'),
+      cAttnOut: makeBuf(device, C * S.cAttnDim * 2, 'c.cAttnOut'),
+      qkvOut:   makeBuf(device, C * S.qkvDim * 2, 'c.qkvOut'),
+      gateRaw:  makeBuf(device, C * S.qDim * 2, 'c.gateRaw'),
+      qOut:     makeBuf(device, C * S.qDim * 2, 'c.qOut'),
+      kOut:     makeBuf(device, C * S.kvDim * 2, 'c.kOut'),
+      vOut:     makeBuf(device, C * S.kvDim * 2, 'c.vOut'),
+      attnOut:  makeBuf(device, C * S.qDim * 2, 'c.attnOut'),
+      gateUp:   makeBuf(device, C * 2 * S.ffn * 2, 'c.gateUp'),
+      ffnOut:   makeBuf(device, C * S.ffn * 2, 'c.ffnOut'),
+      gdnProjOut: makeBuf(device, C * S.gdnProjRows * 2, 'c.gdnProjOut'),
+      gdnConvOut: makeBuf(device, C * S.gdnQkvDim * 2, 'c.gdnConvOut'),
+      gdnGates:   makeBuf(device, C * 2 * S.gdnVHeads * 4, 'c.gdnGates'),
+      gdnRecurOut: makeBuf(device, C * S.gdnVDim * 4, 'c.gdnRecurOut'),
+      gdnNormed:  makeBuf(device, C * S.gdnVDim * 2, 'c.gdnNormed'),
+    }
+
+    // MoE chunk buffers: the decode layouts with a leading TOKEN dimension.
+    // moeIds/moeScores growing from [slots] to [C, slots] is the whole of what
+    // kept MoE off this path — with one expert choice per token per slot, the
+    // expert matmul batches the way every other projection already does.
+    // MoE-only: on a dense spec moeDown alone would be the largest buffer here.
+    const CM = S.moe
+      ? {
+          routerLogits: makeBuf(device, C * MOE_ROUTER_ROWS * 4, 'c.routerLogits'),
+          moeIds:    makeBuf(device, C * S.moeSlots * 4, 'c.moeIds'),
+          moeScores: makeBuf(device, C * S.moeSlots * 4, 'c.moeScores'),
+          moeGateUp: makeBuf(device, C * S.moeSlots * 2 * S.ffn * 2, 'c.moeGateUp'),
+          moeH:      makeBuf(device, C * S.moeSlots * S.ffn * 2, 'c.moeH'),
+          moeDown:   makeBuf(device, C * S.moeSlots * S.d * 2, 'c.moeDown'),
+          /** Pooled chunks only: the whole chunk's expert ids, read back once
+           *  per MoE layer so the CPU can resolve the union and write slot
+           *  ids before the expert matmuls run. */
+          idsRead: pooling ? device.createBuffer({
+            size: C * S.moeSlots * 4,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            label: 'c.idsRead',
+          }) : null,
+        }
+      : null
+
+    // Elementwise grids per token (packGridDimX values scale with seq_len).
+    const CATTN_WGS = S.cAttnDim / WG_SIZE_D
+    const FFN_WGS = S.ffn / WG_SIZE_D
+    const CONV_COMMIT_WGS = ((S.gdnConvK - 1) * S.gdnQkvDim) / WG_SIZE_D
+
+    // Per-chunk uniforms — contents rewritten before each chunk's submit.
+    // int4_matmul_batched_dyn PODArgs: {K_PACKED, SCALES_PER_ROW, N, M_ROWS};
+    // M_ROWS (offset 12) is the per-chunk field.
+    const cU = {
+      emb:   uniformBuf(device, [i32(0), u32(0)]),
+      norm:  uniformBuf(device, [u32(0)]),
+      gdnProj: uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.gdnProjRows), u32(0)]),
+      gdnOut:  uniformBuf(device, [u32(S.gdnVDim / PACK), u32(S.gdnVDim / QGROUP), u32(S.d), u32(0)]),
+      cAttn:   uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(S.cAttnDim), u32(0)]),
+      oProj:   uniformBuf(device, [u32(S.qDim / PACK), u32(S.qDim / QGROUP), u32(S.d), u32(0)]),
+      gateUp:  uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(2 * S.ffn), u32(0)]),
+      ffnDown: uniformBuf(device, [u32(S.ffn / PACK), u32(S.ffn / QGROUP), u32(S.d), u32(0)]),
+      gatedSplit: uniformBuf(device, [i32(0), u32(0)]),
+      qkNorm: uniformBuf(device, [i32(0), u32(0)]),
+      rope:   uniformBuf(device, [i32(1), i32(0), i32(0), u32(0)]),
+      kvApp:  uniformBuf(device, [i32(0), i32(S.maxPages), i32(0), i32(0), u32(0)]),
+      attn:   uniformBuf(device, [i32(0), i32(0), (() => { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, SM_SCALE, true); return a })()]),
+      // int8 chunk pair. The attention uniform carries two extra offsets the
+      // f16 one has no field for, so it cannot be shared.
+      kvQuant: uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]),
+      attnI8: uniformBuf(device, [i32(0), i32(0),
+        (() => { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, SM_SCALE, true); return a })(),
+        i32(0), i32(0)]),
+      attnGate: uniformBuf(device, [u32(0)]),
+      conv:   uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(0)]),
+      convCommit: uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(CONV_COMMIT_WGS)]),
+      gates:  uniformBuf(device, [i32(0), i32(S.gdnProjRows), u32(0)]),
+      recur:  uniformBuf(device, [i32(0), u32(S.gdnVHeads)]),
+      normOut: uniformBuf(device, [i32(0), i32(S.gdnProjRows), u32(0)]),
+      silu:   uniformBuf(device, [i32(0), u32(0)]),
+      // The MoE block's only per-chunk uniform. Its router, top-k, expert
+      // matmul and combine uniforms are chunk-invariant, so the chunk path
+      // binds the DECODE ones rather than keeping a second copy in step.
+      // silu_mul is the exception: it walks a flat [rows, 2*ffn] buffer, and a
+      // chunk has n*slots rows where decode has slots.
+      moeSilu: uniformBuf(device, [i32(0), u32(0)]),
+    }
+
+    // Bind groups (buffers are fixed; only uniform contents change per chunk).
+    //
+    // THE AFFINE EMBEDDING, not P.embedding. This line is why plain-attention
+    // chunking shipped broken on 2026-08-11: the per-token path picks
+    // `AFFINE ? P.embeddingAffine : P.embedding` (see embeddingPipeline above)
+    // and this one bound P.embedding unconditionally — dequantizing MLX-affine
+    // embedding weights with the SYMMETRIC formula, no bias, wrong by b per
+    // group. Every chunked token's residual was corrupted from position 0,
+    // which is exactly the observed failure: divergence at the FIRST generated
+    // token on any prompt long enough to chunk, while MLC-format qwen35 (whose
+    // embedding really is symmetric) stayed token-identical.
+    const cbgEmb = bg(device, AFFINE ? P.embeddingAffine : P.embedding, withBias(
+      [CB.residual, CB.inputIds, weights.embdScales, weights.embdWeights, cU.emb],
+      weights.embdBiases, 'embed_tokens'))
+    const cbgInitNorm = bg(device, P.rmsNorm, [CB.hidden1, CB.residual, weights.layers[0].normGamma1, cU.norm])
+
+    interface ChunkLayerBG {
+      // attention layers
+      cAttn?: GPUBindGroup
+      gatedSplit?: GPUBindGroup
+      qkNorm?: GPUBindGroup
+      rope?: GPUBindGroup
+      kvApp?: GPUBindGroup
+      attn?: GPUBindGroup
+      attnGate?: GPUBindGroup
+      // GDN layers
+      gdnProj?: GPUBindGroup
+      conv?: GPUBindGroup
+      convCommit?: GPUBindGroup
+      gates?: GPUBindGroup
+      recur?: GPUBindGroup
+      normOut?: GPUBindGroup
+      // shared
+      oProj: GPUBindGroup
+      addNorm1: GPUBindGroup
+      addNorm2: GPUBindGroup
+      // dense FFN — absent on a MoE layer, which carries `moe` instead
+      gateUp?: GPUBindGroup
+      silu?: GPUBindGroup
+      ffnDown?: GPUBindGroup
+      moe?: {
+        routerLogits: GPUBindGroup
+        routerTopk: GPUBindGroup
+        gate: GPUBindGroup
+        up: GPUBindGroup
+        silu: GPUBindGroup
+        down: GPUBindGroup
+        combine: GPUBindGroup
+      }
+    }
+    const cLayers: ChunkLayerBG[] = []
+    for (let L = 0; L < S.layers; L++) {
+      const lw = weights.layers[L]
+      const isGdn = S.layerKinds[L] === 'gdn'
+      const nextGamma = L < S.layers - 1 ? weights.layers[L + 1].normGamma1 : weights.finalNormGamma
+      // A MoE layer has no ffn* weights at all, and bg() over an undefined
+      // buffer throws while BUILDING the engine — so the two FFN shapes are
+      // built exclusively, never both.
+      const mw = S.moe ? lw.moe : undefined
+      const common = {
+        addNorm1: bg(device, P.addNorm, [CB.hidden2, CB.residual, lw.normGamma2, CB.hidden1, CB.residual2, cU.norm]),
+        addNorm2: bg(device, P.addNorm, [CB.hidden2, CB.residual2, nextGamma, CB.hidden1, CB.residual, cU.norm]),
+        ...(mw
+          // The MoE block reads CB.hidden1 and writes CB.hidden2 — the dense
+          // FFN's contract, the same one the decode path relies on, which is
+          // why nothing on either side of it changes for a chunk.
+          ? {
+              moe: {
+                routerLogits: bg(device, moeRouterPipe, routerBits === 16
+                  ? [CM!.routerLogits, CB.hidden1, mw.routerWeights, moeRouterU!]
+                  : [CM!.routerLogits, CB.hidden1, mw.routerWeights, mw.routerScales, mw.routerBiases, moeRouterU!]),
+                routerTopk: bg(device, P.moeRouterTopk!, [CM!.moeIds, CM!.moeScores, CM!.routerLogits, moeTopkU!]),
+                // Same interleaved [.., slot, gate|up] layout as decode; `up`
+                // bound ffn*2 bytes in, an offset that must stay 256-aligned.
+                gate: bg(device, moeMMGate!, [
+                  { buffer: CM!.moeGateUp, offset: 0, size: C * S.moeSlots * 2 * S.ffn * 2 },
+                  CB.hidden1, mw.gateScales, mw.gateWeights, moeGateU!, mw.gateBiases, CM!.moeIds]),
+                up: bg(device, moeMMGate!, [
+                  { buffer: CM!.moeGateUp, offset: S.ffn * 2, size: C * S.moeSlots * 2 * S.ffn * 2 - S.ffn * 2 },
+                  CB.hidden1, mw.upScales, mw.upWeights, moeGateU!, mw.upBiases, CM!.moeIds]),
+                silu: bg(device, P.siluMul, [CM!.moeH, CM!.moeGateUp, cU.moeSilu]),
+                down: bg(device, moeMMDown!, [
+                  { buffer: CM!.moeDown, offset: 0, size: C * S.moeSlots * S.d * 2 },
+                  CM!.moeH, mw.downScales, mw.downWeights, moeDownU!, mw.downBiases, CM!.moeIds]),
+                combine: bg(device, P.moeCombine, [CB.hidden2, CM!.moeDown, CM!.moeScores, moeCombU!]),
+              },
+            }
+          : {
+              gateUp: dynBg(CB.gateUp, CB.hidden1, lw.ffnScales!, lw.ffnWeights!, cU.gateUp, lw.ffnBiases),
+              silu: bg(device, P.siluMul, [CB.ffnOut, CB.gateUp, cU.silu]),
+              ffnDown: dynBg(CB.hidden2, CB.ffnOut, lw.ffnDownScales!, lw.ffnDownWeights!, cU.ffnDown, lw.ffnDownBiases),
+            }),
+      }
+      if (isGdn) {
+        const gw = lw.gdn!
+        // Region views into the BATCHED packed projection [C, qkv|z|a|b]:
+        // token t's z / [a|b] rows sit at t·gdnProjRows + region offset — the
+        // kernels stride by gdnProjRows (z_stride / ab_stride uniforms).
+        const zRegion = {
+          buffer: CB.gdnProjOut, offset: S.gdnQkvDim * 2,
+          size: (C - 1) * S.gdnProjRows * 2 + S.gdnVDim * 2,
+        }
+        const abRegion = {
+          buffer: CB.gdnProjOut, offset: (S.gdnQkvDim + S.gdnVDim) * 2,
+          size: (C - 1) * S.gdnProjRows * 2 + 2 * S.gdnVHeads * 2,
+        }
+        cLayers.push({
+          gdnProj: dynBg(CB.gdnProjOut, CB.hidden1, gw.projScales, gw.projWeights, cU.gdnProj, gw.projBiases),
+          conv: bg(device, P.gdnConvSeq, [CB.gdnConvOut, CB.gdnProjOut, gdnConvState[L]!, gw.convWeight, cU.conv]),
+          convCommit: bg(device, P.gdnConvCommit, [gdnConvState[L]!, CB.gdnProjOut, cU.convCommit]),
+          gates: bg(device, P.gdnGates, [CB.gdnGates, abRegion, gw.aLog, gw.dtBias, cU.gates]),
+          recur: bg(device, P.gdnRecur, [CB.gdnRecurOut, CB.gdnConvOut, CB.gdnGates, gdnRecurState[L]!, cU.recur]),
+          normOut: bg(device, P.gdnNormOut, [CB.gdnNormed, CB.gdnRecurOut, gw.normGamma, zRegion, cU.normOut]),
+          oProj: dynBg(CB.hidden2, CB.gdnNormed, gw.outScales, gw.outWeights, cU.gdnOut, gw.outBiases),
+          ...common,
+        })
+      } else {
+        // GATED attention (Qwen3.5) fuses a per-head gate into the projection
+        // and splits it out; a plain spec projects straight into qkvOut and has
+        // no gate. cAttnDim already collapses to qkvDim when !attnGate, so the
+        // dispatch is identical — only the destination and the two extra steps
+        // differ.
+        const gated = S.attnGate === true
+        cLayers.push({
+          cAttn: dynBg(gated ? CB.cAttnOut : CB.qkvOut, CB.hidden1,
+            lw.qkvScales!, lw.qkvWeights!, cU.cAttn, lw.qkvBiases),
+          gatedSplit: gated
+            ? bg(device, P.gatedQkvSplit, [CB.qkvOut, CB.gateRaw, CB.cAttnOut, cU.gatedSplit])
+            : undefined,
+          // Gated like its dispatch: llama32 has no q/k norm gammas at all, and
+          // bg() over an undefined buffer throws while BUILDING the engine.
+          qkNorm: S.qkNorm ? bg(device, P.qkNorm, [CB.qkvOut, lw.qNormGamma!, lw.kNormGamma!, cU.qkNorm]) : undefined,
+          rope: bg(device, P.rope, [CB.qOut, CB.kOut, CB.vOut, CB.qkvOut, CB.posMap, cU.rope, ropeFreqs!]),
+          // int8 replaces the append with a quantizing append and the attention
+          // with the int8 reader — the same swap the per-token path makes, and
+          // the dispatch below must move with it or WebGPU discards the submit.
+          kvApp: int8Mode
+            ? bg(device, P.kvQuantizeInt8,
+              [CB.kOut, CB.vOut, kvPages[kvIndex[L]], kvScales![kvIndex[L]], CB.posMap, cU.kvQuant])
+            : bg(device, P.kvAppend, [CB.kOut, CB.vOut, kvPages[kvIndex[L]], CB.posMap, cU.kvApp]),
+          attn: int8Mode
+            ? bg(device, P.attentionPrefillInt8, [CB.qOut, B.pageValues, kvPages[kvIndex[L]],
+              kvScales![kvIndex[L]], CB.attnOut, cU.attnI8])
+            : bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
+          attnGate: gated ? bg(device, P.attnGate, [CB.attnOut, CB.gateRaw, cU.attnGate]) : undefined,
+          oProj: dynBg(CB.hidden2, CB.attnOut, lw.oProjScales!, lw.oProjWeights!, cU.oProj, lw.oProjBiases),
+          ...common,
+        })
+      }
+    }
+
+    async function record(promptIds: number[], start: number, seqLen: number): Promise<void> {
+      const n = seqLen
+      // Per-chunk state + uniform writes — queue-ordered before the submit.
+      const ids = new Int32Array(n)
+      const posv = new Int32Array(n)
+      for (let t = 0; t < n; t++) { ids[t] = promptIds[start + t]; posv[t] = start + t }
+      device.queue.writeBuffer(CB.inputIds, 0, ids)
+      device.queue.writeBuffer(CB.posMap, 0, posv)
+      device.queue.writeBuffer(cU.emb, 0, new Int32Array([n, n * D_WGS]))
+      device.queue.writeBuffer(cU.norm, 0, new Uint32Array([n]))
+      const m = new Uint32Array([n])
+      for (const u of [cU.gdnProj, cU.gdnOut, cU.cAttn, cU.oProj, cU.gateUp, cU.ffnDown]) {
+        device.queue.writeBuffer(u, 12, m)
+      }
+      device.queue.writeBuffer(cU.gatedSplit, 0, new Int32Array([n, n * CATTN_WGS]))
+      device.queue.writeBuffer(cU.qkNorm, 0, new Int32Array([n, n * QK_NORM_WGS]))
+      device.queue.writeBuffer(cU.rope, 8, new Int32Array([n, n * QKV_WGS]))
+      device.queue.writeBuffer(cU.kvApp, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.kvApp, 16, new Uint32Array([n * KV_WGS]))
+      device.queue.writeBuffer(cU.attn, 0, new Int32Array([n, start + 1]))
+      if (int8Mode) device.queue.writeBuffer(cU.attnI8, 0, new Int32Array([n, start + 1]))
+      device.queue.writeBuffer(cU.attnGate, 0, new Uint32Array([n * ATTN_GATE_WGS]))
+      device.queue.writeBuffer(cU.conv, 0, new Int32Array([start, n]))
+      device.queue.writeBuffer(cU.conv, 12, new Uint32Array([n * GDN_CONV_WGS]))
+      device.queue.writeBuffer(cU.convCommit, 0, new Int32Array([start, n]))
+      device.queue.writeBuffer(cU.gates, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.gates, 8, new Uint32Array([n]))
+      device.queue.writeBuffer(cU.recur, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.normOut, 0, new Int32Array([n]))
+      device.queue.writeBuffer(cU.normOut, 8, new Uint32Array([n * S.gdnVHeads]))
+      device.queue.writeBuffer(cU.silu, 0, new Int32Array([n, n * FFN_WGS]))
+      // silu_mul walks [rows, 2*ffn] and does not know what a slot is: a chunk
+      // is n*slots rows of it, laid out exactly as decode's slots are.
+      if (S.moe) {
+        device.queue.writeBuffer(cU.moeSilu, 0,
+          new Int32Array([n * S.moeSlots, Math.ceil((n * S.moeSlots * S.ffn) / 256)]))
+      }
+
+      // Tiled: 2-D grid over (N/32, n/32). Fallback matvec: N/4 on x alone.
+      const gemmDispatch = (enc2: GPUCommandEncoder, bgx: GPUBindGroup, rows: number, label: string) =>
+        e5OK
+          // E5 tiles are 64(M) x 32(N) — E1's, transposed.
+          ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 64), 1, label)
+          : sgmatOK
+          // E1 tiles are 32(M) x 64(N) — grid x is N/64, y is M/32.
+          ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 64), Math.ceil(n / 32), 1, label)
+          : gemmTiledGrid
+            ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 32), 1, label)
+            : dispatch(enc2, gemm, bgx, Math.ceil(rows / 4), 1, 1, label)
+      let enc = device.createCommandEncoder()
+      if (start === 0) clearGdnState(enc)
+      dispatch(enc, AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
+      dispatch(enc, P.rmsNorm, cbgInitNorm, n, 1, 1, 'cRmsNormInit')
+      /** THE POOLED CUT. The chunk's routers have run for layer L; the expert
+       *  matmuls need every routed expert of every token resident at once.
+       *  One readback per MoE layer per CHUNK — 1/16th of the per-token
+       *  pooled prefill's readback count — then the union is resolved on the
+       *  CPU, misses upload, and CM.moeIds is rewritten from expert ids to
+       *  slot ids, exactly the contract the serial decode path established. */
+      const pooledCut = async (L: number): Promise<void> => {
+        enc.copyBufferToBuffer(CM!.moeIds, 0, CM!.idsRead!, 0, n * S.moeSlots * 4)
+        device.queue.submit([enc.finish()])
+        await CM!.idsRead!.mapAsync(GPUMapMode.READ)
+        const raw = new Uint32Array(CM!.idsRead!.getMappedRange().slice(0, n * S.moeSlots * 4))
+        CM!.idsRead!.unmap()
+        const lp = layerPools[L - L0]!
+        const seen = new Set<number>()
+        const union: number[] = []
+        for (const e of raw) if (!seen.has(e)) { seen.add(e), union.push(e) }
+        if (union.length > POOL_SLOTS) {
+          // v1 limitation, stated rather than mishandled: sub-ranging the
+          // expert dispatch by token needs TOK_BASE plumbed through three
+          // kernels. At C=16 / P>=96 the trace shows zero overflows; if a
+          // prompt finds one anyway, the run fails loudly instead of
+          // computing with an evicted expert.
+          throw new Error(
+            `pooled chunk overflow: layer ${L} routes ${union.length} distinct experts, `
+            + `pool holds ${POOL_SLOTS} — shorten the chunk or raise expertPool`)
+        }
+        const { misses } = lp.pool.resolve(union)
+        if (misses.length > 0) await fillSlots(lp, misses)
+        const slotIds = new Uint32Array(new ArrayBuffer(raw.length * 4))
+        for (let i2 = 0; i2 < raw.length; i2++) slotIds[i2] = lp.pool.slotFor(raw[i2])
+        device.queue.writeBuffer(CM!.moeIds, 0, slotIds)
+        enc = device.createCommandEncoder()
+      }
+      for (let L = 0; L < S.layers; L++) {
+        const blk = cLayers[L]
+        if (blk.gdnProj) {
+          gemmDispatch(enc, blk.gdnProj, S.gdnProjRows, 'cGdnProj')
+          dispatch(enc, P.gdnConvSeq, blk.conv!, n * GDN_CONV_WGS, 1, 1, 'cGdnConv')
+          dispatch(enc, P.gdnConvCommit, blk.convCommit!, CONV_COMMIT_WGS, 1, 1, 'cGdnConvCommit')
+          dispatch(enc, P.gdnGates, blk.gates!, n, 1, 1, 'cGdnGates')
+          dispatch(enc, P.gdnRecur, blk.recur!, S.gdnVHeads, 1, 1, 'cGdnRecur')
+          dispatch(enc, P.gdnNormOut, blk.normOut!, n * S.gdnVHeads, 1, 1, 'cGdnNormOut')
+          gemmDispatch(enc, blk.oProj, S.d, 'cGdnOutProj')
+        } else {
+          gemmDispatch(enc, blk.cAttn!, S.cAttnDim, 'cCAttn')
+          if (blk.gatedSplit) dispatch(enc, P.gatedQkvSplit, blk.gatedSplit, n * CATTN_WGS, 1, 1, 'cGatedSplit')
+          if (S.qkNorm) dispatch(enc, P.qkNorm, blk.qkNorm!, n * QK_NORM_WGS, 1, 1, 'cQkNorm')
+          dispatch(enc, P.rope, blk.rope!, n * QKV_WGS, 1, 1, 'cRope')
+          if (int8Mode) {
+            // (kv head, side) on x, the chunk's tokens on y — the token axis the
+            // quantizer grew so decode (y=1) and prefill share one kernel.
+            dispatch(enc, P.kvQuantizeInt8, blk.kvApp!, S.kvHeads * 2, n, 1, 'cKvQuantize')
+            dispatch(enc, P.attentionPrefillInt8, blk.attn!, n, S.heads, 1, 'cAttention')
+          } else {
+            dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
+            dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
+          }
+          if (blk.attnGate) dispatch(enc, P.attnGate, blk.attnGate, n * ATTN_GATE_WGS, 1, 1, 'cAttnGate')
+          gemmDispatch(enc, blk.oProj, S.d, 'cOProj')
+        }
+        dispatch(enc, P.addNorm, blk.addNorm1, n, 1, 1, 'cAddNorm1')
+        if (blk.moe) {
+          // The decode block's seven dispatches with a token dimension added:
+          // grid y is the token everywhere it appears, and the expert matmuls
+          // keep the slot in grid z. Seven dispatches for a whole chunk where
+          // per-token prefill spent seven PER TOKEN.
+          dispatch(enc, moeRouterPipe, blk.moe.routerLogits, MOE_ROUTER_ROWS, n, 1, 'cMoeRouterLogits')
+          dispatch(enc, P.moeRouterTopk!, blk.moe.routerTopk, n, 1, 1, 'cMoeRouterTopk')
+          if (pooling) await pooledCut(L)
+          const rows = S.ffn / MOE_RPW
+          dispatch(enc, moeMMGate!, blk.moe.gate, rows, n, S.moeSlots, 'cMoeGate')
+          dispatch(enc, moeMMGate!, blk.moe.up, rows, n, S.moeSlots, 'cMoeUp')
+          dispatch(enc, P.siluMul, blk.moe.silu, Math.ceil((n * S.moeSlots * S.ffn) / 256), 1, 1, 'cMoeSilu')
+          dispatch(enc, moeMMDown!, blk.moe.down, S.d / MOE_RPW, n, S.moeSlots, 'cMoeDown')
+          dispatch(enc, P.moeCombine, blk.moe.combine, Math.ceil(S.d / 256), n, 1, 'cMoeCombine')
+        } else {
+          gemmDispatch(enc, blk.gateUp!, 2 * S.ffn, 'cGateUp')
+          dispatch(enc, P.siluMul, blk.silu!, n * FFN_WGS, 1, 1, 'cSiluMul')
+          gemmDispatch(enc, blk.ffnDown!, S.d, 'cFfnDown')
+        }
+        dispatch(enc, P.addNorm, blk.addNorm2, n, 1, 1, 'cAddNorm2')
+      }
+      device.queue.submit([enc.finish()])
+      gdnStatePos = start + n
+      for (let t = 0; t < n; t++) noteAbsorbed(start + t, promptIds[start + t])
+    }
+
+    return {
+      record,
+      cap: C,
+      destroy() {
+        for (const buf of [...Object.values(CB), ...Object.values(cU), ...Object.values(CM ?? {})]) buf?.destroy()
+      },
+    }
+  }
+
+  // MoE specs opt OUT of chunked prefill, deliberately and for two independent
+  // reasons — and Qwen3.6 IS hybrid, so without this it would turn on by
+  // default and quietly record the dense gate_up/silu/ffn_down chain:
+  //   1. buildChunkPrefill dispatches int4_matmul_batched_dyn for every
+  //      projection, and int4_matmul.gen.ts forbids affine with mDyn.
+  //   2. the MoE ids[] buffer is indexed by SLOT with no token dimension, so
+  //      batching a chunk would apply one token's expert choice to all of them.
+  // The cost is per-token prefill; correctness is not negotiable for a speedup.
+  //
+  // TWO of those three arms are gone as of 2026-08-11.
+  //   - !AFFINE lifted: int4_matmul_batched_dyn_affine exists now (w = s*q + b,
+  //     group 64), pinned against a CPU reference at 4.52e-4.
+  //   - `hybrid` lifted: the attention branch dispatched gatedQkvSplit and
+  //     attnGate unconditionally, which are Qwen3.5's GATED attention. cAttnDim
+  //     already collapses to qkvDim when !attnGate, so a plain spec projects
+  //     straight into qkvOut and skips both steps.
+  // ALL THREE are gone as of 2026-08-13. Reason 2 was a buffer SHAPE, not an
+  // algorithm: moeIds/moeScores are now [C, slots], the router's two kernels
+  // and moe_combine take the token in grid y, and the expert matmul takes it in
+  // grid y with the slot still in z. Experts never mix tokens, so batching them
+  // is a re-indexing rather than a grouped GEMM — a token reads its own ids[]
+  // entry and writes its own rows, which is exactly what the per-token path did
+  // one token at a time.
+  //
+  // Phase B — sorting the (token, slot) pairs by expert so each expert's rows
+  // are one contiguous GEMM — is the remaining win and is NOT this. Worth
+  // knowing which half that is: profiled on qwen30b, the expert matmuls are 38%
+  // of a MoE step and the dense chain this now batches is the other 62%
+  // (BENCH.md, "MoE: the experts are the MINORITY of the work").
+  const dynReady = (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn) != null
+  // The `hybrid` arm came back for one day (2026-08-11): with the gate first
+  // opened, qwen3mlx diverged from per-token at the FIRST generated token. The
+  // cause was one line — the chunk path bound P.embedding unconditionally,
+  // dequantizing MLX-affine embeddings with the symmetric formula (see the
+  // cbgEmb comment in buildChunkPrefill). Fixed and re-opened; the equivalence
+  // gate is scripts/chunk-prefill-test.mjs, which now also refuses to pass a
+  // run in which no chunk actually executed.
+  // MLA is the one attention shape this path does not have. buildChunkPrefill's
+  // attention branch dispatches qkv -> rope -> kv_append -> attention_prefill,
+  // and an MLA spec has none of those weights, so it is excluded HERE rather
+  // than left to fail at bind time. Until 2026-08-13 `!S.moe` covered it by
+  // accident — DeepSeek-V2-Lite is both — and accident is not a guard.
+  // POOLING excludes it, and structurally: the chunk path binds the expert
+  // stacks straight and resolves no slots, so with the stacks unallocated its
+  // ids[] would name experts in a buffer that holds slots. It could not be
+  // rescued by resolving per chunk either — one 256-token chunk routes to most
+  // of the experts in the layer, which is more than the pool holds by design.
+  // Pooled chunking needs a pool big enough for a 16-token union: 96 slots is
+  // where the routing trace measures zero overflows. Smaller pools (the
+  // quarter-pool configurations) keep per-token prefill.
+  const pooledChunkOK = !pooling || (POOL_SLOTS >= 96 && !optimistic && opts.pooledChunkedPrefill === true)
+  const chunkPrefill: ChunkPrefill | null =
+    // int8 KV chunks too, since 2026-08-18: the chunk path swaps in
+    // kv_quantize_int8 (batched on a token axis) and attention_prefill_int8,
+    // BOTH bind group and dispatch. Binding one without the other is what
+    // WebGPU discards the whole submit for, silently — which reads as garbage
+    // output rather than an error, and is how this was caught.
+    !partial && !S.mla && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
+      ? buildChunkPrefill()
+      : null
+  {
+    const why = chunkPrefill ? `on (cap ${chunkPrefill.cap}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''}${pooling ? ', pooled' : ''})`
+      : S.mla ? 'off (per-token — MLA has no chunked attention path)'
+      : pooling ? (POOL_SLOTS >= 96
+          ? 'off (per-token — pooled chunking is opt-in until its AC timing pair exists: ?chunk=1)'
+          : `off (per-token — pool of ${POOL_SLOTS} is under the 96-slot union floor for pooled chunks)`)
+      : !dynReady ? 'off (per-token — no subgroups, so no batched GEMM)'
+      : 'off (per-token)'
+    console.log(`[engine] chunked prefill: ${why}`)
+  }
+
+  /**
+   * Submit one forward pass.
+   *
+   * If `writeInputId` is non-null, it's written to B.inputIds[0] before the pass
+   * (prefill path). Otherwise the pass reads whatever argmax from the previous
+   * submission wrote there (decode chain).
+   *
+   * If `wantReadback` is true, a copy of B.tokenOut is routed to a readback
+   * slot and a Promise resolving to the token ID is returned. Otherwise the
+   * pass is fire-and-forget (the GPU chain still runs).
+   *
+   * Single submit per call: compute + argmax + GPU chain + (optional) readback
+   * copy are all in one command encoder.
+   */
+  function submitStep(
+    writeInputId: number | null,
+    position: number,
+    wantReadback: boolean
+  ): Promise<number> | null {
+    if (optimistic) return submitStepOptimistic(writeInputId, position, wantReadback)
+    if (pooling) return submitStepPooled(writeInputId, position, wantReadback)
+    writeStepState(writeInputId, position)
+
+    const enc = recordWholeForward(position)
+    // GPU chain: next decode step reads inputIds[0] without a CPU round-trip.
+    enc.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
+
+    if (wantReadback) {
+      const slot = readRing[readCursor]
+      readCursor = (readCursor + 1) % readRing.length
+      enc.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
+      device.queue.submit([enc.finish()])
+      gdnStatePos = position + 1
+      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+      return slot.mapAsync(GPUMapMode.READ).then(() => {
+        const id = new DataView(slot.getMappedRange()).getInt32(0, true)
+        slot.unmap()
+        return id
+      })
+    }
+
+    device.queue.submit([enc.finish()])
+    gdnStatePos = position + 1
+    if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+    return null
+  }
+
+  /**
+   * submitStep for a pooled engine, with the same signature: returns as soon as
+   * the step is QUEUED, with a promise for the token when one is wanted.
+   *
+   * Recording a pooled pass has to await the GPU (one readback per MoE layer),
+   * so the steps run on a chain rather than synchronously. That costs nothing
+   * generatePipelined was actually getting: its PIPELINE_DEPTH tokens in flight
+   * exist so the CPU can run ahead of the GPU, and a pooled pass cannot — the
+   * router of every layer of token t+1 is downstream of all of token t.
+   *
+   * The readback ring slot is claimed HERE, synchronously, so slots are used in
+   * call order however the chain interleaves.
+   */
+  let pooledChain: Promise<void> = Promise.resolve()
+  /** submitStepPooled's shape over the optimistic recorder: the chain still
+   *  serialises tokens (a pooled pass is inherently GPU-then-CPU-then-GPU on
+   *  a miss), but a CLEAN token is one submit and one 1.6 ms wave instead of
+   *  one submit and one round trip per MoE layer. */
+  function submitStepOptimistic(
+    writeInputId: number | null,
+    position: number,
+    wantReadback: boolean
+  ): Promise<number> | null {
+    const slot = wantReadback ? readRing[readCursor] : null
+    if (slot) readCursor = (readCursor + 1) % readRing.length
+    const done = pooledChain.then(async () => {
+      writeStepState(writeInputId, position)
+      await stepOptimistic(position, (e) => {
+        e.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
+        if (slot) e.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
+      })
+      gdnStatePos = position + 1
+      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+    })
+    pooledChain = done.catch((err) => {
+      if (!wantReadback) console.error('[engine] optimistic prefill step failed', err)
+    })
+    if (!slot) return null
+    return done.then(async () => {
+      await slot.mapAsync(GPUMapMode.READ)
+      const id = new DataView(slot.getMappedRange()).getInt32(0, true)
+      slot.unmap()
+      return id
+    })
+  }
+
+  function submitStepPooled(
+    writeInputId: number | null,
+    position: number,
+    wantReadback: boolean
+  ): Promise<number> | null {
+    const slot = wantReadback ? readRing[readCursor] : null
+    if (slot) readCursor = (readCursor + 1) % readRing.length
+
+    const done = pooledChain.then(async () => {
+      writeStepState(writeInputId, position)
+      const enc = await recordForwardPooled(position)
+      enc.copyBufferToBuffer(B.tokenOut, 0, B.inputIds, 0, 4)
+      if (slot) enc.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
+      device.queue.submit([enc.finish()])
+      gdnStatePos = position + 1
+      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+    })
+    // A failed step must not poison the ORDERING of the ones behind it, and a
+    // fire-and-forget step has no caller to see its rejection — so it is logged
+    // here. A step with a readback rejects the promise below instead.
+    pooledChain = done.catch((err) => {
+      if (!wantReadback) console.error('[engine] pooled prefill step failed', err)
+    })
+    if (!slot) return null
+    return done.then(async () => {
+      await slot.mapAsync(GPUMapMode.READ)
+      const id = new DataView(slot.getMappedRange()).getInt32(0, true)
+      slot.unmap()
+      return id
+    })
+  }
+
+  async function generatePipelined(
+    promptIds: number[],
+    maxTokens: number,
+    onToken: (id: number) => void,
+    shouldStop?: () => boolean,
+    /** Prefill progress, in tokens. Called after each chunk and periodically
+     *  through the per-token tail — prompt processing on a long conversation
+     *  is MINUTES of wall clock during which a caller otherwise has nothing
+     *  to show. Purely observational: it never gates or syncs. */
+    onPrefill?: (done: number, total: number) => void,
+    /** Token index where the trailing GENERATION PROMPT begins — the exact
+     *  point the NEXT turn's prompt will diverge from this one's absorbed
+     *  record, because the next turn re-renders this turn's reply in place of
+     *  the generation prompt.
+     *
+     *  Hybrid reuse is all-or-nothing, so it needs a GDN snapshot at or BELOW
+     *  the divergence. Snapshots are otherwise taken only at chunk boundaries,
+     *  and the last boundary lands at the END of the prompt — above it — so
+     *  rewindSlot found nothing and every short conversation re-prefilled from
+     *  zero. Guessing a point is not possible at prefill time; the caller knows
+     *  it exactly, because it built the string.
+     *
+     *  Only a hint: out-of-range values are ignored, and a spec with no GDN
+     *  state ignores it entirely. */
+    rewindAt?: number,
+  ): Promise<number[]> {
+    const tokens: number[] = []
+    // Clear it FIRST. It is written only on the stop-id / bad-readback exits,
+    // so a turn that ended by hitting maxTokens, by cancellation, or in the
+    // prefill early returns used to leave the PREVIOUS turn's record standing
+    // — and the host prints it as this turn's reason for an empty reply.
+    lastStop = null
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    if (promptIds.length === 0 || maxTokens <= 0) return tokens
+    // Refuse oversized prompts up front — prefilling at position >= MAX_CONTEXT
+    // would write past the last KV page and silently corrupt the cache.
+    if (promptIds.length >= MAX_CONTEXT) {
+      throw new Error(
+        `zero-tvm: prompt (${promptIds.length} tokens) exceeds max context ` +
+        `${MAX_CONTEXT} (maxPages=${S.maxPages} × pageSize=${S.pageSize})`
+      )
+    }
+
+    // --- Prefill ---
+    // Cross-turn prefix reuse: skip prompt tokens the engine has provably
+    // already absorbed (KV slots + GDN state) — see computeReuseStart.
+    // Snapshot the reuse inputs FIRST — before computeReuseStart and before
+    // the rewind below, which TRUNCATES `absorbed` and moves gdnStatePos.
+    // Reading them afterwards would describe the state the rewind created
+    // rather than the one the decision was made against: the same tautology
+    // this diagnostic was already rewritten once to avoid.
+    const preLcp = absorbedLcp(promptIds)
+    const preAbsorbed = absorbed.length
+    const preGdnPos = gdnStatePos
+    const preValid = absorbedValid
+    let startPos = computeReuseStart(promptIds)
+    // Second chance: reuseStart said no, but a rewind point may sit at or
+    // before the position where the prompts still agree. Replaying from there
+    // costs about one chunk instead of the whole conversation, and leaves the
+    // recurrent state exactly where an ordinary prefill would have.
+    let rewoundTo = -1
+    if (startPos === 0 && GDN_CKPT_SLOTS > 0 && absorbedValid && prefixReuse && absorbed.length > 0) {
+      const bestSlot = rewindSlot(gdnCkptPos, absorbedLcp(promptIds), promptIds.length)
+      if (bestSlot >= 0 && restoreGdnCkpt(bestSlot)) {
+        rewoundTo = gdnCkptPos[bestSlot]
+        gdnStatePos = rewoundTo
+        // Truncate the record to match: everything above the rewind point is
+        // about to be rewritten by the replay — noteAbsorbed's own rewind case.
+        absorbed.length = rewoundTo
+        // ...and the SNAPSHOTS above it describe that same doomed sequence.
+        // Leaving them is how a later turn restores an older turn's recurrent
+        // state onto the current cache: silent, fluent, wrong.
+        dropSnapshotsAbove(gdnCkptPos, rewoundTo)
+        startPos = rewoundTo
+      }
+    }
+    const last = promptIds.length - 1
+    // Normalised once. Out of range, already reused past, or a spec with no GDN
+    // state to snapshot -> 0, which both paths read as "no rewind point".
+    const rewindPoint = rewindAt !== undefined && GDN_CKPT_SLOTS > 0
+      && rewindAt > startPos && rewindAt < promptIds.length ? rewindAt : 0
+    let prefillPos = startPos
+    let chunks = 0
+    // Chunked prefill (hybrid + subgroups): all but the last prompt token run
+    // in chunks — batched projections, one gdn_recur dispatch per layer per
+    // chunk. Short tails fall through to the per-token path below.
+    if (chunkPrefill) {
+      while (last - prefillPos >= CHUNK_MIN) {
+        // Cancellation during PREFILL. Only the decode loop used to poll this,
+        // so a client that gave up on a 40k-token prompt still paid for the
+        // whole read — minutes of GPU for an answer nobody would receive.
+        // Stopping here is safe: every chunk noted the positions it absorbed,
+        // so the record still describes the cache.
+        if (shouldStop?.()) return tokens
+        // Short the chunk so a boundary falls ON the rewind point. Without
+        // this the boundaries are on a CHUNK_CAP grid and the divergence sits
+        // between two of them — or, on any conversation shorter than one
+        // chunk, above the only boundary there is.
+        const stopAt = rewindPoint > prefillPos && rewindPoint < last ? rewindPoint : last
+        const s = Math.min(chunkPrefill.cap, stopAt - prefillPos)
+        // Pooled chunks await a readback per MoE layer; unpooled ones resolve
+        // immediately. One await covers both.
+        await chunkPrefill.record(promptIds, prefillPos, s)
+        prefillPos += s
+        chunks++
+        // WAIT for the GPU to actually finish this chunk. record() only
+        // SUBMITS on the unpooled path ("resolves immediately", above), so
+        // without this the CPU races through every chunk in milliseconds and
+        // then blocks on the final readback. Two things broke because of it:
+        // progress reported 100% while MINUTES of queued work remained, and
+        // every shouldStop poll above ran before any of that work had started
+        // — so a cancelled request kept grinding to completion with nothing
+        // left to poll. A chunk is ~8s of GPU against a few ms of recording,
+        // so the bubble this costs is a rounding error next to honest
+        // progress and a cancel that can land within one chunk.
+        await device.queue.onSubmittedWorkDone()
+        // Rewind point for the NEXT turn. The state sits exactly at
+        // prefillPos here, which is the only moment it can be captured cheaply.
+        saveGdnCkpt(prefillPos)
+        onPrefill?.(prefillPos, promptIds.length)
+      }
+    }
+    // Per-token tail: fire without readback. The argmax of intermediate
+    // prefill steps is not useful (we overwrite inputIds on the next step), so
+    // skipping readback removes the CPU syncs.
+    for (; prefillPos < last; prefillPos++) {
+      submitStep(promptIds[prefillPos], prefillPos, false)
+      // saveGdnCkpt's argument is a COUNT of absorbed tokens, and submitStep
+      // has just set gdnStatePos = prefillPos + 1. Passing prefillPos here
+      // labels the snapshot one SHORT, and restoring it replays that token
+      // into a recurrence that is not idempotent — fluent wrong output. That
+      // bug was written and reverted on 2026-08-19; the +1 is the whole fix.
+      if (prefillPos + 1 === rewindPoint) {
+        await device.queue.onSubmittedWorkDone()
+        saveGdnCkpt(prefillPos + 1)
+      }
+      if ((prefillPos & 63) === 0) {
+        // Same reason as the chunk loop: submitStep fires without a readback,
+        // so on a spec that cannot chunk, the whole prompt queues up instantly
+        // and neither the progress nor the poll below means anything until the
+        // GPU catches up.
+        await device.queue.onSubmittedWorkDone()
+        // NO rewind point here, and the attempt to add one is recorded because
+        // it was wrong twice. The problem is real: snapshots are taken only
+        // inside the chunk loop, so a build that cannot chunk keeps an all -1
+        // ring. But taking one HERE does not solve it and introduces a worse
+        // bug.
+        //   - "a short chat cannot chunk" is false. CHUNK_MIN is 8, so a
+        //     36-token prompt chunks in one chunk and this line never runs.
+        //   - the chunk loop's snapshot already lands at `last`, ABOVE the
+        //     divergence (which sits where the generation prompt's <think>
+        //     suffix was, a few tokens earlier), so rewindSlot returns -1 and
+        //     startPos is 0 regardless.
+        //   - saveGdnCkpt's argument is a COUNT of absorbed tokens: the chunk
+        //     loop calls it after `prefillPos += s`, matching gdnStatePos =
+        //     start + n. submitStep sets gdnStatePos = position + 1, so a
+        //     snapshot taken here is one SHORT, and restoring it replays that
+        //     token twice into the recurrence.
+        // The real rewind point is the start of the trailing generation prompt,
+        // which only the CALLER knows — the engine would have to be told. Until
+        // then, hybrid cross-turn reuse falls back to a full re-prefill on any
+        // conversation shorter than CHUNK_CAP. Named in docs rather than
+        // papered over.
+        onPrefill?.(prefillPos, promptIds.length)
+        if (shouldStop?.()) return tokens
+      }
+    }
+    onPrefill?.(promptIds.length, promptIds.length)
+    lastPrefill = {
+      promptLen: promptIds.length, reused: startPos, chunks,
+      lcp: preLcp, absorbed: preAbsorbed, gdnStatePos: preGdnPos, hybrid, valid: preValid,
+    }
+    if (startPos > 0 || chunks > 0) {
+      console.log(
+        `[engine] prefill: ${promptIds.length} tokens, reused prefix ${startPos}` +
+        (chunks ? `, ${chunks} chunk${chunks > 1 ? 's' : ''} of ≤${chunkPrefill!.cap}` : ''),
+      )
+    }
+    // A rewind is a SAVE, not a miss, and it would otherwise be invisible: the
+    // line above just shows a smaller reuse than the caller expected. Say what
+    // it cost against what the all-or-nothing rule would have charged.
+    if (rewoundTo > 0) {
+      console.log(
+        `[engine] prefix REWOUND to ${rewoundTo} — the prompt diverged at ${preLcp} of ` +
+        `${preAbsorbed} absorbed; replayed ${promptIds.length - rewoundTo} tokens ` +
+        `instead of re-reading all ${promptIds.length}`,
+      )
+    }
+    // Re-prefilling a conversation that the cache already holds is the most
+    // expensive failure mode here, and it is invisible without this line: say
+    // WHERE the agreement ended, so a caller can tell "the client changed an
+    // earlier turn" from "the recurrent state is not where reuse needs it".
+    // ...but say nothing when reuse was TURNED OFF. Under ?reuse=0 the decline
+    // is the instruction, not a fault, and the branch below reports it as
+    // "lcp == absorbed and state is aligned, but reuseStart still declined" —
+    // which reads as the engine refusing a reuse it should have taken. That
+    // line appeared in a bisection arm whose whole purpose was disabling reuse.
+    if (startPos === 0 && preAbsorbed > 0 && (opts.prefixReuse ?? true)) {
+      const why = !preValid ? 'the absorbed record was invalidated (a gap in submitted positions)'
+        : preLcp === 0 ? 'the new prompt diverges at token 0 — a different conversation, or the system prompt changed'
+        : preLcp < preAbsorbed
+          ? `the new prompt matches only ${preLcp} of ${preAbsorbed} absorbed tokens — it CHANGED an earlier turn `
+            + '(a re-rendered assistant message or re-tokenized text will do this)'
+        : hybrid && preGdnPos !== preAbsorbed
+          ? `recurrent state sits at ${preGdnPos}, not ${preAbsorbed} — hybrid reuse is all-or-nothing`
+          : `lcp ${preLcp} == absorbed ${preAbsorbed} and state is aligned, but reuseStart still declined`
+      console.log(`[engine] prefix reuse DECLINED — ${why}; re-prefilling all ${promptIds.length} tokens`)
+    }
+    // Last prefill step: readback to get the first generated token.
+    const firstTokenPromise = submitStep(promptIds[last], last, true)!
+    // Readback bookkeeping for the absorbed record: the input of the step at
+    // position p is the readback of the step at position p-1.
+    const rbByPos = new Map<number, Promise<number>>()
+    rbByPos.set(last, firstTokenPromise)
+    const firstToken = await firstTokenPromise
+    if (STOP.has(firstToken) || firstToken < 0 || firstToken >= S.vocab) {
+      // THREE different failures used to share this silent return, and the
+      // caller could not tell them apart — so an empty reply was reported as
+      // "the model chose to stop" whether or not that was true. An id outside
+      // the vocab is not a decision at all: it means the readback did not
+      // produce a valid token, which is an engine fault, not a model one.
+      // Worth one line, because an empty reply makes an agent client resend
+      // the identical prompt and pay the whole prefill again.
+      lastStop = { id: firstToken, generated: 0, stop: STOP.has(firstToken), inVocab: firstToken >= 0 && firstToken < S.vocab }
+      console.log(
+        `[engine] empty generation — first token id ${firstToken} after ${promptIds.length} prompt tokens: ` +
+        (STOP.has(firstToken)
+          ? `a STOP id (stops ${[...STOP].join(',')}) — the model ended the turn immediately`
+          : `OUT OF RANGE for vocab ${S.vocab} — the readback did not return a valid id, so this is an engine fault`),
+      )
+      return tokens
+    }
+    tokens.push(firstToken)
+    onToken(firstToken)
+    if (tokens.length >= maxTokens) return tokens
+
+    // --- Pipelined decode ---
+    // Keep PIPELINE_DEPTH tokens of work in flight so the GPU never waits on
+    // a CPU round-trip between tokens. argmax → inputIds[0] is chained on-GPU.
+    //
+    // Hybrid (GDN) note — why the 2-deep ring is safe with non-idempotent
+    // state: the on-GPU chain never *mispredicts* a token (each step consumes
+    // the previous step's real argmax, not a guess), so the only steps whose
+    // state mutations are ever discarded are the ≤ PIPELINE_DEPTH-1 already
+    // submitted when we break (stop token / maxTokens / shouldStop). Those
+    // run positions past the end of the emitted sequence and mutate S/conv
+    // rings there — harmless, because generation ends and no later call
+    // trusts that state: this path always prefills from 0 (position 0 clears
+    // GDN state) and the blocking generate() verifies gdnStatePos before
+    // reusing state (falling back to a full replay on mismatch).
+    const inFlight: Promise<number>[] = []
+    let pos = promptIds.length
+    const submitChained = (): void => {
+      const p = submitStep(null, pos, true)!
+      rbByPos.set(pos, p)
+      inFlight.push(p)
+      pos++
+    }
+
+    try {
+      for (let k = 0; k < PIPELINE_DEPTH && tokens.length + k < maxTokens && pos < MAX_CONTEXT; k++) {
+        submitChained()
+      }
+
+      while (inFlight.length > 0) {
+        const tok = await inFlight.shift()!
+        if (STOP.has(tok) || tok < 0 || tok >= S.vocab) {
+          // Record WHY the turn ended. No threshold on "too short" here — the
+          // engine cannot know what the caller considers empty, and a constant
+          // guessing at it would be wrong at some length. The caller sees the
+          // parsed reply and can tell exactly; it reads this to explain it.
+          lastStop = { id: tok, generated: tokens.length, stop: STOP.has(tok), inVocab: tok >= 0 && tok < S.vocab }
+          break
+        }
+        tokens.push(tok)
+        onToken(tok)
+        if (tokens.length >= maxTokens) break
+        // Cooperative stop: never unwind mid-pipeline — just stop submitting;
+        // the finally-drain below leaves the readback ring clean.
+        if (shouldStop?.()) break
+        // Keep the pipeline full, but don't overshoot maxTokens or the KV window.
+        if (tokens.length + inFlight.length < maxTokens && pos < MAX_CONTEXT) {
+          submitChained()
+        }
+      }
+    } finally {
+      // Drain pending readbacks (frees ring slots for the next generation —
+      // mapAsync on a still-pending slot buffer would be a validation error).
+      while (inFlight.length > 0) {
+        await inFlight.shift()!.catch(() => {})
+      }
+      // Patch the absorbed record for the chained-argmax steps: every decode
+      // step at position p (last+1 .. pos-1) consumed the readback of the
+      // step at p-1 — including the ≤ PIPELINE_DEPTH-1 overrun steps past the
+      // emitted text (in normal chat the first overrun input is the stop id,
+      // which the next turn's prompt also contains). All these promises are
+      // settled by the drain above.
+      try {
+        for (let p = promptIds.length; p < pos; p++) {
+          noteAbsorbed(p, await rbByPos.get(p - 1)!)
+        }
+      } catch {
+        absorbedValid = false
+      }
+    }
+
+    return tokens
+  }
+
+  // ============================================================
+  // Profiling + bench primitives
+  // ============================================================
+
+  // Instrument a single forward pass with timestamp-query. Runs the warmup
+  // prefill without instrumentation (so we're measuring a steady-state decode
+  // step, not cold-compile time), then records one more step with a QuerySet
+  // and reads back begin/end timestamps per dispatch.
+  //
+  // Returns null if the 'timestamp-query' feature wasn't enabled at device
+  // creation — the caller prints a hint in that case.
+  async function profileStep(warmupIds: number[]): Promise<KernelProfile | null> {
+    if (!(device.features as ReadonlySet<string>).has('timestamp-query')) return null
+    // The profiled pass is recorded as ONE encoder, which a pooled engine's
+    // decode is not: the per-layer round trip and the miss copies are outside
+    // every number below. Said out loud rather than left to be misread as the
+    // pooled token cost.
+    if (pooling) console.warn('[engine] profileStep measures the dispatches only — expertPool\'s readback, slab reads and uploads are not in this profile')
+
+    // Warmup: run prefill + a handful of decode steps without profile, so
+    // shader compilation, texture caches, etc. are warm when we measure.
+    for (let i = 0; i < warmupIds.length; i++) {
+      submitStep(warmupIds[i], i, false)
+    }
+    // Two decode warmup steps, then await so the GPU is idle before we
+    // allocate the query set.
+    const warmA = submitStep(null, warmupIds.length, true)!
+    const warmB = submitStep(null, warmupIds.length + 1, true)!
+    await warmA; await warmB
+    const nextPos = warmupIds.length + 2
+
+    // 2 slots per pass; worst case is the hybrid gated-attention path
+    // (12/layer; GDN layers are 10 with the fused input projection) plus
+    // embedding, init norm, LM head, argmax and a little headroom.
+    // 14 was the widest layer before MLA; an MLA+MoE layer is ~19 dispatches.
+    // Past capacity, dispatch() silently omits its timestamp writes and the
+    // profile TRUNCATES rather than erroring — so it reads as "the tail is
+    // free" instead of "you ran out of query slots".
+    const CAPACITY = 2 * (S.layers * (S.mla ? 20 : 14) + 8)
+    const querySet = device.createQuerySet({ type: 'timestamp', count: CAPACITY })
+    const resolveBuf = device.createBuffer({
+      size: CAPACITY * 8,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    })
+    const profReadBuf = device.createBuffer({
+      size: CAPACITY * 8,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    })
+
+    profile = { querySet, capacity: CAPACITY, labels: new Array(CAPACITY), nextSlot: 0 }
+    try {
+      writeStepState(null, nextPos)
+
+      const enc = device.createCommandEncoder()
+      recordForward(enc, nextPos)
+      const usedSlots = profile.nextSlot
+      enc.resolveQuerySet(querySet, 0, usedSlots, resolveBuf, 0)
+      enc.copyBufferToBuffer(resolveBuf, 0, profReadBuf, 0, usedSlots * 8)
+      device.queue.submit([enc.finish()])
+
+      await profReadBuf.mapAsync(GPUMapMode.READ)
+      const raw = new BigInt64Array(profReadBuf.getMappedRange().slice(0))
+      profReadBuf.unmap()
+
+      // Aggregate: slot 2k = begin, 2k+1 = end, label at labels[2k].
+      // Very short passes can read identical begin/end timestamps (duration
+      // below the GPU timer resolution) or — rarely — negative on
+      // counter-domain quirks. Clamp to zero rather than drop, so the call
+      // count still reflects every dispatch we issued.
+      const totals = new Map<string, { ns: bigint; calls: number }>()
+      let totalNs = 0n
+      for (let i = 0; i + 1 < usedSlots; i += 2) {
+        const label = profile.labels[i]
+        if (!label) continue
+        const raw_dur = raw[i + 1] - raw[i]
+        const dur = raw_dur > 0n ? raw_dur : 0n
+        const entry = totals.get(label) ?? { ns: 0n, calls: 0 }
+        entry.ns += dur
+        entry.calls += 1
+        totals.set(label, entry)
+        totalNs += dur
+      }
+      const totalMs = Number(totalNs) / 1e6
+      const kernels = [...totals.entries()]
+        .map(([label, v]) => ({
+          label,
+          totalMs: Number(v.ns) / 1e6,
+          calls: v.calls,
+          pctOfTotal: totalMs > 0 ? (Number(v.ns) / Number(totalNs)) * 100 : 0,
+        }))
+        .sort((a, b) => b.totalMs - a.totalMs)
+      return { kernels, totalMs }
+    } finally {
+      profile = null
+      querySet.destroy()
+      resolveBuf.destroy()
+      profReadBuf.destroy()
+    }
+  }
+
+  // Isolated falsifiability test for the batched int4 matmul primitive before
+  // we invest in porting 4 more shaders (fused_ffn, qkv_fused, attention,
+  // argmax). Runs two timed passes on real ffnDown weights:
+  //
+  //   batched:  `iters` dispatches of int4MatmulBatchedM4 (each produces M×N)
+  //   tiled×M:  `iters * M` dispatches of the current tiled matmul (each 1×N)
+  //
+  // If weight reuse lands, batched should approach 1× the cost of a single
+  // tiled dispatch — i.e. speedup → M. If Apple can't actually cache the
+  // reused weight tile across 16 f32 accumulators × 4 batch rows, speedup
+  // collapses to ~1× and the batched-forward plan in RESEARCH.md dies here.
+  async function benchBatchedFfnDown(
+    M: number = 4,
+    iters: number = 500,
+    target: 'ffnDown' | 'oproj' = 'ffnDown',
+  ): Promise<BatchedBenchResult | null> {
+    if (!P.int4MatmulBatchedM4) {
+      console.warn('[batched-bench] int4MatmulBatchedM4 unavailable (subgroups off)')
+      return null
+    }
+    if (M !== 4) {
+      console.warn(`[batched-bench] M=${M} unsupported by batched shader (TILE_M=4 hardcoded); forcing M=4`)
+      M = 4
+    }
+    // Target matmul: ffnDown has K=8192, oproj has K=3072.
+    const isFfnDown = target === 'ffnDown'
+    const K = isFfnDown ? S.ffn : S.qDim
+    const N = S.d
+    const uniformBufForTarget = isFfnDown ? ffnDnU : oProjU
+    const oprojLayer = weights.layers.find((l) => l.oProjScales)  // first attention layer (hybrid: layer 0 may be GDN)
+    if (!isFfnDown && !oprojLayer) {
+      console.warn('[batched-bench] no attention layer with o_proj weights')
+      return null
+    }
+    // The ffn_down target has no meaning on a MoE spec — there is no dense down
+    // projection to bench. Say so instead of dereferencing an absent buffer.
+    if (isFfnDown && !weights.layers[0].ffnDownScales) {
+      console.warn('[bench] ffn_down target: this spec has a sparse MoE FFN, no dense down projection')
+      return null
+    }
+    const scalesBuf = isFfnDown ? weights.layers[0].ffnDownScales! : oprojLayer!.oProjScales!
+    const weightsBuf = isFfnDown ? weights.layers[0].ffnDownWeights! : oprojLayer!.oProjWeights!
+    const batchedPipeline = P.int4MatmulBatchedM4
+    // Per-instance vec4 gating: compare against the pipeline the engine
+    // actually dispatches for this K (identical to R.matmul on Phi-3).
+    const tiledPipeline = isFfnDown ? R.matmulFfnDown : R.matmulOProj
+
+    const inBuf  = makeBuf(device, M * K * 2, 'batchedBench.in')
+    const outBuf = makeBuf(device, M * N * 2, 'batchedBench.out')
+    const tiledOutBuf = makeBuf(device, N * 2, 'batchedBench.tiledOut')
+
+    const inf16 = new Uint16Array(M * K)
+    for (let i = 0; i < inf16.length; i++) inf16[i] = 0x2a00 | (i & 0x03ff)
+    device.queue.writeBuffer(inBuf, 0, inf16)
+
+    const batchedBG = bg(device, batchedPipeline,
+      [outBuf, inBuf, scalesBuf, weightsBuf, uniformBufForTarget])
+    const tiledBG = bg(device, tiledPipeline,
+      [tiledOutBuf, inBuf, scalesBuf, weightsBuf, uniformBufForTarget])
+
+    // ── one bind group per LAYER, cycled ────────────────────────────────────
+    // Hammering a single weight buffer measures CACHE, not memory. Measured
+    // 2026-08-10 on an M2 Max: llama32's 9.4 MB ffn_down re-read 300 times
+    // reported 658 GB/s — above the machine's ~400 GB/s of actual memory
+    // bandwidth, which is the tell. Decode walks every layer once per token, so
+    // nothing it reads is resident.
+    //
+    // Cycling every layer's buffer makes the working set the model, not one
+    // matrix. Falls back to the single-layer set when a spec has only one
+    // (and then the number is a cache figure and says so).
+    const layerBGs: GPUBindGroup[] = []
+    for (const lw of weights.layers) {
+      const sc = isFfnDown ? lw.ffnDownScales : lw.oProjScales
+      const w = isFfnDown ? lw.ffnDownWeights : lw.oProjWeights
+      if (!sc || !w) continue
+      layerBGs.push(bg(device, tiledPipeline, [tiledOutBuf, inBuf, sc, w, uniformBufForTarget]))
+    }
+    const cycled = layerBGs.length > 1 ? layerBGs : [tiledBG]
+    const workingSetMB = (cycled.length * ((N * K) / 2 + (N * K / QGROUP) * 2 * (AFFINE ? 2 : 1))) / 1e6
+
+    const batchedWGs = N / 4
+    const tiledWGs   = N / R.matmulRowsPerWG
+
+    {
+      const enc = device.createCommandEncoder()
+      for (let i = 0; i < 20; i++) {
+        const p1 = enc.beginComputePass()
+        p1.setPipeline(batchedPipeline); p1.setBindGroup(0, batchedBG)
+        p1.dispatchWorkgroups(batchedWGs); p1.end()
+        const p2 = enc.beginComputePass()
+        p2.setPipeline(tiledPipeline); p2.setBindGroup(0, tiledBG)
+        p2.dispatchWorkgroups(tiledWGs); p2.end()
+      }
+      device.queue.submit([enc.finish()])
+      await device.queue.onSubmittedWorkDone()
+    }
+
+    const tB0 = performance.now()
+    {
+      const enc = device.createCommandEncoder()
+      for (let i = 0; i < iters; i++) {
+        const pass = enc.beginComputePass()
+        pass.setPipeline(batchedPipeline); pass.setBindGroup(0, batchedBG)
+        pass.dispatchWorkgroups(batchedWGs); pass.end()
+      }
+      device.queue.submit([enc.finish()])
+      await device.queue.onSubmittedWorkDone()
+    }
+    const msBatched = performance.now() - tB0
+
+    const tT0 = performance.now()
+    {
+      const enc = device.createCommandEncoder()
+      for (let i = 0; i < iters * M; i++) {
+        const pass = enc.beginComputePass()
+        pass.setPipeline(tiledPipeline); pass.setBindGroup(0, cycled[i % cycled.length])
+        pass.dispatchWorkgroups(tiledWGs); pass.end()
+      }
+      device.queue.submit([enc.finish()])
+      await device.queue.onSubmittedWorkDone()
+    }
+    const msTiledTotal = performance.now() - tT0
+
+    const msPerMBatched = msBatched / iters
+    const msPerMTiled   = msTiledTotal / iters
+    const speedup = msPerMTiled / msPerMBatched
+
+    // ── achieved bandwidth — READ THE CAVEAT BEFORE QUOTING THIS ────────────
+    // Decode is memory-bound: a matvec reads a whole weight matrix to produce
+    // one token, so tok/s is bounded by (weight bytes) / (memory bandwidth).
+    // The hope was that comparing this figure against that bound would settle
+    // whether decode is kernel-limited or per-dispatch-overhead-limited.
+    //
+    // IT DOES NOT, and the number says so itself. Measured 2026-08-10 on an
+    // M2 Max (~400 GB/s of real memory bandwidth): 658 GB/s re-reading one
+    // buffer, and 884 GB/s cycling all 16 layers for a 151 MB working set.
+    // Both are above the hardware, so neither is measuring memory.
+    //
+    // Two confounds stack. Cache: even 151 MB gets substantial reuse. And,
+    // worse, these dispatches are INDEPENDENT — nothing reads tiledOutBuf, and
+    // they all sit in one command buffer, so the driver overlaps them freely.
+    // Real decode is a dependency chain: layer N+1 cannot start until layer N
+    // has written its residual.
+    //
+    // So what this reports is peak overlapped read throughput — a real ceiling
+    // for the kernel, and an upper bound rather than a model of decode.
+    // Settling the original question needs dependent dispatches, and note
+    // gpu.mjs's finding that onSubmittedWorkDone here resolves on a fixed
+    // ~100 ms tick, which is why per-dispatch timing is not simply available.
+    //
+    // Packed 4-bit rows plus their scales, and biases too on the affine path.
+    // The activation (M*K*2) is left out deliberately: at K=8192 it is 16 KB
+    // against 14 MB of weights, and including it would flatter the result.
+    const scaleBytes = (N * K / QGROUP) * 2
+    const weightBytes = (N * K) / 2 + scaleBytes * (AFFINE ? 2 : 1)
+    const gbPerSecTiled = weightBytes / (msPerMTiled / 1000) / 1e9
+    // The batched kernel reads those same bytes once for M rows of work.
+    const gbPerSecBatched = weightBytes / (msPerMBatched / 1000) / 1e9
+    console.log(
+      `[batched-bench] ${target} K=${K} N=${N}: ${(weightBytes / 1e6).toFixed(2)} MB of weights per dispatch\n` +
+      `  working set ${workingSetMB.toFixed(0)} MB across ${cycled.length} layer(s)` +
+      `${cycled.length > 1 ? '' : ' — SINGLE BUFFER, this is a cache figure'}\n` +
+      `  M=1 tiled   ${msPerMTiled.toFixed(3)} ms  ->  ${gbPerSecTiled.toFixed(1)} GB/s  (what decode actually dispatches)\n` +
+      `  M=4 batched ${msPerMBatched.toFixed(3)} ms  ->  ${gbPerSecBatched.toFixed(1)} GB/s effective for 4x the work`,
+    )
+
+    // Correctness: dispatch once, read back first 32 f16 of outBuf, compute a
+    // byte-sum. If the shader returns early or fails silently, sum will be 0.
+    // A proper A/B against the default variant would match byte-exactly.
+    const sampleReadBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    {
+      const enc = device.createCommandEncoder()
+      const pass = enc.beginComputePass()
+      pass.setPipeline(batchedPipeline); pass.setBindGroup(0, batchedBG)
+      pass.dispatchWorkgroups(batchedWGs); pass.end()
+      enc.copyBufferToBuffer(outBuf, 0, sampleReadBuf, 0, 64)
+      device.queue.submit([enc.finish()])
+    }
+    await sampleReadBuf.mapAsync(GPUMapMode.READ)
+    const sample = new Uint16Array(sampleReadBuf.getMappedRange().slice(0))
+    sampleReadBuf.unmap()
+    let sum = 0
+    let nonZero = 0
+    for (const v of sample) { sum += v; if (v !== 0) nonZero++ }
+    const sampleHex = Array.from(sample).slice(0, 8).map(v => v.toString(16).padStart(4, '0')).join(' ')
+
+    console.log(`[batched-bench] ${target} M=${M} iters=${iters}`)
+    console.log(`  batched:  ${msBatched.toFixed(1)} ms total  → ${msPerMBatched.toFixed(3)} ms per M-pack`)
+    console.log(`  tiled×M:  ${msTiledTotal.toFixed(1)} ms total → ${msPerMTiled.toFixed(3)} ms per M sequential`)
+    console.log(`  speedup:  ${speedup.toFixed(2)}× (>1 means weight reuse amortizes; ceiling is M=${M})`)
+    console.log(`  output[0..8] f16 hex: ${sampleHex}`)
+    console.log(`  output[0..32] non-zero count: ${nonZero}/32, byte-sum: ${sum}`)
+
+    sampleReadBuf.destroy()
+    inBuf.destroy(); outBuf.destroy(); tiledOutBuf.destroy()
+    return {
+      msBatched, msTiledTotal, msPerMBatched, msPerMTiled, speedup,
+      weightBytes, gbPerSecTiled, gbPerSecBatched,
+    }
+  }
+
+  /**
+   * Change sampling without rebuilding the engine — the whole reason both the
+   * argmax and sampler paths are bound. `null` (or temperature <= 0) returns to
+   * greedy, which really is argmax.wgsl again and not a degenerate sampler.
+   *
+   * Takes effect on the NEXT token: recordForward reads `sampling` per call.
+   * The uniform's counter field (offset 24) is rewritten per token elsewhere,
+   * so only the four knobs are written here.
+   */
+  function setSampling(next: DecodeEngineOptions['sampling'] | null): void {
+    sampling = next && next.temperature > 0 ? next : null
+    if (!samplerU) return
+    const u = new ArrayBuffer(16)
+    const dv = new DataView(u)
+    dv.setFloat32(0, sampling?.temperature ?? 0, true)
+    dv.setFloat32(4, sampling?.topP ?? 1, true)
+    dv.setFloat32(8, sampling?.minP ?? 0, true)
+    dv.setUint32(12, sampling?.seed ?? 0, true)
+    device.queue.writeBuffer(samplerU, 8, u)
+  }
+
+  // ============================================================
+  // Teardown
+  // ============================================================
+
+  // THE OWNERSHIP LINE, and the reason destroy() is a list rather than "free
+  // everything reachable": `weights` and `kvPages`/`kvScales` came in as
+  // arguments and are the caller's. They are also routinely SHARED —
+  // model-smoke.html builds engine after engine over one `weights`, and a
+  // pipeline split runs two stages off it — so an engine cannot tell whether it
+  // is the last reader. Freeing a shared weight buffer here would leave a live
+  // sibling dispatching against destroyed memory, which is not an error the
+  // caller sees, it is wrong logits. Everything below this line was allocated
+  // by THIS call and by nothing else.
+  //
+  // Pipelines, shader modules and bind groups take no part: WebGPU gives them
+  // no destroy(), and they go when the engine object becomes unreachable.
+  //
+  // Destroying with a generate() still in flight is the caller's bug — its
+  // pending mapAsync rejects. The guard below only stops the NEXT call.
+  let destroyed = false
+  function destroy(): void {
+    if (destroyed) return
+    destroyed = true
+    // Add a buffer above, add it here. `B` and the chunk-prefill closure carry
+    // their own members by construction; the uniforms have to be named.
+    const owned: (GPUBuffer | null)[] = [
+      // The rewind ring, per its own rule above. It is allocated LAZILY, so
+      // these arrays are empty on an engine that never chunked — flat() over
+      // nothing, rather than a special case.
+      ...gdnCkptConv.flat(), ...gdnCkptRecur.flat(),
+      ...Object.values(B), ...gdnStateBufs, ...readRing, ffnGateUp,
+      qkvU, oProjU, ffnDnU, ffnGateUpU, ffnSiluU, lmHdU, embU, normU, ffnU, argmaxU,
+      samplerU, samplePartials, ropeU, ropeFreqs, kvAppU, qkNormU, qkFuseU,
+      qkvFusedU, qkvFusedScratchU, kvQuantU,
+      moeRouterU, moeTopkU, moeGateU, moeDownU, moeSiluU, moeCombU,
+      gdnProjU, gdnOutU, cAttnU, gdnConvU, gdnGatesU, gdnRecurU, gdnNormU,
+      gatedSplitU, attnGateU,
+      mlaQU, mlaKvaU, mlaSplitU, mlaWriteU, mlaProjKU, mlaProjVU, mlaNarrowU,
+      mlaScoresU, mlaCombineU,
+      attnU, attnSkU, combineU, attnI8U,
+      residualReadBuf, readBuf, logitsReadBuf, hiddenReadBuf,
+      moeTraceBuf, moeTraceRead, ...moeIdRing,
+      specLogits, specIds, specScores,
+      // NOT the pool buffers: they are the loader's, they arrived inside
+      // `weights`, and two engines over one weight load share them — the same
+      // reason this frees no other weight buffer.
+    ]
+    for (const b of owned) b?.destroy()
+    chunkPrefill?.destroy()
+  }
+
+  // A dispatch against destroyed buffers is a Dawn validation error raised
+  // asynchronously on the device, half a stack away from whoever caused it.
+  // Naming the method at the call site is the whole point.
+  const guard = <A extends unknown[], R>(name: string, fn: (...args: A) => R) =>
+    (...args: A): R => {
+      if (destroyed) throw new Error(`DecodeEngine.${name}: this engine was destroyed — build a new one`)
+      return fn(...args)
+    }
+
+  return {
+    generate: guard('generate', generate),
+    generatePipelined: guard('generatePipelined', generatePipelined),
+    forwardLogits: guard('forwardLogits', forwardLogits),
+    readMoeTrace,
+    getPoolStats,
+    forwardEmbedding: guard('forwardEmbedding', forwardEmbedding),
+    scoreSequence: guard('scoreSequence', scoreSequence),
+    pipelineStep: guard('pipelineStep', pipelineStep),
+    setSampling: guard('setSampling', setSampling),
+    exportKV: guard('exportKV', exportKV),
+    importKV: guard('importKV', importKV),
+    setPageTable: guard('setPageTable', setPageTable),
+    resetKVTracking: guard('resetKVTracking', resetKVTracking),
+    debugCompareReuse: guard('debugCompareReuse', debugCompareReuse),
+    getLastPrefill: guard('getLastPrefill', getLastPrefill),
+    getLastStop: guard('getLastStop', getLastStop),
+    destroy,
+    maxContext: MAX_CONTEXT,
+    spec: S,
+    profileStep: guard('profileStep', profileStep),
+    benchBatchedFfnDown: guard('benchBatchedFfnDown', benchBatchedFfnDown),
+  }
+}

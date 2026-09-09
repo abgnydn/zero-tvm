@@ -1,0 +1,16 @@
+# Six pages deleted in the 2026-08-14 redesign, five of them in the sitemap
+# Google is crawling at priority 0.6-0.9. Without these, every bookmark, README
+# link and search result for them lands on a bare 404 and the accumulated link
+# equity is dropped instead of passed to the successor page.
+/demo               /                       301
+/demo.html          /                       301
+/architecture       /docs                   301
+/architecture.html  /docs                   301
+/shaders            /docs#shaders           301
+/shaders.html       /docs#shaders           301
+/dump               /docs                   301
+/dump.html          /docs                   301
+/compiler-chat      /zero-tvm               301
+/compiler-chat.html /zero-tvm               301
+/webllm-bench       /docs#vs-webllm         301
+/webllm-bench.html  /docs#vs-webllm         301

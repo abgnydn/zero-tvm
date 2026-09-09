@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zero-TVM Chat — LLMs up to a 35B MoE on hand-written WebGPU kernels</title>
+  <meta name="description" content="Live browser chat with models from Phi-3-mini to the Qwen3.6-35B-A3B sparse MoE, decoding on raw WebGPU. No WebLLM, no TVM, no WASM — hand-written WGSL, readable end-to-end.">
+  <meta name="theme-color" content="#0a0a0c">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://zerotvm.com/zero-tvm.html">
+  <meta property="og:title" content="Zero-TVM Chat — LLMs up to a 35B MoE on hand-written WebGPU kernels">
+  <meta property="og:description" content="Live browser chat with models from Phi-3-mini to the Qwen3.6-35B-A3B sparse MoE, decoding on raw WebGPU. No WebLLM, no TVM, no WASM — hand-written WGSL, readable end-to-end.">
+  <meta property="og:image" content="https://zerotvm.com/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Zero-TVM Chat — LLMs up to a 35B MoE on hand-written WebGPU kernels">
+  <meta name="twitter:description" content="Live browser chat with models from Phi-3-mini to the Qwen3.6-35B-A3B sparse MoE, decoding on raw WebGPU. No WebLLM, no TVM, no WASM — hand-written WGSL, readable end-to-end.">
+  <meta name="twitter:image" content="https://zerotvm.com/og.png">
+  <link rel="stylesheet" href="/fonts.css">
+  <link rel="stylesheet" href="/tokens.css">
+  <link rel="stylesheet" href="/chat-ui.css">
+  <style>
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 15px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
+    }
+
+    button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-2); }
+
+    .icon { width: 18px; height: 18px; stroke: currentColor; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* ─────────── Layout ─────────── */
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      height: 100vh;
+      max-height: 100dvh;
+    }
+
+    /* ─────────── Header ─────────── */
+    .app-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.65rem 1rem;
+      border-bottom: 1px solid var(--border);
+      background: rgba(10, 10, 12, 0.85);
+      backdrop-filter: blur(10px);
+      position: relative;
+      z-index: 10;
+    }
+    .back-link {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      color: var(--text-dim);
+      transition: background 0.15s, color 0.15s;
+    }
+    .back-link:hover { background: var(--panel-2); color: var(--text); }
+    .model-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; position: relative; }
+    .model-switch {
+      display: flex; align-items: center; gap: 4px; background: none; border: 0;
+      padding: 0; margin: 0; cursor: pointer; color: inherit; font: inherit;
+      border-radius: 5px; align-self: flex-start;
+    }
+    .model-switch:hover .chev { opacity: 1; }
+    .model-switch .chev {
+      width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor;
+      stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round;
+      opacity: 0.45; transition: opacity .15s, transform .15s;
+    }
+    .model-switch[aria-expanded="true"] .chev { opacity: 1; transform: rotate(180deg); }
+    .model-menu {
+      position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
+      min-width: 258px; padding: 5px;
+      background: #14161b; border: 1px solid #2a2e37; border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.55);
+    }
+    .model-menu button {
+      display: flex; width: 100%; align-items: baseline; gap: 8px;
+      background: none; border: 0; color: #e6e8ec; cursor: pointer;
+      padding: 8px 10px; border-radius: 7px; text-align: left; font: inherit;
+    }
+    .model-menu button:hover { background: #1e222b; }
+    .model-menu button[aria-selected="true"] { background: #1a2b22; }
+    .model-menu .mm-name { font-weight: 600; font-size: 0.86rem; }
+    .model-menu .mm-meta { font-size: 0.7rem; color: #8b93a1; margin-left: auto; white-space: nowrap; }
+    .model-menu .mm-cached { color: #5fc796; }
+    .model-info h1 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .model-sub {
+      font-size: 0.72rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .header-spacer { flex: 1; }
+    /* Sampling popover. Mirrors .model-menu's anchoring; wider because these
+       are labelled sliders rather than a list of names. */
+    .samp-wrap { position: relative; }
+    .header-btn.active { color: var(--accent); border-color: var(--accent); }
+    .samp-menu {
+      position: absolute; top: calc(100% + 6px); right: 0; z-index: 40;
+      width: 300px; padding: 12px; display: flex; flex-direction: column; gap: 12px;
+      background: var(--panel); border: 1px solid var(--border-2); border-radius: 10px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.35); font-size: 12px;
+    }
+    .samp-menu[hidden] { display: none; }
+    .samp-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .samp-head span { color: var(--muted); font-size: 11px; }
+    .samp-row { display: flex; flex-direction: column; gap: 4px; }
+    .samp-label { display: flex; justify-content: space-between; color: var(--text); }
+    .samp-label b { color: var(--accent); font-weight: 600; }
+    .samp-note { color: var(--muted); font-size: 10.5px; line-height: 1.35; }
+    .samp-row input[type=range] { width: 100%; accent-color: var(--accent); }
+    .samp-seed-row { display: flex; gap: 6px; }
+    .samp-seed-row input {
+      flex: 1; min-width: 0; padding: 4px 6px; font: inherit; color: var(--text);
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    }
+    .samp-btn {
+      padding: 4px 8px; font: inherit; color: var(--text); cursor: pointer;
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    }
+    .samp-btn:hover { border-color: var(--border-2); }
+    .samp-reset { align-self: flex-start; }
+    /* At temperature 0 the other two knobs do nothing — dimming them beats
+       letting someone move a slider and conclude the feature is broken. */
+    .samp-menu.samp-greedy #samp-topp-val,
+    .samp-menu.samp-greedy #samp-minp-val { color: var(--muted); }
+    .samp-menu.samp-greedy .samp-row:nth-child(3),
+    .samp-menu.samp-greedy .samp-row:nth-child(4) { opacity: .45; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 500;
+      background: var(--panel-2);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+    .badge.loading { color: #fbbf24; background: rgba(251, 191, 36, 0.08); border-color: rgba(251, 191, 36, 0.24); }
+    .badge.loading .dot { background: #fbbf24; animation: pulse 1.4s infinite; }
+    .badge.ready   { color: var(--accent); background: var(--accent-tint); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+    .badge.ready .dot { background: var(--accent); }
+    .badge.error   { color: var(--danger); background: rgba(239, 68, 68, 0.08); border-color: rgba(239, 68, 68, 0.25); }
+    .badge.error .dot { background: var(--danger); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    .stats {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .header-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 10px;
+      border-radius: 8px;
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      background: transparent;
+      border: 1px solid var(--border);
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .header-btn:hover { background: var(--panel-2); color: var(--text); border-color: var(--border-2); }
+    .header-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .header-btn .icon { width: 13px; height: 13px; }
+
+    /* ─────────── Welcome state ─────────── */
+    .welcome {
+      padding: 3rem 1rem 3.5rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1.1rem;
+      text-align: center;
+    }
+    .welcome.hidden { display: none; }
+    .welcome-logo {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-hi));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      color: #000;
+      letter-spacing: -0.04em;
+      font-size: 1.25rem;
+      box-shadow: 0 8px 32px color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+    /* The lettered tile is the fallback. With a mascot mounted the frame gets
+       out of the way entirely — no plate, no glow, no letter — so the
+       character reads as the character and not as an icon inside a button. */
+    .welcome-logo.has-mascot {
+      width: 148px;
+      height: 148px;
+      border-radius: 0;
+      background: none;
+      box-shadow: none;
+      font-size: 0;
+    }
+    .welcome-logo canvas { display: block; width: 100%; height: 100%; }
+    .welcome-title {
+      font-size: 1.55rem;
+      font-weight: 600;
+      letter-spacing: -0.022em;
+      margin-top: 0.15rem;
+    }
+    .welcome-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      justify-content: center;
+      margin-top: 0.1rem;
+    }
+    .welcome-pill {
+      font-size: 0.68rem;
+      color: var(--muted);
+      padding: 3px 10px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel);
+      font-variant-numeric: tabular-nums;
+    }
+    .welcome-sub {
+      color: var(--text-dim);
+      font-size: 0.88rem;
+      max-width: 480px;
+      line-height: 1.55;
+    }
+    .suggest-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.6rem;
+      margin-top: 0.85rem;
+      width: 100%;
+      max-width: 560px;
+    }
+    .suggest {
+      display: flex;
+      gap: 0.6rem;
+      text-align: left;
+      padding: 0.7rem 0.85rem;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      color: var(--text-dim);
+      font-size: 0.8rem;
+      transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.15s;
+      align-items: flex-start;
+    }
+    .suggest:hover {
+      background: var(--panel-2);
+      border-color: var(--border-2);
+      color: var(--text);
+      transform: translateY(-1px);
+    }
+    .suggest:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .suggest .suggest-icon {
+      width: 28px; height: 28px;
+      border-radius: 8px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      color: var(--accent-2);
+    }
+    .suggest .suggest-icon .icon { width: 14px; height: 14px; }
+    .suggest .suggest-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .suggest .suggest-title {
+      color: var(--text);
+      font-weight: 500;
+      font-size: 0.82rem;
+      letter-spacing: -0.005em;
+    }
+    .suggest .suggest-hint {
+      color: var(--muted);
+      font-size: 0.72rem;
+      line-height: 1.4;
+    }
+
+    /* ─────────── Start dialog (pre-download gate) ─────────── */
+    dialog#start-dialog {
+      position: fixed;
+      inset: 0;
+      margin: auto;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border-2);
+      border-radius: 16px;
+      padding: 0;
+      max-width: 460px;
+      width: calc(100vw - 2rem);
+      max-height: calc(100vh - 2rem);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    /* No negative margin: it pulled the canvas up into the hero's padding,
+       where the dialog clipped the character's hair flat. */
+    .dialog-mascot { display: block; width: 100%; height: 210px; margin: 0 0 0.35rem; }
+    /* The same character, small, beside the model name — so closing the gate
+       does not drop the thing the page was themed around. */
+    .header-mascot { display: block; width: 40px; height: 40px; flex: 0 0 auto; }
+    .dialog-models { padding: 0.85rem 1.25rem; border-top: 1px solid var(--border); text-align: center; }
+    .dm-change { font-size: 0.8rem; color: var(--text-dim); }
+    .dm-change:hover { color: var(--accent); }
+    .dialog-models .dm-label {
+      font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.07em;
+      color: var(--muted); margin-bottom: 0.5rem;
+    }
+    .dialog-models .dm-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    /* Only when the picker actually rendered — an empty container must not
+       leave a gap above the link. */
+    .dialog-models .dm-chips:not(:empty) { margin-bottom: 0.7rem; }
+    .dialog-models .dm-chip {
+      display: flex; flex-direction: column; gap: 1px; flex: 1 1 0; min-width: 96px;
+      padding: 7px 10px; border-radius: 8px; text-align: left; cursor: pointer;
+      background: var(--panel-2); border: 1px solid var(--border);
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .dialog-models .dm-chip:hover { border-color: var(--border-2); background: #1b1b22; }
+    .dialog-models .dm-chip[aria-pressed="true"] {
+      border-color: var(--accent); background: var(--accent-tint);
+    }
+    .dialog-models .dm-chip .n { font-size: 0.78rem; font-weight: 600; color: var(--text); }
+    .dialog-models .dm-chip .s { font-size: 0.66rem; color: var(--muted); }
+    .dialog-models .dm-chip[aria-pressed="true"] .s { color: var(--accent); }
+    dialog#start-dialog::backdrop {
+      background: rgba(8, 8, 10, 0.82);
+      backdrop-filter: blur(10px);
+    }
+
+    .dialog-hero {
+      padding: 1.75rem 1.5rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      text-align: center;
+    }
+    .dialog-logo {
+      width: 52px; height: 52px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-hi));
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      color: #000;
+      font-size: 1.15rem;
+      letter-spacing: -0.05em;
+      margin-bottom: 0.9rem;
+    }
+    .dialog-title {
+      font-size: 1.15rem;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      margin-bottom: 0.3rem;
+    }
+    .dialog-sub {
+      color: var(--text-dim);
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+
+    .dialog-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      padding: 1rem 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .dstat { text-align: center; padding: 0 0.5rem; }
+    .dstat .val { font-weight: 600; font-size: 0.95rem; letter-spacing: -0.01em; }
+    .dstat .lab { font-size: 0.66rem; color: var(--muted); margin-top: 3px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    .dialog-notes {
+      padding: 0.9rem 1.25rem;
+      color: var(--text-dim);
+      font-size: 0.78rem;
+      line-height: 1.6;
+      border-bottom: 1px solid var(--border);
+    }
+    .dialog-notes ul { margin: 0; padding-left: 1.1rem; }
+    .dialog-notes li { margin-bottom: 0.2rem; }
+    .dialog-notes li:last-child { margin-bottom: 0; }
+
+    .dialog-actions {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.85rem 1rem;
+    }
+    .dialog-btn {
+      flex: 1;
+      padding: 0.65rem 1rem;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.88rem;
+      transition: background 0.15s, color 0.15s, opacity 0.15s;
+      border: 1px solid transparent;
+    }
+    .dialog-btn[data-variant="cancel"] {
+      background: transparent;
+      color: var(--text-dim);
+      border-color: var(--border);
+    }
+    .dialog-btn[data-variant="cancel"]:hover { background: var(--panel-2); color: var(--text); }
+    .dialog-btn[data-variant="primary"] {
+      background: var(--accent);
+      color: #000;
+    }
+    .dialog-btn[data-variant="primary"]:hover:not(:disabled) { background: var(--accent-2); }
+    .dialog-btn[data-variant="primary"]:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    /* ─────────── Loading overlay ─────────── */
+    .loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(10, 10, 12, 0.92);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 90;
+      padding: 1rem;
+    }
+    .loading-overlay.active { display: flex; }
+
+    .loading-card {
+      background: var(--panel);
+      border: 1px solid var(--border-2);
+      border-radius: 16px;
+      padding: 1.75rem 1.5rem 1.25rem;
+      max-width: 440px;
+      width: 100%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    }
+    .loading-title {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 0.2rem;
+    }
+    .loading-status {
+      color: var(--text-dim);
+      font-size: 0.82rem;
+      margin-bottom: 1rem;
+      min-height: 1.2em;
+    }
+    .progress-track {
+      height: 6px;
+      background: var(--panel-2);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--accent), var(--accent-hi));
+      border-radius: 999px;
+      transition: width 0.25s ease;
+    }
+    .progress-detail {
+      color: var(--muted);
+      font-size: 0.72rem;
+      margin-top: 0.5rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .loading-log-details {
+      margin-top: 0.85rem;
+    }
+    .loading-log-details summary {
+      font-size: 0.74rem;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .loading-log-details summary::-webkit-details-marker { display: none; }
+    .loading-log-details summary:hover { color: var(--text-dim); }
+    .loading-log-details summary::before { content: '▸'; transition: transform 0.15s; font-size: 0.65rem; }
+    .loading-log-details[open] summary::before { transform: rotate(90deg); }
+    .loading-log {
+      margin-top: 0.5rem;
+      max-height: 140px;
+      overflow-y: auto;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem 0.65rem;
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    .loading-log::-webkit-scrollbar { width: 6px; }
+    .loading-log::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 3px; }
+
+    .loading-error {
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      color: #fca5a5;
+      padding: 0.65rem 0.8rem;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      margin-top: 0.85rem;
+      display: none;
+    }
+    .loading-error.visible { display: block; }
+
+    /* ─────────── Responsive ─────────── */
+    @media (max-width: 640px) {
+      .app-header { padding: 0.55rem 0.75rem; }
+      .model-info h1 { font-size: 0.9rem; }
+      .model-sub { font-size: 0.68rem; }
+      .chat-inner { padding: 1rem 0.75rem 1.25rem; }
+      .composer-wrap { padding: 0.55rem 0.75rem 0.75rem; }
+      .welcome { padding: 1.25rem 0.5rem 1.5rem; }
+      .welcome-title { font-size: 1.15rem; }
+      .suggest-grid { grid-template-columns: 1fr; }
+      .badge { padding: 3px 8px; font-size: 0.68rem; }
+      /* The header computed 513px inside a 390px viewport, and body's
+         overflow-x: hidden CLIPPED the excess rather than scrolling — "New
+         chat" and the status badge sat past the right edge, unreachable. The
+         icons and the dot carry the same information; the words are what did
+         not fit. The h1 also gets an ellipsis: "Qwen3.6-35B-A3B" is wider
+         than the slot the flex layout leaves it. */
+      #new-chat-btn span { display: none; }
+      #badge-text { display: none; }
+      .model-info h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42vw; }
+      .stats { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <!-- ─────────── Pre-download gate ─────────── -->
+  <dialog id="start-dialog">
+    <div class="dialog-hero">
+      <canvas class="dialog-mascot" id="gate-mascot" aria-hidden="true"></canvas>
+      <div class="dialog-title">Phi-3-mini on raw WebGPU</div>
+      <div class="dialog-sub">Runs in your browser on hand-written WGSL kernels. Weights download once and cache locally; prompts and generation stay on this machine.</div>
+    </div>
+    <div class="dialog-stats">
+      <div class="dstat"><div class="val">~2 GB</div><div class="lab">weights</div></div>
+      <div class="dstat"><div class="val">~70 t/s</div><div class="lab">M2 Max</div></div>
+      <div class="dstat"><div class="val" id="gate-ctx">&mdash;</div><div class="lab">context</div></div>
+    </div>
+    <!-- The chips container carries the id, not the wrapper: renderGateChips
+         clears its host before appending, so putting the id on the wrapper
+         would delete the link below it. It had no id at all until now, so the
+         lookup returned null and bailed — the picker has never rendered, and
+         everyone arriving without ?model= was offered Phi-3 and nothing else.
+         Empty until the JS fills it; the link works regardless. -->
+    <div class="dialog-models">
+      <div class="dm-chips" id="dialog-models"></div>
+      <a class="dm-change" href="/#models">Pick a different model →</a>
+    </div>
+    <div class="dialog-notes">
+      <ul>
+        <li>Cached after first load — next visit starts in seconds</li>
+        <li>Chrome 113+ / Edge 113+ with shader-f16 required</li>
+        <li>Progress and detailed log shown while downloading</li>
+      </ul>
+    </div>
+    <div class="dialog-actions">
+      <a class="dialog-btn" data-variant="cancel" href="/">Not now</a>
+      <button class="dialog-btn" data-variant="primary" id="start-btn" autofocus>Download &amp; start →</button>
+    </div>
+  </dialog>
+
+  <!-- ─────────── Loading overlay ─────────── -->
+  <!-- Ships with .active: boot begins the moment the page loads, so the
+       progress/error card must be visible from the first frame. chat.ts's
+       hideLoadingOverlay() removes the class once the engine is ready. -->
+  <div class="loading-overlay active" id="loading-overlay">
+    <div class="loading-card">
+      <div class="loading-title" id="loading-title">Preparing Zero-TVM</div>
+      <div class="loading-status" id="progress-status">Starting…</div>
+      <div class="progress-track"><div class="progress-fill" id="progress-bar"></div></div>
+      <div class="progress-detail" id="progress-detail">0%</div>
+      <details class="loading-log-details">
+        <summary>Details</summary>
+        <pre class="loading-log" id="progress-log"></pre>
+      </details>
+      <div class="loading-error" id="loading-error"></div>
+    </div>
+  </div>
+
+  <!-- ─────────── App shell ─────────── -->
+  <div class="app">
+    <header class="app-header">
+      <a href="/" class="back-link" title="Back to zerotvm.com" aria-label="Back to zerotvm.com">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+      </a>
+      <div class="model-info">
+        <button class="model-switch" id="model-switch" type="button" aria-haspopup="listbox" aria-expanded="false">
+          <h1 id="model-name">Phi-3-mini</h1>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="model-sub" id="model-sub">hand-written WGSL · paged KV · WebGPU</div>
+        <div class="model-menu" id="model-menu" role="listbox" hidden></div>
+      </div>
+      <div class="header-spacer"></div>
+      <span class="stats" id="stats"></span>
+      <div class="samp-wrap">
+        <button class="header-btn" id="sampling-btn" type="button" title="Sampling: off (greedy)" aria-haspopup="dialog" aria-expanded="false">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/>
+            <circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>
+          </svg>
+        </button>
+        <div class="samp-menu" id="sampling-menu" role="dialog" aria-label="Sampling settings" hidden></div>
+      </div>
+      <button class="header-btn" id="new-chat-btn" type="button" title="New chat" disabled>
+        <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        <span>New chat</span>
+      </button>
+      <span class="badge" id="badge"><span class="dot"></span><span id="badge-text">Waiting</span></span>
+    </header>
+
+    <main class="chat-main" id="chat-main">
+      <div class="chat-inner">
+        <div class="welcome" id="welcome">
+          <div class="welcome-logo" id="welcome-logo">Z</div>
+          <div class="welcome-title">Chat with Phi-3-mini</div>
+          <div class="welcome-pills">
+            <span class="welcome-pill" id="welcome-quant">q4f16_1 · 3.8 B</span>
+            <span class="welcome-pill" id="welcome-ctx">4 K context</span>
+            <span class="welcome-pill">Runs on your GPU · WebGPU</span>
+            <span class="welcome-pill">On-device only</span>
+          </div>
+          <div class="welcome-sub">Running on your own GPU through hand-written WGSL kernels. Prompts, tokens and the KV cache stay in this tab.</div>
+          <div class="suggest-grid" id="suggest-grid">
+            <!-- Answerable because chat-flow.ts's system prompt carries the
+                 zero-tvm facts — none of these models saw zerotvm.com in
+                 training. -->
+            <button class="suggest" data-prompt="What is zero-tvm, and what makes it different from other ways of running an LLM in a browser?">
+              <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 2l10 10-10 10L2 12z"/><path d="M8 12h3l1.5-2.5L14 14l1.5-2H17"/></svg></span>
+              <span class="suggest-body">
+                <span class="suggest-title">What is zero-tvm?</span>
+                <span class="suggest-hint">The engine you are talking through</span>
+              </span>
+            </button>
+            <button class="suggest" data-prompt="Explain WebGPU compute shaders in three sentences.">
+              <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 2v20M2 12h20M4.93 4.93l14.14 14.14M19.07 4.93L4.93 19.07"/></svg></span>
+              <span class="suggest-body">
+                <span class="suggest-title">Explain WebGPU</span>
+                <span class="suggest-hint">Compute shaders in three sentences</span>
+              </span>
+            </button>
+            <button class="suggest" data-prompt="Write a TypeScript memoized fibonacci with a short test block that prints fib(10), fib(20), and fib(30).">
+              <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg></span>
+              <span class="suggest-body">
+                <span class="suggest-title">Write TypeScript</span>
+                <span class="suggest-hint">Memoized fib with a tiny test block</span>
+              </span>
+            </button>
+            <button class="suggest" data-prompt="Summarize how a transformer decode step works, focusing on what the KV cache actually stores.">
+              <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg></span>
+              <span class="suggest-body">
+                <span class="suggest-title">Summarize</span>
+                <span class="suggest-hint">What the KV cache actually stores</span>
+              </span>
+            </button>
+            <button class="suggest" data-prompt="List four kinds of questions where a 3.8B model like Phi-3-mini is likely to fall short compared to a frontier LLM, with one-sentence reasons.">
+              <span class="suggest-icon"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg></span>
+              <span class="suggest-body">
+                <span class="suggest-title">Honest comparison</span>
+                <span class="suggest-hint">Where a 3.8B model falls short</span>
+              </span>
+            </button>
+          </div>
+        </div>
+        <div id="messages"></div>
+      </div>
+      <button class="scroll-fab" id="scroll-fab" title="Scroll to bottom" aria-label="Scroll to bottom">
+        <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+      </button>
+    </main>
+
+    <div class="composer-wrap">
+      <form class="composer" id="composer">
+        <textarea id="inp" rows="1" placeholder="Waiting for model…" aria-label="Message" disabled></textarea>
+        <button class="composer-btn" data-variant="send" id="btn" type="submit" disabled aria-label="Send">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M5 12l14-7-7 14-2-5-5-2z"/></svg>
+        </button>
+        <button class="composer-btn" data-variant="stop" id="stop-btn" type="button" hidden aria-label="Stop">
+          <svg class="icon" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+        </button>
+      </form>
+      <div class="composer-hint">
+        <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for new line ·
+        <span id="ctx-hint" style="color:var(--text-dim)">Zero TVM · 10 WGSL kernel roles</span>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/zero-tvm/chat.ts"></script>
+</body>
+</html>

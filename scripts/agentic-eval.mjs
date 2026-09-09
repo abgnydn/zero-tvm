@@ -1,0 +1,303 @@
+// AGENTIC EVAL — can the model drive a tool loop to completion, or does it
+// read and read and never act?
+//
+// Not a chat benchmark. It scores the loop itself: does it use what a tool
+// returned, does it stop reading once it has the answer, does it finish. The
+// reported failure was "it reads and reads, fills the context, then I compact"
+// — so REDUNDANT READS and NEVER FINISHING are the two things measured, not
+// prose quality.
+//
+// The workspace is fake but consistent: the answer exists, is reachable in
+// three steps, and cannot be guessed from the task text.
+// Needs the station on :8017. It loads the model itself, so the station can be
+// idle when this starts.
+//
+//   npm run station                          # in another shell
+//   node scripts/agentic-eval.mjs qwen36q3            # short task
+//   PAD=24000 node scripts/agentic-eval.mjs qwen36q3  # the failing arm
+//   PAD=24000 KV8=0 node scripts/agentic-eval.mjs qwen36q3    # f16 control
+//   PAD=24000 REUSE=0 node scripts/agentic-eval.mjs qwen36q3  # no-reuse control
+//
+// Measured 2026-08-18 on qwen36q3, ctx 32768: short = SOLVED in 20s, 3/3 files,
+// no wasted reads. PAD=24000 = reads all three files, computes the right
+// number, then answers in PROSE ("7 * 12 = 84.\n\n84") instead of calling
+// attempt_completion. KV8=0 fails identically, so the int8 cache is not it.
+// qwen38 at the same depth is worse: it invents mcp__tools__list_directory and
+// calls it nine times.
+import http from 'node:http'
+
+const post = (port, path, body) => new Promise((res, rej) => {
+  const d = JSON.stringify(body)
+  const r = http.request({ host: '127.0.0.1', port, path, method: 'POST',
+    headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(d) } }, (x) => {
+    let b = ''; x.on('data', (c) => b += c); x.on('end', () => { try { res(JSON.parse(b)) } catch (e) { rej(new Error(b.slice(0, 300))) } })
+  })
+  r.setTimeout(0); r.on('error', rej); r.end(d)
+})
+const get = (p, q) => new Promise((res, rej) => {
+  const r = http.get({ host: '127.0.0.1', port: p, path: q }, (x) => {
+    let b = ''; x.on('data', (c) => b += c); x.on('end', () => { try { res(JSON.parse(b)) } catch (e) { rej(new Error(b.slice(0, 300))) } })
+  }); r.on('error', rej)
+})
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Module scope: load() requests these and the caller ASSERTS the engine came
+// back with them. They were declared inside load(), which is why the assertion
+// referenced names that did not exist there.
+const KV8 = process.env.KV8 !== '0'
+const REUSE = process.env.REUSE !== '0'
+const CHUNK = process.env.CHUNK !== '0'
+const CAP = Number(process.env.CAP) || 0
+
+async function load(param) {
+  // ECONNREFUSED here is the ordinary case — the station is a separate process
+  // and it is easy to forget. A raw stack trace for that is noise.
+  try {
+    await get(8017, '/api/state')
+  } catch (e) {
+    if (e.code === 'ECONNREFUSED') {
+      console.error('no station on 127.0.0.1:8017 — start it first:\n\n  npm run station\n')
+      process.exit(1)
+    }
+    throw e
+  }
+  // KV8=0 loads an f16 cache — the control for "is this the model or our
+  // quantizer?". int8 was measured at 1k and 4k windows only, and the failure
+  // being chased sits at 24k.
+  // REUSE=0 turns off cross-turn prefix reuse AND the GDN rewind ring, so every
+  // turn prefills the whole prompt from zero. It is the control for "does our
+  // cross-turn machinery corrupt a deep conversation?" — the failing turn is
+  // the FOURTH one, and turns 2-4 all ride reused state. Slow on purpose: a
+  // 24k-token turn re-prefills 24k tokens.
+  // CHUNK=0 is the third length-dependent arm: chunked prefill batches GEMMs
+  // over token blocks instead of running per-token matvecs, which is a
+  // different arithmetic order and only reachable on prompts long enough to
+  // chunk. scripts/depth-bisect.mjs drives all three.
+  // CHECK the load response. The station refuses with 409 while the engine is
+  // still generating, and polling for phase === 'ready' sails straight past
+  // that — it was already ready, just busy with someone else's request. The
+  // next chat call then gets an error body, and an error body scored as an
+  // empty completion reads as "the model answered with prose". One such run was
+  // reported as a model failure before this check existed.
+  // Two of the station's refusals are TRANSIENT — it is mid-load, or still
+  // generating for someone else — and both clear on their own. Throwing on
+  // those makes the harness unusable right after a restart, when the station
+  // auto-loads the last model. Anything else is a real refusal.
+  const req = { param, ctx: 32768, pool: 0, kv8: KV8, reuse: REUSE, chunk: CHUNK, cap: CAP }
+  for (let i = 0; ; i++) {
+    const acc = await post(8017, '/api/load', req)
+    if (!acc?.error) break
+    const transient = /already loading|generating right now/i.test(acc.error)
+    if (!transient) throw new Error(`/api/load refused: ${acc.error}`)
+    if (i === 0) console.log(`  waiting: ${acc.error}`)
+    if (i > 150) throw new Error(`/api/load still refusing after 5 min: ${acc.error}`)
+    await sleep(2000)
+  }
+  for (let i = 0; i < 200; i++) {
+    await sleep(2000)
+    const s = await get(8017, '/api/state')
+    if (s.phase === 'ready') return
+    if (s.phase === 'failed') throw new Error(`${param}: ${s.failure}`)
+  }
+  throw new Error(`${param}: no boot`)
+}
+
+// ── the workspace ───────────────────────────────────────────────────────────
+// 24 files, 3 of which matter. The reported failure is "it reads and reads,
+// fills the context, then I compact" — so the workspace has to REWARD not
+// reading. Every distractor is plausible: same naming, same shape, several
+// carry numbers that look like they could be the answer.
+const FILES = {
+  'README.md': 'Service workspace. Pipeline stages live under src/. See docs/ for notes.',
+  'config.json': '{ "entry": "src/pipeline.ts", "version": 7, "timeout": 300 }',
+  'package.json': '{ "name": "svc", "version": "2.4.1" }',
+  'src/pipeline.ts': 'import { WIDTH } from "./dims.ts"\nimport { scale } from "./scale.ts"\n'
+    + 'export function capacity() { return scale(WIDTH) }',
+  'src/dims.ts': 'export const WIDTH = 12\nexport const HEIGHT = 40   // unused by capacity()',
+  'src/scale.ts': 'export const FACTOR = 7\nexport function scale(n: number) { return n * FACTOR }',
+  'src/legacy.ts': 'export const WIDTH = 99   // old copy, nothing imports this',
+  'src/util.ts': 'export const clamp = (n: number) => Math.max(0, n)',
+  'src/index.ts': 'export * from "./pipeline.ts"',
+  'src/cache.ts': 'export const TTL = 84',
+  'src/queue.ts': 'export const DEPTH = 21',
+  'src/retry.ts': 'export const LIMIT = 3',
+  'src/log.ts': 'export const LEVEL = "info"',
+  'src/http.ts': 'export const PORT = 8080',
+  'src/db.ts': 'export const POOL = 16',
+  'src/auth.ts': 'export const ROUNDS = 12',
+  'docs/architecture.md': 'The pipeline computes capacity from the configured width.',
+  'docs/notes.md': 'Old note: capacity used to be 99. This is out of date.',
+  'docs/faq.md': 'Q: what is capacity? A: see src/pipeline.ts',
+  'tests/pipeline.test.ts': 'test("capacity", () => { expect(capacity()).toBe(EXPECTED) })',
+  'tests/dims.test.ts': 'test("width", () => { expect(WIDTH).toBeGreaterThan(0) })',
+  'CHANGELOG.md': '2.4.1 — bumped FACTOR. 2.4.0 — initial.',
+  '.gitignore': 'node_modules\ndist',
+  'LICENSE': 'MIT',
+}
+// capacity() = scale(WIDTH) = 12 * 7 = 84. Needs pipeline.ts, dims.ts, scale.ts.
+// Traps: legacy.ts says WIDTH=99, notes.md says capacity was 99, cache.ts
+// carries the literal 84 so a guesser can land on it without earning it.
+const ANSWER = '84'
+
+const TOOLS = [
+  { type: 'function', function: { name: 'list_files', description: 'List every file in the workspace',
+    parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'read_file', description: 'Read one file by path',
+    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } } },
+  { type: 'function', function: { name: 'search', description: 'Search file contents for a string',
+    parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'write_file', description: 'Write content to a file',
+    parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
+  { type: 'function', function: { name: 'run_command', description: 'Run a shell command in the workspace',
+    parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+  { type: 'function', function: { name: 'attempt_completion', description: 'Report the final answer and finish the task',
+    parameters: { type: 'object', properties: { result: { type: 'string' } }, required: ['result'] } } },
+]
+
+/** Files a correct solution must read. Anything else is a wasted step. */
+const NEEDED = ['src/pipeline.ts', 'src/dims.ts', 'src/scale.ts']
+
+const TASK = 'What number does capacity() return? Read only the files you need, '
+  + 'then call attempt_completion with just the number. Do not guess.'
+
+/** Prior conversation, to put the task at REAL depth. The short version of
+ *  this eval both models ace; the reported failure only shows up on sessions
+ *  tens of thousands of tokens deep, so depth is the variable to move. Content
+ *  is inert on purpose — it must not contain the answer or hint at it, or the
+ *  test measures retrieval rather than whether the loop survives length. */
+function padding(targetTokens) {
+  const msgs = []
+  if (!targetTokens) return msgs
+  let approx = 0
+  for (let i = 0; approx < targetTokens; i++) {
+    const q = `Step ${i}: summarise what changed in release 2.${i % 9}.${i % 5}.`
+    const a = `Release 2.${i % 9}.${i % 5} adjusted logging thresholds, renamed two internal `
+      + `helpers, and left public behaviour unchanged. No configuration keys moved, and the `
+      + `deployment procedure is identical to the previous release. Nothing here affects `
+      + `pipeline capacity or the dimension constants used elsewhere in the service.`
+    msgs.push({ role: 'user', content: q }, { role: 'assistant', content: a })
+    approx += Math.ceil((q.length + a.length) / 3.6)
+  }
+  return msgs
+}
+
+async function runEpisode(label, maxSteps = 12, padTokens = 0) {
+  const msgs = [
+    { role: 'system', content: 'You are a coding agent. Call exactly one tool per step. '
+      + 'Use what each tool returns. When you know the answer, call attempt_completion. '
+      + 'Never read a file you have already read.' },
+    ...padding(padTokens),
+    { role: 'user', content: TASK },
+  ]
+  const calls = []
+  const reads = []
+  let finished = null
+  let steps = 0
+  const t0 = Date.now()
+
+  for (; steps < maxSteps; steps++) {
+    const j = await post(8017, '/v1/chat/completions', {
+      model: 'ztvm', messages: msgs, tools: TOOLS, max_tokens: 300, temperature: 0, stream: false,
+    })
+    // A response with no choices is an ERROR, not an empty answer. Reporting it
+    // as prose turns "the server refused" into "the model failed", which is the
+    // wrong finding about the wrong component.
+    if (!j?.choices?.length) {
+      throw new Error(`no completion from the engine: ${JSON.stringify(j).slice(0, 300)}`)
+    }
+    const m = j.choices?.[0]?.message ?? {}
+    const c = (m.tool_calls ?? [])[0]
+    if (!c) {
+      calls.push('TEXT')
+      // What it said instead matters: prose CONTAINING the answer means the
+      // model solved it and only failed to emit the call — instruction
+      // following, not arithmetic. Prose without it means it lost the thread.
+      //
+      // Print the END as well as the start, and say whether the budget ran
+      // out. This model's own template invites reasoning BEFORE the call, so
+      // the call is the LAST thing generated — a run cut off at max_tokens
+      // looks, from the front, exactly like a model that chose prose. The
+      // reference harness was misread that way once already.
+      const text = m.content ?? ''
+      const fin = j.choices?.[0]?.finish_reason ?? '?'
+      console.log(`    prose instead of a call (finish_reason=${fin}, ${text.length} chars)`)
+      console.log(`      starts: ${JSON.stringify(text.slice(0, 180))}`)
+      if (text.length > 180) console.log(`      ends:   ${JSON.stringify(text.slice(-180))}`)
+      break
+    }
+    const args = (() => { try { return JSON.parse(c.function.arguments) } catch { return {} } })()
+    const sig = `${c.function.name}(${args.path ?? ''})`
+    calls.push(sig)
+
+    let out
+    if (c.function.name === 'list_files') out = Object.keys(FILES).join('\n')
+    else if (c.function.name === 'read_file') {
+      reads.push(args.path)
+      out = FILES[args.path] ?? `Error: no such file: ${args.path}`
+    } else if (c.function.name === 'search') {
+      const q = String(args.query ?? '')
+      const hits = Object.entries(FILES).filter(([, v]) => v.includes(q)).map(([k]) => k)
+      out = hits.length ? hits.join('\n') : 'no matches'
+    } else if (c.function.name === 'write_file' || c.function.name === 'run_command') {
+      out = 'Error: this task is read-only'
+    } else if (c.function.name === 'attempt_completion') {
+      finished = String(args.result ?? '')
+      break
+    } else out = `Error: unknown tool ${c.function.name}`
+
+    msgs.push({ role: 'assistant', content: m.content ?? '', tool_calls: m.tool_calls })
+    msgs.push({ role: 'tool', tool_call_id: c.id, content: out })
+  }
+
+  const dupReads = reads.length - new Set(reads).size
+  const wasted = [...new Set(reads)].filter((f) => !NEEDED.includes(f)).length
+  const missed = NEEDED.filter((f) => !reads.includes(f)).length
+  const correct = finished !== null && finished.includes(ANSWER)
+  const secs = ((Date.now() - t0) / 1000).toFixed(0)
+  console.log(`\n  ${label}`)
+  console.log(`    steps        ${steps + (finished !== null ? 1 : 0)} of ${maxSteps}`)
+  console.log(`    finished     ${finished !== null ? `yes → ${JSON.stringify(finished.slice(0, 60))}` : 'NO — ran out of steps or gave prose'}`)
+  console.log(`    correct      ${correct ? 'YES' : 'no'}   (expected ${ANSWER})`)
+  console.log(`    files read   ${reads.length} (${dupReads} repeats, ${wasted} unnecessary of ${new Set(reads).size} distinct)`)
+  console.log(`    needed files ${NEEDED.length - missed}/${NEEDED.length} read`)
+  console.log(`    trace        ${calls.join(' → ')}`)
+  console.log(`    wall         ${secs}s`)
+  return { correct, finished: finished !== null, steps, dupReads, wasted, secs }
+}
+
+const PAD = Number(process.env.PAD ?? 0)
+// STEPS caps the model calls. The loop is normally allowed 12, but the FIRST
+// call is what fails at depth — it invents a tool name before reading anything
+// — and a per-token arm costs ~39 minutes per call at 16k, so twelve of them is
+// eight hours. One call at the SAME depth answers the same question. Changing
+// the depth instead would not: the baseline solves at 8k, so an arm that also
+// solves there says nothing.
+const STEPS = Number(process.env.STEPS ?? 12)
+const models = process.argv.slice(2)
+if (!models.length) { console.error('usage: agentic-eval.mjs <param> [param...]'); process.exit(1) }
+const results = {}
+for (const p of models) {
+  console.log(`\n=== ${p} ===`)
+  await load(p)
+  const h = await get(8019, '/health')
+  console.log(`  loaded ${h.hosting} · ctx ${h.ctx} · kv8=${h.kv8} · reuse=${h.reuse} · chunk=${h.chunk}${h.cap ? ` · cap=${h.cap}` : ''}`)
+  // ASSERT the engine is running what was asked for. The station remembers the
+  // last configuration and auto-loads it on restart, so a run can inherit
+  // someone else's flags — you ask for reuse off, the engine has it on, and the
+  // arm silently measures the baseline again. Every arm of a bisection is a
+  // claim about a flag; an unchecked flag makes the whole run meaningless.
+  const want = { kv8: KV8, reuse: REUSE, chunk: CHUNK }
+  const bad = Object.entries(want).filter(([k, v]) => h[k] !== v)
+  if (bad.length) {
+    throw new Error(`engine flags do not match the request: `
+      + bad.map(([k, v]) => `${k} wanted ${v}, engine reports ${h[k]}`).join('; ')
+      + ' — the station may have auto-loaded a remembered configuration')
+  }
+  const arm = `kv8=${h.kv8} reuse=${h.reuse} chunk=${h.chunk}`
+  results[p] = await runEpisode(`${p} · ${PAD ? `~${Math.round(PAD / 1000)}k-token history` : 'short'} · ${arm}${STEPS < 12 ? ` · ${STEPS}-step` : ''}`, STEPS, PAD)
+}
+console.log('\n=== VERDICT ===')
+for (const [p, r] of Object.entries(results)) {
+  console.log(`  ${p.padEnd(10)} ${r.correct ? 'SOLVED' : r.finished ? 'finished but WRONG' : 'DID NOT FINISH'}`
+    + ` · ${r.steps} steps · ${r.wasted} unnecessary reads · ${r.dupReads} repeats · ${r.secs}s`)
+}

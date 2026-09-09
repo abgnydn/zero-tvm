@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Every URL here is a page a stranger should be able to land on cold.
+
+  Rewritten 2026-08-14. The old list named five pages that were deleted in the
+  same change (demo, architecture, shaders, dump, compiler-chat) and omitted
+  zero-tvm.html, the product itself — so search traffic was steered into the
+  orphans and away from the chat. share.html and 404.html carry noindex;
+  agent-host.html needs a local server and is not a public destination.
+-->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://zerotvm.com/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://zerotvm.com/zero-tvm.html</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.9</priority>
+  </url>
+  <url>
+    <loc>https://zerotvm.com/docs.html</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
+    <loc>https://zerotvm.com/validate.html</loc>
+    <changefreq>monthly</changefreq>
+    <priority>0.6</priority>
+  </url>
+</urlset>

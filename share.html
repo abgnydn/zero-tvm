@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Room — zero-tvm</title>
+  <meta name="description" content="Serve a model running in this tab to another device over an encrypted WebRTC data channel. No install on either end.">
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+
+  <!-- The scene's own assets, same two the entrance preloads: the backdrop and
+       the summoning ring are the first two things painted here too. -->
+  <link rel="preload" href="/entrance/bg.svg" as="image" type="image/svg+xml">
+  <link rel="preload" href="/entrance/ring.svg" as="image" type="image/svg+xml">
+  <link rel="stylesheet" href="/fonts.css">
+  <link rel="stylesheet" href="/tokens.css">
+  <!-- chat-ui.css carries the message surface (bubbles, composer, scroll FAB)
+       for the guest; landing.css carries the scene and every panel component
+       this page wears. Same order, same two files, as index.html — this page
+       has no stylesheet of its own, which is the point: it used to ship ~130
+       lines of inline CSS re-inventing chrome the entrance already had. -->
+  <link rel="stylesheet" href="/chat-ui.css">
+  <link rel="stylesheet" href="/landing.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="wrap nav-in">
+    <a href="/" class="nav-logo">zero<span>-tvm</span></a>
+    <div class="nav-links">
+      <a href="/">Models</a>
+      <a href="docs.html">Docs</a>
+    </div>
+  </div>
+</nav>
+
+<!-- id="models" is load-bearing: the entrance's scene rules are written as
+     `#models .cs-root …`, and this page is the same scene with one character
+     on it — the one that arrived in the URL. share.ts renders the whole thing
+     (atmosphere, plate, stage, sheet or chat panel) per role, exactly as
+     landing.ts does for the entrance. -->
+<section id="models">
+  <div id="share-root" class="cs-root"></div>
+</section>
+
+<script type="module" src="/src/zero-tvm/share.ts"></script>
+</body>
+</html>

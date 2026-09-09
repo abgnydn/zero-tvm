@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Zero-TVM: browser LLM inference on hand-written WGSL kernels"
+abstract: >-
+  Browser LLM inference on hand-written WGSL kernels — models from a 3.8B dense to a 35B sparse MoE, no TVM, no WebLLM runtime, no compiler. Measured against WebLLM on identical weights; every number in BENCH.md.
+type: software
+authors:
+  - family-names: Gunaydin
+    given-names: Ahmet Baris
+    email: hi@barisgunaydin.com
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # <- add your ORCID
+    affiliation: Independent Researcher
+license: MIT
+repository-code: "https://github.com/abgnydn/zero-tvm"
+url: "https://zerotvm.com"
+version: 0.3.0
+date-released: "2026-08-25"
+keywords:
+  - webgpu
+  - wgsl
+  - llm
+  - phi-3
+  - inference
+  - browser
+  - from-scratch
+  - mlc-llm
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.20838918"
+    description: "Concept DOI (all versions)"

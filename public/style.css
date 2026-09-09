@@ -1,0 +1,141 @@
+/* Shared styles for Zero-TVM chat, WebLLM bench, and related demo pages. */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: #0a0a0a;
+  color: #e0e0e0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+header {
+  padding: 1rem 2rem;
+  background: #111;
+  border-bottom: 1px solid #222;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+header h1 {
+  font-size: 1.2rem;
+  color: #fff;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.back-link {
+  color: #6c63ff;
+  text-decoration: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin-right: 0.5rem;
+  transition: opacity 0.15s;
+}
+
+.back-link:hover { opacity: 0.75; }
+
+.badge {
+  background: #1a472a;
+  color: #4caf50;
+  padding: 0.25rem 0.75rem;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.badge.loading { background: #3a3a00; color: #ffd54f; }
+.badge.error   { background: #4a1a1a; color: #ff7070; }
+
+.stats, #stats {
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: #666;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.log, #log {
+  padding: 0.5rem 2rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.65rem;
+  color: #666;
+  background: #0d0d0d;
+  max-height: 140px;
+  overflow-y: auto;
+  border-bottom: 1px solid #1a1a1a;
+  white-space: pre-wrap;
+}
+
+.chat, #chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem 2rem;
+}
+
+.msg {
+  margin-bottom: 1rem;
+  max-width: 80%;
+  padding: 0.75rem 1rem;
+  border-radius: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  font-size: 0.95rem;
+}
+.msg.user { background: #1a3a5c; margin-left: auto; border-bottom-right-radius: 4px; }
+.msg.ai   { background: #1a1a1a; border-bottom-left-radius: 4px; }
+
+.input-row, #bar {
+  padding: 1rem 2rem;
+  background: #111;
+  border-top: 1px solid #222;
+  display: flex;
+  gap: 0.75rem;
+}
+
+.input-row input, #bar input {
+  flex: 1;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  color: #fff;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  font-size: 1rem;
+  outline: none;
+}
+.input-row input:focus, #bar input:focus { border-color: #1a73e8; }
+.input-row input:disabled, #bar input:disabled { opacity: 0.5; }
+
+.input-row button, #bar button {
+  background: #1a73e8;
+  color: #fff;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  border-radius: 8px;
+  font-size: 1rem;
+  cursor: pointer;
+}
+.input-row button:hover:not(:disabled),
+#bar button:hover:not(:disabled) { background: #1557b0; }
+.input-row button:disabled, #bar button:disabled { background: #333; cursor: not-allowed; }
+
+footer, .note {
+  text-align: center;
+  padding: 0.6rem;
+  font-size: 0.7rem;
+  color: #555;
+  background: #0d0d0d;
+  border-top: 1px solid #1a1a1a;
+}

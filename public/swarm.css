@@ -1,0 +1,74 @@
+/* SWARM — the NO-JS FALLBACK only (index.html #swarm).
+
+   The swarm is a mode of the character-select scene now, not a section under
+   it: landing.ts appends the ⟁ doorway to the sheet's RAM line and mounts the
+   builder inside the sheet, and everything that mode needs lives in
+   landing.css beside the scene it belongs to. The first thing landing.ts does
+   once the scene has rendered is hide #swarm.
+
+   What is left here dresses the section a browser with no JavaScript still
+   gets: the prose, the four explainer cards, the plain share.html link and the
+   full reach paragraph. No component below is used by the scene.
+
+   Its own file rather than more of landing.css so the fallback can be worked
+   on without touching the stylesheet the character screen lives in. */
+
+#swarm { border-top: 1px solid var(--border); }
+
+/* The nav is the only pointer to the swarm from the top of the page, and
+   landing.css hides every nav link but Docs under 720px — because the ones it
+   hides cost gigabytes to follow. This one costs a tap, so it stays. Same
+   specificity as that rule, later in the cascade; the entrance's own layout is
+   deliberately not touched, since it already fills the viewport exactly at
+   1440x900 and one more line under ENTER took it past. */
+@media (max-width: 720px) {
+  .nav .nav-links a[href="#swarm"] { display: inline; }
+}
+
+/* The explainer band. .band styles its cells as `a` — these are not links, so
+   the cell chrome is restated for divs and nothing else changes. Three ideas
+   would leave a hole in the four-column grid; the fourth (peer weight copy) is
+   a real mechanism, not filler. */
+.sw-band > div { background: var(--surface); padding: 22px; }
+
+.sw-builder { margin-top: 28px; }
+
+.sw-reach { max-width: 76ch; margin-top: 28px; }
+.sw-reach b { color: var(--text); font-weight: 500; }
+
+#swarm code {
+  font-family: var(--mono); font-size: 0.92em;
+  color: var(--accent); overflow-wrap: anywhere;
+}
+
+/* An editable stage boundary. An even split is the wrong default for real
+   hardware — a phone cannot hold a sixteenth of a 27B — so every end but the
+   last is a number you set. Sized to the digits so the row still reads as a
+   sentence rather than a form. */
+#models .sw-cut {
+  width: 3.6ch; padding: 1px 3px; margin: 0 1px;
+  background: #0b0d10; color: var(--cs-accent, var(--accent));
+  border: 1px solid #ffffff24; border-radius: 3px;
+  font: inherit; font-variant-numeric: tabular-nums; text-align: center;
+  -moz-appearance: textfield;
+}
+#models .sw-cut::-webkit-outer-spin-button,
+#models .sw-cut::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+#models .sw-cut:focus { outline: 1px solid var(--cs-accent, var(--accent)); outline-offset: 1px; }
+
+/* Context is a room-wide setting, so it sits with the machine count rather
+   than inside any one stage's row. */
+#models .sw-ctx { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+#models .sw-ctx > span:first-child {
+  font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+}
+#models .sw-ctx-in {
+  width: 7ch; padding: 3px 6px; background: #0b0d10;
+  color: var(--cs-accent, var(--accent)); border: 1px solid #ffffff24;
+  border-radius: 3px; font: inherit; font-variant-numeric: tabular-nums; text-align: right;
+  -moz-appearance: textfield;
+}
+#models .sw-ctx-in::-webkit-outer-spin-button,
+#models .sw-ctx-in::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+#models .sw-ctx-unit { font-size: 12px; color: var(--muted); }

@@ -1,0 +1,545 @@
+/* CHAT-UI — the conversational surface shared by zero-tvm.html (chat) and
+ * share.html (remote guest): palette, chat area, message bubbles, streaming
+ * markdown, actions, scroll FAB, composer. Moved VERBATIM out of
+ * zero-tvm.html's inline styles so the two pages cannot drift; the page-
+ * specific chrome (header, welcome, gate, overlay) stays inline per page.
+ * Companion module: src/zero-tvm/chat-ui.ts. */
+
+    /* ALIAS LAYER onto the family tokens (public/tokens.css), which must be
+     * linked BEFORE this file. The chat surface kept its own palette — a green
+     * accent on a different ground — so the instrument and the landing page
+     * looked like two products. Only the names this file does not share with
+     * tokens.css are redefined here; --bg, --border, --text, --accent and
+     * --mono come straight through.
+     *
+     * --muted is the exception and must be restated: this file uses it for the
+     * DIMMEST text, where the token set uses it for mid-tone. Letting the token
+     * value through would brighten every caption on the page. */
+    :root {
+      --panel:       var(--surface);
+      --panel-2:     var(--surface-2);
+      --border-2:    var(--border-hi);
+      --text-dim:    #a9b3c6;
+      --muted:       var(--dim);
+      --accent-2:    var(--accent-hi);
+      --accent-tint: var(--accent-dim);
+      --user-bubble: var(--surface-2);
+      --danger:      var(--err);
+      --radius:      12px;
+      --composer-max: 760px;
+      --msg-max:      760px;
+      --font:        var(--body);
+    }
+
+    /* The browser's default focus ring is blue, which on this palette reads as
+     * a second selected state next to the amber one — in the model picker two
+     * chips looked chosen at once. Shared by the chat page and the rooms guest,
+     * matching landing.css. */
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: var(--radius);
+    }
+
+    /* ─────────── Chat area ─────────── */
+    /* #guest-view was share.html's own flex column and needed flex:1 here or it
+       collapsed to ~56px on an empty room. That view is the entrance's .cs-chat
+       panel now, and landing.css's `.cs-chat .chat-main { flex: 1 }` — written
+       for the same reason — carries it. */
+.chat-main {
+      overflow-y: auto;
+      scroll-behavior: smooth;
+      position: relative;
+    }
+    .chat-main::-webkit-scrollbar { width: 8px; }
+    .chat-main::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+    .chat-main::-webkit-scrollbar-track { background: transparent; }
+
+    .chat-inner {
+      max-width: var(--msg-max);
+      margin: 0 auto;
+      padding: 1.5rem 1rem 2rem;
+    }
+
+
+    /* ─────────── Messages ─────────── */
+    .msg { margin-bottom: 1.75rem; animation: fade-in 0.2s ease; }
+    .msg:last-child { margin-bottom: 0.5rem; }
+    @keyframes fade-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+    .msg.user {
+      display: flex;
+      justify-content: flex-end;
+      gap: 0.5rem;
+    }
+    .msg.user .bubble {
+      max-width: 80%;
+      background: var(--user-bubble);
+      border: 1px solid var(--border);
+      padding: 0.65rem 0.95rem;
+      border-radius: 16px 16px 4px 16px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      line-height: 1.55;
+    }
+
+    .msg.ai .role {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-bottom: 0.45rem;
+      font-weight: 500;
+    }
+    .msg.ai .role .role-name { color: var(--text-dim); }
+    .msg.ai .role .model-tag {
+      margin-left: auto;
+      font-size: 0.65rem;
+      color: var(--muted);
+      padding: 2px 7px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel);
+      font-variant-numeric: tabular-nums;
+    }
+    .msg.ai .role-dot {
+      width: 22px; height: 22px; border-radius: 7px;
+      /* Was a fixed violet, so every model's replies were badged in Phi-3's
+         colours. Both stops come from the model's own lane now. */
+      background: linear-gradient(135deg, var(--accent), var(--accent-hi));
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 0.62rem; font-weight: 800; color: #000;
+      letter-spacing: -0.05em;
+    }
+    /* One still frame of the model's mascot, captured once at boot and reused
+       by every reply. The letter stays as the fallback for browsers that gave
+       us no mascot to capture. */
+    .has-mascot-avatar .msg.ai .role-dot {
+      background: var(--mascot-avatar) center/cover no-repeat,
+                  linear-gradient(135deg, var(--accent), var(--accent-hi));
+      font-size: 0;
+    }
+    .msg.ai .body {
+      color: var(--text);
+      word-wrap: break-word;
+      line-height: 1.65;
+    }
+    .msg.ai .body > *:first-child { margin-top: 0; }
+    .msg.ai .body > *:last-child { margin-bottom: 0; }
+    .msg.ai .body p { margin: 0 0 0.7rem; }
+    .msg.ai .body ul, .msg.ai .body ol {
+      margin: 0 0 0.7rem;
+      padding-left: 1.4rem;
+    }
+    .msg.ai .body li { margin-bottom: 0.25rem; }
+    .msg.ai .body li > p { margin: 0; }
+    .msg.ai .body h1, .msg.ai .body h2, .msg.ai .body h3,
+    .msg.ai .body h4, .msg.ai .body h5, .msg.ai .body h6 {
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      margin: 1rem 0 0.45rem;
+      line-height: 1.3;
+      color: #fff;
+    }
+    .msg.ai .body h1 { font-size: 1.25rem; }
+    .msg.ai .body h2 { font-size: 1.12rem; }
+    .msg.ai .body h3 { font-size: 1.02rem; }
+    .msg.ai .body h4, .msg.ai .body h5, .msg.ai .body h6 { font-size: 0.95rem; }
+    .msg.ai .body code {
+      font-family: var(--mono);
+      font-size: 0.85em;
+      background: var(--panel-2);
+      padding: 1px 5px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .msg.ai .body blockquote {
+      border-left: 3px solid var(--border-2);
+      padding: 0.1rem 0 0.1rem 0.85rem;
+      color: var(--text-dim);
+      margin: 0 0 0.7rem;
+    }
+    .msg.ai .body hr {
+      border: 0;
+      border-top: 1px solid var(--border);
+      margin: 1rem 0;
+    }
+    .msg.ai .body a { color: var(--accent-2); text-decoration: underline; text-underline-offset: 2px; }
+    .msg.ai .body strong { color: #fff; font-weight: 600; }
+
+    /* Fenced code block — top bar with lang pill + copy button */
+    .msg.ai .body .code-block {
+      margin: 0.7rem 0;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .msg.ai .body .code-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.4rem 0.6rem 0.4rem 0.75rem;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--border);
+      font-size: 0.68rem;
+      color: var(--muted);
+    }
+    .msg.ai .body .code-lang {
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 600;
+    }
+    .msg.ai .body .code-copy {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      color: var(--text-dim);
+      font-size: 0.68rem;
+      transition: background 0.15s, color 0.15s;
+    }
+    .msg.ai .body .code-copy:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+    .msg.ai .body .code-copy.copied { color: var(--accent); }
+    .msg.ai .body .code-copy .icon { width: 11px; height: 11px; stroke-width: 2.3; }
+    .msg.ai .body .code-block pre {
+      margin: 0;
+      padding: 0.75rem 0.9rem;
+      overflow-x: auto;
+      background: none;
+      border: none;
+    }
+    .msg.ai .body .code-block pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: 0.82rem;
+      line-height: 1.5;
+      color: var(--text);
+    }
+
+    .msg.ai .cursor {
+      display: inline-block;
+      width: 7px;
+      height: 1.05em;
+      background: var(--accent);
+      margin-left: 2px;
+      vertical-align: text-bottom;
+      border-radius: 1px;
+      animation: blink 1.1s steps(2) infinite;
+      opacity: 0.9;
+    }
+    @keyframes blink { 50% { opacity: 0.1; } }
+
+    /* Thinking indicator — 3 dots that wave while prefill runs */
+    .thinking {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 0;
+    }
+    .thinking span {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--muted);
+      animation: wave 1.2s ease-in-out infinite;
+    }
+    .thinking span:nth-child(2) { animation-delay: 0.15s; }
+    .thinking span:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes wave {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+      30% { transform: translateY(-3px); opacity: 1; }
+    }
+
+    .msg .actions {
+      display: flex;
+      align-items: center;
+      gap: 0.15rem;
+      margin-top: 0.55rem;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    .msg:hover .actions,
+    .msg:focus-within .actions,
+    .msg .actions:focus-within { opacity: 1; }
+    .msg.ai .actions { margin-left: -0.35rem; }
+    .msg.ai .actions .msg-stats {
+      margin-left: auto;
+      font-size: 0.66rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      padding-right: 0.2rem;
+    }
+    .msg.user .actions { justify-content: flex-end; }
+
+    /* Reply cut short (context window full, or the user hit Stop). Unlike
+       .actions this is always visible — a truncated answer must never look
+       like a finished one. */
+    .msg.ai .truncation {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      margin-top: 0.7rem;
+      padding: 0.45rem 0.7rem;
+      border: 1px solid var(--border-2);
+      border-left: 2px solid var(--accent-2);
+      border-radius: 8px;
+      background: var(--panel-2);
+      font-size: 0.72rem;
+      line-height: 1.45;
+      color: var(--text-dim);
+    }
+    .truncation-btn {
+      padding: 3px 11px;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: #000;
+      background: var(--accent);
+    }
+    .truncation-btn:hover { background: var(--accent-2); }
+    .truncation-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .action-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      color: var(--muted);
+      transition: background 0.15s, color 0.15s;
+    }
+    .action-btn:hover { background: var(--panel-2); color: var(--text); }
+    .action-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .action-btn.copied { color: var(--accent); }
+    .action-btn .icon { width: 13px; height: 13px; }
+
+    /* ─────────── Scroll-to-bottom FAB ─────────── */
+    .scroll-fab {
+      position: absolute;
+      bottom: 1rem;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--panel-2);
+      border: 1px solid var(--border-2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-dim);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s, transform 0.2s;
+      z-index: 5;
+    }
+    .scroll-fab.visible { opacity: 1; pointer-events: auto; visibility: visible; }
+    .scroll-fab:hover { background: var(--panel); color: var(--text); }
+
+    /* ─────────── Composer ─────────── */
+    .composer-wrap {
+      padding: 0.75rem 1rem 1rem;
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .composer {
+      max-width: var(--composer-max);
+      margin: 0 auto;
+      display: flex;
+      align-items: flex-end;
+      gap: 0.5rem;
+      background: var(--panel);
+      border: 1px solid var(--border-2);
+      border-radius: 14px;
+      padding: 0.5rem 0.5rem 0.5rem 0.9rem;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    /* A class `display` beats the UA's `[hidden] { display: none }`, so setting
+       the attribute did nothing here: a tab serving one stage of a split holds
+       no chat of its own and hides the composer, and rendered a greyed but fully
+       laid-out one anyway (782x53, checkVisibility() true — measured 2026-09-01).
+       Same guard `.composer-btn[hidden]` already carries one class over. */
+    .composer[hidden] { display: none; }
+    /* border-color used to restate the UNFOCUSED border — a focus style that
+       cancelled itself, leaving a 1.07:1 background shift as the only cue on
+       the product's main control. The accent is the ring every other control
+       already uses. */
+    .composer:focus-within {
+      border-color: var(--accent);
+      background: var(--panel-2);
+    }
+    .composer textarea {
+      flex: 1;
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font: inherit;
+      resize: none;
+      padding: 0.4rem 0;
+      max-height: 200px;
+      line-height: 1.5;
+    }
+    .composer textarea::placeholder { color: var(--muted); }
+    .composer textarea:disabled { cursor: not-allowed; }
+
+    .composer-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      transition: background 0.15s, color 0.15s, opacity 0.15s;
+      flex-shrink: 0;
+    }
+    .composer-btn[hidden] { display: none; }
+    .composer-btn[data-variant="send"] {
+      background: var(--accent);
+      color: #000;
+    }
+    .composer-btn[data-variant="send"]:hover:not(:disabled) { background: var(--accent-2); }
+    .composer-btn[data-variant="send"]:disabled {
+      background: var(--border);
+      color: var(--muted);
+      cursor: not-allowed;
+    }
+    .composer-btn[data-variant="stop"] {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border-2);
+    }
+    .composer-btn[data-variant="stop"]:hover { background: #222228; }
+
+    .composer-hint {
+      max-width: var(--composer-max);
+      margin: 0.4rem auto 0;
+      text-align: center;
+      font-size: 0.68rem;
+      color: var(--muted);
+    }
+    .composer-hint kbd {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: var(--mono);
+      font-size: 0.62rem;
+    }
+
+
+    /* ─────────── The Canvas (model-written code, actually run) ─────────── */
+    /* Run button beside copy; the lang pill pushes both right so the pair
+       stays grouped even though .code-head is space-between. */
+    .msg.ai .body .code-head .code-lang { margin-right: auto; }
+    .msg.ai .body .code-head { gap: 6px; }
+    .msg.ai .body .code-run {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      color: var(--accent);
+      font-size: 0.68rem;
+      font-weight: 600;
+      transition: background 0.15s, color 0.15s;
+    }
+    .msg.ai .body .code-run:hover { background: var(--accent-tint); }
+    .msg.ai .body .code-run .icon { width: 11px; height: 11px; stroke-width: 2.3; }
+
+    #code-canvas {
+      position: fixed;
+      inset: 0;
+      z-index: 120;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4vh 4vw;
+      background: rgba(5, 7, 13, 0.72);
+      backdrop-filter: blur(5px);
+    }
+    .canvas-frame {
+      width: min(940px, 100%);
+      height: min(660px, 100%);
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+      border: 1px solid var(--border-2);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+    }
+    .canvas-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px 8px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.7rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .canvas-close {
+      padding: 3px 9px;
+      border-radius: 6px;
+      color: var(--text-dim);
+      font-size: 0.7rem;
+      transition: background 0.15s, color 0.15s;
+    }
+    .canvas-close:hover { background: var(--panel-2); color: var(--text); }
+    /* The iframe ground is white on purpose: model-written pages assume a
+       default (light) document, and an unstyled preview should look like one. */
+    .canvas-view { flex: 1; width: 100%; border: 0; background: #fff; }
+
+    /* ─────────── Command feedback + reply settle ─────────── */
+    /* A quiet system line in the message column (slash-command feedback) —
+       styled as stage direction, not as a conversation turn. */
+    .sys-note {
+      margin: 0.6rem auto 1rem;
+      max-width: 80%;
+      text-align: center;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+    }
+    /* A finished reply settles with a brief accent wash. */
+    .msg.ai.msg-done { animation: msgDone 0.8s ease; border-radius: 10px; }
+    @keyframes msgDone {
+      0% { background: var(--accent-tint); }
+      100% { background: transparent; }
+    }
+    @media (prefers-reduced-motion: reduce) { .msg.ai.msg-done { animation: none; } }
+
+    /* Reduced motion: the message surface holds still too — instant scroll,
+       no entrance fade, steady cursor and thinking dots (they stay VISIBLE;
+       only the movement goes). */
+    @media (prefers-reduced-motion: reduce) {
+      .chat-main { scroll-behavior: auto; }
+      .msg { animation: none; }
+      .msg.ai .cursor { animation: none; }
+      .thinking span { animation: none; opacity: 0.6; }
+    }
+
+    /* ─── PHONE ───
+       This surface is what share.html's GUEST role is, and it was measured on
+       a real iPhone (2026-08-29): send/stop and the scroll FAB are 34px
+       against a 44px touch floor, and the composer hint rendered at 10.2px
+       with a 9.3px key cap. Floors only — nothing here applies above 480px,
+       so the desktop chat is untouched. */
+    @media (max-width: 480px) {
+      .composer-wrap { padding: 0.6rem 0.75rem 0.75rem; }
+      /* The textarea is the biggest tap target on the page and was 35px.
+         min-height, not padding alone: autoGrow writes an inline height. */
+      .composer textarea { padding: 0.6rem 0; min-height: 44px; }
+      .composer-btn { width: 44px; height: 44px; }
+      .scroll-fab { width: 44px; height: 44px; }
+      .composer-hint { font-size: 14px; }
+      .composer-hint kbd { font-size: 13px; }
+    }
