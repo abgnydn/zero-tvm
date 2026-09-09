@@ -75,7 +75,7 @@ export interface CreateEngineOptions {
    *  windows, +0.10% at 4k, both within noise (docs/TURBOQUANT_PLAN.md).
    *  Runs on the unfused path, on hybrids and through chunked prefill; MLA is
    *  the one exclusion, since it caches a latent rather than per-head K/V and
-   *  buildDecodeEngine throws for it. */
+   *  buildDecodeEngine throws for it. Overrides the parsed variant flag. */
   int8KV?: boolean
   /** Expert slots held per MoE layer instead of all of them — see
    *  DecodeEngineOptions.expertPool. MoE models only; below top-K + 1 the
@@ -313,7 +313,10 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   // Same query string the chat page's URL flags produce, so a native A/B and a
   // browser A/B select kernels through ONE code path. Two resolvers would let
   // an arm measured here be a kernel users never run.
-  const variants = parseVariantFlags(opts.variantQuery ?? '', { hasSubgroupsFeature, sgSizeOk })
+  const variants = {
+    ...parseVariantFlags(opts.variantQuery ?? '', { hasSubgroupsFeature, sgSizeOk }),
+    ...(opts.int8KV !== undefined ? { int8KV: opts.int8KV } : {}),
+  }
 
   report({ stage: 'tokenizer', message: 'Loading tokenizer' })
   const tokenizer = await loadTokenizerFor(spec, (m) => report({ stage: 'tokenizer', message: m }))
@@ -347,9 +350,9 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   // RoPE. buildDecodeEngine owns the one case int8 still cannot cover — MLA —
   // and names it; duplicating a stale rule here is what refused a model the
   // engine supports.
-  const kv = opts.int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
+  const kv = variants.int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
   const engine = buildDecodeEngine(device, weights, kv, {
-    spec, variants, fused, ...(opts.int8KV ? { int8KV: true } : {}), ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
+    spec, variants, fused, ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
     ...(opts.traceMoe ? { traceMoe: true } : {}),
     ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),
     ...(opts.expertSpeculate ? { expertSpeculate: true } : {}),

@@ -139,8 +139,8 @@ const MUTATIONS = [
     defect: 'the engine ignoring the ?kv8 variant flag and defaulting to f16',
     shipped: 'the agent host, both room paths and validate ran f16 while their flags said int8',
     file: 'src/zero-tvm/engine-core.ts',
-    find: '  return opts.int8KV ?? variants.int8KV ?? false',
-    replace: '  return opts.int8KV ?? false',
+    find: '  return variants.int8KV ?? false',
+    replace: '  return false',
   },
   {
     id: 'station-flags',
