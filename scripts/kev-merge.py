@@ -19,7 +19,7 @@ kev-4b (qwen3) and kev-4b (Qwen3.5) keep 20/21 at 4.
 import argparse, json, pathlib, subprocess, sys
 
 import torch
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 from peft import PeftModel
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -106,9 +106,13 @@ if not (out / "model.safetensors.index.json").exists() and not (out / "model.saf
 # Pointer head: q/k Linear(d -> 256) with bias, fp32. Stored next to the
 # quantized checkpoint so the engine fetches it from the same directory.
 hw = {k: v.float().contiguous() for k, v in head["head"].items()}
+# The adapter's commit goes into the sidecar too: `main` and `qwen3` move, and
+# the shipped file is the only place a reader can pin what was merged.
+adapter_sha = HfApi().model_info(args.adapter, revision=args.revision or "main").sha
 save_file(hw, str(out / "kev_head.safetensors"), metadata={
     "scale": str(1 / 16), "temperature": str(head.get("temperature", 1.0)),
-    "adapter": args.adapter + (f"@{args.revision}" if args.revision else ""), "base": base, "base_revision": rev,
+    "adapter": args.adapter + (f"@{args.revision}" if args.revision else ""), "adapter_revision": adapter_sha,
+    "base": base, "base_revision": rev,
 })
 print("head ->", out / "kev_head.safetensors", {k: tuple(v.shape) for k, v in hw.items()})
 print(sorted(p.name for p in out.iterdir()))

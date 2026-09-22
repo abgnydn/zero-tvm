@@ -1,0 +1,24 @@
+# scripts/kev-onnx-vs-ref.mjs (run from ~/dev/open-jev-test) ~/dev/zero-tvm/tests/fixtures/kev-records.json /tmp/ref-kev4b kev-4b q4 — open-jev 0.1.2, onnx-community/kev-4b-ONNX dtype q4 (not the repo's default q4f16), Transformers.js 4.3.0 / onnxruntime-node 1.30.0 on cpu, Apple M2 Max, 2026-09-22T12:04Z; reference = kev's f32 torch forward on the merged kev-4b@qwen3 (docs/kev-parity/refs/kev4b-f32.json)
+onnx: onnx-community/kev-4b-ONNX q4 on cpu
+rec1 q1 onnx 0.980 0.003 0.012 0.005 | f32 0.961 0.004 0.025 0.010 | Δmax 0.019
+rec1 q2 onnx 0.028 0.972 | f32 0.019 0.981 | Δmax 0.009
+rec1 q3 onnx 0.804 0.191 0.004 0.000 0.000 | f32 0.790 0.207 0.003 0.000 0.000 | Δmax 0.015
+rec2 q1 onnx 1.000 0.000 0.000 0.000 0.000 | f32 1.000 0.000 0.000 0.000 0.000 | Δmax 0.000
+rec2 q2 onnx 0.105 0.895 | f32 0.111 0.889 | Δmax 0.006
+rec3 q1 onnx 0.782 0.001 0.001 0.215 0.001 | f32 0.627 0.000 0.000 0.371 0.001 | Δmax 0.156
+rec3 q2 onnx 0.698 0.302 | f32 0.873 0.127 | Δmax 0.174
+rec4 q1 onnx 0.818 0.136 0.020 0.024 0.001 | f32 0.920 0.058 0.007 0.013 0.001 | Δmax 0.102
+rec4 q2 onnx 0.490 0.510 | f32 0.663 0.337 | Δmax 0.173  ARGMAX DIFFERS
+rec5 q1 onnx 0.003 0.376 0.003 0.619 | f32 0.002 0.481 0.002 0.514 | Δmax 0.105
+rec5 q2 onnx 0.001 0.035 0.068 0.897 | f32 0.000 0.014 0.046 0.940 | Δmax 0.043
+rec5 q3 onnx 0.300 0.700 | f32 0.324 0.676 | Δmax 0.024
+rec5 q4 onnx 0.107 0.893 | f32 0.135 0.865 | Δmax 0.028
+rec6 q1 onnx 0.261 0.558 0.174 0.006 0.001 | f32 0.271 0.665 0.063 0.001 0.000 | Δmax 0.111
+rec6 q2 onnx 0.942 0.058 | f32 0.979 0.021 | Δmax 0.037
+rec7 q1 onnx 0.836 0.001 0.000 0.001 0.006 0.156 | f32 0.950 0.000 0.000 0.000 0.002 0.048 | Δmax 0.113
+rec8 q1 onnx 0.000 0.000 0.000 0.761 0.001 0.238 | f32 0.000 0.000 0.000 0.790 0.001 0.209 | Δmax 0.029
+rec9 q1 onnx 0.784 0.216 | f32 0.767 0.233 | Δmax 0.017
+rec9 q2 onnx 0.968 0.032 | f32 0.959 0.041 | Δmax 0.008
+rec9 q3 onnx 0.181 0.379 0.441 | f32 0.085 0.403 0.512 | Δmax 0.095
+rec10 q1 onnx 0.027 0.973 | f32 0.015 0.985 | Δmax 0.012
+ONNX q4 vs torch f32: argmax 20/21, mean|Δp| 0.061, max|Δp| 0.174
