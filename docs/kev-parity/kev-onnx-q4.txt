@@ -1,4 +1,4 @@
-# node kev-records-vs-ref.mjs ~/dev/zero-tvm/tests/fixtures/kev-records.json /tmp/ref-kev kev-0.6b — open-jev 0.1.2, onnx-community/kev-0.6b-ONNX dtype q4 (not the repo's default q4f16), Transformers.js 4.3.0 / onnxruntime-node 1.30.0 on cpu, Apple M2 Max, 2026-09-22T11:27Z; reference = kev's own f32 torch forward on the merged kev-0.6b (scripts/kev-ref.py)
+# scripts/kev-onnx-vs-ref.mjs (run from ~/dev/open-jev-test as `node kev-records-vs-ref.mjs …`, the same file before it was committed with a dtype argument) ~/dev/zero-tvm/tests/fixtures/kev-records.json /tmp/ref-kev kev-0.6b — open-jev 0.1.2, onnx-community/kev-0.6b-ONNX dtype q4 (not the repo's default q4f16), Transformers.js 4.3.0 / onnxruntime-node 1.30.0 on cpu, Apple M2 Max, 2026-09-22T11:27Z; reference = kev's own f32 torch forward on the merged kev-0.6b (scripts/kev-ref.py)
 onnx: onnx-community/kev-0.6b-ONNX q4 on cpu
 rec1 q1 onnx 0.817 0.006 0.053 0.124 | f32 0.925 0.008 0.019 0.047 | Δmax 0.109
 rec1 q2 onnx 0.263 0.737 | f32 0.659 0.341 | Δmax 0.396  ARGMAX DIFFERS
