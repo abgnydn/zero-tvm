@@ -351,25 +351,27 @@ Latency numbers live in BENCH.md.
 
 `?model=kev4bq35` is kev-4b@main — Qwen3.5-4B-Base, the DeltaNet HYBRID, the
 best kev (0.837 OOD on its locked test) and the one no browser runtime served
-before this. A hybrid cannot pack branches (the recurrence would carry one
-branch into the next), so `forwardHiddenPacked` takes the REWIND path there:
-state once, `saveGdnCkpt`, one branch per replay with `restoreGdnCkpt` between,
-and the state left resident for the next call. Exact against plain
+before this. A hybrid packs too, since the second commit:
+`gdn_conv_seq_packed.wgsl` reads the prefix's ring for taps before a branch
+start and `gdn_recur_packed.wgsl` reloads the prefix's state at every branch
+start, neither writing anything — so one chunk carries every branch and
+147 / 313 / 599 / 1488 ms buys 1 / 5 / 10 / 25 questions (BENCH.md). The
+REWIND path (state once, `saveGdnCkpt`, one branch per replay with
+`restoreGdnCkpt` between, state left resident) remains the fallback where
+packing is off (int8 KV, pooled, MoE). Both exact against plain
 `state + branch` rows (`scripts/kev-packed-check.mjs kev4bq35`, max |Δ| 0) and
 21/21 vs mlx_lm (max |Δp| 0.0078). Two things it needed: the merge goes through
 a config-patched sibling dir (`*-mlxsrc`) because mlx_lm's loader does not know
 transformers' `qwen3_5_text`, and kev's delimiters are resolved BY NAME from the
 checkpoint's tokenizer (`resolveKevDelimiters`) — Qwen3.5 renumbered every
 special token for its 248k vocab, and hard-coded Qwen3 ids produced 17/21 with
-"rec 1 ids MISMATCH", not a crash. Cost: ~300 ms per question, no batching;
-a segment-aware `gdn_recur` (reset the state at branch starts inside one chunk)
-is what would pack it.
+"rec 1 ids MISMATCH", not a crash.
 
 Gotchas: `?model=kev*` weights are the LOCAL merges (`.weights-local/`, nothing
 uploaded); the OPFS cache is keyed by spec id, so a re-merge under the same id
 serves the OLD buffers — bump the id. Packed mode needs f16 pages, pure
-attention, no MoE, no pooling; hybrids take the rewind path; anything else
-falls back to branch by branch.
+attention or GDN hybrid, no MoE, no pooling; anything else takes the rewind
+path (hybrid) or branch by branch.
 
 ## Sharing + peer weights (`share.html`, `workers/share-signal/`)
 

@@ -32,6 +32,8 @@ import gatedQkvSplitSrc from './shaders/gated_qkv_split.wgsl?raw'
 import attnGateSrc from './shaders/attn_gate.wgsl?raw'
 import gdnConvSrc from './shaders/gdn_conv.wgsl?raw'
 import gdnConvSeqSrc from './shaders/gdn_conv_seq.wgsl?raw'
+import gdnConvSeqPackedSrc from './shaders/gdn_conv_seq_packed.wgsl?raw'
+import gdnRecurPackedSrc from './shaders/gdn_recur_packed.wgsl?raw'
 import gdnConvCommitSrc from './shaders/gdn_conv_commit.wgsl?raw'
 import gdnGatesSrc from './shaders/gdn_gates.wgsl?raw'
 import gdnRecurSrc from './shaders/gdn_recur.wgsl?raw'
@@ -147,6 +149,11 @@ export interface Pipelines {
   gdnConvCommit: GPUComputePipeline    // chunked-prefill ring commit (last RING raw tokens)
   gdnGates: GPUComputePipeline         // per-v-head exp(g) decay + beta
   gdnRecur: GPUComputePipeline         // gated delta rule recurrence (f32 state)
+  /** Packed-branch twins (record's packed mode on a hybrid): conv taps before a
+   *  branch start read the prefix's ring; the recurrence reloads the prefix's
+   *  state at every branch start and persists nothing. */
+  gdnConvSeqPacked: GPUComputePipeline
+  gdnRecurPacked: GPUComputePipeline
   gdnNormOut: GPUComputePipeline       // per-head gated RMSNorm · silu(z)
   qkvFused: GPUComputePipeline       // decode-path fusion: QKV matmul + RoPE + KV append
   qkvFusedSg: GPUComputePipeline | null  // subgroup variant of qkvFused
@@ -360,6 +367,8 @@ export function compile(
     gdnConvCommit: createPipeline(device, gdnConvCommitSrc, 'gdn_conv_commit'),
     gdnGates: createPipeline(device, gdnGatesSrc, 'gdn_gates'),
     gdnRecur: createPipeline(device, gdnRecurSrc, 'gdn_recur'),
+    gdnConvSeqPacked: createPipeline(device, gdnConvSeqPackedSrc, 'gdn_conv_seq_packed'),
+    gdnRecurPacked: createPipeline(device, gdnRecurPackedSrc, 'gdn_recur_packed'),
     gdnNormOut: createPipeline(device, gdnNormOutSrc, 'gdn_norm_out'),
     qkvFused: createPipeline(device, qkvFusedSrc, 'qkv_fused'),
     qkvFusedSg: subgroups ? createPipeline(device, qkvFusedSgSrc, 'qkv_fused_sg') : null,

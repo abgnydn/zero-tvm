@@ -29,6 +29,11 @@ from `0.1.0`.
   GDN snapshot/rewind path (`forwardHiddenPacked` on hybrids). 21/21 vs
   mlx_lm. Delimiters are now resolved from the checkpoint's tokenizer by
   name; Qwen3.5 renumbers Qwen3's special tokens.
+- Hybrids pack branches now: `gdn_conv_seq_packed.wgsl` and
+  `gdn_recur_packed.wgsl` restart every branch from the prefix's ring and
+  state inside one chunk, nothing persisted — 25 questions on the Qwen3.5
+  Kev-4B go 7634 → 1488 ms. Bit-exact vs per-branch kernels with one-segment
+  negative controls; the snapshot/rewind path stays as the fallback.
 
 
 ## [0.3.0] — 2026-08-25

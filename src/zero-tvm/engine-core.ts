@@ -3395,7 +3395,9 @@ export function buildDecodeEngine(
     // through the chunk, so branch tokens would leak into each other through
     // the recurrence no matter how attention is masked. Branches run one at a
     // time off a SNAPSHOT of the state's recurrent state instead.
-    if (hybrid && GDN_CKPT_SLOTS > 0) return forwardHiddenBranchesRewind(state, branches, total)
+    if (hybrid && !(chunkPrefill && chunkPrefill.packedOK) && GDN_CKPT_SLOTS > 0) {
+      return forwardHiddenBranchesRewind(state, branches, total)
+    }
 
     // 1. The state, through the ordinary path: reuse what is absorbed, prefill
     //    the rest, so pages [0, S_LEN) hold its K/V. Straight from the LCP,
@@ -3404,7 +3406,10 @@ export function buildDecodeEngine(
     //    (measured: 62 ms instead of 32 for one question) for a KV slot that
     //    is already valid.
     {
-      let pos = absorbedValid && prefixReuse ? Math.min(absorbedLcp(state), S_LEN) : 0
+      // A hybrid can reuse the state only when the engine holds EXACTLY it
+      // (its recurrence cannot be partially rewound); otherwise from zero.
+      const lcp = absorbedValid && prefixReuse ? Math.min(absorbedLcp(state), S_LEN) : 0
+      let pos = hybrid ? (lcp === S_LEN && absorbed.length === S_LEN && gdnStatePos === S_LEN ? S_LEN : 0) : lcp
       while (pos < S_LEN) {
         const n = Math.min(cap, S_LEN - pos)
         await chunkPrefill.record(state, pos, n)
@@ -3431,16 +3436,19 @@ export function buildDecodeEngine(
         const ids: number[] = []
         const pos = new Int32Array(n)
         const seg = new Int32Array(n)
+        const segStart = new Int32Array(n)
         const offsets: number[] = []
         group.forEach((bi, gi) => {
-          offsets.push(ids.length)
+          const start = ids.length
+          offsets.push(start)
           for (let t = 0; t < branches[bi].ids.length; t++) {
             pos[ids.length] = S_LEN + t
             seg[ids.length] = gi
+            segStart[ids.length] = start
             ids.push(branches[bi].ids[t])
           }
         })
-        await chunkPrefill.record(ids, 0, n, { pos, seg, stateLen: S_LEN })
+        await chunkPrefill.record(ids, 0, n, { pos, seg, segStart, stateLen: S_LEN })
         const enc = device.createCommandEncoder()
         group.forEach((bi, gi) => {
           for (const p of branches[bi].positions) {
@@ -3830,11 +3838,14 @@ export function buildDecodeEngine(
   interface PackedChunk {
     pos: Int32Array<ArrayBuffer>
     seg: Int32Array<ArrayBuffer>
+    /** chunk index of each token's branch start (the packed GDN conv's tap rule) */
+    segStart: Int32Array<ArrayBuffer>
     stateLen: number
   }
-  // Packed chunks read f16 pages and bind attention only: no int8 twin of the
-  // kernel, no GDN state to keep in step, no pooled expert cut.
-  const packedOK = !int8Mode && !hybrid && !S.moe && !pooling
+  // Packed chunks read f16 pages: no int8 twin of the attention kernel, no
+  // pooled expert cut. Hybrids pack too (gdn_conv_seq_packed / gdn_recur_packed
+  // restart every branch from the prefix's ring and state).
+  const packedOK = !int8Mode && !S.moe && !pooling
 
   interface ChunkPrefill {
     record(promptIds: number[], start: number, seqLen: number, packed?: PackedChunk): void | Promise<void>
@@ -3954,6 +3965,7 @@ export function buildDecodeEngine(
     const CB = {
       inputIds: makeBuf(device, C * 4, 'c.inputIds'),
       seg:      makeBuf(device, C * 4, 'c.seg'),        // packed mode: branch id per token
+      segStart: makeBuf(device, C * 4, 'c.segStart'),   // packed mode: chunk index of the token's branch start
       posMap:   makeBuf(device, C * 4, 'c.posMap'),
       residual: makeBuf(device, C * S.d * 2, 'c.residual'),
       residual2: makeBuf(device, C * S.d * 2, 'c.residual2'),
@@ -4034,6 +4046,9 @@ export function buildDecodeEngine(
       convCommit: uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(CONV_COMMIT_WGS)]),
       gates:  uniformBuf(device, [i32(0), i32(S.gdnProjRows), u32(0)]),
       recur:  uniformBuf(device, [i32(0), u32(S.gdnVHeads)]),
+      // packed mode (hybrid): [state_len, seq_len, qkv_stride, grid] and [seq_len, grid]
+      convPacked: uniformBuf(device, [i32(0), i32(0), i32(S.gdnProjRows), u32(0)]),
+      recurPacked: uniformBuf(device, [i32(0), u32(S.gdnVHeads)]),
       normOut: uniformBuf(device, [i32(0), i32(S.gdnProjRows), u32(0)]),
       silu:   uniformBuf(device, [i32(0), u32(0)]),
       // The MoE block's only per-chunk uniform. Its router, top-k, expert
@@ -4078,6 +4093,9 @@ export function buildDecodeEngine(
       convCommit?: GPUBindGroup
       gates?: GPUBindGroup
       recur?: GPUBindGroup
+      /** Packed-branch twins: ring/state read only, nothing persisted. */
+      convPacked?: GPUBindGroup
+      recurPacked?: GPUBindGroup
       normOut?: GPUBindGroup
       // shared
       oProj: GPUBindGroup
@@ -4159,6 +4177,8 @@ export function buildDecodeEngine(
           convCommit: bg(device, P.gdnConvCommit, [gdnConvState[L]!, CB.gdnProjOut, cU.convCommit]),
           gates: bg(device, P.gdnGates, [CB.gdnGates, abRegion, gw.aLog, gw.dtBias, cU.gates]),
           recur: bg(device, P.gdnRecur, [CB.gdnRecurOut, CB.gdnConvOut, CB.gdnGates, gdnRecurState[L]!, cU.recur]),
+          convPacked: bg(device, P.gdnConvSeqPacked, [CB.gdnConvOut, CB.gdnProjOut, gdnConvState[L]!, gw.convWeight, CB.segStart, cU.convPacked]),
+          recurPacked: bg(device, P.gdnRecurPacked, [CB.gdnRecurOut, CB.gdnConvOut, CB.gdnGates, gdnRecurState[L]!, CB.seg, cU.recurPacked]),
           normOut: bg(device, P.gdnNormOut, [CB.gdnNormed, CB.gdnRecurOut, gw.normGamma, zRegion, cU.normOut]),
           oProj: dynBg(CB.hidden2, CB.gdnNormed, gw.outScales, gw.outWeights, cU.gdnOut, gw.outBiases),
           ...common,
@@ -4212,7 +4232,11 @@ export function buildDecodeEngine(
       device.queue.writeBuffer(CB.posMap, 0, posv)
       if (packed) {
         device.queue.writeBuffer(CB.seg, 0, packed.seg.subarray(0, n))
+        device.queue.writeBuffer(CB.segStart, 0, packed.segStart.subarray(0, n))
         device.queue.writeBuffer(cU.attnSeg, 0, new Int32Array([n, packed.stateLen]))
+        device.queue.writeBuffer(cU.convPacked, 0, new Int32Array([packed.stateLen, n]))
+        device.queue.writeBuffer(cU.convPacked, 12, new Uint32Array([n * GDN_CONV_WGS]))
+        device.queue.writeBuffer(cU.recurPacked, 0, new Int32Array([n]))
       }
       device.queue.writeBuffer(cU.emb, 0, new Int32Array([n, n * D_WGS]))
       device.queue.writeBuffer(cU.norm, 0, new Uint32Array([n]))
@@ -4298,10 +4322,20 @@ export function buildDecodeEngine(
         const blk = cLayers[L]
         if (blk.gdnProj) {
           gemmDispatch(enc, blk.gdnProj, S.gdnProjRows, 'cGdnProj')
-          dispatch(enc, P.gdnConvSeq, blk.conv!, n * GDN_CONV_WGS, 1, 1, 'cGdnConv')
-          dispatch(enc, P.gdnConvCommit, blk.convCommit!, CONV_COMMIT_WGS, 1, 1, 'cGdnConvCommit')
-          dispatch(enc, P.gdnGates, blk.gates!, n, 1, 1, 'cGdnGates')
-          dispatch(enc, P.gdnRecur, blk.recur!, S.gdnVHeads, 1, 1, 'cGdnRecur')
+          if (packed) {
+            // Every branch continues the PREFIX: conv taps before a branch
+            // start read the prefix's ring, the recurrence restarts from the
+            // prefix's state at each branch start, and neither is written —
+            // no commit, no persist.
+            dispatch(enc, P.gdnConvSeqPacked, blk.convPacked!, n * GDN_CONV_WGS, 1, 1, 'cGdnConvPacked')
+            dispatch(enc, P.gdnGates, blk.gates!, n, 1, 1, 'cGdnGates')
+            dispatch(enc, P.gdnRecurPacked, blk.recurPacked!, S.gdnVHeads, 1, 1, 'cGdnRecurPacked')
+          } else {
+            dispatch(enc, P.gdnConvSeq, blk.conv!, n * GDN_CONV_WGS, 1, 1, 'cGdnConv')
+            dispatch(enc, P.gdnConvCommit, blk.convCommit!, CONV_COMMIT_WGS, 1, 1, 'cGdnConvCommit')
+            dispatch(enc, P.gdnGates, blk.gates!, n, 1, 1, 'cGdnGates')
+            dispatch(enc, P.gdnRecur, blk.recur!, S.gdnVHeads, 1, 1, 'cGdnRecur')
+          }
           dispatch(enc, P.gdnNormOut, blk.normOut!, n * S.gdnVHeads, 1, 1, 'cGdnNormOut')
           gemmDispatch(enc, blk.oProj, S.d, 'cGdnOutProj')
         } else {
