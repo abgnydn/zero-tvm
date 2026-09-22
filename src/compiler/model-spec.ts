@@ -1250,8 +1250,9 @@ export const KEV_4B: ModelSpec = makeModelSpec({
 // browser runtime has served it: 24 of the 32 layers are recurrent. Dims are
 // QWEN35_4B's; the layout is the MLX one (mlx_lm's qwen3_5 loader writes
 // `language_model.model.*` even for the text-only base, like the 9B). Served
-// through forwardHiddenPacked's rewind path: state once, snapshot, one branch
-// per replay. The head carries a fitted temperature (T = 2.14) in its sidecar.
+// through forwardHiddenPacked: every branch in one chunk via the packed GDN
+// kernels (gdn_conv_seq_packed / gdn_recur_packed); the snapshot/rewind path
+// is the fallback. The head carries a fitted temperature (T = 2.14) in its sidecar.
 export const KEV_4B_Q35: ModelSpec = makeModelSpec({
   id: 'kev-4b-q35-mlx-4bit',
   d: 2560,
