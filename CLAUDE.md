@@ -310,8 +310,9 @@ silu_mul → down; fused_ffn is symmetric-only).
 Not chat: jaredpalmer/kev is Qwen3 + a LoRA + a POINTER HEAD that answers typed
 questions about one state (TypeSafe's Jev / `/v1/systemone` shape) — one
 probability per option, nothing generated. `src/zero-tvm/kev.ts` ports
-kev/model.py's `encode` and `PointerHead` (the head runs on the CPU: two
-d→256 projections per option); the engine side is `forwardHiddenPacked`:
+kev/model.py's `encode` and `PointerHead` (two d→256 projections, `q` on the
+`<decide>` row and `k` on each option row; evaluated on the CPU); the engine side
+is `forwardHiddenPacked`:
 prefill (or reuse) the state, then run EVERY question branch in ONE chunk with
 `attention_prefill_seg.wgsl` — prefix from the pages, the chunk's own K/V from
 the chunk buffers, causal within a branch, nothing written to the cache. Branch

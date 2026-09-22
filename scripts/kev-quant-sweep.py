@@ -30,6 +30,8 @@ p.add_argument("--kev-src", required=True)
 p.add_argument("--adapter", default="jaredpalmer/kev-0.6b")
 p.add_argument("--revision", default=None)
 p.add_argument("--quick", action="store_true", help="only the pipeline check, 8-bit and 4-bit g64")
+p.add_argument("--shipped", default=None, help="the converted 4-bit/g64 directory: assert the in-memory 4-bit/g64 arm is "
+               "byte-identical to its model.safetensors, so the sweep's number is the shipped file's number")
 args = p.parse_args()
 
 sys.path.insert(0, args.kev_src)
@@ -70,12 +72,33 @@ def fresh():
     return m
 
 
-def arm(name, bits=None, group=64, skip=lambda path, mod: False):
+def assert_shipped(m, shipped):
+    """Every quantized tensor of the in-memory model equals the shipped safetensors, bit for bit."""
+    from mlx.utils import tree_flatten
+    disk = {}
+    for f in sorted(pathlib.Path(shipped).glob("*.safetensors")):
+        if f.name.startswith("kev_head"): continue
+        disk.update(mx.load(str(f)))
+    mem = dict(tree_flatten(m.parameters()))
+    missing = [k for k in disk if k not in mem]
+    differing = [k for k in disk if k in mem and not (mem[k].shape == disk[k].shape and mem[k].dtype == disk[k].dtype
+                                                      and bool(mx.array_equal(mem[k], disk[k])))]
+    # Informational, not an assertion: this sweep quantizes with f32 compute
+    # (set_dtype above), so its scales/biases are f32 while the shipped file's
+    # are f16 — the dtypes differ even when the quantized values agree. The
+    # shipped file's OWN survival number comes from scripts/kev-survival.py
+    # over the committed reference dumps, not from this arm.
+    print(f"shipped check: {len(disk)} tensors on disk, {len(disk) - len(missing) - len(differing)} bit-equal, "
+          f"{len(differing)} differing (dtype or value), {len(missing)} missing from memory", flush=True)
+
+
+def arm(name, bits=None, group=64, skip=lambda path, mod: False, shipped=None):
     m = fresh()
     if bits is not None:
         nn.quantize(m, group_size=group, bits=bits,
                     class_predicate=lambda path, mod: isinstance(mod, (nn.Linear, nn.Embedding)) and not skip(path, mod))
         mx.eval(m.parameters())
+    if shipped: assert_shipped(m, shipped)
     a, n, mean_dp, max_dp = score(m)
     print(f"{name:<44} argmax {a:>2}/{n}  mean|Δp| {mean_dp:.3f}  max|Δp| {max_dp:.3f}", flush=True)
 
@@ -83,11 +106,11 @@ def arm(name, bits=None, group=64, skip=lambda path, mod: False):
 arm("bf16 conversion, f32 compute (pipeline check)")
 arm("8-bit / g64", bits=8)
 if args.quick:
-    arm("4-bit / g64 (what ships)", bits=4)
+    arm("4-bit / g64 (what ships)", bits=4, shipped=args.shipped)
     sys.exit(0)
 arm("6-bit / g64", bits=6)
 arm("4-bit / g32", bits=4, group=32)
-arm("4-bit / g64 (what ships)", bits=4)
+arm("4-bit / g64 (what ships)", bits=4, shipped=args.shipped)
 arm("4-bit / g64, embedding kept", bits=4, skip=lambda p, m: isinstance(m, nn.Embedding))
 arm("4-bit / g64, embedding + lm_head kept", bits=4, skip=lambda p, m: isinstance(m, nn.Embedding) or "lm_head" in p)
 arm("4-bit / g64, embedding + layers 0-1 kept", bits=4,
