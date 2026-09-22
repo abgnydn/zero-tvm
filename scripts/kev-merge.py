@@ -10,9 +10,10 @@ checkpoint plus a small sidecar with the pointer head.
 Also writes <out>/../<name>-merged-bf16 (the un-quantized merge) so the torch
 reference (scripts/kev-ref.py) scores the SAME merged weights.
 
-Which bit width a checkpoint survives is MEASURED, not assumed:
-scripts/kev-quant-sweep.py. kev-0.6b keeps its decisions at 8 bits and loses
-8 of 21 argmaxes at 4 (2026-09-22).
+Which bit width a checkpoint survives is measured per checkpoint by
+scripts/kev-quant-sweep.py against the checkpoint's own f32 forward
+(2026-09-22): kev-0.6b keeps 21/21 argmaxes at 8 bits and 17/21 at 4;
+kev-4b (qwen3) and kev-4b (Qwen3.5) keep 20/21 at 4.
 """
 
 import argparse, json, pathlib, subprocess, sys
