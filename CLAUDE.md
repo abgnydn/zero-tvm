@@ -305,6 +305,72 @@ cards, switcher and branding — `specFromSearch` derives from it. Proof run
 **Paris**."); dense MLX models run the affine FFN chain (gate_up matmul →
 silu_mul → down; fused_ffn is symmetric-only).
 
+## Kev decision models (`?model=kev`, `?model=kev4b`)
+
+Not chat: jaredpalmer/kev is Qwen3 + a LoRA + a POINTER HEAD that answers typed
+questions about one state (TypeSafe's Jev / `/v1/systemone` shape) — one
+probability per option, nothing generated. `src/zero-tvm/kev.ts` ports
+kev/model.py's `encode` and `PointerHead` (the head runs on the CPU: two
+d→256 projections per option); the engine side is `forwardHiddenPacked`:
+prefill (or reuse) the state, then run EVERY question branch in ONE chunk with
+`attention_prefill_seg.wgsl` — prefix from the pages, the chunk's own K/V from
+the chunk buffers, causal within a branch, nothing written to the cache. Branch
+by branch (`forwardHiddenAtMany`) it was ~31 ms per question on the 0.6B flat
+in branch length, dispatch-bound; packed, 25 questions cost 189 ms.
+
+The chain, every step measured against the step before (2026-09-22):
+
+```bash
+# 1. merge + quantize (+ head sidecar). The adapter wraps the BARE backbone:
+#    peft over the CausalLM matches NOTHING and only warns — the script
+#    fails hard on that, because half a day of numbers were once measured
+#    on base Qwen3 + kev's head. --revision MUST match on every script below:
+#    kev-4b@main and kev-4b@qwen3 ship heads of the same shape.
+cd ~/dev/ml-research && uv run --with peft python ~/dev/zero-tvm/scripts/kev-merge.py \
+    --adapter jaredpalmer/kev-4b --revision qwen3 --out ~/dev/zero-tvm/.weights-local/kev-4b-mlx-4bit
+uv run python -m mlx_lm convert --hf-path .weights-local/kev-4b-merged-bf16 --mlx-path .weights-local/kev-4b-mlx-bf16
+# 2. references: kev's own encoder + head over torch f32, and over mlx_lm on the 4-bit file
+uv run python ~/dev/zero-tvm/scripts/kev-ref.py --merged … --records tests/fixtures/kev-records.json --kev-src /tmp/kev --adapter jaredpalmer/kev-4b --revision qwen3 --out /tmp/ref-kev4b
+uv run python ~/dev/zero-tvm/scripts/kev-ref-mlx.py --mlx … --adapter jaredpalmer/kev-4b --revision qwen3 --out /tmp/ref-kev4b-mlx
+# 3. does the checkpoint SURVIVE 4 bits? (in-memory, no engine)
+uv run python ~/dev/zero-tvm/scripts/kev-quant-sweep.py --mlx-bf16 … --ref /tmp/ref-kev4b --adapter jaredpalmer/kev-4b --revision qwen3 --quick
+# 4. engine == mlx_lm on the same 4-bit weights (ids, readout positions, argmax, max |Δp|)
+node --experimental-strip-types scripts/kev-parity.mjs --ref /tmp/ref-kev4b-mlx --model kev4b
+node --experimental-strip-types scripts/kev-bench.mjs kev4b       # latency shapes
+node --experimental-strip-types scripts/openjev-bench.mjs kev-4b  # same shapes, ORT WebGPU, same Chrome
+npm run test:kernels:qwen35    # includes attention_prefill_seg, bit-exact vs branch-by-branch
+```
+
+Measured: engine vs mlx_lm 21/21 argmax on both checkpoints (max |Δp| 0.0019 /
+0.0016). Quantization is per checkpoint, not per recipe: kev-0.6b at 4-bit/g64
+keeps 17/21 argmaxes against its own f32 (8-bit keeps 21/21 — the engine has no
+8-bit dense kernels), kev-4b@qwen3 at 4-bit keeps 20/21 (max |Δp| 0.15), so the
+4B is the one to serve. Nico Martin's ONNX q4 kev-0.6b scores the same 17/21
+against the same reference (`~/dev/open-jev-test/kev-records-vs-ref.mjs`).
+Latency numbers live in BENCH.md.
+
+`?model=kev4bq35` is kev-4b@main — Qwen3.5-4B-Base, the DeltaNet HYBRID, the
+best kev (0.837 OOD on its locked test) and the one no browser runtime served
+before this. A hybrid cannot pack branches (the recurrence would carry one
+branch into the next), so `forwardHiddenPacked` takes the REWIND path there:
+state once, `saveGdnCkpt`, one branch per replay with `restoreGdnCkpt` between,
+and the state left resident for the next call. Exact against plain
+`state + branch` rows (`scripts/kev-packed-check.mjs kev4bq35`, max |Δ| 0) and
+21/21 vs mlx_lm (max |Δp| 0.0078). Two things it needed: the merge goes through
+a config-patched sibling dir (`*-mlxsrc`) because mlx_lm's loader does not know
+transformers' `qwen3_5_text`, and kev's delimiters are resolved BY NAME from the
+checkpoint's tokenizer (`resolveKevDelimiters`) — Qwen3.5 renumbered every
+special token for its 248k vocab, and hard-coded Qwen3 ids produced 17/21 with
+"rec 1 ids MISMATCH", not a crash. Cost: ~300 ms per question, no batching;
+a segment-aware `gdn_recur` (reset the state at branch starts inside one chunk)
+is what would pack it.
+
+Gotchas: `?model=kev*` weights are the LOCAL merges (`.weights-local/`, nothing
+uploaded); the OPFS cache is keyed by spec id, so a re-merge under the same id
+serves the OLD buffers — bump the id. Packed mode needs f16 pages, pure
+attention, no MoE, no pooling; hybrids take the rewind path; anything else
+falls back to branch by branch.
+
 ## Sharing + peer weights (`share.html`, `workers/share-signal/`)
 
 `share.html?model=<param>` hosts the model running in that tab; `share.html#<room>`

@@ -19,6 +19,61 @@ weight files, so it isolates the runtime. **llama.cpp via wllama** is *not*
 same-bytes — it reads GGUF — so it measures runtime and quantization together.
 The two are reported separately and must not be merged into one table.
 
+## Kev decision models vs open-jev / ONNX Runtime WebGPU (2026-09-22, Apple M2 Max 32 GB)
+
+Not tok/s: a decision model answers typed questions about one state with a
+probability per option, so the unit is **milliseconds per call**, measured
+INSIDE the page with `performance.now()` around `decide()`, median of 5 after
+one warm-up. Same machine, same Chrome, same 74-token state, same yes/no
+questions. `scripts/kev-bench.mjs` (engine) and `scripts/openjev-bench.mjs`
+(Nico Martin's open-jev over Transformers.js → ORT WebGPU, its `q4f16` build,
+STOCK Chrome flags — under the harness's experimental flags ORT's
+subgroup-matrix shader fails validation and nothing runs).
+
+Not the same bytes: the engine runs the MLX affine 4-bit/g64 merge produced by
+`scripts/kev-merge.py`, ORT runs the `onnx-community/*-ONNX` q4 export. Both
+were checked against kev's own f32 forward on the same 21 questions
+(`scripts/kev-quant-sweep.py`, `~/dev/open-jev-test/kev-records-vs-ref.mjs`):
+0.6B — 17/21 argmax either way; 4B — 20/21 either way. The engine reproduces
+mlx_lm on its own file at 21/21 (`scripts/kev-parity.mjs`).
+
+| questions per call, state hot | Kev-0.6B engine | Kev-0.6B ORT | Kev-4B engine | Kev-4B ORT |
+|---|---|---|---|---|
+| 1 | **33 ms** | 79 ms | **147 ms** | 308 ms |
+| 5 | **52 ms** | 97 ms | **290 ms** | 496 ms |
+| 10 | **89 ms** | 132 ms | **541 ms** | 713 ms |
+| 25 | **189 ms** | 273 ms | **1180 ms** | 1517 ms |
+| cold state, 4 questions | **81 ms** | 98 ms | **430 ms** | 498 ms |
+| hot state, one NEW question | **32 ms** | 79 ms | **145 ms** | 308 ms |
+
+The last row is the design difference, not a kernel difference: the engine
+keeps the state's K/V resident and prefills only the new branch; ORT's graph
+takes `input_ids` and re-reads the state every call.
+
+**Kev-4B on Qwen3.5 (`?model=kev4bq35`, the DeltaNet hybrid, kev-4b@main)** has
+no ORT column: no ONNX export of it exists — the reason it is here. Rewind
+path (state once, GDN snapshot, one branch per replay), machine idle:
+
+| questions per call, state hot | Kev-4B Qwen3.5 engine |
+|---|---|
+| 1 / 5 / 10 / 25 | 305 / 1536 / 3433 / 7634 ms (~305 ms per question, no batching) |
+| cold state, 4 questions | 1272 ms |
+| hot state, one NEW question | 313 ms |
+
+Fidelity: 21/21 vs mlx_lm on the same 4-bit file (max |Δp| 0.0078); the 4-bit
+file keeps 20/21 against the checkpoint's own f32 forward (max |Δp| 0.168),
+8-bit 21/21. A hybrid cannot share a chunk across branches — the recurrence
+would carry branch k into branch k+1 — so every question is one dispatch-bound
+pass; a segment-aware `gdn_recur` that reloads the snapshot at each branch
+start inside one chunk is the missing kernel.
+
+How the engine got there, on the 0.6B (same shapes): branch by branch
+(`forwardHiddenAtMany`, one chunk pass per question) was 32 / 155 / 309 / 764 ms
+for 1 / 5 / 10 / 25 — ~31 ms per question flat in branch length, i.e. the pass
+is dispatch-bound at a dozen tokens. One readback for all branches changed
+nothing (31 ms/question). Packing every branch into ONE chunk with
+`attention_prefill_seg.wgsl` (`forwardHiddenPacked`) is the whole gain.
+
 ## Qwen3.6-35B-A3B MoE (2026-08-05) — no baseline exists
 
 **This model has no A/B column.** WebLLM ships zero Qwen3.6 builds, so the
