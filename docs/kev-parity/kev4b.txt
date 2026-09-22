@@ -1,0 +1,47 @@
+# scripts/kev-parity.mjs --ref /tmp/ref-kev4b-mlx --model kev4b — 2026-09-22T11:07Z, commit 66dbda8, Apple M2 Max
+ref: /Users/ahmetbarisgunaydin/dev/zero-tvm/.weights-local/kev-4b-mlx-4bit | head T=1 | kev@90990a5f | 10 records
+PASS  rec 1 ids              3 rows, state 22 tok
+PASS  rec 1 readout          decide/opts equal
+      q1 engine 0.976 0.004 0.015 0.005 | ref 0.976 0.004 0.014 0.005 | Δmax 0.0001
+      q2 engine 0.035 0.965 | ref 0.035 0.965 | Δmax 0.0002
+      q3 engine 0.792 0.204 0.004 0.000 0.000 | ref 0.792 0.204 0.004 0.000 0.000 | Δmax 0.0004
+PASS  rec 2 ids              2 rows, state 11 tok
+PASS  rec 2 readout          decide/opts equal
+      q1 engine 1.000 0.000 0.000 0.000 0.000 | ref 1.000 0.000 0.000 0.000 0.000 | Δmax 0.0000
+      q2 engine 0.060 0.940 | ref 0.060 0.940 | Δmax 0.0002
+PASS  rec 3 ids              2 rows, state 11 tok
+PASS  rec 3 readout          decide/opts equal
+      q1 engine 0.481 0.000 0.001 0.517 0.001 | ref 0.481 0.000 0.001 0.517 0.001 | Δmax 0.0005
+      q2 engine 0.757 0.243 | ref 0.756 0.244 | Δmax 0.0005
+PASS  rec 4 ids              2 rows, state 12 tok
+PASS  rec 4 readout          decide/opts equal
+      q1 engine 0.806 0.149 0.017 0.026 0.001 | ref 0.806 0.150 0.017 0.026 0.001 | Δmax 0.0003
+      q2 engine 0.631 0.369 | ref 0.631 0.369 | Δmax 0.0003
+PASS  rec 5 ids              4 rows, state 74 tok
+PASS  rec 5 readout          decide/opts equal
+      q1 engine 0.002 0.383 0.002 0.613 | ref 0.002 0.384 0.002 0.613 | Δmax 0.0004
+      q2 engine 0.001 0.017 0.035 0.947 | ref 0.001 0.018 0.035 0.947 | Δmax 0.0001
+      q3 engine 0.376 0.624 | ref 0.377 0.623 | Δmax 0.0007
+      q4 engine 0.157 0.843 | ref 0.157 0.843 | Δmax 0.0001
+PASS  rec 6 ids              2 rows, state 19 tok
+PASS  rec 6 readout          decide/opts equal
+      q1 engine 0.360 0.609 0.030 0.001 0.000 | ref 0.361 0.609 0.029 0.001 0.000 | Δmax 0.0008
+      q2 engine 0.986 0.014 | ref 0.986 0.014 | Δmax 0.0001
+PASS  rec 7 ids              1 rows, state 8 tok
+PASS  rec 7 readout          decide/opts equal
+      q1 engine 0.870 0.001 0.000 0.001 0.003 0.126 | ref 0.869 0.001 0.000 0.001 0.003 0.126 | Δmax 0.0003
+PASS  rec 8 ids              1 rows, state 9 tok
+PASS  rec 8 readout          decide/opts equal
+      q1 engine 0.000 0.000 0.000 0.694 0.001 0.304 | ref 0.000 0.000 0.000 0.694 0.001 0.304 | Δmax 0.0005
+PASS  rec 9 ids              3 rows, state 182 tok
+PASS  rec 9 readout          decide/opts equal
+      q1 engine 0.862 0.138 | ref 0.860 0.140 | Δmax 0.0016
+      q2 engine 0.986 0.014 | ref 0.986 0.014 | Δmax 0.0001
+      q3 engine 0.058 0.444 0.498 | ref 0.059 0.444 0.497 | Δmax 0.0007
+PASS  rec 10 ids             1 rows, state 43 tok
+PASS  rec 10 readout         decide/opts equal
+      q1 engine 0.016 0.984 | ref 0.016 0.984 | Δmax 0.0000
+PASS  argmax                 21/21 questions agree
+PASS  max |Δp|               0.0016 (tol 0.05)
+21 questions in 9.2s incl. page evaluate overhead
+kev parity: engine decides what kev decides
