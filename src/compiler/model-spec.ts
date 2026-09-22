@@ -1180,6 +1180,109 @@ export const QWEN3_EMBEDDING_06B: ModelSpec = makeModelSpec({
   paramNaming: mlxParamNaming(""),
 })
 
+// KEV-0.6B (jaredpalmer/kev-0.6b): Qwen3-0.6B-Base with a LoRA merged in and a
+// pointer head on the side — a typed-DECISION model, not a chat model. Same
+// backbone dims as the embedding spec above; only the vocab differs (the base
+// model's 151936, no trimmed rows). It is served through forwardHiddenAt: the
+// engine reads post-final-norm hidden rows at the option / <decide> tokens and
+// kev.ts applies the head on the CPU. The lm_head is never dispatched for a
+// decision, which is what `embeddingOnly` records. Weights are the merge
+// produced by scripts/kev-merge.py (MLX affine 4-bit, group 64) plus
+// kev_head.safetensors in the same directory.
+export const KEV_06B: ModelSpec = makeModelSpec({
+  id: 'kev-0-6b-mlx-4bit-r2',
+  d: 1024,
+  layers: 28,
+  heads: 16,
+  kvHeads: 8,
+  headDim: 128,
+  ffn: 3072,
+  vocab: 151936,
+  pageSize: 16,
+  maxPages: 512,
+  maxSeq: 32768,
+  ropeTheta: 1000000,
+  rmsEps: 0.000001,
+  tiedEmbeddings: true,
+  qkNorm: true,
+  stops: [151643],
+  chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'abgnydn/kev-0.6b-mlx-4bit',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  embeddingOnly: true,
+  paramNaming: mlxParamNaming(""),
+})
+
+// KEV-4B, Qwen3 generation (jaredpalmer/kev-4b@qwen3): Qwen3-4B-Base with the
+// LoRA merged in — QWEN3_4B_MLX's dims exactly. Same serving path as KEV_06B.
+// Where the 0.6B loses its decisions at 4 bits (scripts/kev-quant-sweep.py),
+// this backbone is the one the sweep is run on before the checkpoint ships.
+export const KEV_4B: ModelSpec = makeModelSpec({
+  id: 'kev-4b-mlx-4bit',
+  d: 2560,
+  layers: 36,
+  heads: 32,
+  kvHeads: 8,
+  headDim: 128,
+  ffn: 9728,
+  vocab: 151936,
+  pageSize: 16,
+  maxPages: 448,
+  maxSeq: 40960,
+  ropeTheta: 1000000,
+  rmsEps: 0.000001,
+  tiedEmbeddings: true,
+  qkNorm: true,
+  stops: [151645, 151643],
+  chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'abgnydn/kev-4b-mlx-4bit',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  embeddingOnly: true,
+  paramNaming: mlxParamNaming(""),
+})
+
+// KEV-4B on Qwen3.5-4B-Base (jaredpalmer/kev-4b@main): the best kev — 0.837
+// out-of-domain on its locked test — and a DeltaNet HYBRID, which is why no
+// browser runtime has served it: 24 of the 32 layers are recurrent. Dims are
+// QWEN35_4B's; the layout is the MLX one (mlx_lm's qwen3_5 loader writes
+// `language_model.model.*` even for the text-only base, like the 9B). Served
+// through forwardHiddenPacked's rewind path: state once, snapshot, one branch
+// per replay. The head carries a fitted temperature (T = 2.14) in its sidecar.
+export const KEV_4B_Q35: ModelSpec = makeModelSpec({
+  id: 'kev-4b-q35-mlx-4bit',
+  d: 2560,
+  layers: 32,
+  heads: 16,
+  kvHeads: 4,
+  headDim: 256,
+  ffn: 9216,
+  vocab: 248320,
+  pageSize: 16,
+  maxPages: 2048,
+  maxSeq: 262144,
+  ropeTheta: 10000000,
+  rmsEps: 0.000001,
+  tiedEmbeddings: true,
+  qkNorm: true,
+  stops: [248046, 248044],
+  chatTemplateId: 'chatml-q35',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'abgnydn/kev-4b-q35-mlx-4bit',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  mlxPrefix: 'language_model.',
+  fullAttnInterval: 4,
+  gdn: { kHeads: 16, vHeads: 32, headK: 128, headV: 128, convK: 4 },
+  attnGate: true,
+  partialRotaryFactor: 0.25,
+  embeddingOnly: true,
+  paramNaming: mlxParamNaming("language_model."),
+})
+
 
 // mlx-community/DeepSeek-V2-Lite-Chat-4bit-mlx — hand-written, because the
 // checker still refuses MLA and add-model may not generate what cannot run.

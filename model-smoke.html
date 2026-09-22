@@ -254,6 +254,59 @@ try{
   // Embedding models stop one dispatch earlier: the pooled, L2-normalised
   // hidden state instead of logits. scripts/embed-ref.py is the reference.
   window.__embed = async (ids) => Array.from(await engine.forwardEmbedding(ids))
+  // Post-final-norm rows at arbitrary positions — the decision-model primitive.
+  window.__hiddenAt = async (ids, positions) => (await engine.forwardHiddenAt(ids, positions)).map((v) => Array.from(v))
+  // Decision models (?model=kev): kev.ts over forwardHiddenAt. Tokenizer and
+  // pointer head load on first use, from the same directory as the weights.
+  // __kevRecord takes kev's INTERNAL record (tests/fixtures/kev-records.json)
+  // and returns rows + probabilities, which scripts/kev-parity.mjs diffs
+  // against scripts/kev-ref.py; __kevDecide is the TypeSafe-shaped call.
+  let kevP = null
+  const kev = () => (kevP ??= (async () => {
+    const { loadTokenizerFor } = await import('/src/zero-tvm/model-select.ts')
+    const { resolveModelBase } = await import('/src/zero-tvm/weight-loader.ts')
+    const { createKev, loadKevHead } = await import('/src/zero-tvm/kev.ts')
+    const tok = await loadTokenizerFor(S, say)
+    const head = await loadKevHead(await resolveModelBase(S))
+    say(`kev head: dp ${head.dp}, T ${head.temperature}`)
+    return createKev(engine, tok, head)
+  })())
+  window.__kevRecord = async (rec) => {
+    const r = await (await kev()).decideRecord(rec)
+    return { state: r.state, rows: r.rows, probs: r.probs }
+  }
+  window.__kevDecide = async (state, questions) => (await kev()).decide(state, questions)
+  // Bisection for forwardHiddenAt: the same rows from (a) the resident engine
+  // (prefix reuse in play), (b) a FRESH engine with chunked prefill, (c) a
+  // fresh engine per-token. Fresh engines start from an empty absorbed record,
+  // so (b) vs (a) isolates reuse and (c) vs (b) isolates the chunk path.
+  // forwardHiddenPacked (packed chunk on attention specs, GDN rewind on
+  // hybrids) against a FRESH engine's plain `state + branch` rows: the two
+  // must agree for every branch, and a second call on the same state must
+  // agree again (the resident-state path).
+  window.__packedCheck = async (state, branches) => {
+    const flat = (rows) => rows.map((r) => r.map((v) => Array.from(v)))
+    const packed1 = flat(await engine.forwardHiddenPacked(state, branches))
+    const packed2 = flat(await engine.forwardHiddenPacked(state, branches))
+    const kv = allocKVPages(dev, S)
+    const e = buildDecodeEngine(dev, weights, kv, { spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' } })
+    let plain
+    try {
+      plain = flat(await e.forwardHiddenAtMany(branches.map((b) => ({ ids: [...state, ...b.ids], positions: b.positions.map((p) => p + state.length) }))))
+    } finally { e.destroy(); for (const b of kv) b.destroy() }
+    return { packed1, packed2, plain, reuse: engine.getLastPrefill() }
+  }
+  window.__hiddenAtCheck = async (ids, positions) => {
+    const rows = (e) => e.forwardHiddenAt(ids, positions).then((r) => r.map((v) => Array.from(v)))
+    const fresh = async (chunkedPrefill) => {
+      const kv = allocKVPages(dev, S)
+      const e = buildDecodeEngine(dev, weights, kv, {
+        spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }, chunkedPrefill,
+      })
+      try { return await rows(e) } finally { e.destroy(); for (const b of kv) b.destroy() }
+    }
+    return { resident: await rows(engine), freshChunked: await fresh(true), freshPerToken: await fresh(false) }
+  }
   // Timed pipelined generate — the chat path with instrumentation. TTFT is
   // wall-clock to the FIRST onToken callback, which includes prefill; decode
   // rate is the remaining tokens over the remaining time.

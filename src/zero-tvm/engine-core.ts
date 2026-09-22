@@ -388,6 +388,29 @@ export interface DecodeEngine {
    */
   forwardEmbedding(promptIds: number[]): Promise<Float32Array>
   /**
+   * Prefill `promptIds` (reusing whatever prefix the cache already holds) and
+   * return the post-final-norm f32 hidden row — HF's `last_hidden_state` — at
+   * each of `positions`, in the order given. Not normalised: the caller owns
+   * whatever head reads them. Every requested position is recomputed in this
+   * call, even one the prefix reuse would otherwise skip.
+   *
+   * The decision-model primitive (kev.ts): the state is prefilled once, each
+   * question branch is appended to it, its option / <decide> rows are read,
+   * and the next branch overwrites its KV slots — exact isolation with no
+   * mask, because a branch never sees another branch's tokens.
+   */
+  forwardHiddenAt(promptIds: number[], positions: number[]): Promise<Float32Array[]>
+  /** forwardHiddenAt over several prompts, run in order, with ONE readback at
+   *  the end — rows sharing a prefix (a decision model's question branches)
+   *  pay one GPU drain instead of one each. */
+  forwardHiddenAtMany(prompts: Array<{ ids: number[]; positions: number[] }>): Promise<Float32Array[][]>
+  /** Hidden rows for several BRANCHES of one state, all branches packed into
+   *  one chunk (attention_prefill_seg): the same rows forwardHiddenAtMany
+   *  returns for `state + branch_k`, at one pass instead of one per branch.
+   *  `positions` are branch-local. Falls back to the sequential path where
+   *  the engine cannot pack. */
+  forwardHiddenPacked(state: number[], branches: Array<{ ids: number[]; positions: number[] }>): Promise<Float32Array[][]>
+  /**
    * One token through ONE pipeline stage (see DecodeEngineOptions.layerRange).
    * First stage: token id in, residual out. Last: residual in, token out.
    * A whole-model engine accepts a token id and returns the token, which is
@@ -3220,6 +3243,339 @@ export function buildDecodeEngine(
   }
 
   /**
+   * Post-final-norm hidden rows at `positions` after prefilling `promptIds`.
+   *
+   * Prefix reuse applies exactly as it does to a chat turn: the run starts at
+   * the longest prefix the absorbed record already holds — but never above the
+   * first requested position, because a row is only readable in the pass that
+   * computes it. A branch that is byte-identical to the previous one is
+   * therefore recomputed from its first option token rather than served from
+   * the cache, which holds KV, not hidden states.
+   *
+   * Chunked where the engine can chunk (every token, the last one included —
+   * there is no argmax to read here, so nothing forces a per-token tail), else
+   * the per-token path with B.hidden1 copied out after each requested step.
+   * The copy is queued right after the pass that wrote it and before the next
+   * pass is recorded, so queue order alone guarantees it reads the right rows.
+   */
+  async function forwardHiddenAt(promptIds: number[], positions: number[]): Promise<Float32Array[]> {
+    return (await forwardHiddenAtMany([{ ids: promptIds, positions }]))[0]
+  }
+
+  /**
+   * forwardHiddenAt over several prompts with ONE readback. The prompts run in
+   * order, each reusing whatever prefix the previous one left absorbed — the
+   * decision model's rows all share a state, so row k+1 prefills only its own
+   * branch — and every requested row is copied into one staging buffer as
+   * soon as the pass that wrote it is recorded. The single mapAsync at the end
+   * is the point: per-row readbacks cost a full GPU drain each (measured
+   * ~32 ms per question on kev-0.6b, flat in the question count).
+   */
+  async function forwardHiddenAtMany(
+    prompts: Array<{ ids: number[]; positions: number[] }>,
+  ): Promise<Float32Array[][]> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    let total = 0
+    for (const { ids, positions } of prompts) {
+      if (ids.length === 0) throw new Error('forwardHiddenAt: empty prompt')
+      if (ids.length > MAX_CONTEXT) {
+        throw new Error(`forwardHiddenAt: ${ids.length} tokens exceeds the ${MAX_CONTEXT}-token context`)
+      }
+      for (const p of positions) {
+        if (!Number.isInteger(p) || p < 0 || p >= ids.length) {
+          throw new Error(`forwardHiddenAt: position ${p} outside the ${ids.length}-token prompt`)
+        }
+      }
+      total += positions.length
+    }
+    if (total === 0) return prompts.map(() => [])
+
+    // One staging buffer for every requested row of every prompt; prompt k's
+    // rows occupy slots [base_k, base_k + positions.length).
+    const rowBytes = S.d * 2
+    const readBuf2 = device.createBuffer({
+      size: total * rowBytes,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'hiddenAtReadback',
+    })
+    try {
+      let base = 0
+      for (const { ids, positions } of prompts) {
+        if (positions.length === 0) continue
+        const first = Math.min(...positions)
+        const startPos = Math.min(computeReuseStart(ids), first)
+        const end = ids.length
+        // Requested rows that fall in [lo, hi) — copied out of `src`, whose
+        // row 0 is prompt position `lo`. Queued right after the pass that
+        // wrote them and before the next pass is recorded, so queue order
+        // alone guarantees it reads the right rows.
+        const copyRows = (src: GPUBuffer, lo: number, hi: number): void => {
+          const enc = device.createCommandEncoder()
+          let any = false
+          positions.forEach((p, i) => {
+            if (p < lo || p >= hi) return
+            enc.copyBufferToBuffer(src, (p - lo) * rowBytes, readBuf2, (base + i) * rowBytes, rowBytes)
+            any = true
+          })
+          if (any) device.queue.submit([enc.finish()])
+        }
+        let pos = startPos
+        if (chunkPrefill) {
+          while (pos < end) {
+            const n = Math.min(chunkPrefill.cap, end - pos)
+            await chunkPrefill.record(ids, pos, n)
+            copyRows(chunkPrefill.hidden1, pos, pos + n)
+            pos += n
+          }
+        } else {
+          for (; pos < end; pos++) {
+            submitStep(ids[pos], pos, false)
+            copyRows(B.hidden1, pos, pos + 1)
+          }
+        }
+        base += positions.length
+      }
+
+      await readBuf2.mapAsync(GPUMapMode.READ)
+      const half = new Uint16Array(readBuf2.getMappedRange().slice(0))
+      readBuf2.unmap()
+      let slot = 0
+      return prompts.map(({ positions }) => positions.map(() => {
+        const out = new Float32Array(S.d)
+        const off = slot++ * S.d
+        for (let j = 0; j < S.d; j++) out[j] = halfToF32(half[off + j])
+        return out
+      }))
+    } finally {
+      readBuf2.destroy()
+    }
+  }
+
+  /**
+   * Hidden rows for several BRANCHES of one state, the branches packed into as
+   * few chunks as fit: the state is prefilled (or reused) once, then every
+   * branch rides the same GEMMs. Positions continue from the state for every
+   * branch, exactly as running `state + branch` alone would place them, and
+   * attention_prefill_seg keeps each branch blind to the others — so the rows
+   * equal forwardHiddenAtMany's over `state + branch_k`, at one pass instead
+   * of one per branch. `positions` are branch-local.
+   *
+   * Falls back to the branch-by-branch path when the engine cannot pack
+   * (int8 KV, hybrid, MoE, pooled, no chunk path) or a branch alone exceeds
+   * the chunk capacity.
+   */
+  async function forwardHiddenPacked(
+    state: number[],
+    branches: Array<{ ids: number[]; positions: number[] }>,
+  ): Promise<Float32Array[][]> {
+    if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    if (state.length === 0) throw new Error('forwardHiddenPacked: empty state')
+    const S_LEN = state.length
+    const sequential = () => forwardHiddenAtMany(branches.map((b) => ({
+      ids: [...state, ...b.ids], positions: b.positions.map((p) => p + S_LEN),
+    })))
+    if (!chunkPrefill || !chunkPrefill.packedOK) return sequential()
+    const cap = chunkPrefill.cap
+    let total = 0
+    for (const b of branches) {
+      if (b.ids.length === 0) throw new Error('forwardHiddenPacked: empty branch')
+      if (S_LEN + b.ids.length > MAX_CONTEXT) {
+        throw new Error(`forwardHiddenPacked: ${S_LEN + b.ids.length} tokens exceeds the ${MAX_CONTEXT}-token context`)
+      }
+      for (const p of b.positions) {
+        if (!Number.isInteger(p) || p < 0 || p >= b.ids.length) {
+          throw new Error(`forwardHiddenPacked: position ${p} outside the ${b.ids.length}-token branch`)
+        }
+      }
+      if (b.ids.length > cap) return sequential()
+      total += b.positions.length
+    }
+    if (total === 0) return branches.map(() => [])
+    // A hybrid cannot pack: its DeltaNet layers carry a recurrent state
+    // through the chunk, so branch tokens would leak into each other through
+    // the recurrence no matter how attention is masked. Branches run one at a
+    // time off a SNAPSHOT of the state's recurrent state instead.
+    if (hybrid && GDN_CKPT_SLOTS > 0) return forwardHiddenBranchesRewind(state, branches, total)
+
+    // 1. The state, through the ordinary path: reuse what is absorbed, prefill
+    //    the rest, so pages [0, S_LEN) hold its K/V. Straight from the LCP,
+    //    not reuseStart: that rule re-runs the final token because a chat turn
+    //    needs its argmax, and here a hot state would pay a whole extra pass
+    //    (measured: 62 ms instead of 32 for one question) for a KV slot that
+    //    is already valid.
+    {
+      let pos = absorbedValid && prefixReuse ? Math.min(absorbedLcp(state), S_LEN) : 0
+      while (pos < S_LEN) {
+        const n = Math.min(cap, S_LEN - pos)
+        await chunkPrefill.record(state, pos, n)
+        pos += n
+      }
+    }
+
+    // 2. Branches, packed greedily in order; a branch never straddles chunks.
+    const rowBytes = S.d * 2
+    const readBuf2 = device.createBuffer({
+      size: total * rowBytes,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'hiddenPackedReadback',
+    })
+    try {
+      let slot = 0   // staging slot in caller order (branch by branch)
+      let k = 0
+      while (k < branches.length) {
+        const group: number[] = []
+        let n = 0
+        while (k < branches.length && n + branches[k].ids.length <= cap) {
+          group.push(k); n += branches[k].ids.length; k++
+        }
+        const ids: number[] = []
+        const pos = new Int32Array(n)
+        const seg = new Int32Array(n)
+        const offsets: number[] = []
+        group.forEach((bi, gi) => {
+          offsets.push(ids.length)
+          for (let t = 0; t < branches[bi].ids.length; t++) {
+            pos[ids.length] = S_LEN + t
+            seg[ids.length] = gi
+            ids.push(branches[bi].ids[t])
+          }
+        })
+        await chunkPrefill.record(ids, 0, n, { pos, seg, stateLen: S_LEN })
+        const enc = device.createCommandEncoder()
+        group.forEach((bi, gi) => {
+          for (const p of branches[bi].positions) {
+            enc.copyBufferToBuffer(chunkPrefill.hidden1, (offsets[gi] + p) * rowBytes, readBuf2, slot * rowBytes, rowBytes)
+            slot++
+          }
+        })
+        device.queue.submit([enc.finish()])
+      }
+
+      await readBuf2.mapAsync(GPUMapMode.READ)
+      const half = new Uint16Array(readBuf2.getMappedRange().slice(0))
+      readBuf2.unmap()
+      let s = 0
+      return branches.map(({ positions }) => positions.map(() => {
+        const out = new Float32Array(S.d)
+        const off = s++ * S.d
+        for (let j = 0; j < S.d; j++) out[j] = halfToF32(half[off + j])
+        return out
+      }))
+    } finally {
+      readBuf2.destroy()
+    }
+  }
+
+  /**
+   * forwardHiddenPacked for a HYBRID (GDN) spec: the state is prefilled once
+   * and its recurrent state snapshotted; every branch then runs as an ordinary
+   * causal continuation of the state, and the snapshot is restored before the
+   * next one — exactly the cross-turn rewind generatePipelined performs, once
+   * per branch. Branch k's tokens sit at positions [S, S+len) like every other
+   * path, and its KV slots and recurrent state are overwritten by branch k+1.
+   *
+   * On return the engine holds the STATE alone (snapshot restored, record
+   * truncated), so a further call on the same state reuses it — the hybrid
+   * reuse rule demands the record extend exactly, which this arranges.
+   *
+   * The per-branch pass is the same dispatch-bound pass forwardHiddenAtMany
+   * pays; what this saves is re-reading the state per branch (a full
+   * re-prefill from zero, since a hybrid cannot partially reuse).
+   */
+  async function forwardHiddenBranchesRewind(
+    state: number[],
+    branches: Array<{ ids: number[]; positions: number[] }>,
+    total: number,
+  ): Promise<Float32Array[][]> {
+    const S_LEN = state.length
+    const run = async (ids: number[], from: number): Promise<void> => {
+      // The chunk path where it exists, the per-token path otherwise — both
+      // advance gdnStatePos and the absorbed record.
+      let pos = from
+      if (chunkPrefill) {
+        while (pos < ids.length) {
+          const n = Math.min(chunkPrefill.cap, ids.length - pos)
+          await chunkPrefill.record(ids, pos, n)
+          pos += n
+        }
+      } else {
+        for (; pos < ids.length; pos++) submitStep(ids[pos], pos, false)
+      }
+    }
+    // 1. The state: reusable only when the engine holds EXACTLY it (the hybrid
+    //    rule); anything else is a prefill from zero, which re-zeroes the
+    //    recurrent state at position 0.
+    const resident = absorbedValid && prefixReuse && gdnStatePos === S_LEN
+      && absorbed.length === S_LEN && absorbedLcp(state) === S_LEN
+    if (!resident) await run(state, 0)
+    saveGdnCkpt(S_LEN)
+    const slot = (gdnCkptNext - 1 + GDN_CKPT_SLOTS) % GDN_CKPT_SLOTS
+    const rewind = (): void => {
+      if (!restoreGdnCkpt(slot)) throw new Error('forwardHiddenBranchesRewind: the snapshot ring is empty')
+      gdnStatePos = S_LEN
+      absorbed.length = S_LEN
+    }
+
+    const rowBytes = S.d * 2
+    const readBuf2 = device.createBuffer({
+      size: total * rowBytes,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'hiddenRewindReadback',
+    })
+    try {
+      let slotIdx = 0
+      for (let k = 0; k < branches.length; k++) {
+        if (k > 0) rewind()
+        const b = branches[k]
+        const ids = [...state, ...b.ids]
+        // Per-chunk copies straight after each chunk is recorded, as the
+        // other paths do; the requested positions are branch-local.
+        let pos = S_LEN
+        const copy = (src: GPUBuffer, lo: number, hi: number): void => {
+          const enc = device.createCommandEncoder()
+          let any = false
+          b.positions.forEach((p, i) => {
+            const row = S_LEN + p
+            if (row < lo || row >= hi) return
+            enc.copyBufferToBuffer(src, (row - lo) * rowBytes, readBuf2, (slotIdx + i) * rowBytes, rowBytes)
+            any = true
+          })
+          if (any) device.queue.submit([enc.finish()])
+        }
+        if (chunkPrefill) {
+          while (pos < ids.length) {
+            const n = Math.min(chunkPrefill.cap, ids.length - pos)
+            await chunkPrefill.record(ids, pos, n)
+            copy(chunkPrefill.hidden1, pos, pos + n)
+            pos += n
+          }
+        } else {
+          for (; pos < ids.length; pos++) {
+            submitStep(ids[pos], pos, false)
+            copy(B.hidden1, pos, pos + 1)
+          }
+        }
+        slotIdx += b.positions.length
+      }
+      // 3. Leave the state resident for the next call.
+      rewind()
+
+      await readBuf2.mapAsync(GPUMapMode.READ)
+      const half = new Uint16Array(readBuf2.getMappedRange().slice(0))
+      readBuf2.unmap()
+      let s = 0
+      return branches.map(({ positions }) => positions.map(() => {
+        const out = new Float32Array(S.d)
+        const off = s++ * S.d
+        for (let j = 0; j < S.d; j++) out[j] = halfToF32(half[off + j])
+        return out
+      }))
+    } finally {
+      readBuf2.destroy()
+    }
+  }
+
+  /**
    * Opt-in debug assertion for prefix reuse (?checkreuse=1 / window.checkReuse):
    * runs the REUSED-prefix prefill of `promptIds` and reads the final-position
    * logits, then a FRESH full prefill of the same prompt, and diffs the two
@@ -3467,12 +3823,32 @@ export function buildDecodeEngine(
   const CHUNK_CAP = resolveChunkCap(opts, S, sgmatAvail)
   const CHUNK_MIN = 8    // below this, the per-token path is not worth the uniform churn
 
+  /** record()'s packed mode — several independent branches of the resident
+   *  prefix in one chunk. `pos[t]` is token t's RoPE position, `seg[t]` its
+   *  branch; every token attends to prefix slots [0, stateLen) plus the
+   *  earlier tokens of its own branch. Nothing is written to the KV cache. */
+  interface PackedChunk {
+    pos: Int32Array<ArrayBuffer>
+    seg: Int32Array<ArrayBuffer>
+    stateLen: number
+  }
+  // Packed chunks read f16 pages and bind attention only: no int8 twin of the
+  // kernel, no GDN state to keep in step, no pooled expert cut.
+  const packedOK = !int8Mode && !hybrid && !S.moe && !pooling
+
   interface ChunkPrefill {
-    record(promptIds: number[], start: number, seqLen: number): void | Promise<void>
+    record(promptIds: number[], start: number, seqLen: number, packed?: PackedChunk): void | Promise<void>
     /** Tokens per chunk this instance was built for — pooled chunks are capped
      *  at 16 (see the pooled-cut note in record), so the caller must slice by
      *  THIS, not by CHUNK_CAP. */
     cap: number
+    /** Whether record()'s packed mode may be used on this engine. */
+    packedOK: boolean
+    /** [cap, d] f16. After record() the last layer's addNorm2 has written
+     *  RMSNorm(residual, model.norm) for every token of that chunk here — the
+     *  chunk-wide twin of B.hidden1, which forwardHiddenAt reads rows from
+     *  before the next chunk overwrites them. */
+    hidden1: GPUBuffer
     /** These buffers are CHUNK_CAP times the width of the decode ones, so on a
      *  hybrid spec they are the largest thing the engine allocates for itself —
      *  worth freeing, and only reachable from inside this closure. */
@@ -3577,6 +3953,7 @@ export function buildDecodeEngine(
     // Batched activation buffers ([C, dim] row-major).
     const CB = {
       inputIds: makeBuf(device, C * 4, 'c.inputIds'),
+      seg:      makeBuf(device, C * 4, 'c.seg'),        // packed mode: branch id per token
       posMap:   makeBuf(device, C * 4, 'c.posMap'),
       residual: makeBuf(device, C * S.d * 2, 'c.residual'),
       residual2: makeBuf(device, C * S.d * 2, 'c.residual2'),
@@ -3644,6 +4021,8 @@ export function buildDecodeEngine(
       rope:   uniformBuf(device, [i32(1), i32(0), i32(0), u32(0)]),
       kvApp:  uniformBuf(device, [i32(0), i32(S.maxPages), i32(0), i32(0), u32(0)]),
       attn:   uniformBuf(device, [i32(0), i32(0), (() => { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, SM_SCALE, true); return a })()]),
+      // packed mode: [seq_len, state_len, sm_scale] for attention_prefill_seg
+      attnSeg: uniformBuf(device, [i32(0), i32(0), (() => { const a = new ArrayBuffer(4); new DataView(a).setFloat32(0, SM_SCALE, true); return a })()]),
       // int8 chunk pair. The attention uniform carries two extra offsets the
       // f16 one has no field for, so it cannot be shared.
       kvQuant: uniformBuf(device, [i32(0), i32(0), i32(0), u32(S.kvHeads * 2)]),
@@ -3689,6 +4068,9 @@ export function buildDecodeEngine(
       rope?: GPUBindGroup
       kvApp?: GPUBindGroup
       attn?: GPUBindGroup
+      /** Packed-branch attention (record's `packed` mode): prefix from the
+       *  pages, this chunk's K/V from CB.kOut/vOut, causal within a segment. */
+      attnSeg?: GPUBindGroup
       attnGate?: GPUBindGroup
       // GDN layers
       gdnProj?: GPUBindGroup
@@ -3809,6 +4191,9 @@ export function buildDecodeEngine(
             ? bg(device, P.attentionPrefillInt8, [CB.qOut, B.pageValues, kvPages[kvIndex[L]],
               kvScales![kvIndex[L]], CB.attnOut, cU.attnI8])
             : bg(device, P.attentionPrefill, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.attnOut, cU.attn]),
+          // f16 pages only: the int8 cache would need an int8 twin of the kernel.
+          attnSeg: int8Mode ? undefined
+            : bg(device, P.attentionPrefillSeg, [CB.qOut, B.pageValues, kvPages[kvIndex[L]], CB.kOut, CB.vOut, CB.seg, CB.attnOut, cU.attnSeg]),
           attnGate: gated ? bg(device, P.attnGate, [CB.attnOut, CB.gateRaw, cU.attnGate]) : undefined,
           oProj: dynBg(CB.hidden2, CB.attnOut, lw.oProjScales!, lw.oProjWeights!, cU.oProj, lw.oProjBiases),
           ...common,
@@ -3816,14 +4201,19 @@ export function buildDecodeEngine(
       }
     }
 
-    async function record(promptIds: number[], start: number, seqLen: number): Promise<void> {
+    async function record(promptIds: number[], start: number, seqLen: number, packed?: PackedChunk): Promise<void> {
       const n = seqLen
+      if (packed && !packedOK) throw new Error('chunk prefill: packed mode is not available on this engine (int8 KV, hybrid, MoE or pooled)')
       // Per-chunk state + uniform writes — queue-ordered before the submit.
       const ids = new Int32Array(n)
       const posv = new Int32Array(n)
-      for (let t = 0; t < n; t++) { ids[t] = promptIds[start + t]; posv[t] = start + t }
+      for (let t = 0; t < n; t++) { ids[t] = promptIds[start + t]; posv[t] = packed ? packed.pos[t] : start + t }
       device.queue.writeBuffer(CB.inputIds, 0, ids)
       device.queue.writeBuffer(CB.posMap, 0, posv)
+      if (packed) {
+        device.queue.writeBuffer(CB.seg, 0, packed.seg.subarray(0, n))
+        device.queue.writeBuffer(cU.attnSeg, 0, new Int32Array([n, packed.stateLen]))
+      }
       device.queue.writeBuffer(cU.emb, 0, new Int32Array([n, n * D_WGS]))
       device.queue.writeBuffer(cU.norm, 0, new Uint32Array([n]))
       const m = new Uint32Array([n])
@@ -3866,7 +4256,9 @@ export function buildDecodeEngine(
             ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 32), 1, label)
             : dispatch(enc2, gemm, bgx, Math.ceil(rows / 4), 1, 1, label)
       let enc = device.createCommandEncoder()
-      if (start === 0) clearGdnState(enc)
+      // A packed chunk continues a prefix that is already resident; position 0
+      // of ITS token axis is not position 0 of the sequence.
+      if (start === 0 && !packed) clearGdnState(enc)
       dispatch(enc, AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
       dispatch(enc, P.rmsNorm, cbgInitNorm, n, 1, 1, 'cRmsNormInit')
       /** THE POOLED CUT. The chunk's routers have run for layer L; the expert
@@ -3923,8 +4315,15 @@ export function buildDecodeEngine(
             dispatch(enc, P.kvQuantizeInt8, blk.kvApp!, S.kvHeads * 2, n, 1, 'cKvQuantize')
             dispatch(enc, P.attentionPrefillInt8, blk.attn!, n, S.heads, 1, 'cAttention')
           } else {
-            dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
-            dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
+            if (packed) {
+              // Branch tokens share positions across branches, so they never
+              // enter the position-indexed pages: the kernel reads them from
+              // the chunk's own K/V and the prefix from the pages.
+              dispatch(enc, P.attentionPrefillSeg, blk.attnSeg!, n, S.heads, 1, 'cAttentionSeg')
+            } else {
+              dispatch(enc, P.kvAppend, blk.kvApp!, n * KV_WGS, 1, 1, 'cKvAppend')
+              dispatch(enc, P.attentionPrefill, blk.attn!, n, S.heads, 1, 'cAttention')
+            }
           }
           if (blk.attnGate) dispatch(enc, P.attnGate, blk.attnGate, n * ATTN_GATE_WGS, 1, 1, 'cAttnGate')
           gemmDispatch(enc, blk.oProj, S.d, 'cOProj')
@@ -3952,6 +4351,9 @@ export function buildDecodeEngine(
         dispatch(enc, P.addNorm, blk.addNorm2, n, 1, 1, 'cAddNorm2')
       }
       device.queue.submit([enc.finish()])
+      // A packed chunk wrote no KV slot and moved no recurrent state: the
+      // absorbed record still describes the cache exactly, so it is untouched.
+      if (packed) return
       gdnStatePos = start + n
       for (let t = 0; t < n; t++) noteAbsorbed(start + t, promptIds[start + t])
     }
@@ -3959,6 +4361,8 @@ export function buildDecodeEngine(
     return {
       record,
       cap: C,
+      packedOK,
+      hidden1: CB.hidden1,
       destroy() {
         for (const buf of [...Object.values(CB), ...Object.values(cU), ...Object.values(CM ?? {})]) buf?.destroy()
       },
@@ -4859,6 +5263,9 @@ export function buildDecodeEngine(
     readMoeTrace,
     getPoolStats,
     forwardEmbedding: guard('forwardEmbedding', forwardEmbedding),
+    forwardHiddenAt: guard('forwardHiddenAt', forwardHiddenAt),
+    forwardHiddenAtMany: guard('forwardHiddenAtMany', forwardHiddenAtMany),
+    forwardHiddenPacked: guard('forwardHiddenPacked', forwardHiddenPacked),
     scoreSequence: guard('scoreSequence', scoreSequence),
     pipelineStep: guard('pipelineStep', pipelineStep),
     setSampling: guard('setSampling', setSampling),

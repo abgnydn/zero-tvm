@@ -7,6 +7,30 @@ from `0.1.0`.
 
 ## [Unreleased]
 
+### 2026-09-22 — Kev decision models: typed questions, not chat
+
+- `?model=kev` (Kev-0.6B) and `?model=kev4b` (Kev-4B, Qwen3 generation):
+  jaredpalmer/kev's pointer-head decision models, TypeSafe's `/v1/systemone`
+  shape, served by `src/zero-tvm/kev.ts` over two new engine primitives —
+  `forwardHiddenAt[Many]` (post-final-norm rows at chosen positions) and
+  `forwardHiddenPacked` (every question branch of one state in ONE chunk).
+- New kernel `attention_prefill_seg.wgsl`: prefix from the paged cache, the
+  chunk's own K/V from the chunk buffers, causal within a branch. Bit-exact
+  against branch-by-branch `attention_prefill` (`tests/kernels/compile-qwen35.mjs`).
+- Fidelity: engine == mlx_lm on the same 4-bit weights, 21/21 argmax on both
+  checkpoints (`scripts/kev-parity.mjs`). Quantization survival is measured per
+  checkpoint (`scripts/kev-quant-sweep.py`): the 0.6B loses 4 of 21 argmaxes
+  at 4 bits, the 4B loses 1.
+- `scripts/kev-merge.py` fails hard when peft matches no adapter key: kev's
+  LoRA wraps the bare backbone, and wrapping the CausalLM silently yields the
+  base model — the first day's numbers were measured on that.
+- `?model=kev4bq35`: kev-4b on Qwen3.5-4B-Base, the DeltaNet hybrid and the
+  best kev — served for the first time in a browser, through a per-branch
+  GDN snapshot/rewind path (`forwardHiddenPacked` on hybrids). 21/21 vs
+  mlx_lm. Delimiters are now resolved from the checkpoint's tokenizer by
+  name; Qwen3.5 renumbers Qwen3's special tokens.
+
+
 ## [0.3.0] — 2026-08-25
 
 ### 2026-08-24 — main had been red for six days behind a green local suite
