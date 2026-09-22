@@ -51,28 +51,26 @@ keeps the state's K/V resident and prefills only the new branch; ORT's graph
 takes `input_ids` and re-reads the state every call.
 
 **Kev-4B on Qwen3.5 (`?model=kev4bq35`, the DeltaNet hybrid, kev-4b@main)** has
-no ORT column: no ONNX export of it exists — the reason it is here. Rewind
-path (state once, GDN snapshot, one branch per replay), machine idle:
+no ORT column: no ONNX export of it exists — the reason it is here. Two
+serving paths were measured, machine idle:
 
-| questions per call, state hot | Kev-4B Qwen3.5 engine |
-|---|---|
-| 1 / 5 / 10 / 25 | 305 / 1536 / 3433 / 7634 ms (~305 ms per question, no batching) |
-| cold state, 4 questions | 1272 ms |
-| hot state, one NEW question | 313 ms |
+| questions per call, state hot | rewind (one branch per replay) | **packed** (`gdn_conv_seq_packed` + `gdn_recur_packed` + `attention_prefill_seg`) |
+|---|---|---|
+| 1 | 305 ms | **147 ms** |
+| 5 | 1536 ms | **313 ms** |
+| 10 | 3433 ms | **599 ms** |
+| 25 | 7634 ms | **1488 ms** |
+| cold state, 4 questions | 1272 ms | **673 ms** |
+| hot state, one NEW question | 313 ms | **167 ms** |
 
-Fidelity: 21/21 vs mlx_lm on the same 4-bit file (max |Δp| 0.0078); the 4-bit
-file keeps 20/21 against the checkpoint's own f32 forward (max |Δp| 0.168),
-8-bit 21/21. A hybrid cannot share a chunk across branches — the recurrence
-would carry branch k into branch k+1 — so every question is one dispatch-bound
-pass; a segment-aware `gdn_recur` that reloads the snapshot at each branch
-start inside one chunk is the missing kernel.
-
-How the engine got there, on the 0.6B (same shapes): branch by branch
-(`forwardHiddenAtMany`, one chunk pass per question) was 32 / 155 / 309 / 764 ms
-for 1 / 5 / 10 / 25 — ~31 ms per question flat in branch length, i.e. the pass
-is dispatch-bound at a dozen tokens. One readback for all branches changed
-nothing (31 ms/question). Packing every branch into ONE chunk with
-`attention_prefill_seg.wgsl` (`forwardHiddenPacked`) is the whole gain.
+The packed path restarts every branch from the prefix's ring and recurrent
+state INSIDE one chunk (nothing persisted), so N branches share the GEMMs the
+way they do on an attention model. Both paths are bit-exact against plain
+`state + branch` rows (`scripts/kev-packed-check.mjs kev4bq35`) and 21/21 vs
+mlx_lm on the same 4-bit file (max |Δp| 0.0078); the 4-bit file keeps 20/21
+against the checkpoint's own f32 forward (max |Δp| 0.168), 8-bit 21/21. The
+rewind path stays as the fallback for engines that cannot pack (int8 KV,
+pooled, MoE).
 
 ## Qwen3.6-35B-A3B MoE (2026-08-05) — no baseline exists
 
