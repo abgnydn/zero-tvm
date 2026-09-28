@@ -1,0 +1,5 @@
+# scripts/kev-quant-sweep.py --mlx-bf16 .weights-local/kev-0.6b-mlx-bf16 --ref /tmp/ref-kev --quick --shipped .weights-local/kev-0.6b-mlx-4bit — 2026-09-22T12:02Z, Apple M2 Max, mlx f32 compute; ref = kev's f32 torch forward on the bf16 merge (docs/kev-parity/refs/kev-f32.json)
+bf16 conversion, f32 compute (pipeline check) argmax 21/21  mean|Δp| 0.000  max|Δp| 0.000
+8-bit / g64                                  argmax 21/21  mean|Δp| 0.011  max|Δp| 0.066
+shipped check: 704 tensors on disk, 197 bit-equal, 507 differing (dtype or value), 0 missing from memory
+4-bit / g64 (what ships)                     argmax 17/21  mean|Δp| 0.130  max|Δp| 0.552

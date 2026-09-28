@@ -19,6 +19,66 @@ weight files, so it isolates the runtime. **llama.cpp via wllama** is *not*
 same-bytes — it reads GGUF — so it measures runtime and quantization together.
 The two are reported separately and must not be merged into one table.
 
+## Kev decision models vs open-jev / ONNX Runtime WebGPU (2026-09-22, Apple M2 Max 32 GB)
+
+Not tok/s: a decision model answers typed questions about one state with a
+probability per option, so the unit is **milliseconds per call**, measured
+INSIDE the page with `performance.now()` around `decide()`, median of 5 after
+one warm-up. Same machine, same Chrome, same 74-token state, same yes/no
+questions. `scripts/kev-bench.mjs` (engine) and `scripts/openjev-bench.mjs`
+(Nico Martin's open-jev over Transformers.js → ORT WebGPU, its `q4f16` build,
+STOCK Chrome flags — under the harness's experimental flags ORT's
+subgroup-matrix shader fails validation and nothing runs).
+
+Not the same bytes: the engine runs the MLX affine 4-bit/g64 merge produced by
+`scripts/kev-merge.py`; the ORT latency column ran the `onnx-community/*-ONNX`
+repos' default `q4f16` build. The fidelity cross-check used their `q4` build
+(`scripts/kev-onnx-vs-ref.mjs`, run recorded in `docs/kev-parity/kev-onnx-q4.txt`)
+and the engine's file (`scripts/kev-survival.py` over `docs/kev-parity/refs/`),
+both against kev's own f32 forward on the same 21 questions: 0.6B — 17/21
+argmax either way (three of the four flips the same questions,
+`docs/kev-parity/kev-onnx-q4.txt`); 4B (Qwen3) — 20/21 either way, on different
+questions (`docs/kev-parity/kev4b-onnx-q4.txt`). The `q4f16` build's fidelity is
+not measured. 8-bit arms of the in-memory sweep keep 21/21 on all three
+(`docs/kev-parity/sweep-*.txt`). The engine reproduces
+mlx_lm on its own file at 21/21 (`scripts/kev-parity.mjs`).
+
+| questions per call, state hot | Kev-0.6B engine | Kev-0.6B ORT | Kev-4B engine | Kev-4B ORT |
+|---|---|---|---|---|
+| 1 | **33 ms** | 79 ms | **147 ms** | 308 ms |
+| 5 | **52 ms** | 97 ms | **290 ms** | 496 ms |
+| 10 | **89 ms** | 132 ms | **541 ms** | 713 ms |
+| 25 | **189 ms** | 273 ms | **1180 ms** | 1517 ms |
+| cold state, 4 questions | **81 ms** | 98 ms | **430 ms** | 498 ms |
+| hot state, one NEW question | **32 ms** | 79 ms | **145 ms** | 308 ms |
+
+The last row is the design difference, not a kernel difference: the engine
+keeps the state's K/V resident and prefills only the new branch; ORT's graph
+takes `input_ids` and re-reads the state every call.
+
+**Kev-4B on Qwen3.5 (`?model=kev4bq35`, the DeltaNet hybrid, kev-4b@main)** has
+no ORT column: no ONNX export of it exists — the reason it is here. Two
+serving paths were measured, machine idle:
+
+| questions per call, state hot | rewind (one branch per replay) | **packed** (`gdn_conv_seq_packed` + `gdn_recur_packed` + `attention_prefill_seg`) |
+|---|---|---|
+| 1 | 305 ms | **147 ms** |
+| 5 | 1536 ms | **313 ms** |
+| 10 | 3433 ms | **599 ms** |
+| 25 | 7634 ms | **1488 ms** |
+| cold state, 4 questions | 1272 ms | **673 ms** |
+| hot state, one NEW question | 313 ms | **167 ms** |
+
+The packed path restarts every branch from the prefix's ring and recurrent
+state INSIDE one chunk (nothing persisted), so N branches share the GEMMs the
+way they do on an attention model. Both paths are bit-exact against plain
+`state + branch` rows (`scripts/kev-packed-check.mjs kev4bq35`) and 21/21 vs
+mlx_lm on the same 4-bit file (max |Δp| 0.0078); the 4-bit file keeps 20/21
+against the checkpoint's own f32 forward (max |Δp| 0.169); 8-bit keeps 21/21
+(`docs/kev-parity/sweep-kev4bq35.txt`). The
+rewind path stays as the fallback for engines that cannot pack (int8 KV,
+pooled, MoE).
+
 ## Qwen3.6-35B-A3B MoE (2026-08-05) — no baseline exists
 
 **This model has no A/B column.** WebLLM ships zero Qwen3.6 builds, so the

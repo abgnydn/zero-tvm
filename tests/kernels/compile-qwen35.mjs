@@ -807,6 +807,117 @@ async function testGdnConvSeq(device) {
   }
 }
 
+// ── gdn_conv_seq_packed — two branches off one prefix ring, BIT-EXACT vs
+// per-branch gdn_conv_seq. Prefix of 3 tokens builds the ring through the
+// per-token kernel; branches of 4 and 3 tokens are then convolved (a) each as
+// its own chunk at base_pos 3 over a COPY of the ring, (b) packed into one
+// 7-token chunk with seg_start = [0,0,0,0,4,4,4]. The ring must be untouched. ─
+async function testGdnConvSeqPacked(device) {
+  const r = rng(41)
+  const C = Q.gdnQkvDim, K = Q.gdnConvK, RING = K - 1
+  const STRIDE = Q.gdnProjRows
+  const PREFIX = 3, LENS = [4, 3], SEQ = 7
+  const xs = arr(PREFIX + SEQ, () => arr(C, () => toF16(r() * 2 - 1)))
+  const convW = arr(C * K, () => toF16(r() - 0.5))
+  const wBuf = buffer(device, f16Array(convW), BU.STORAGE | BU.COPY_DST)
+  const GRID1 = C / 256
+
+  // The prefix's ring, from the pinned per-token kernel.
+  const stepPipe = pipelineFor(device, wgsl('gdn_conv.wgsl'), 'gdn_conv')
+  const ring = device.createBuffer({ size: RING * C * 2, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC })
+  device.queue.writeBuffer(ring, 0, new Uint16Array(RING * C))
+  {
+    const out = device.createBuffer({ size: C * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const xBuf = device.createBuffer({ size: C * 2, usage: BU.STORAGE | BU.COPY_DST })
+    for (let t = 0; t < PREFIX; t++) {
+      device.queue.writeBuffer(xBuf, 0, f16Array(xs[t]))
+      await runCompute(device, stepPipe, [out, xBuf, ring, wBuf, podBuffer(device, [{ i32: t }, { u32: GRID1 }])], [GRID1], 0, C * 2)
+    }
+  }
+  const ringBefore = new Uint16Array(await readBack(device, ring, RING * C * 2))
+  const rawOf = (tokens) => {
+    const raw = new Uint16Array(tokens.length * STRIDE)
+    for (let i = 0; i < raw.length; i++) raw[i] = (r() * 0xffff) | 0
+    tokens.forEach((x, t) => { for (let c = 0; c < C; c++) raw[t * STRIDE + c] = f32ToF16Bits(x[c]) })
+    return raw
+  }
+
+  // (a) per branch, base_pos = PREFIX, over a copy of the ring
+  const seqPipe = pipelineFor(device, wgsl('gdn_conv_seq.wgsl'), 'gdn_conv_seq')
+  const ref = new Uint16Array(SEQ * C)
+  let off = 0
+  for (const n of LENS) {
+    const ringCopy = buffer(device, ringBefore, BU.STORAGE | BU.COPY_DST)
+    const rawBuf = buffer(device, rawOf(xs.slice(PREFIX + off, PREFIX + off + n)), BU.STORAGE | BU.COPY_DST)
+    const outBuf = device.createBuffer({ size: n * C * 2, usage: BU.STORAGE | BU.COPY_SRC })
+    const pod = podBuffer(device, [{ i32: PREFIX }, { i32: n }, { i32: STRIDE }, { u32: n * GRID1 }])
+    ref.set(new Uint16Array(await runCompute(device, seqPipe, [outBuf, rawBuf, ringCopy, wBuf, pod], [n * GRID1], 0, n * C * 2)), off * C)
+    off += n
+  }
+
+  // (b) packed
+  const packedPipe = pipelineFor(device, wgsl('gdn_conv_seq_packed.wgsl'), 'gdn_conv_seq_packed')
+  const segStart = new Int32Array(SEQ); for (let t = LENS[0]; t < SEQ; t++) segStart[t] = LENS[0]
+  const rawAll = buffer(device, rawOf(xs.slice(PREFIX)), BU.STORAGE | BU.COPY_DST)
+  const outAll = device.createBuffer({ size: SEQ * C * 2, usage: BU.STORAGE | BU.COPY_SRC })
+  const pod = podBuffer(device, [{ i32: PREFIX }, { i32: SEQ }, { i32: STRIDE }, { u32: SEQ * GRID1 }])
+  const got = new Uint16Array(await runCompute(device, packedPipe, [outAll, rawAll, ring, wBuf, buffer(device, segStart, BU.STORAGE | BU.COPY_DST), pod], [SEQ * GRID1], 0, SEQ * C * 2))
+  const ringAfter = new Uint16Array(await readBack(device, ring, RING * C * 2))
+  let bad = 0; for (let i = 0; i < ref.length; i++) if (got[i] !== ref[i]) bad++
+  let ringBad = 0; for (let i = 0; i < ringBefore.length; i++) if (ringAfter[i] !== ringBefore[i]) ringBad++
+  // Negative control: one segment (seg_start all 0) must differ — branch 1
+  // would then see branch 0's tail instead of the ring.
+  const ctrl = new Uint16Array(await runCompute(device, packedPipe, [outAll, rawAll, ring, wBuf, buffer(device, new Int32Array(SEQ), BU.STORAGE | BU.COPY_DST), pod], [SEQ * GRID1], 0, SEQ * C * 2))
+  let ctrlDiff = 0; for (let i = 0; i < ref.length; i++) if (ctrl[i] !== ref[i]) ctrlDiff++
+  return {
+    name: 'gdn_conv_seq_packed 4+3',
+    pass: bad === 0 && ringBad === 0 && ctrlDiff > 0,
+    detail: `${bad} output mismatches vs per-branch gdn_conv_seq, ${ringBad} ring cells changed (both must be 0); one-segment control differs in ${ctrlDiff} (must be > 0)`,
+  }
+}
+
+// ── gdn_recur_packed — the fixture's 8 tokens as two branches of 4 off one
+// state, BIT-EXACT vs gdn_recur run per branch from a copy of that state; the
+// state buffer must come back untouched. ─────────────────────────────────────
+async function testGdnRecurPacked(device, fx) {
+  const { STEPS, convOut, gates, state0 } = fx
+  const HALF = STEPS / 2
+  const V = Q.gdnVDim, QKV = Q.gdnQkvDim, G2 = 2 * Q.gdnVHeads
+  const pipe = pipelineFor(device, wgsl('gdn_recur.wgsl'), 'gdn_recur')
+  const ref = new Float32Array(STEPS * V)
+  for (const b of [0, 1]) {
+    const out = device.createBuffer({ size: HALF * V * 4, usage: BU.STORAGE | BU.COPY_SRC })
+    const st = buffer(device, state0, BU.STORAGE | BU.COPY_DST | BU.COPY_SRC)
+    const bytes = await runCompute(device, pipe, [
+      out,
+      buffer(device, convOut.subarray(b * HALF * QKV, (b + 1) * HALF * QKV), BU.STORAGE | BU.COPY_DST),
+      buffer(device, gates.subarray(b * HALF * G2, (b + 1) * HALF * G2), BU.STORAGE | BU.COPY_DST),
+      st,
+      podBuffer(device, [{ i32: HALF }, { u32: Q.gdnVHeads }]),
+    ], [Q.gdnVHeads], 0, HALF * V * 4)
+    ref.set(new Float32Array(bytes), b * HALF * V)
+  }
+  const packed = pipelineFor(device, wgsl('gdn_recur_packed.wgsl'), 'gdn_recur_packed')
+  const seg = new Int32Array(STEPS); for (let t = HALF; t < STEPS; t++) seg[t] = 1
+  const out = device.createBuffer({ size: STEPS * V * 4, usage: BU.STORAGE | BU.COPY_SRC })
+  const state = buffer(device, state0, BU.STORAGE | BU.COPY_DST | BU.COPY_SRC)
+  const run = async (segBuf) => new Float32Array(await runCompute(device, packed, [
+    out, buffer(device, convOut, BU.STORAGE | BU.COPY_DST), buffer(device, gates, BU.STORAGE | BU.COPY_DST),
+    state, segBuf, podBuffer(device, [{ i32: STEPS }, { u32: Q.gdnVHeads }]),
+  ], [Q.gdnVHeads], 0, STEPS * V * 4))
+  const got = await run(buffer(device, seg, BU.STORAGE | BU.COPY_DST))
+  const stateAfter = new Float32Array(await readBack(device, state, state0.length * 4))
+  let bad = 0; for (let i = 0; i < ref.length; i++) if (got[i] !== ref[i]) bad++
+  let stateBad = 0; for (let i = 0; i < state0.length; i++) if (stateAfter[i] !== state0[i]) stateBad++
+  const ctrl = await run(buffer(device, new Int32Array(STEPS), BU.STORAGE | BU.COPY_DST))
+  let ctrlDiff = 0; for (let i = 0; i < ref.length; i++) if (ctrl[i] !== ref[i]) ctrlDiff++
+  return {
+    name: 'gdn_recur_packed 4+4',
+    pass: bad === 0 && stateBad === 0 && ctrlDiff > 0,
+    detail: `${bad} output mismatches vs per-branch gdn_recur, ${stateBad} state cells changed (both must be 0); one-segment control differs in ${ctrlDiff} (must be > 0)`,
+  }
+}
+
 // ── gdn_gates seq — strided batched gates BIT-EXACT vs per-token dispatches ──
 async function testGdnGatesSeq(device) {
   const r = rng(34)
@@ -1230,6 +1341,96 @@ async function testGdnChunkChain(device, opts = {}) {
   }
 }
 
+// ── attention_prefill_seg — two packed branches BIT-EXACT vs branch-by-branch ─
+// A 5-token prefix in the pages; branches of 3 and 4 tokens packed into one
+// 7-token chunk with seg = [0,0,0,1,1,1,1]. Reference: attention_prefill over
+// `prefix + branch` with the branch appended to the pages, once per branch.
+// The page slots past the prefix are then left holding the OTHER branch's K/V
+// when the packed kernel runs — stale data it must never read.
+async function testAttentionPrefillSeg(device) {
+  const r = rng(53)
+  const S_LEN = 5
+  const LENS = [3, 4]
+  const SEQ = LENS[0] + LENS[1]
+  const NUM_PAGES = 1   // 5 + 4 = 9 slots fit one 16-slot page
+  const k16 = () => toF16(r() - 0.5)
+
+  // Prefix K/V straight into the page layout.
+  const prefixPages = new Uint16Array(NUM_PAGES * Q.kvPageStride)
+  for (let h = 0; h < Q.kvHeads; h++) {
+    for (let t = 0; t < S_LEN; t++) {
+      for (let dd = 0; dd < Q.headDim; dd++) {
+        prefixPages[h * Q.headPageStride + t * Q.headDim + dd] = f32ToF16Bits(k16())
+        prefixPages[Q.vPageOffset + h * Q.headPageStride + t * Q.headDim + dd] = f32ToF16Bits(k16())
+      }
+    }
+  }
+  // Chunk K/V and Q, laid out per token: [kv_head][head_dim] / [head][head_dim].
+  const kChunk = arr(SEQ * Q.kvDim, k16)
+  const vChunk = arr(SEQ * Q.kvDim, k16)
+  const qAll = arr(SEQ * Q.qDim, () => toF16(r() * 2 - 1))
+  const seg = new Int32Array(SEQ)
+  for (let t = LENS[0]; t < SEQ; t++) seg[t] = 1
+  const scale = 1 / Math.sqrt(Q.headDim)
+
+  const pageVals = buffer(device, new Int32Array([0]), BU.STORAGE | BU.COPY_DST)
+  const prefillAttn = pipelineFor(device, wgsl('attention_prefill.wgsl'), 'attention_prefill')
+
+  // Reference, branch by branch: pages = prefix + this branch, then the
+  // ordinary causal chunk kernel over the branch's query rows.
+  const ref = new Uint16Array(SEQ * Q.qDim)
+  const withBranch = (b) => {
+    const p = prefixPages.slice()
+    const off = b === 0 ? 0 : LENS[0]
+    for (let h = 0; h < Q.kvHeads; h++) {
+      for (let t = 0; t < LENS[b]; t++) {
+        for (let dd = 0; dd < Q.headDim; dd++) {
+          p[h * Q.headPageStride + (S_LEN + t) * Q.headDim + dd] = f32ToF16Bits(kChunk[(off + t) * Q.kvDim + h * Q.headDim + dd])
+          p[Q.vPageOffset + h * Q.headPageStride + (S_LEN + t) * Q.headDim + dd] = f32ToF16Bits(vChunk[(off + t) * Q.kvDim + h * Q.headDim + dd])
+        }
+      }
+    }
+    return p
+  }
+  for (let b = 0; b < 2; b++) {
+    const off = b === 0 ? 0 : LENS[0]
+    const pages = buffer(device, withBranch(b), BU.STORAGE | BU.COPY_DST)
+    const qB = buffer(device, f16Array(qAll.slice(off * Q.qDim, (off + LENS[b]) * Q.qDim)), BU.STORAGE | BU.COPY_DST)
+    const out = device.createBuffer({ size: LENS[b] * Q.qDim * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+    device.queue.writeBuffer(out, 0, new Uint16Array(LENS[b] * Q.qDim))
+    const pod = podBuffer(device, [{ i32: LENS[b] }, { i32: S_LEN + 1 }, { f32: scale }])
+    const bytes = await runCompute(device, prefillAttn, [qB, pageVals, pages, out, pod], [LENS[b], Q.heads], 3, LENS[b] * Q.qDim * 2)
+    ref.set(new Uint16Array(bytes), off * Q.qDim)
+  }
+
+  // Packed: prefix in the pages with branch 1's K/V left STALE past the
+  // prefix, both branches' K/V in the chunk buffers, one dispatch.
+  const segAttn = pipelineFor(device, wgsl('attention_prefill_seg.wgsl'), 'attention_prefill_seg')
+  const pagesStale = buffer(device, withBranch(1), BU.STORAGE | BU.COPY_DST)
+  const qBatch = buffer(device, f16Array(qAll), BU.STORAGE | BU.COPY_DST)
+  const kBuf = buffer(device, f16Array(kChunk), BU.STORAGE | BU.COPY_DST)
+  const vBuf = buffer(device, f16Array(vChunk), BU.STORAGE | BU.COPY_DST)
+  const segBuf = buffer(device, seg, BU.STORAGE | BU.COPY_DST)
+  const outBatch = device.createBuffer({ size: SEQ * Q.qDim * 2, usage: BU.STORAGE | BU.COPY_SRC | BU.COPY_DST })
+  device.queue.writeBuffer(outBatch, 0, new Uint16Array(SEQ * Q.qDim))
+  const pod = podBuffer(device, [{ i32: SEQ }, { i32: S_LEN }, { f32: scale }])
+  const bytes = await runCompute(device, segAttn, [qBatch, pageVals, pagesStale, kBuf, vBuf, segBuf, outBatch, pod], [SEQ, Q.heads], 6, SEQ * Q.qDim * 2)
+  const got = new Uint16Array(bytes)
+  let bad = 0
+  for (let i = 0; i < ref.length; i++) if (got[i] !== ref[i]) bad++
+  // Negative control: the same dispatch with every token in ONE segment must
+  // differ, or the test is not looking at the mask at all.
+  const segOne = buffer(device, new Int32Array(SEQ), BU.STORAGE | BU.COPY_DST)
+  const ctrl = new Uint16Array(await runCompute(device, segAttn, [qBatch, pageVals, pagesStale, kBuf, vBuf, segOne, outBatch, pod], [SEQ, Q.heads], 6, SEQ * Q.qDim * 2))
+  let ctrlDiff = 0
+  for (let i = 0; i < ref.length; i++) if (ctrl[i] !== ref[i]) ctrlDiff++
+  return {
+    name: 'attention_prefill_seg 3+4',
+    pass: bad === 0 && ctrlDiff > 0,
+    detail: `${bad} mismatches vs branch-by-branch attention_prefill (must be bit-exact); one-segment control differs in ${ctrlDiff} values (must be > 0)`,
+  }
+}
+
 // ── attention_prefill — chunk of 5 query tokens BIT-EXACT vs per-token decode ─
 async function testAttentionPrefill(device) {
   const r = rng(37)
@@ -1488,6 +1689,7 @@ const TESTS = [
   { label: 'gdn_recur_seq', fn: (d) => testGdnRecurSeq(d, recurFixture) },
   { label: 'gdn_recur_step', fn: (d) => testGdnRecurStepwise(d, recurFixture) },
   { label: 'gdn_recur_pairing', fn: () => testGdnRecurPairingControl(recurFixture) },
+  { label: 'gdn_recur_packed', fn: (d) => testGdnRecurPacked(d, recurFixture) },
   { label: 'gdn_norm_out', fn: testGdnNormOut },
   { label: 'gdn_block', fn: testGdnBlockChain },
   { label: 'rope_partial', fn: testRopePartial },
@@ -1497,6 +1699,7 @@ const TESTS = [
   { label: 'gated_attn_block', fn: testGatedAttnBlockChain },
   // Chunked-prefill kernel family (perf round A):
   { label: 'gdn_conv_seq', fn: testGdnConvSeq },
+  { label: 'gdn_conv_seq_packed', fn: testGdnConvSeqPacked },
   { label: 'gdn_gates_seq', fn: testGdnGatesSeq },
   { label: 'matmul_batched_dyn', fn: testMatmulBatchedDyn },
   { label: 'matmul_batched_dyn_affine', fn: testMatmulBatchedDynAffine },
@@ -1534,6 +1737,7 @@ const TESTS = [
     }),
   },
   { label: 'attention_prefill', fn: testAttentionPrefill },
+  { label: 'attention_prefill_seg', fn: testAttentionPrefillSeg },
   { label: 'silu_mul', fn: testSiluMul },
 ]
 

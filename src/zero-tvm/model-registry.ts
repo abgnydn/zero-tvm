@@ -33,6 +33,7 @@ import { QWEN3_4B_MLX } from '../compiler/model-spec.ts'
 import { LLAMA_3_2_1B_INSTRUCT_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_30B_A3B_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_EMBEDDING_06B } from '../compiler/model-spec.ts'
+import { KEV_06B, KEV_4B, KEV_4B_Q35 } from '../compiler/model-spec.ts'
 import { QWEN3_5_9B_MLX_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_8_27B_4BIT } from '../compiler/model-spec.ts'
 // ADD-MODEL:IMPORTS
@@ -63,6 +64,12 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
   // Not a chat model: ?model=embed serves forwardEmbedding, not generation.
   // Last on purpose — it answers nothing a visitor typed.
   { param: 'embed', spec: QWEN3_EMBEDDING_06B },
+  // Not a chat model either: ?model=kev serves typed decisions (kev.ts) over
+  // forwardHiddenAt. Same roster treatment as embed — it answers questions,
+  // not conversation.
+  { param: 'kev', spec: KEV_06B },
+  { param: 'kev4b', spec: KEV_4B },
+  { param: 'kev4bq35', spec: KEV_4B_Q35 },
   // ADD-MODEL:MODELS
 ]
 
@@ -286,6 +293,10 @@ const BRANDINGS: Record<string, ModelBrand> = {
   // Not a chat model. Its output is the pooled hidden state, so rateLabel stays
   // '' — tok/s is not the unit here.
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },
+  // Decision model: output is a probability per option, so tok/s is not the unit.
+  [KEV_06B.id]: { name: 'Kev-0.6B', params: '0.6B decision · pointer head', sizeLabel: '~0.4 GB', rateLabel: '' },
+  [KEV_4B.id]: { name: 'Kev-4B', params: '4B decision · pointer head', sizeLabel: '~2.3 GB', rateLabel: '' },
+  [KEV_4B_Q35.id]: { name: 'Kev-4B (Qwen3.5)', params: '4B hybrid decision · DeltaNet', sizeLabel: '~2.5 GB', rateLabel: '' },
   [QWEN3_5_9B_MLX_4BIT.id]: { name: 'Qwen3.5-9B', params: '9B hybrid (DeltaNet)', sizeLabel: '~4.7 GB', rateLabel: '~43 t/s' },
   // Validated against mlx_lm 2026-08-17: logits cosine 0.999996, top-5 5/5,
   // all 24 greedy tokens exact ("The capital of France is **Paris**…"), 0 GPU

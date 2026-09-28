@@ -32,6 +32,8 @@ import gatedQkvSplitSrc from './shaders/gated_qkv_split.wgsl?raw'
 import attnGateSrc from './shaders/attn_gate.wgsl?raw'
 import gdnConvSrc from './shaders/gdn_conv.wgsl?raw'
 import gdnConvSeqSrc from './shaders/gdn_conv_seq.wgsl?raw'
+import gdnConvSeqPackedSrc from './shaders/gdn_conv_seq_packed.wgsl?raw'
+import gdnRecurPackedSrc from './shaders/gdn_recur_packed.wgsl?raw'
 import gdnConvCommitSrc from './shaders/gdn_conv_commit.wgsl?raw'
 import gdnGatesSrc from './shaders/gdn_gates.wgsl?raw'
 import gdnRecurSrc from './shaders/gdn_recur.wgsl?raw'
@@ -47,6 +49,7 @@ import attentionInt8Src from './shaders/attention_int8.wgsl?raw'
 import attentionSrc from './shaders/attention.wgsl?raw'
 import attentionPrefillSrc from './shaders/attention_prefill.wgsl?raw'
 import attentionPrefillInt8Src from './shaders/attention_prefill_int8.wgsl?raw'
+import attentionPrefillSegSrc from './shaders/attention_prefill_seg.wgsl?raw'
 import attentionSgSrc from './shaders/attention_sg.wgsl?raw'
 import attentionSplitkSrc from './shaders/attention_splitk.wgsl?raw'
 import attentionSplitkSgSrc from './shaders/attention_splitk_sg.wgsl?raw'
@@ -146,6 +149,11 @@ export interface Pipelines {
   gdnConvCommit: GPUComputePipeline    // chunked-prefill ring commit (last RING raw tokens)
   gdnGates: GPUComputePipeline         // per-v-head exp(g) decay + beta
   gdnRecur: GPUComputePipeline         // gated delta rule recurrence (f32 state)
+  /** Packed-branch twins (record's packed mode on a hybrid): conv taps before a
+   *  branch start read the prefix's ring; the recurrence reloads the prefix's
+   *  state at every branch start and persists nothing. */
+  gdnConvSeqPacked: GPUComputePipeline
+  gdnRecurPacked: GPUComputePipeline
   gdnNormOut: GPUComputePipeline       // per-head gated RMSNorm · silu(z)
   qkvFused: GPUComputePipeline       // decode-path fusion: QKV matmul + RoPE + KV append
   qkvFusedSg: GPUComputePipeline | null  // subgroup variant of qkvFused
@@ -161,6 +169,10 @@ export interface Pipelines {
    *  it int8 KV forces per-token prefill, which is unusable on exactly the
    *  long prompts it saves memory for. */
   attentionPrefillInt8: GPUComputePipeline
+  /** attention_prefill for a chunk holding several independent branches of
+   *  one cached prefix (kev.ts): prefix from the pages, the chunk's own K/V
+   *  from the chunk buffers, causal within a branch only. */
+  attentionPrefillSeg: GPUComputePipeline
   attentionSg: GPUComputePipeline | null  // subgroup variant; null if `subgroups` feature absent
   // ?splitk=N experiment (measured ~+3% at short context on M2 Max,
   // 2026-07-25; opt-in until a long-context A/B — BENCH.md):
@@ -355,6 +367,8 @@ export function compile(
     gdnConvCommit: createPipeline(device, gdnConvCommitSrc, 'gdn_conv_commit'),
     gdnGates: createPipeline(device, gdnGatesSrc, 'gdn_gates'),
     gdnRecur: createPipeline(device, gdnRecurSrc, 'gdn_recur'),
+    gdnConvSeqPacked: createPipeline(device, gdnConvSeqPackedSrc, 'gdn_conv_seq_packed'),
+    gdnRecurPacked: createPipeline(device, gdnRecurPackedSrc, 'gdn_recur_packed'),
     gdnNormOut: createPipeline(device, gdnNormOutSrc, 'gdn_norm_out'),
     qkvFused: createPipeline(device, qkvFusedSrc, 'qkv_fused'),
     qkvFusedSg: subgroups ? createPipeline(device, qkvFusedSgSrc, 'qkv_fused_sg') : null,
@@ -367,6 +381,7 @@ export function compile(
     attention: createPipeline(device, attentionSrc, 'attention'),
     attentionPrefill: createPipeline(device, attentionPrefillSrc, 'attention_prefill'),
     attentionPrefillInt8: createPipeline(device, attentionPrefillInt8Src, 'attention_prefill_int8'),
+    attentionPrefillSeg: createPipeline(device, attentionPrefillSegSrc, 'attention_prefill_seg'),
     attentionSg: subgroups ? createPipeline(device, attentionSgSrc, 'attention_sg') : null,
     attentionSplitK: createPipeline(device, attentionSplitkSrc, 'attention_splitk'),
     attentionSplitKSg: subgroups ? createPipeline(device, attentionSplitkSgSrc, 'attention_splitk_sg') : null,

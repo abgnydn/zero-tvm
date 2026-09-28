@@ -1,0 +1,9 @@
+# scripts/kev-merge-precision.py --adapter jaredpalmer/kev-0.6b — 2026-09-22T11:30Z, Apple M2 Max, torch f32 on CPU, transformers 5.12.1 / peft 0.21.0; unmerged = base f32 + adapter at runtime (how upstream serves), merged16 = the bf16 merge kev-merge.py writes
+unmerged (peft, f32)…
+merged32…
+merged16…
+merged32   vs unmerged: argmax 21/21  mean|Δp| 0.0000  max|Δp| 0.0000
+merged16   vs unmerged: argmax 21/21  mean|Δp| 0.0024  max|Δp| 0.0124
+rec2 unmerged [0.992, 0.003, 0.002, 0.001, 0.001] | merged16 [0.991, 0.003, 0.002, 0.001, 0.001]
+rec7 unmerged [0.41, 0.0, 0.001, 0.002, 0.006, 0.581] | merged16 [0.416, 0.0, 0.001, 0.002, 0.006, 0.575]
+rec8 unmerged [0.002, 0.0, 0.0, 0.016, 0.003, 0.98] | merged16 [0.002, 0.0, 0.0, 0.015, 0.003, 0.98]
