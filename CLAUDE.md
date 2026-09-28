@@ -115,8 +115,8 @@ Deploy: `npx wrangler pages deploy dist --project-name=zerotvm --branch=main` (C
 ## Qwen3-4B (`?model=qwen3`)
 
 Second architecture on the same engine (GQA 32/8, QK-norm, byte-level BPE,
-tied lm_head, ChatML non-thinking). Phi-3 stays the default everywhere;
-`model-select.ts` maps `?model=qwen3` → `QWEN3_4B`. The Qwen chat path
+tied lm_head, ChatML non-thinking). Qwen3.6-35B-A3B is the URL default
+(a bare page with no `?model=`); `model-select.ts` maps `?model=qwen3` → `QWEN3_4B`. The Qwen chat path
 keeps the QKV matmul unfused (QK-norm is incompatible with the fused QKV
 kernel) but since the 2026-07-29 tuning round runs the fused
 `qk_norm_rope_append` kernel after it (**8 dispatches/layer**; `?fuseqk=0`

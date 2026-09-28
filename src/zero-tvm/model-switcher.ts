@@ -37,8 +37,9 @@ const MODELS = SHIPPED_MODELS.filter((m) =>
  */
 function switchTo(param: string): void {
   const url = new URL(window.location.href)
-  if (param) url.searchParams.set('model', param)
-  else url.searchParams.delete('model')
+  // Always set, even Phi-3's empty param: deleting the key lands on the
+  // absent-flag default — the flagship — instead of the model just picked.
+  url.searchParams.set('model', param)
   window.location.href = url.toString()
 }
 

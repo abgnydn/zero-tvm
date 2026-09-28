@@ -43,17 +43,19 @@ import { QWEN3_8_27B_4BIT } from '../compiler/model-spec.ts'
  *  ORDER IS THE ROSTER ORDER, and the entrance opens on the first entry
  *  (`GROUPS[0]`). It used to be the order specs were added, which put Phi-3 —
  *  the oldest and least capable thing here — on stage as the first thing any
- *  visitor saw. Strongest first now, descending.
+ *  visitor saw. Strongest first now, descending: the 35B MoE leads.
  *
- *  This does NOT change the no-flag default: `specForParam` matches on `param`,
- *  and an empty or unknown value still boots Phi-3, so every pre-registry URL
- *  keeps its exact behaviour. */
+ *  The reorder does NOT change typo'd or empty values: `specForParam` matches
+ *  on `param`, and an empty or unknown value still boots Phi-3, so every
+ *  pre-registry URL keeps its exact behaviour. What the reorder DOES change
+ *  is the absent flag — no `model` key at all now boots the flagship, on
+ *  every surface that asks `specForParam`. */
 export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> = [
+  { param: 'qwen36', spec: QWEN36_35B_A3B },
   { param: 'qwen38', spec: QWEN3_8_27B_4BIT },
   // The 35B MoE ships twice: 3-bit experts first (the build most machines can
   // actually run — ~20 GB free RAM), full 4-bit for the boxes that can.
   { param: 'qwen36q3', spec: QWEN36_35B_A3B_Q3 },
-  { param: 'qwen36', spec: QWEN36_35B_A3B },
   { param: 'qwen30b', spec: QWEN3_30B_A3B_4BIT },
   { param: 'qwen35mlx', spec: QWEN3_5_9B_MLX_4BIT },
   { param: 'qwen35', spec: QWEN35_4B },
@@ -73,11 +75,24 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
   // ADD-MODEL:MODELS
 ]
 
-/** `?model=<param>` → spec; unknown values (and no flag) boot Phi-3, so every
- *  pre-registry URL keeps its exact behavior. */
+/** `?model=<param>` → spec. ABSENT flag (null) boots the flagship — the
+ *  roster lead, Qwen3.6-35B-A3B — on every surface that asks. Empty and
+ *  unknown values still boot Phi-3, so every pre-registry URL keeps its
+ *  exact behavior; a typo must never summon a 20 GB download. */
 export function specForParam(model: string | null): ModelSpec {
-  const hit = model && SHIPPED_MODELS.find((m) => m.param === model)
+  if (model === null) return QWEN36_35B_A3B
+  const hit = SHIPPED_MODELS.find((m) => m.param === model)
   return hit ? hit.spec : PHI3
+}
+
+/** spec → its `?model=` value. Serving links and the room info frame name
+ *  the model EXPLICITLY — an absent flag must not travel as an absent key,
+ *  or the next hop boots whatever the default is that month instead of the
+ *  model actually running here. */
+export function paramForSpec(spec: ModelSpec): string {
+  const hit = SHIPPED_MODELS.find((m) => m.spec === spec)
+  if (!hit) throw new Error(`paramForSpec: unshipped spec ${spec.id}`)
+  return hit.param
 }
 
 /**

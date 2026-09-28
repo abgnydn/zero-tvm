@@ -76,9 +76,12 @@ describe("zero-tvm.html download gate", () => {
   }, 30_000);
 
   test("seeded ndarray-cache.json sentinel → gate is skipped", async () => {
-    const page = await newPage("/zero-tvm.html");
+    // Explicit `?model=` (Phi-3), NOT the bare page: the sentinel stands in
+    // for Phi-3's 1.8 GB download, and the bare default is the flagship —
+    // seeding its cache would need the real 20 GB checkpoint.
+    const page = await newPage("/zero-tvm.html?model=");
     await seedOpfsSentinel(page);
-    await page.goto(`${BASE}/zero-tvm.html`, { waitUntil: "domcontentloaded" });
+    await page.goto(`${BASE}/zero-tvm.html?model=`, { waitUntil: "domcontentloaded" });
     // Give boot()'s probe + main() time to run. main() will fail to actually
     // load weights (the seeded sentinel is empty), but the test only cares
     // that no gate was shown.

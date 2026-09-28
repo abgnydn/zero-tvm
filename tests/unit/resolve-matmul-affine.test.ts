@@ -148,7 +148,7 @@ describe('?matmul=scalar reaches scalar on an MLX checkpoint', () => {
 })
 
 describe('model selection reachability', () => {
-  it('?model=qwen36 selects the MoE spec, and the three existing mappings are unchanged', async () => {
+  it('?model=qwen36 selects the MoE spec; bare default is the flagship, empty key stays Phi-3', async () => {
     // model-select imports weight-loader, which reads GPUBufferUsage at MODULE
     // scope — so importing it under Node throws before any code runs. The real
     // values do not matter here; only that the constant exists.
@@ -159,7 +159,8 @@ describe('model selection reachability', () => {
     expect(specFromSearch('?model=qwen36').id).toBe('qwen36-35b-a3b')
     expect(specFromSearch('?model=qwen35').id).toBe(QWEN35_4B.id)
     expect(specFromSearch('?model=qwen3').id).toBe('qwen3-4b')
-    expect(specFromSearch('').id).toBe(PHI3.id)
+    expect(specFromSearch('').id).toBe('qwen36-35b-a3b')
+    expect(specFromSearch('?model=').id).toBe(PHI3.id)
   })
 
   it('SCALAR_VARIANTS is still the all-off preset it is used as', () => {
