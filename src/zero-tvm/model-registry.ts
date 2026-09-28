@@ -67,8 +67,8 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
   // Last on purpose — it answers nothing a visitor typed.
   { param: 'embed', spec: QWEN3_EMBEDDING_06B },
   // Not a chat model either: ?model=kev serves typed decisions (kev.ts) over
-  // forwardHiddenAt. Same roster treatment as embed — it answers questions,
-  // not conversation.
+  // forwardHiddenAt. A roster card that opens the decision console, not the
+  // chat — it answers questions, not conversation.
   { param: 'kev', spec: KEV_06B },
   { param: 'kev4b', spec: KEV_4B },
   { param: 'kev4bq35', spec: KEV_4B_Q35 },

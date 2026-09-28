@@ -176,6 +176,25 @@ describe('the gate says what it will boot', () => {
     const room = gateCopy(plan, { room: true, cached: false, stage: null, int8: true })
     expect(room.go).toBe('Download & open a room →')
   })
+
+  it('a deciding character is gated on deciding, never on chatting or rooms', () => {
+    // The consent question is always put — but a kev card must not promise a
+    // chat or a room. The wrong verb here boots the wrong contract: "Enter
+    // chat" on a model that scores options is consent to something that will
+    // not happen.
+    const sel: Selection = { gi: groupOf('Kev-4B'), vi: 0, mi: 0, xi: 0 }
+    const plan = bootPlanFor(sel, null)
+    expect(plan.spec.decisionOnly).toBe(true)
+    expect(plan.param).toBe('kev4b')
+    const cold = gateCopy(plan, { room: false, cached: false, stage: null, int8: true })
+    const warm = gateCopy(plan, { room: false, cached: true, stage: null, int8: true })
+    expect(cold.go).toBe('Download & decide →')
+    expect(warm.go).toBe('Enter & decide →')
+    for (const c of [cold, warm]) {
+      expect(c.what).toContain('does not converse')
+      expect(c.what).not.toContain('chat')
+    }
+  })
 })
 
 describe('a plan is the same model wherever it is read', () => {

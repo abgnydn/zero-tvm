@@ -309,6 +309,17 @@ export interface ModelSpecBase {
    */
   embeddingOnly?: boolean
   /**
+   * The model is a typed-DECISION model (kev): a backbone plus a pointer head
+   * that scores a fixed set of options, nothing generated. The LM head is
+   * never dispatched for a decision, so these specs keep `embeddingOnly` for
+   * every engine/dispatch purpose — this flag is the UI half only: a decision
+   * spec earns a roster card that opens a decision console, while a pure
+   * embedding spec earns no card at all. Conflating the two hid kev from
+   * every surface; splitting them keeps the engine truth and the UI truth
+   * from sharing one bit.
+   */
+  decisionOnly?: boolean
+  /**
    * On-disk weight layout. 'mlc' is the ndarray/tensor-cache shard format with
    * symmetric q4f16_1 (group 32); 'mlx-safetensors' is a HuggingFace
    * safetensors checkpoint quantised MLX-affine (group 64, with biases).
@@ -1186,7 +1197,8 @@ export const QWEN3_EMBEDDING_06B: ModelSpec = makeModelSpec({
 // model's 151936, no trimmed rows). It is served through forwardHiddenAt: the
 // engine reads post-final-norm hidden rows at the option / <decide> tokens and
 // kev.ts applies the head on the CPU. The lm_head is never dispatched for a
-// decision, which is what `embeddingOnly` records. Weights are the merge
+// decision, which is what `embeddingOnly` records for the engine; `decisionOnly`
+// is the UI half — a roster card that decides rather than chats. Weights are the merge
 // produced by scripts/kev-merge.py (MLX affine 4-bit, group 64) plus
 // kev_head.safetensors in the same directory.
 export const KEV_06B: ModelSpec = makeModelSpec({
@@ -1212,6 +1224,7 @@ export const KEV_06B: ModelSpec = makeModelSpec({
   manifestName: 'model.safetensors.index.json',
   weightFormat: 'mlx-safetensors',
   embeddingOnly: true,
+  decisionOnly: true,
   paramNaming: mlxParamNaming(""),
 })
 
@@ -1242,6 +1255,7 @@ export const KEV_4B: ModelSpec = makeModelSpec({
   manifestName: 'model.safetensors.index.json',
   weightFormat: 'mlx-safetensors',
   embeddingOnly: true,
+  decisionOnly: true,
   paramNaming: mlxParamNaming(""),
 })
 
@@ -1281,6 +1295,7 @@ export const KEV_4B_Q35: ModelSpec = makeModelSpec({
   attnGate: true,
   partialRotaryFactor: 0.25,
   embeddingOnly: true,
+  decisionOnly: true,
   paramNaming: mlxParamNaming("language_model."),
 })
 

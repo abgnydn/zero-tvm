@@ -15,6 +15,7 @@ export const LANE_SIGIL: Record<string, string> = {
   dense: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1" opacity="0.55"/><rect x="4" y="13" width="7" height="7" rx="1" opacity="0.55"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg>',
   mla: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l8 9-8 9-8-9z"/><path d="M12 8l4 4-4 4-4-4z" fill="currentColor" stroke="none" opacity="0.7"/></svg>',
   embed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12c2.5-4 6-6 9-6s6.5 2 9 6c-2.5 4-6 6-9 6s-6.5-2-9-6z"/><path d="M8 12h8" opacity="0.8"/></svg>',
+  decide: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M5 7l7-4 7 4"/><path d="M5 7l-2 7 7 3 7-3-2-7"/></svg>',
 }
 
 /** The character's ABILITIES: the spec's real mechanics written as passives.
@@ -32,12 +33,14 @@ export function abilitiesOf(spec: ModelSpec): Array<{ name: string; desc: string
   if (!spec.moe && gdn === 0 && !spec.mla && !spec.embeddingOnly) {
     out.push({ name: 'Full Attention', desc: `every token sees every token, ${spec.layers} layers deep` })
   }
+  if (spec.decisionOnly) out.push({ name: 'Pointer Head', desc: 'one probability per option, nothing generated' })
   if (spec.qkNorm) out.push({ name: 'Steady Gaze', desc: 'QK-norm holds attention in range' })
   if (spec.maxSeq >= 131072) out.push({ name: 'Long Sight', desc: `trained to a ${Math.round(spec.maxSeq / 1024)}k window` })
   return out.slice(0, 3)
 }
 
 export function laneOf(spec: ModelSpec): string {
+  if (spec.decisionOnly) return 'decide'
   return spec.embeddingOnly ? 'embed' : spec.mla ? 'mla' : spec.moe ? 'moe'
     : spec.layerKinds.some((k) => k === 'gdn') ? 'hybrid' : 'dense'
 }
@@ -45,6 +48,7 @@ export function laneOf(spec: ModelSpec): string {
 /** One line of lore per character — every clause computed from the spec, so
  *  the flavour text is as registry-true as the stat rows. */
 export function loreOf(spec: ModelSpec): string {
+  if (spec.decisionOnly) return 'Scores fixed options. It does not converse.'
   if (spec.embeddingOnly) return 'Returns a vector. It does not speak.'
   if (spec.mla) return 'Attends through a compressed latent — the cache is 7× smaller than it looks.'
   if (spec.moe) {
