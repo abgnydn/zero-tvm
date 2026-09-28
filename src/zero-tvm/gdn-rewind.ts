@@ -22,6 +22,7 @@ export class GdnRewindRing {
   private readonly pos: number[]
   private next = 0
   private allocated = false
+  private lastSaved = -1
 
   constructor(opts: {
     device: GPUDevice
@@ -72,6 +73,7 @@ export class GdnRewindRing {
     }
     this.device.queue.submit([enc.finish()])
     this.pos[slot] = pos
+    this.lastSaved = slot
     this.next = (this.next + 1) % this.slotCount
   }
 
@@ -93,6 +95,17 @@ export class GdnRewindRing {
   invalidate(): void {
     this.pos.fill(-1)
     this.next = 0
+    this.lastSaved = -1
+  }
+
+  /**
+   * Slot written by the most recent save(), or -1 when the ring is empty.
+   * A caller that saves and then restores the same snapshot needs this, not
+   * findBest: an older slot can hold the same position, and findBest breaks
+   * that tie toward the lowest index — the stale state, silently.
+   */
+  lastSavedSlot(): number {
+    return this.lastSaved
   }
 
   /** Which snapshot to replay from, or -1 if none is usable. */

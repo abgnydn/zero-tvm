@@ -3188,7 +3188,7 @@ export function buildDecodeEngine(
       for (const { ids, positions } of prompts) {
         if (positions.length === 0) continue
         const first = Math.min(...positions)
-        const startPos = Math.min(computeReuseStart(ids), first)
+        const startPos = Math.min(absorbed.computeReuseStart(ids), first)
         const end = ids.length
         // Requested rows that fall in [lo, hi) — copied out of `src`, whose
         // row 0 is prompt position `lo`. Queued right after the pass that
@@ -3280,7 +3280,7 @@ export function buildDecodeEngine(
     // through the chunk, so branch tokens would leak into each other through
     // the recurrence no matter how attention is masked. Branches run one at a
     // time off a SNAPSHOT of the state's recurrent state instead.
-    if (hybrid && !(chunkPrefill && chunkPrefill.packedOK) && GDN_CKPT_SLOTS > 0) {
+    if (hybrid && !(chunkPrefill && chunkPrefill.packedOK) && gdnRewind.slotCount > 0) {
       return forwardHiddenBranchesRewind(state, branches, total)
     }
 
@@ -3293,7 +3293,7 @@ export function buildDecodeEngine(
     {
       // A hybrid can reuse the state only when the engine holds EXACTLY it
       // (its recurrence cannot be partially rewound); otherwise from zero.
-      const lcp = absorbedValid && prefixReuse ? Math.min(absorbedLcp(state), S_LEN) : 0
+      const lcp = absorbed.isValid && prefixReuse ? Math.min(absorbed.lcp(state), S_LEN) : 0
       let pos = hybrid ? (lcp === S_LEN && absorbed.length === S_LEN && gdnStatePos === S_LEN ? S_LEN : 0) : lcp
       while (pos < S_LEN) {
         const n = Math.min(cap, S_LEN - pos)
@@ -3398,15 +3398,15 @@ export function buildDecodeEngine(
     // 1. The state: reusable only when the engine holds EXACTLY it (the hybrid
     //    rule); anything else is a prefill from zero, which re-zeroes the
     //    recurrent state at position 0.
-    const resident = absorbedValid && prefixReuse && gdnStatePos === S_LEN
-      && absorbed.length === S_LEN && absorbedLcp(state) === S_LEN
+    const resident = absorbed.isValid && prefixReuse && gdnStatePos === S_LEN
+      && absorbed.length === S_LEN && absorbed.lcp(state) === S_LEN
     if (!resident) await run(state, 0)
-    saveGdnCkpt(S_LEN)
-    const slot = (gdnCkptNext - 1 + GDN_CKPT_SLOTS) % GDN_CKPT_SLOTS
+    gdnRewind.save(S_LEN)
+    const slot = gdnRewind.lastSavedSlot()
     const rewind = (): void => {
-      if (!restoreGdnCkpt(slot)) throw new Error('forwardHiddenBranchesRewind: the snapshot ring is empty')
+      if (slot < 0 || !gdnRewind.restore(slot)) throw new Error('forwardHiddenBranchesRewind: the snapshot ring is empty')
       gdnStatePos = S_LEN
-      absorbed.length = S_LEN
+      absorbed.truncate(S_LEN)
     }
 
     const rowBytes = S.d * 2
