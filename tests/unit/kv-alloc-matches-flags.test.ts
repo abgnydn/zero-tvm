@@ -27,7 +27,7 @@ import { resolveInt8Mode } from '../../src/zero-tvm/engine-core.ts'
 // allocKVFor call this same function, so allocation and execution cannot
 // disagree about which cache is in use.
 const wantsScales = (spec: { mla?: unknown }, flags: { int8KV?: boolean }) =>
-  resolveInt8Mode({}, flags, spec)
+  resolveInt8Mode(flags, spec)
 
 describe('the KV cache matches the flags that asked for it', () => {
   it('?kv8 defaults ON, so a surface that ignores it runs the wrong cache', () => {

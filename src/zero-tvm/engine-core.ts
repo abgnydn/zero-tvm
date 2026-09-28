@@ -24,7 +24,8 @@ import { LoadedWeights } from './weight-loader.js'
 import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
-import { reuseStart, rewindSlot, dropSnapshotsAbove, noteAbsorbed as pureNoteAbsorbed, type ReuseState } from './prefix-reuse.js'
+import { AbsorbedRecord } from './absorbed-record.js'
+import { GdnRewindRing } from './gdn-rewind.js'
 import { ExpertPool } from './expert-pool.js'
 import type { SlabKind, SlabProj } from './slab-source.js'
 
@@ -132,19 +133,9 @@ export function allocKVPages(device: GPUDevice, spec: ModelSpec = PHI3): GPUBuff
  * The KV cache the FLAGS ask for. Use this instead of picking an allocator by
  * hand.
  *
- * int8KV was expressed twice — once as VariantFlags.int8KV (parsed from ?kv8,
- * DEFAULT ON) and once as DecodeEngineOptions.int8KV — and the engine read only
- * the option. Threading the two together was a hand-written step at every
- * construction site, and four of the five got it wrong: the agent host, both
- * room paths and the validate boot allocated an f16 cache while their own flags
- * reported int8.
- *
- * That was silent and it mattered three ways. `?kv8=0` was a NO-OP on those
- * surfaces, so a bisection could "clear" int8 KV as a cause on a surface that
- * never ran it. They ran different attention kernels from the chat page for the
- * same model (`splitK = int8Mode ? 0 : R.splitK`), so a number measured on one
- * describes kernels the other does not execute. And they allocated twice the KV
- * the entrance publishes.
+ * VariantFlags.int8KV (parsed from ?kv8, DEFAULT ON) is the single source.
+ * DecodeEngineOptions no longer carries a separate int8KV knob, so the engine
+ * cannot disagree with the allocator about which cache layout is in use.
  */
 /**
  * Does this engine run an int8 KV cache? The ONE place that decides.
@@ -154,18 +145,16 @@ export function allocKVPages(device: GPUDevice, spec: ModelSpec = PHI3): GPUBuff
  * copy of the branch, and the mutation gate showed it stayed green when the
  * engine was reverted to the buggy version.
  *
- * The explicit option wins when given; otherwise the VARIANT flag decides,
- * which is the fix for four surfaces that parsed ?kv8 and then never threaded
- * it, silently running f16 while reporting int8. MLA is excluded either way —
- * it caches a latent rather than per-head K/V and has no int8 path.
+ * VariantFlags.int8KV is the single source; DecodeEngineOptions no longer
+ * carries a separate int8KV knob. MLA is excluded either way — it caches a
+ * latent rather than per-head K/V and has no int8 path.
  */
 export function resolveInt8Mode(
-  opts: { int8KV?: boolean },
   variants: { int8KV?: boolean },
   spec: { mla?: unknown },
 ): boolean {
   if (spec.mla) return false
-  return opts.int8KV ?? variants.int8KV ?? false
+  return variants.int8KV ?? false
 }
 
 /**
@@ -259,7 +248,7 @@ export function allocKVFor(
 ): GPUBuffer[] | { pages: GPUBuffer[]; scales: GPUBuffer[] } {
   // MLA caches a latent rather than per-head K/V and has no int8 path;
   // buildDecodeEngine throws for it, so it must keep the f16 allocator.
-  return resolveInt8Mode({}, flags, spec) ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
+  return resolveInt8Mode(flags, spec) ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
 }
 
 export function allocKVPagesInt8(device: GPUDevice, spec: ModelSpec = PHI3): { pages: GPUBuffer[]; scales: GPUBuffer[] } {
@@ -493,8 +482,6 @@ export interface DecodeEngineOptions {
    *         (9/layer; 10 with qkNorm).
    */
   fused?: boolean
-  /** int8 KV cache. Requires `fused` and a kv argument carrying `scales`. */
-  int8KV?: boolean
   /** Model shape to build for. Default: PHI3. Must match the loaded weights. */
   spec?: ModelSpec
   /**
@@ -651,7 +638,7 @@ export function buildDecodeEngine(
 ): DecodeEngine {
   const variants = opts.variants ?? SCALAR_VARIANTS
   const fused = opts.fused ?? false
-  const int8Mode = resolveInt8Mode(opts, variants, opts.spec ?? PHI3)
+  const int8Mode = resolveInt8Mode(variants, opts.spec ?? PHI3)
   const S = opts.spec ?? PHI3
   const kvPages = Array.isArray(kv) ? kv : kv.pages
   const kvScales = Array.isArray(kv) ? undefined : kv.scales
@@ -924,85 +911,15 @@ export function buildDecodeEngine(
   // 43,761. Four slots is ~4k tokens of lookback, which covers a client
   // rewriting its own trailing turn; a divergence older than the ring simply
   // falls back to the full re-prefill it does today.
-  // NB: read the option directly — `prefixReuse` is declared further down, so
-  // referencing it here is a temporal dead zone, not a value.
-  const GDN_CKPT_SLOTS = hybrid && (opts.prefixReuse ?? true) ? 4 : 0
-  const gdnCkptConv: (GPUBuffer | null)[][] = []
-  const gdnCkptRecur: (GPUBuffer | null)[][] = []
-  /** Absorbed-token position each slot's state sits at; -1 = empty. */
-  const gdnCkptPos: number[] = new Array(GDN_CKPT_SLOTS).fill(-1)
-  let gdnCkptNext = 0
-
-  /**
-   * Allocate the ring on FIRST USE, not at build time.
-   *
-   * Only the chunked-prefill loop ever writes a snapshot, and whether chunking
-   * exists is decided thousands of lines below this — from subgroup support,
-   * `?chunk=0` and the pooled-expert path. Allocating up front burned 0.19 GB
-   * (qwen35) to 0.57 GB (qwen38) on every engine that can never fill it:
-   * devices without subgroups, anyone passing ?chunk=0, and the pooled builds
-   * whose whole purpose is using less memory. Worst on the weakest hardware,
-   * which is exactly backwards.
-   */
-  function ensureGdnCkptBuffers(): void {
-    if (GDN_CKPT_SLOTS === 0 || gdnCkptConv.length > 0) return
-    for (let slot = 0; slot < GDN_CKPT_SLOTS; slot++) {
-      const conv: (GPUBuffer | null)[] = []
-      const recur: (GPUBuffer | null)[] = []
-      for (let L = 0; L < S.layers; L++) {
-        if (gdnConvState[L]) {
-          conv.push(makeBuf(device, (S.gdnConvK - 1) * S.gdnQkvDim * 2, `gdnCkptConv_${slot}_${L}`))
-          recur.push(makeBuf(device, S.gdnVHeads * S.gdnStatePerHead * 4, `gdnCkptRecur_${slot}_${L}`))
-        } else { conv.push(null); recur.push(null) }
-      }
-      gdnCkptConv.push(conv)
-      gdnCkptRecur.push(recur)
-    }
-  }
-
-  /** Snapshot the live GDN state as the rewind point for `pos`. */
-  function saveGdnCkpt(pos: number): void {
-    if (GDN_CKPT_SLOTS === 0) return
-    ensureGdnCkptBuffers()
-    const slot = gdnCkptNext
-    const enc = device.createCommandEncoder()
-    for (let L = 0; L < S.layers; L++) {
-      const c = gdnConvState[L], r = gdnRecurState[L]
-      if (!c || !r) continue
-      enc.copyBufferToBuffer(c, 0, gdnCkptConv[slot][L]!, 0, c.size)
-      enc.copyBufferToBuffer(r, 0, gdnCkptRecur[slot][L]!, 0, r.size)
-    }
-    device.queue.submit([enc.finish()])
-    gdnCkptPos[slot] = pos
-    gdnCkptNext = (gdnCkptNext + 1) % GDN_CKPT_SLOTS
-  }
-
-  /** @returns false if the ring holds nothing to restore — the caller MUST
-   *  then abandon the rewind. Returning void here was a latent trap: the call
-   *  site goes on to set gdnStatePos, truncate `absorbed` and skip the
-   *  prefill, so a guard that fired silently would produce fluent wrong output
-   *  rather than a loud failure. Unreachable today (positions only leave -1
-   *  inside saveGdnCkpt, after allocation), which is exactly why it should not
-   *  depend on staying unreachable. */
-  function restoreGdnCkpt(slot: number): boolean {
-    if (gdnCkptConv.length === 0) return false
-    const enc = device.createCommandEncoder()
-    for (let L = 0; L < S.layers; L++) {
-      const c = gdnConvState[L], r = gdnRecurState[L]
-      if (!c || !r) continue
-      enc.copyBufferToBuffer(gdnCkptConv[slot][L]!, 0, c, 0, c.size)
-      enc.copyBufferToBuffer(gdnCkptRecur[slot][L]!, 0, r, 0, r.size)
-    }
-    device.queue.submit([enc.finish()])
-    return true
-  }
-
-  /** Anything that moves the state without replaying tokens voids every slot.
-   *  A stale rewind point is not a slow path, it is a wrong answer. */
-  function invalidateGdnCkpts(): void {
-    gdnCkptPos.fill(-1)
-    gdnCkptNext = 0
-  }
+  const gdnRewind = new GdnRewindRing({
+    device,
+    spec: S,
+    gdnConvState,
+    gdnRecurState,
+    prefixReuse: opts.prefixReuse ?? true,
+    hybrid,
+    makeBuf,
+  })
 
   // A MoE block is STATELESS — unlike the GDN recurrence above, nothing carries
   // between tokens — so every buffer here is shared across all 40 layers.
@@ -1662,9 +1579,8 @@ export function buildDecodeEngine(
   // record stays exact even for the ≤ PIPELINE_DEPTH-1 overrun steps
   // submitted after a stop token. A readback failure (device loss) marks the
   // record invalid, which disables reuse until resetKVTracking().
-  let absorbed: number[] = []
-  let absorbedValid = true
   const prefixReuse = opts.prefixReuse ?? true
+  const absorbed = new AbsorbedRecord(prefixReuse, hybrid, () => gdnStatePos)
   /** What ended the last turn. `stop` false with `inVocab` false means the
    *  readback produced no valid token — an engine fault, not a decision. */
   let lastStop: { id: number; generated: number; stop: boolean; inVocab: boolean } | null = null
@@ -1677,37 +1593,6 @@ export function buildDecodeEngine(
      *  it says why rather than leaving it to be inferred from a stopwatch. */
     lcp: number; absorbed: number; gdnStatePos: number; hybrid: boolean; valid: boolean
   } | null = null
-
-  // The rules themselves live in prefix-reuse.ts, pinned by
-  // tests/unit/prefix-reuse.test.ts against a table hand-derived from the
-  // stated rule. They were closures here, and their only assertion was
-  // checkReuse() in bench-console.ts — a browser, a loaded model, 48 decoded
-  // tokens and ?chunk=0. These two wrappers keep the local `let`s as the
-  // single source of truth: gdnStatePos is written from six places in this
-  // file, so it is read at call time rather than mirrored.
-  function reuseState(): ReuseState {
-    return { absorbed, absorbedValid, prefixReuse, hybrid, gdnStatePos }
-  }
-
-  function noteAbsorbed(position: number, id: number): void {
-    const s = reuseState()
-    pureNoteAbsorbed(s, position, id)
-    absorbed = s.absorbed
-    absorbedValid = s.absorbedValid
-  }
-
-  function computeReuseStart(promptIds: number[]): number {
-    return reuseStart(reuseState(), promptIds)
-  }
-
-  /** How far the new prompt agrees with what the cache holds. Reported, never
-   *  used to decide — reuseStart owns the decision. */
-  function absorbedLcp(promptIds: number[]): number {
-    const max = Math.min(absorbed.length, promptIds.length)
-    let lcp = 0
-    while (lcp < max && absorbed[lcp] === promptIds[lcp]) lcp++
-    return lcp
-  }
 
   // Logit readback buffer — used by forwardLogits() for the validation harness only.
   // Allocated lazily on first call.
@@ -2877,7 +2762,7 @@ export function buildDecodeEngine(
   function clearGdnState(enc: GPUCommandEncoder): void {
     for (const b of gdnStateBufs) enc.clearBuffer(b)
     // Every rewind point described the state this just erased.
-    invalidateGdnCkpts()
+    gdnRewind.invalidate()
   }
 
   // ============================================================
@@ -2947,7 +2832,7 @@ export function buildDecodeEngine(
     if (optimistic) {
       await stepOptimistic(position, (e) => e.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4))
       gdnStatePos = position + 1
-      noteAbsorbed(position, tokenId)
+      absorbed.note(position, tokenId)
       await readBuf.mapAsync(GPUMapMode.READ)
       const r = new DataView(readBuf.getMappedRange()).getInt32(0, true)
       readBuf.unmap()
@@ -2958,7 +2843,7 @@ export function buildDecodeEngine(
     enc.copyBufferToBuffer(B.tokenOut, 0, readBuf, 0, 4)
     device.queue.submit([enc.finish()])
     gdnStatePos = position + 1
-    noteAbsorbed(position, tokenId)
+    absorbed.note(position, tokenId)
 
     await readBuf.mapAsync(GPUMapMode.READ)
     const result = new DataView(readBuf.getMappedRange()).getInt32(0, true)
@@ -3235,7 +3120,7 @@ export function buildDecodeEngine(
     meanAbsDiff: number
   }> {
     if (promptIds.length < 2) throw new Error('debugCompareReuse: prompt too short')
-    const startPos = computeReuseStart(promptIds)
+    const startPos = absorbed.computeReuseStart(promptIds)
     // Reused-prefix pass: prefill only the delta, then read logits.
     for (let i = startPos; i < promptIds.length - 1; i++) {
       await decodeToken(promptIds[i], i)
@@ -3308,7 +3193,7 @@ export function buildDecodeEngine(
     { tokens: number; ids: number[]; layers: ArrayBuffer[]; scales: ArrayBuffer[]; gdn: ArrayBuffer[] } | null
   > {
     if (partial || MLA) return null
-    if (!absorbedValid || absorbed.length === 0) return null
+    if (!absorbed.isValid || absorbed.length === 0) return null
     if (hybrid && gdnStatePos !== absorbed.length) return null   // mid-chunk state: not attachable
     const tokens = absorbed.length
     const pages = Math.ceil(tokens / S.pageSize)
@@ -3344,7 +3229,7 @@ export function buildDecodeEngine(
         gdn.push(await readBack(gdnRecurState[L]!, gdnRecurState[L]!.size))
       }
     }
-    return { tokens, ids: [...absorbed], layers, scales, gdn }
+    return { tokens, ids: [...absorbed.ids], layers, scales, gdn }
   }
 
   /**
@@ -3382,9 +3267,8 @@ export function buildDecodeEngine(
     }
     // A restored snapshot jumps the state to snap.tokens without replaying
     // anything, so no earlier rewind point describes it any more.
-    invalidateGdnCkpts()
-    absorbed = [...snap.ids]
-    absorbedValid = true
+    gdnRewind.invalidate()
+    absorbed.setFrom(snap.ids)
     return true
   }
 
@@ -3394,8 +3278,7 @@ export function buildDecodeEngine(
     // are overwritten in order, and a from-0 prefill re-zeroes GDN state).
     // Blocking-path callers additionally track their own prefix length and
     // pass startPos to generate().
-    absorbed = []
-    absorbedValid = true
+    absorbed.clear()
   }
 
   // ============================================================
@@ -3953,7 +3836,7 @@ export function buildDecodeEngine(
       }
       device.queue.submit([enc.finish()])
       gdnStatePos = start + n
-      for (let t = 0; t < n; t++) noteAbsorbed(start + t, promptIds[start + t])
+      for (let t = 0; t < n; t++) absorbed.note(start + t, promptIds[start + t])
     }
 
     return {
@@ -4069,7 +3952,7 @@ export function buildDecodeEngine(
       enc.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
       device.queue.submit([enc.finish()])
       gdnStatePos = position + 1
-      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+      if (writeInputId !== null) absorbed.note(position, writeInputId)
       return slot.mapAsync(GPUMapMode.READ).then(() => {
         const id = new DataView(slot.getMappedRange()).getInt32(0, true)
         slot.unmap()
@@ -4079,7 +3962,7 @@ export function buildDecodeEngine(
 
     device.queue.submit([enc.finish()])
     gdnStatePos = position + 1
-    if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+    if (writeInputId !== null) absorbed.note(position, writeInputId)
     return null
   }
 
@@ -4115,7 +3998,7 @@ export function buildDecodeEngine(
         if (slot) e.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
       })
       gdnStatePos = position + 1
-      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+      if (writeInputId !== null) absorbed.note(position, writeInputId)
     })
     pooledChain = done.catch((err) => {
       if (!wantReadback) console.error('[engine] optimistic prefill step failed', err)
@@ -4144,7 +4027,7 @@ export function buildDecodeEngine(
       if (slot) enc.copyBufferToBuffer(B.tokenOut, 0, slot, 0, 4)
       device.queue.submit([enc.finish()])
       gdnStatePos = position + 1
-      if (writeInputId !== null) noteAbsorbed(position, writeInputId)
+      if (writeInputId !== null) absorbed.note(position, writeInputId)
     })
     // A failed step must not poison the ORDERING of the ones behind it, and a
     // fire-and-forget step has no caller to see its rejection — so it is logged
@@ -4179,7 +4062,7 @@ export function buildDecodeEngine(
      *  Hybrid reuse is all-or-nothing, so it needs a GDN snapshot at or BELOW
      *  the divergence. Snapshots are otherwise taken only at chunk boundaries,
      *  and the last boundary lands at the END of the prompt — above it — so
-     *  rewindSlot found nothing and every short conversation re-prefilled from
+     *  findBest returned nothing and every short conversation re-prefilled from
      *  zero. Guessing a point is not possible at prefill time; the caller knows
      *  it exactly, because it built the string.
      *
@@ -4212,35 +4095,35 @@ export function buildDecodeEngine(
     // Reading them afterwards would describe the state the rewind created
     // rather than the one the decision was made against: the same tautology
     // this diagnostic was already rewritten once to avoid.
-    const preLcp = absorbedLcp(promptIds)
+    const preLcp = absorbed.lcp(promptIds)
     const preAbsorbed = absorbed.length
     const preGdnPos = gdnStatePos
-    const preValid = absorbedValid
-    let startPos = computeReuseStart(promptIds)
+    const preValid = absorbed.isValid
+    let startPos = absorbed.computeReuseStart(promptIds)
     // Second chance: reuseStart said no, but a rewind point may sit at or
     // before the position where the prompts still agree. Replaying from there
     // costs about one chunk instead of the whole conversation, and leaves the
     // recurrent state exactly where an ordinary prefill would have.
     let rewoundTo = -1
-    if (startPos === 0 && GDN_CKPT_SLOTS > 0 && absorbedValid && prefixReuse && absorbed.length > 0) {
-      const bestSlot = rewindSlot(gdnCkptPos, absorbedLcp(promptIds), promptIds.length)
-      if (bestSlot >= 0 && restoreGdnCkpt(bestSlot)) {
-        rewoundTo = gdnCkptPos[bestSlot]
+    if (startPos === 0 && gdnRewind.slotCount > 0 && absorbed.isValid && prefixReuse && absorbed.length > 0) {
+      const bestSlot = gdnRewind.findBest(absorbed.lcp(promptIds), promptIds.length)
+      if (bestSlot >= 0 && gdnRewind.restore(bestSlot)) {
+        rewoundTo = gdnRewind.position(bestSlot)
         gdnStatePos = rewoundTo
         // Truncate the record to match: everything above the rewind point is
         // about to be rewritten by the replay — noteAbsorbed's own rewind case.
-        absorbed.length = rewoundTo
+        absorbed.truncate(rewoundTo)
         // ...and the SNAPSHOTS above it describe that same doomed sequence.
         // Leaving them is how a later turn restores an older turn's recurrent
         // state onto the current cache: silent, fluent, wrong.
-        dropSnapshotsAbove(gdnCkptPos, rewoundTo)
+        gdnRewind.dropAbove(rewoundTo)
         startPos = rewoundTo
       }
     }
     const last = promptIds.length - 1
     // Normalised once. Out of range, already reused past, or a spec with no GDN
     // state to snapshot -> 0, which both paths read as "no rewind point".
-    const rewindPoint = rewindAt !== undefined && GDN_CKPT_SLOTS > 0
+    const rewindPoint = rewindAt !== undefined && gdnRewind.slotCount > 0
       && rewindAt > startPos && rewindAt < promptIds.length ? rewindAt : 0
     let prefillPos = startPos
     let chunks = 0
@@ -4279,7 +4162,7 @@ export function buildDecodeEngine(
         await device.queue.onSubmittedWorkDone()
         // Rewind point for the NEXT turn. The state sits exactly at
         // prefillPos here, which is the only moment it can be captured cheaply.
-        saveGdnCkpt(prefillPos)
+        gdnRewind.save(prefillPos)
         onPrefill?.(prefillPos, promptIds.length)
       }
     }
@@ -4288,14 +4171,14 @@ export function buildDecodeEngine(
     // skipping readback removes the CPU syncs.
     for (; prefillPos < last; prefillPos++) {
       submitStep(promptIds[prefillPos], prefillPos, false)
-      // saveGdnCkpt's argument is a COUNT of absorbed tokens, and submitStep
+      // gdnRewind.save's argument is a COUNT of absorbed tokens, and submitStep
       // has just set gdnStatePos = prefillPos + 1. Passing prefillPos here
       // labels the snapshot one SHORT, and restoring it replays that token
       // into a recurrence that is not idempotent — fluent wrong output. That
       // bug was written and reverted on 2026-08-19; the +1 is the whole fix.
       if (prefillPos + 1 === rewindPoint) {
         await device.queue.onSubmittedWorkDone()
-        saveGdnCkpt(prefillPos + 1)
+        gdnRewind.save(prefillPos + 1)
       }
       if ((prefillPos & 63) === 0) {
         // Same reason as the chunk loop: submitStep fires without a readback,
@@ -4312,9 +4195,9 @@ export function buildDecodeEngine(
         //     36-token prompt chunks in one chunk and this line never runs.
         //   - the chunk loop's snapshot already lands at `last`, ABOVE the
         //     divergence (which sits where the generation prompt's <think>
-        //     suffix was, a few tokens earlier), so rewindSlot returns -1 and
+        //     suffix was, a few tokens earlier), so findBest returns -1 and
         //     startPos is 0 regardless.
-        //   - saveGdnCkpt's argument is a COUNT of absorbed tokens: the chunk
+        //   - gdnRewind.save's argument is a COUNT of absorbed tokens: the chunk
         //     loop calls it after `prefillPos += s`, matching gdnStatePos =
         //     start + n. submitStep sets gdnStatePos = position + 1, so a
         //     snapshot taken here is one SHORT, and restoring it replays that
@@ -4460,10 +4343,10 @@ export function buildDecodeEngine(
       // settled by the drain above.
       try {
         for (let p = promptIds.length; p < pos; p++) {
-          noteAbsorbed(p, await rbByPos.get(p - 1)!)
+          absorbed.note(p, await rbByPos.get(p - 1)!)
         }
       } catch {
-        absorbedValid = false
+        absorbed.invalidate()
       }
     }
 
@@ -4821,7 +4704,7 @@ export function buildDecodeEngine(
       // The rewind ring, per its own rule above. It is allocated LAZILY, so
       // these arrays are empty on an engine that never chunked — flat() over
       // nothing, rather than a special case.
-      ...gdnCkptConv.flat(), ...gdnCkptRecur.flat(),
+      ...gdnRewind.buffers(),
       ...Object.values(B), ...gdnStateBufs, ...readRing, ffnGateUp,
       qkvU, oProjU, ffnDnU, ffnGateUpU, ffnSiluU, lmHdU, embU, normU, ffnU, argmaxU,
       samplerU, samplePartials, ropeU, ropeFreqs, kvAppU, qkNormU, qkFuseU,
