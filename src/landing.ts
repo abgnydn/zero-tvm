@@ -93,10 +93,12 @@ function splitParams(s: string): { family: string; variant: string } {
 function buildGroups(): Group[] {
   const out = new Map<string, Group>()
   for (const { param, spec } of SHIPPED_MODELS) {
-    // The entrance is a CHAT roster. The embedding model returns a vector and
-    // does not speak — it stays in the registry (validate + ?model= still
-    // work) but earns no place on a character-select screen for conversation.
-    if (spec.embeddingOnly) continue
+    // The entrance is a CHAT roster, plus the decision characters. The
+    // embedding model returns a vector and does not speak — it stays in the
+    // registry (validate + ?model= still work) but earns no card. A decision
+    // spec (kev) answers fixed options instead of conversing; it earns a card
+    // whose ENTER opens the decision console rather than the chat.
+    if (spec.embeddingOnly && !spec.decisionOnly) continue
     const b = modelBranding(spec)
     // Pending = generated but not yet numerics-validated. A roster card is a
     // claim the model runs; the claim waits for validate-model.
@@ -172,10 +174,12 @@ export interface EntranceIntent {
  * A spec the ROSTER does not carry — the embedding model, which answers
  * nothing a visitor typed, or a build that is generated but not yet
  * numerics-validated — takes the registry's own fallback rather than the
- * roster's lead. The entrance cannot put a character on stage that it
- * deliberately does not ship. (That fallback is the absent-flag default, so
- * today it coincides with slot 0; the lookup stays written as the fallback,
- * not as slot 0, so the next reorder cannot silently re-point it.)
+ * roster's lead. (Decision specs ARE carried: a kev card opens the decision
+ * console, so `?model=kev` resolves to its own slot, not the fallback.)
+ * The entrance cannot put a character on stage that it deliberately does
+ * not ship. (That fallback is the absent-flag default, so today it coincides
+ * with slot 0; the lookup stays written as the fallback, not as slot 0, so
+ * the next reorder cannot silently re-point it.)
  */
 function rosterSlotFor(param: string | null): { gi: number; vi: number } {
   // Presentation: no ?model= key, so nothing was asked for. Open on the
@@ -379,7 +383,9 @@ export function gateCopy(plan: BootPlan, o: {
   })
   return {
     title: `Run ${plan.name} on this machine?`,
-    what: `This link asks to run ${plan.name} on this machine. ${c.weights} Nothing has downloaded yet.`,
+    what: plan.spec.decisionOnly
+      ? `This link asks to run ${plan.name} on this machine. It scores fixed options — it does not converse. ${c.weights} Nothing has downloaded yet.`
+      : `This link asks to run ${plan.name} on this machine. ${c.weights} Nothing has downloaded yet.`,
     // The second half of the price: the KV cache is allocated EAGERLY at boot,
     // and ?ctx= moves it. A stage's RAM line names the whole checkpoint as the
     // whole checkpoint's rather than dropping the figure.
@@ -387,9 +393,11 @@ export function gateCopy(plan: BootPlan, o: {
       `${ctxLabel(plan.ctxTokens)} context · ~${kvPrice(plan.spec, plan.ctxTokens, o.int8)} allocated at boot`,
       c.ram,
     ].filter(Boolean).join(' — '),
-    go: o.room
-      ? (o.cached ? 'Enter & open a room →' : 'Download & open a room →')
-      : (o.cached ? 'Enter chat →' : 'Download & enter →'),
+    go: plan.spec.decisionOnly
+      ? (o.cached ? 'Enter & decide →' : 'Download & decide →')
+      : o.room
+        ? (o.cached ? 'Enter & open a room →' : 'Download & open a room →')
+        : (o.cached ? 'Enter chat →' : 'Download & enter →'),
   }
 }
 
@@ -552,12 +560,14 @@ function render(): void {
     <div class="cs-roster-head" aria-hidden="true">Roster</div>
     <div class="mb-dots mb-roster" role="tablist" aria-label="Models"></div>
     <div class="cs-enter">
-      <!-- TWO verbs, equal weight. Serving a room works on EVERY model — only
-           splitting one across machines needs an MLX checkpoint, and 8 of the
-           11 shipped specs are MLX. Hiding the room behind a line of grey text
-           under the button, below the fold, buried the most shareable thing
-           the project does; the split doorway on the RAM line made it worse by
-           framing the swarm as a consolation for not having enough memory. -->
+      <!-- TWO verbs, equal weight, on chat characters. Serving a room works on
+            every CHAT model — only splitting one across machines needs an MLX
+            checkpoint, and 8 of the shipped chat specs are MLX. Deciding
+            characters (kev) hide the room verb in paint(): rooms serve chat.
+            Hiding the room behind a line of grey text
+            under the button, below the fold, buried the most shareable thing
+            the project does; the split doorway on the RAM line made it worse by
+            framing the swarm as a consolation for not having enough memory. -->
       <div class="cs-verbs">
         <a class="mb-cta btn btn-primary">Enter chat ▸</a>
         <a class="mb-cta-room btn btn-room">⟁ Open a room</a>
@@ -789,11 +799,15 @@ function render(): void {
       // The SAME query the boot uses — one resolver, so a middle-click and an
       // in-place ENTER cannot land on different builds.
       const q2 = planFor({ gi, vi, mi, xi }).query
-      el<HTMLAnchorElement>('.mb-cta').href = `zero-tvm.html${q2}`
-      // The room path carries the SAME build choices — share.html reads
-      // ?pool= and ?ctx= too, so a modified click hosts the build that was
-      // chosen, not silently the full model.
-      el<HTMLAnchorElement>('.mb-cta-room').href = `share.html${q2}`
+      const cta = el<HTMLAnchorElement>('.mb-cta')
+      cta.href = `zero-tvm.html${q2}`
+      // A deciding character decides in place; the verb says so. Rooms serve
+      // chat — decision hosting over rooms is a later step, so the room verb
+      // hides here rather than opening a surface that cannot use the model.
+      cta.textContent = v.spec.decisionOnly ? 'Decide ▸' : 'Enter chat ▸'
+      const roomCta = el<HTMLAnchorElement>('.mb-cta-room')
+      roomCta.href = `share.html${q2}`
+      roomCta.style.display = v.spec.decisionOnly ? 'none' : ''
     }
 
     el('.mb-modes').innerHTML = modes.length < 2 ? '' : modes.map((x, i) =>
@@ -1157,13 +1171,15 @@ function render(): void {
   })
   host.tabIndex = 0
   host.setAttribute('role', 'application')
-  host.setAttribute('aria-label', 'Character select — Up and Down arrows change model, Enter opens the chat')
+  host.setAttribute('aria-label', 'Character select — Up and Down arrows change model, Enter opens the chat, or the decision console on a deciding character')
   host.addEventListener('keydown', (e) => {
     // The rule is keyIntent()'s, not this listener's — it is unit-tested, and
     // the bug it closes (Enter walking past an open consent gate) is only
     // decidable headlessly because the decision left the listener body.
     const act = keyIntent(e.key, (e.target as HTMLElement).tagName, {
-      chatting: root.classList.contains('cs-chatting'),
+      // Deciding owns the keyboard exactly like chatting does: the console
+      // has its own text fields, and arrows must not walk the roster under it.
+      chatting: root.classList.contains('cs-chatting') || root.classList.contains('cs-deciding'),
       gated: gate !== null,
       swarm: swarm !== null,
     })
@@ -1256,6 +1272,21 @@ function render(): void {
     const st = intent.split && Q.get('model') === plan.param ? intent.split : null
     const urlRange = st ? { start: st.bounds[st.index], end: st.bounds[st.index + 1] } : undefined
     const urlSplit = st ? { bounds: st.bounds, index: st.index, ctx: plan.ctxTokens } : undefined
+    // A deciding character opens the decision console, not the chat — same
+    // in-place contract (the plan, the gate, the fallback), a different room.
+    if (plan.spec.decisionOnly) {
+      import('./landing-kev.js').then(({ enterDecide }) => enterDecide({
+        root,
+        spec: plan.spec,
+        param: plan.param,
+        ctxTokens: plan.ctxTokens !== plan.spec.maxContext ? plan.ctxTokens : 0,
+        mascot,
+      })).catch((err) => {
+        console.error('[landing] in-place decide failed, navigating:', err)
+        location.href = `zero-tvm.html${plan.query}`
+      })
+      return
+    }
     import('./landing-chat.js').then(({ enterChat }) => enterChat({
       root,
       spec: plan.spec,
@@ -1277,7 +1308,7 @@ function render(): void {
 
   const engage = (e: MouseEvent, openRoom: boolean): void => {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return
-    if (root.classList.contains('cs-chatting')) { e.preventDefault(); return }
+    if (root.classList.contains('cs-chatting') || root.classList.contains('cs-deciding')) { e.preventDefault(); return }
     // The verbs are behind an open modal and cannot be clicked; a synthesised
     // click still could, so the state is checked rather than assumed.
     if (gate) { e.preventDefault(); return }

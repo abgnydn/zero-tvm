@@ -126,6 +126,19 @@ describe('a ?model= that is PRESENT is the registry\'s question', () => {
     }
   })
 
+  it('AGREES with /zero-tvm.html on ?model=kev, and that is the point', () => {
+    // The mirror of the embed exclusion: kev RESOLVES and the roster CARRIES
+    // it — a deciding character, whose ENTER opens the decision console. A
+    // "simplification" that sends kev to the absent-flag fallback would boot
+    // the flagship where a decision console was asked for: a 20 GB download
+    // instead of a 2.3 GB one, and a chat instead of decisions.
+    for (const s of ['?model=kev', '?model=kev4b&chat=1']) {
+      const param = new URLSearchParams(s).get('model')
+      expect(specForParam(param).decisionOnly).toBe(true)
+      expect(specOf(entranceIntent(s, '')).id, s).toBe(specForParam(param).id)
+    }
+  })
+
   it('DISAGREES with /zero-tvm.html on ?model=embed, and that is the point', () => {
     // `embed` RESOLVES — it is a real registry entry, and /zero-tvm.html boots
     // it. The entrance does not, because a character-select screen for

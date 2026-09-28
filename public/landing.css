@@ -1153,7 +1153,9 @@ footer li a:hover { color: var(--accent); }
    summoning heartbeat while the weights land, faster heartbeat while it
    thinks, one bounce per real token while it speaks. Requires chat-ui.css
    (linked by index.html) for the message bubbles and the composer; below is
-   only the panel chrome and the stagecraft. */
+   only the panel chrome and the stagecraft.
+   DECIDE MODE (cs-deciding) reuses every rule here: the decision console
+   mounts the same right column, only the panel's contents differ. */
 
 #models .cs-root.cs-chatting {
   /* The nav is sticky IN FLOW (60px + border), so a flat 100dvh hangs the
@@ -1176,12 +1178,15 @@ footer li a:hover { color: var(--accent); }
    (caught by the first browser pass). */
 #models .cs-chatting .mb-info, #models .cs-chatting .mb-roster,
 #models .cs-chatting .cs-roster-head, #models .cs-chatting .cs-enter,
-#models .cs-chatting .mb-arrow, #models .cs-chatting .cs-corner-r { display: none; }
+#models .cs-chatting .mb-arrow, #models .cs-chatting .cs-corner-r,
+#models .cs-deciding .mb-info, #models .cs-deciding .mb-roster,
+#models .cs-deciding .cs-roster-head, #models .cs-deciding .cs-enter,
+#models .cs-deciding .mb-arrow, #models .cs-deciding .cs-corner-r { display: none; }
 
 /* The engage flash no longer hands off to another page — it lifts to reveal
    the chamber. Starts opaque (the .cs-go fade ran under it), holds long
    enough to cover the swap, then clears. */
-#models .cs-root.cs-chatting .cs-engage.cs-go { animation: csEngageReveal 0.9s ease forwards; }
+#models .cs-root.cs-chatting .cs-engage.cs-go, #models .cs-root.cs-deciding .cs-engage.cs-go { animation: csEngageReveal 0.9s ease forwards; }
 @keyframes csEngageReveal {
   0%, 30% { opacity: 1; }
   100% { opacity: 0; visibility: hidden; }
@@ -1353,16 +1358,16 @@ footer li a:hover { color: var(--accent); }
 
 /* Phones: the character folds to a small familiar above the conversation. */
 @media (max-width: 900px) {
-  #models .cs-root.cs-chatting {
+  #models .cs-root.cs-chatting, #models .cs-root.cs-deciding {
     grid-template-columns: 1fr;
     grid-template-rows: auto auto 1fr;
     grid-template-areas: 'plate' 'stage' 'chat';
     --cs-char-h: 110px;
   }
-  #models .cs-chatting .mb-mascot { -webkit-box-reflect: none; }
-  #models .cs-chatting .cs-lore { display: none; }
-  #models .cs-chatting .mb-plate { padding-bottom: 4px; }
-  #models .cs-chatting .mb-name { font-size: 1.3rem; }
+  #models .cs-chatting .mb-mascot, #models .cs-deciding .mb-mascot { -webkit-box-reflect: none; }
+  #models .cs-chatting .cs-lore, #models .cs-deciding .cs-lore { display: none; }
+  #models .cs-chatting .mb-plate, #models .cs-deciding .mb-plate { padding-bottom: 4px; }
+  #models .cs-chatting .mb-name, #models .cs-deciding .mb-name { font-size: 1.3rem; }
   .cs-sug-grid { grid-template-columns: 1fr; }
   .cs-chat-tool#new-chat-btn { display: none; }
   /* THE HEAD WRAPS ONCE THE ROOM TOOLS ARE IN IT. ⟁ Awake is the control a

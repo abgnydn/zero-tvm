@@ -25,6 +25,8 @@
 import { describe, expect, it } from 'vitest'
 import { PHI3, QWEN36_35B_A3B } from '../../src/compiler/model-spec.js'
 import { SHIPPED_MODELS, modelBranding, specForParam } from '../../src/zero-tvm/model-registry.js'
+import { GROUPS } from '../../src/landing.js'
+import { laneOf, loreOf } from '../../src/landing-lore.js'
 
 describe('entrance identity', () => {
   it('gives every shipped model exactly one name', () => {
@@ -50,7 +52,10 @@ describe('entrance identity', () => {
     // variant labels or the card offers two chips reading the same thing.
     const byName = new Map<string, string[]>()
     for (const { spec } of SHIPPED_MODELS) {
-      if (spec.embeddingOnly) continue
+      // The pure embedding model earns no card; deciding characters do.
+      // Skipping them here would let two kev builds share one card with
+      // identical chips and no test to say so.
+      if (spec.embeddingOnly && !spec.decisionOnly) continue
       const b = modelBranding(spec)
       const i = b.params.indexOf(' · ')
       const variant = i < 0 ? b.params : b.params.slice(i + 3)
@@ -82,5 +87,22 @@ describe('entrance identity', () => {
     // of the fall-through — ?model= with no value is a real pre-registry URL.
     const empty = SHIPPED_MODELS.find((m) => m.param === '')
     expect(empty?.spec.id).toBe(PHI3.id)
+  })
+
+  it('carries the deciding characters on the roster, each with its own lane and lore', () => {
+    // kev hid behind the same embeddingOnly bit as the vector model, which
+    // kept it off every surface. The split flag must earn it a card — and a
+    // card that speaks decision, not chat or vector.
+    for (const param of ['kev', 'kev4b', 'kev4bq35']) {
+      const spec = specForParam(param)
+      expect(spec.decisionOnly).toBe(true)
+      const slot = GROUPS.flatMap((g, gi) => g.variants.map((x) => ({ ...x, gi })))
+        .find((x) => x.spec.id === spec.id)
+      expect(slot, `?model=${param} has no roster slot`).toBeDefined()
+      expect(laneOf(spec)).toBe('decide')
+      expect(loreOf(spec)).toContain('does not converse')
+    }
+    // And the vector model still earns no card.
+    expect(GROUPS.flatMap((g) => g.variants).some((x) => x.param === 'embed')).toBe(false)
   })
 })

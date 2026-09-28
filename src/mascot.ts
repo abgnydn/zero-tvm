@@ -24,6 +24,8 @@
  *                     quant group (32 MLC-symmetric vs 64 MLX-affine) shifts
  *                     the band split, so the two Qwen3-4B builds differ
  *   embeddingOnly   → eyes closed. It does not answer; it returns a vector.
+ *   decisionOnly    → scales-and-beam sigil, gold lane. It scores options; it
+ *                     does not converse.
  */
 
 import type { ModelSpec } from './compiler/model-spec.js'
@@ -386,6 +388,7 @@ const HAIR = {
   moe: [0.96, 0.60, 0.36],
   mla: [0.72, 0.54, 0.95],
   embed: [0.62, 0.66, 0.74],
+  decide: [0.95, 0.82, 0.35],
 }
 const IRIS = {
   dense: [0.30, 0.52, 0.92],
@@ -393,6 +396,7 @@ const IRIS = {
   moe: [0.94, 0.52, 0.24],
   mla: [0.60, 0.40, 0.92],
   embed: [0.45, 0.50, 0.58],
+  decide: [0.88, 0.70, 0.22],
 }
 
 /** The lane a model's character belongs to, as CSS. The chat page themes
@@ -402,7 +406,8 @@ const IRIS = {
 export function mascotPalette(spec: ModelSpec): { accent: string; accentHi: string } {
   const gdn = spec.layerKinds.filter((k) => k === 'gdn').length
   const coil = gdn / Math.max(spec.layers, 1)
-  const lane = spec.embeddingOnly === true ? 'embed'
+  const lane = spec.decisionOnly === true ? 'decide'
+    : spec.embeddingOnly === true ? 'embed'
     : spec.moe != null ? 'moe'
     : spec.mla != null ? 'mla'
     : coil > 0.1 ? 'hybrid' : 'dense'
@@ -418,8 +423,8 @@ export function mascotParams(spec: ModelSpec, cached = false, poolFrac = 0): Flo
   const coil = gdn / Math.max(spec.layers, 1)
   const isMoe = spec.moe != null
   const isMla = spec.mla != null
-  const isEmb = spec.embeddingOnly === true
-  const lane = isEmb ? 'embed' : isMoe ? 'moe' : isMla ? 'mla' : coil > 0.1 ? 'hybrid' : 'dense'
+  const isEmb = spec.embeddingOnly === true && spec.decisionOnly !== true
+  const lane = spec.decisionOnly === true ? 'decide' : isEmb ? 'embed' : isMoe ? 'moe' : isMla ? 'mla' : coil > 0.1 ? 'hybrid' : 'dense'
   const hair = HAIR[lane as keyof typeof HAIR]
   const iris = IRIS[lane as keyof typeof IRIS]
 
