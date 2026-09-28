@@ -23,9 +23,11 @@ import { describe, expect, it } from 'vitest'
 import { specFromSearch } from '../../src/zero-tvm/model-select.ts'
 import { SHIPPED_MODELS } from '../../src/zero-tvm/model-registry.ts'
 
-/** `?model=` for a registry entry — '' is a real param (Phi-3), so a link to
- *  the default carries no query at all. */
-const search = (param: string): string => (param ? `?model=${param}` : '')
+/** `?model=` for a registry entry — '' is a real param (Phi-3's explicit key),
+ *  so it builds `?model=` with the key PRESENT. A link to the flagship
+ *  default carries no query at all: that is `specFromSearch('')`, asserted
+ *  separately below. */
+const search = (param: string): string => `?model=${param}`
 
 describe('?ctx= override', () => {
   it('is absent → the compiled spec, byte-for-byte the same object', () => {
@@ -42,11 +44,19 @@ describe('?ctx= override', () => {
     // maxContext exceeds its maxSeq, and there is exactly one of those today.
     // A sample that happened to miss it is how the shrink below shipped.
     for (const { param, spec } of SHIPPED_MODELS) {
-      expect(specFromSearch(search(param)), param || '(default)').toBe(spec)
+      expect(specFromSearch(search(param)), param || '?model=').toBe(spec)
     }
   })
 
-  it('the DEFAULT model keeps its 257th KV page — pages round UP, past maxSeq', () => {
+  it('no query at all boots the flagship, untouched', () => {
+    // The absent flag is the flagship default — and like every other spec
+    // without an explicit ctx, it must be the registry's own object, not a
+    // rebuild: not asking is not a request to re-size.
+    expect(specFromSearch('').id).toBe('qwen36-35b-a3b')
+    expect(specFromSearch('')).toBe(SHIPPED_MODELS[0].spec)
+  })
+
+  it('Phi-3 keeps its 257th KV page — pages round UP, past maxSeq', () => {
     // Phi-3 is the one spec where maxContext (4112) is ABOVE maxSeq (4096):
     // 4096 tokens need ceil(4096/16) = 256 pages... but the compiled budget is
     // 257, and 257 × 16 = 4112. scripts/station.mjs states the rule this pins
@@ -54,8 +64,10 @@ describe('?ctx= override', () => {
     // 4096-token trained window, and a naive clamp to maxSeq would SHRINK the
     // shipped default". Routing the no-flag default through the maxSeq clamp
     // is that naive clamp, and it cost the default model on zero-tvm.html and
-    // validate.html one page without a word.
-    const s = specFromSearch('')
+    // validate.html one page without a word. (Phi-3 has not been the default
+    // since the qwen36 reorder; the explicit empty key below keeps the story
+    // pinned to the spec it happened to.)
+    const s = specFromSearch('?model=')
     expect(s.id).toBe('phi3-mini')
     expect(s.maxPages).toBe(257)
     expect(s.maxContext).toBe(4112)
@@ -66,8 +78,8 @@ describe('?ctx= override', () => {
     // it: not asking is not the same as asking for the number you already
     // have. An explicit budget is a request to re-size, and re-sizing clamps
     // to the trained window.
-    expect(specFromSearch('?ctx=4112').maxPages).toBe(256)
-    expect(specFromSearch('').maxPages).toBe(257)
+    expect(specFromSearch('?model=&ctx=4112').maxPages).toBe(256)
+    expect(specFromSearch('?model=').maxPages).toBe(257)
   })
 
   it('raises qwen35 to its native window: 262,144 tokens, 8 GiB of KV', () => {
@@ -105,7 +117,7 @@ describe('?ctx= override', () => {
   it('Phi-3 cannot be pushed past its 4k window at all', () => {
     // Its maxSeq IS its default window (the one spec where the budget rule
     // was never the binder), so ctx can only shrink it.
-    const s = specFromSearch('?ctx=1000000')
+    const s = specFromSearch('?model=&ctx=1000000')
     expect(s.maxContext).toBe(4096)
   })
 })

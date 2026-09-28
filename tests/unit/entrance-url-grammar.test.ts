@@ -79,7 +79,7 @@
 // which is where all four bugs lived.
 
 import { describe, expect, it } from 'vitest'
-import { PHI3 } from '../../src/compiler/model-spec.js'
+import { PHI3, QWEN36_35B_A3B } from '../../src/compiler/model-spec.js'
 import { SHIPPED_MODELS, canSplitAcrossDevices, specForParam } from '../../src/zero-tvm/model-registry.js'
 import { GROUPS, entranceIntent, urlAfterEnter } from '../../src/landing.js'
 
@@ -131,15 +131,16 @@ describe('a ?model= that is PRESENT is the registry\'s question', () => {
     // it. The entrance does not, because a character-select screen for
     // conversation cannot put on stage a model that returns a vector and does
     // not speak; the roster excludes it (buildGroups skips embeddingOnly) and
-    // the entrance takes the registry's own fallback rather than the roster's
-    // lead. Both halves are asserted so that "fixing the inconsistency" —
-    // answering specForParam here like the other surfaces do — fails loudly
-    // instead of quietly deleting the exclusion.
+    // the entrance takes the registry's own fallback — the absent-flag
+    // default — rather than the roster's lead. Both halves are asserted so
+    // that "fixing the inconsistency" — answering specForParam here like the
+    // other surfaces do — fails loudly instead of quietly deleting the
+    // exclusion.
     expect(specForParam('embed').id).toBe('qwen3-embedding-0-6b-4bit-dwq')
     expect(specForParam('embed').embeddingOnly).toBe(true)
     expect(onRoster('qwen3-embedding-0-6b-4bit-dwq')).toBe(false)
     for (const s of ['?model=embed', '?model=embed&chat=1']) {
-      expect(specOf(entranceIntent(s, '')).id, s).toBe(PHI3.id)
+      expect(specOf(entranceIntent(s, '')).id, s).toBe(QWEN36_35B_A3B.id)
       expect(specOf(entranceIntent(s, '')).id, s).not.toBe(specForParam('embed').id)
     }
   })

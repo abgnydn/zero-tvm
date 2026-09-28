@@ -187,12 +187,14 @@ describe('a plan is the same model wherever it is read', () => {
     // a different model, a middle-click and an in-place ENTER on the same card
     // would boot different checkpoints: the gate's defect, one URL further out.
     //
-    // Note which reader this is NOT. Running plan.query back through
-    // `entranceIntent` fails for the default model, correctly: Phi-3's param
-    // is '', so the plan writes no `model=` key, and an ABSENT key is the
-    // select screen's own question ("which character does it open on"), which
-    // the roster answers with its lead. Two readers, two questions — the split
-    // entrance-url-grammar.test.ts exists to keep from being collapsed.
+    // Note which reader this is NOT. An ABSENT key is the select screen's own
+    // question ("which character does it open on"), answered by the roster's
+    // lead — so a plan that omitted its key would resolve differently through
+    // `entranceIntent` than through `specForParam`. That is why the plan
+    // always names its model, even Phi-3's empty `?model=`: with the key
+    // present, both readers agree on every card. Two readers, two questions —
+    // the split entrance-url-grammar.test.ts exists to keep from being
+    // collapsed.
     for (const sel of SLOTS) {
       const plan = bootPlanFor(sel, null)
       const named = new URLSearchParams(plan.query).get('model')

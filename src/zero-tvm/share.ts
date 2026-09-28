@@ -48,7 +48,7 @@ import {
   setChatIdentity, autoGrow, wireScrollFab, hideWelcome,
   addUserMsg, addAiMsg, type AiMsgHandle,
 } from './chat-ui.js'
-import { specForParam, modelBranding, quantLabel, canSplitAcrossDevices } from './model-registry.js'
+import { specForParam, paramForSpec, modelBranding, quantLabel, canSplitAcrossDevices } from './model-registry.js'
 import { ENGINE_GPU_FEATURES } from './variants.js'
 import type { ModelSpec } from '../compiler/model-spec.js'
 import { fetchInventory, pullWeights, type Inventory } from './peer-weights.js'
@@ -131,7 +131,7 @@ const role = roleFor(location.search, location.hash)
 // a whole consent screen for a split that cannot exist and then died in
 // loadWeights. The predicate needs a spec, which this module deliberately does
 // not take, so it is asked here and answered there.
-const urlSpec = specForParam(new URLSearchParams(location.search).get('model') ?? '')
+const urlSpec = specForParam(new URLSearchParams(location.search).get('model'))
 const stage = stageFor(
   stageRangeFrom(location.search),
   canSplitAcrossDevices(urlSpec) ? urlSpec.layers : null,
@@ -459,8 +459,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
   // loader chain is even imported, and stays there if the import is refused.
   // `?ctx=` only moves maxContext, which the sheet reads from the BOOTED spec
   // below rather than from this one.
-  const param = new URLSearchParams(location.search).get('model') ?? ''
-  const baseSpec = specForParam(param)
+  const baseSpec = specForParam(new URLSearchParams(location.search).get('model'))
   const brand = modelBranding(baseSpec)
   const stageLine = stageRange ? `layers ${stageRange.start}–${stageRange.end} of ${baseSpec.layers}` : ''
   document.title = stageRange
@@ -653,7 +652,10 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     spec,
     // A pooled host must not tell guests the full model's measured rate.
     brand: poolSlots ? { ...brand, rateLabel: '' } : brand,
-    param,
+    // Canonical, never the raw flag: an absent ?model= boots the flagship
+    // here, and the info frame must name qwen36 explicitly — not travel as
+    // an absent key the next hop would re-resolve to a newer default.
+    param: paramForSpec(spec),
     engine, tokenizer,
     encode: (messages) => buildChatPromptFor(spec, messages, tokenizer),
     existingRoom, stageRange,
@@ -718,7 +720,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
  * life, and the one arc it occupies on the ring the swarm builder drew.
  */
 async function runHelper(roomId: string, range: { start: number; end: number }): Promise<void> {
-  const param = new URLSearchParams(location.search).get('model') ?? ''
+  const param = new URLSearchParams(location.search).get('model')
   const baseSpec = specForParam(param)
   const brand = modelBranding(baseSpec)
   const layersLine = `layers ${range.start}–${range.end} of ${baseSpec.layers}`

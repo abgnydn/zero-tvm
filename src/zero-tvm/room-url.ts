@@ -82,7 +82,7 @@ export const MIN_CTX = 256
  * always reads downstream as "re-size me". `specFromSearch` passed the spec's
  * own maxContext as that default and fed it back through `specWithCtx`, whose
  * ceiling is floor(maxSeq / pageSize). A no-op on ten of eleven shipped specs,
- * and a silent SHRINK on Phi-3, the default model of zero-tvm.html and
+ * and a silent SHRINK on Phi-3, then the default model of zero-tvm.html and
  * validate.html: KV pages round UP, so its 257 pages hold 4112 tokens against
  * a 4096-token window, and every plain page load lost the 257th page (measured
  * 4112 → 4096). Not asking for a budget is not the same as
@@ -182,8 +182,8 @@ export interface RoomLinkParts {
   room: string | null
   /** `?model=` — LEAVE UNSET (or null) for a link that must route as a guest:
    *  roleFor reads a model inside a room as "this device serves too". The
-   *  EMPTY STRING is a real value, not "unset": it is how the default model
-   *  is named in this grammar (specForParam('') is Phi-3), and `?model=`
+   *  EMPTY STRING is a real value, not "unset": it is Phi-3's explicit name
+   *  in this grammar (specForParam('') is Phi-3), and `?model=`
    *  routes to a serving role exactly like a named one. */
   model?: string | null
   /** `?layers=` — the slice the opener holds. */
@@ -241,7 +241,7 @@ export function roomLink(p: RoomLinkParts): string {
     throw new Error(`roomLink: invalid room id ${JSON.stringify(p.room)}`)
   }
   const q = new URLSearchParams()
-  // `!= null`, not truthiness: `model: ''` is the DEFAULT model, and dropping
+  // `!= null`, not truthiness: `model: ''` is Phi-3's own param, and dropping
   // it turns a serving link into a guest link that quietly runs nothing.
   if (p.model != null) q.set('model', p.model)
   if (p.layers) q.set('layers', `${p.layers.start}-${p.layers.end}`)

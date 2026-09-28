@@ -18,11 +18,12 @@
 // The ORDER bug was quieter. SHIPPED_MODELS led with Phi-3, so the strongest
 // model this project runs sat below four weaker ones on the character select.
 // Reordering it is a one-line change with a trap underneath: `specForParam`
-// resolves an unknown or absent ?model= by FALLING THROUGH to Phi-3, and it
-// must keep doing that whatever position Phi-3 holds in the list — every
-// pre-registry URL depends on it.
+// used to resolve an unknown or absent ?model= by FALLING THROUGH to Phi-3.
+// The absent flag now boots the flagship instead — while the empty/unknown
+// fall-through to Phi-3 must keep doing that whatever position Phi-3 holds
+// in the list, because every pre-registry URL depends on it.
 import { describe, expect, it } from 'vitest'
-import { PHI3 } from '../../src/compiler/model-spec.js'
+import { PHI3, QWEN36_35B_A3B } from '../../src/compiler/model-spec.js'
 import { SHIPPED_MODELS, modelBranding, specForParam } from '../../src/zero-tvm/model-registry.js'
 
 describe('entrance identity', () => {
@@ -65,13 +66,16 @@ describe('entrance identity', () => {
   it('leads the roster with the strongest model, not the smallest', () => {
     // The character select reads top-down. Phi-3 leading it made the weakest
     // shipped model the project's first impression.
-    expect(SHIPPED_MODELS[0].param).toBe('qwen38')
+    expect(SHIPPED_MODELS[0].param).toBe('qwen36')
     expect(SHIPPED_MODELS[0].spec.id).not.toBe(PHI3.id)
   })
 
-  it('still falls through to Phi-3 for an absent or unknown ?model=', () => {
-    // The trap under the reorder: this must not depend on Phi-3's position.
-    expect(specForParam(null).id).toBe(PHI3.id)
+  it('boots the flagship for an absent ?model=, Phi-3 for empty or unknown', () => {
+    // The trap under the reorder: the ABSENT flag must not depend on Phi-3's
+    // position, and the compat fall-through must not follow the flagship —
+    // a typo'd param summoning a 20 GB download is the defect this split
+    // exists to prevent.
+    expect(specForParam(null).id).toBe(QWEN36_35B_A3B.id)
     expect(specForParam('').id).toBe(PHI3.id)
     expect(specForParam('not-a-model').id).toBe(PHI3.id)
     // And the empty param must still be Phi-3's own entry, not a coincidence

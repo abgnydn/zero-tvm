@@ -165,14 +165,17 @@ export interface EntranceIntent {
  * booted Qwen3.8-27B. Every pre-registry URL depends on that fall-through.
  *
  * So the split is on PRESENCE (`q.get('model') !== null`), not on whether the
- * value resolves. `?model=bogus`, `?model=` and `?model=embed` are all Phi-3;
- * a bare `/` is the flagship.
+ * value resolves. `?model=bogus` and `?model=` are Phi-3 on every surface —
+ * the compat fallback, deliberately NOT the flagship: a typo must never
+ * summon a 20 GB download. A bare `/` is the flagship.
  *
  * A spec the ROSTER does not carry — the embedding model, which answers
  * nothing a visitor typed, or a build that is generated but not yet
- * numerics-validated — takes the registry's own fallback rather than slot 0.
- * The entrance cannot put a character on stage that it deliberately does not
- * ship, and slot 0 is whichever model leads the roster this month.
+ * numerics-validated — takes the registry's own fallback rather than the
+ * roster's lead. The entrance cannot put a character on stage that it
+ * deliberately does not ship. (That fallback is the absent-flag default, so
+ * today it coincides with slot 0; the lookup stays written as the fallback,
+ * not as slot 0, so the next reorder cannot silently re-point it.)
  */
 function rosterSlotFor(param: string | null): { gi: number; vi: number } {
   // Presentation: no ?model= key, so nothing was asked for. Open on the
@@ -304,7 +307,9 @@ export interface Selection { gi: number; vi: number; mi: number; xi: number }
  */
 export interface BootPlan {
   spec: ModelSpec
-  /** `?model=` value. `''` is the DEFAULT model, not "unset". */
+  /** `?model=` value. `''` is Phi-3's own param, not "unset" — the plan
+   *  always names its model, so a middle-click and an in-place ENTER on the
+   *  same card can never boot different checkpoints. */
   param: string
   name: string
   sizeLabel: string
@@ -330,7 +335,11 @@ export function bootPlanFor(sel: Selection, linkedCtx: number | null): BootPlan 
   const ctxs = ctxModesOf(v.spec, linkedCtx)
   const cx = ctxs[sel.xi] ?? ctxs[0]
   const qs: string[] = []
-  if (v.param) qs.push(`model=${v.param}`)
+  // Always named, even Phi-3's empty param: an absent key is the select
+  // screen's own question ("which character does it open on"), answered by
+  // the roster lead — so a plan that omitted it would boot the flagship
+  // wherever the link lands instead of the card it was drawn for.
+  qs.push(`model=${v.param}`)
   if (mode && mode.slots) qs.push(`pool=${mode.slots}`)
   if (cx.tokens !== v.spec.maxContext) qs.push(`ctx=${cx.tokens}`)
   return {

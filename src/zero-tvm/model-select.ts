@@ -26,7 +26,8 @@ import { loadByteLevelTokenizer, buildChatPrompt as buildChatMLPrompt, buildDeep
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
 
 /** `?model=<param>` → spec, straight from SHIPPED_MODELS — registering a model
- *  there is what creates its URL. Default (and anything unknown) is Phi-3. */
+ *  there is what creates its URL. Absent flag boots the flagship (Qwen3.6-35B);
+ *  empty and unknown values boot Phi-3, the compat fallback. */
 export function specFromSearch(search: string): ModelSpec {
   const q = new URLSearchParams(search)
   const base = specForParam(q.get('model'))

@@ -39,7 +39,7 @@
 // This is the cheap always-runnable half.
 
 import { describe, expect, it } from 'vitest'
-import { SHIPPED_MODELS, specForParam, modelBranding, quantLabel, opfsDirFor, kvBytesPerTokenShown } from '../../src/zero-tvm/model-registry.ts'
+import { SHIPPED_MODELS, specForParam, paramForSpec, modelBranding, quantLabel, opfsDirFor, kvBytesPerTokenShown } from '../../src/zero-tvm/model-registry.ts'
 import { PHI3 } from '../../src/compiler/model-spec.ts'
 
 /** Chat templates a renderer actually branches on. `toolDialectFor` defaults to
@@ -90,9 +90,17 @@ describe('the registry itself', () => {
 describe.each(entries)('?model=$label', ({ param, spec }) => {
   it('round-trips through specForParam', () => {
     // Every param must resolve to its OWN spec. specForParam falls back to
-    // Phi-3 on a miss, so a typo'd param silently serves the default rather
-    // than failing — that fallback is the reason this assertion exists.
+    // Phi-3 on a miss, so a typo'd param silently serves the compat fallback
+    // rather than failing — that fallback is the reason this assertion exists.
     expect(specForParam(param).id).toBe(spec.id)
+  })
+
+  it('round-trips back through paramForSpec', () => {
+    // The serving direction: share.html's info frame and every serving link
+    // name the RUNNING model explicitly. If this mapping ever disagrees with
+    // the one above, a host serves one checkpoint while its links boot
+    // another — silently, on someone else's machine.
+    expect(paramForSpec(spec)).toBe(param)
   })
 
   it('has its OWN branding, not the Phi-3 fallback', () => {
