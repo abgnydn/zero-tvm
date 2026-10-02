@@ -91,14 +91,37 @@ function splitParams(s: string): { family: string; variant: string } {
 }
 
 function buildGroups(): Group[] {
+  return groupsFor(SHIPPED_MODELS, isLocalDev())
+}
+
+/**
+ * This host serves `.weights-local` (the dev mirror) or it does not. Node —
+ * where the suite runs — has no location and cannot know, so it defaults to
+ * INCLUDE: a test that cannot see a card cannot pin its behavior.
+ */
+export function isLocalDev(host: string | null = null): boolean {
+  const h = host ?? (typeof location === 'undefined' ? null : location.hostname)
+  if (h === null) return true
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h.endsWith('.local')
+}
+
+/** Roster rows for `entries`, minus what this host must not offer. Exported
+ *  so the suite can hold both arms: `localWeightsOnly` cards (kev today)
+ *  appear on a dev host and never on prod, whatever position they hold. */
+export function groupsFor(
+  entries: ReadonlyArray<{ param: string; spec: ModelSpec }>,
+  local: boolean,
+): Group[] {
   const out = new Map<string, Group>()
-  for (const { param, spec } of SHIPPED_MODELS) {
+  for (const { param, spec } of entries) {
     // The entrance is a CHAT roster, plus the decision characters. The
     // embedding model returns a vector and does not speak — it stays in the
     // registry (validate + ?model= still work) but earns no card. A decision
     // spec (kev) answers fixed options instead of conversing; it earns a card
-    // whose ENTER opens the decision console rather than the chat.
+    // whose ENTER opens the decision console rather than the chat — on a host
+    // that can actually boot it (see localWeightsOnly).
     if (spec.embeddingOnly && !spec.decisionOnly) continue
+    if (spec.localWeightsOnly && !local) continue
     const b = modelBranding(spec)
     // Pending = generated but not yet numerics-validated. A roster card is a
     // claim the model runs; the claim waits for validate-model.
