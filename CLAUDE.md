@@ -183,8 +183,7 @@ VRAM). They are taken at chunk boundaries AND, since 2026-08-19, every 64 tokens
 on the per-token path — without that, any build that cannot chunk (a pooled MoE,
 a hybrid without subgroups, `?chunk=0`) kept an empty ring and got no reuse at
 all. Lookback is 4 x CHUNK_CAP, so ~4k tokens where the matrix unit gives cap
-1024, ~1k on a spec quarantined to 256 (qwen38 — see below), and only ~256 on a
-browser without the matrix unit. Agent clients that
+1024, and only ~256 on a browser without the matrix unit. Agent clients that
 rewrite a trailing metadata block every turn hit this constantly: measured
 392.50s → 12.76s. WebLLM A/B
 needs `@mlc-ai/web-llm` ≥ 0.2.84 (Qwen3.5 first ships in the v0_2_84
@@ -680,17 +679,19 @@ because it would read as coverage.
 
 ## Known gaps
 
-- **qwen38 chunked prefill corrupts at long context.** At ~16k the model is
-  correct per-token and at cap 256, invents tool names at the shipped cap of
-  1024, and loses the task at 4096. Cleared at a failing depth: the model
-  (mlx_lm), the prompt (byte-identical to the vendor jinja), int8 KV, cross-turn
-  reuse, retrieval. `gdn_recur`'s workgroup barriers are correct. The mechanism
-  is NOT found; `ModelSpec.maxChunkCap` quarantines the spec at 256, which cuts
-  the rewind ring's lookback to ~1k and costs prefill throughput — how much on
-  qwen38 is UNMEASURED; the nearest sweep (llama32 at 4k, which is not clamped)
-  reads ~13% between those caps. 512 was never swept FOR CORRECTNESS at this
-  depth, so the threshold is somewhere in (256, 1024], and 24k is untested under the
-  quarantine.
+- **qwen38 chunked prefill corrupted at long context — RESOLVED 2026-09-28.**
+  At ~16k the model was correct per-token and at cap 256 and invented tool
+  names at 1024. The mechanism is found: the dense chunk FFN epilogue
+  (`cSiluMul`) recorded n * ffn/256 workgroups in grid x — 69632 on qwen38
+  at n=1024, past the 65535 limit — and the invalid command buffer poisoned
+  every pass after it while every kernel's numerics stayed exact. The
+  dispatch folds across z now (`foldGridX`, same as the LM head); CAP=1024
+  holds token identity on both arms at PROMPT=2000 (twice) and 4000 with 0
+  GPU errors, `gdn_chunk_chain_scale` is bit-exact at 1024 on qwen38 dims,
+  and the `maxChunkCap: 256` quarantine is lifted. Honest boundary: the 16k
+  `--long` reference arm needs ~4 h (quadratic per-token prefill on 27B) and
+  is still unrun — `tests/unit/chunk-grid-limits.test.ts` pins the folded
+  set so the next over-limit spec fails before it can corrupt.
 - **The scale gates still do not reach that configuration.**
   `gdn_chunk_chain_scale` runs at 1024 through `int4_matmul_batched_dyn`, and
   the kernel harness never requests the subgroup-matrix feature. Cap 1024 is
