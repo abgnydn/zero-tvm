@@ -33,6 +33,16 @@ const check = (name, ok, detail) => {
 }
 
 await startHarness()
+// Hoisted above the try: the summary after `finally` reports them, and a
+// block-scoped `let` is invisible there — every run since Sep 4 ended in
+// ReferenceError AFTER printing its PASS lines, so the gate that "exits
+// non-zero on failure" exited non-zero on success too and nobody noticed,
+// because humans read the lines, not $?.
+const logs = []
+let sawChunks = 0
+// PER ARM. Summing across arms let two single-chunk runs total 2 and satisfy
+// a >= 2 check that exists precisely to reject a single chunk.
+let maxArmChunks = 0
 try {
   const page = await newPage(`/model-smoke.html?model=${param}${GEMM ? `&gemm=${GEMM}` : ''}`)
   await page.waitForFunction(() => window.__phase === 'loaded' || window.__phase === 'error',
@@ -40,11 +50,6 @@ try {
   if (await page.evaluate(() => window.__phase) === 'error') {
     throw new Error(await page.evaluate(() => window.__error))
   }
-  const logs = []
-  let sawChunks = 0
-  // PER ARM. Summing across arms let two single-chunk runs total 2 and satisfy
-  // a >= 2 check that exists precisely to reject a single chunk.
-  let maxArmChunks = 0
   page.on('console', (m) => {
     const t = m.text()
     if (t.includes('chunked prefill')) logs.push(t)

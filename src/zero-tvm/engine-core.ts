@@ -241,6 +241,20 @@ export function pickChunkGemm(caps: {
   return { used, rejected: null }
 }
 
+/**
+ * Fold a 1-D workgroup count across grid z so no dimension exceeds the
+ * device limit. Below the limit this is the identity ({x: total, z: 1}),
+ * so call sites read the same dispatch they always did. Above it, x is
+ * capped and z carries the remainder — which requires the shader to index
+ * `blockIdx.z * gridDim.x + blockIdx.x` and guard on the true total (the
+ * packGridDimX pattern silu_mul and the LM head already use). A shader
+ * without that indexing must never be given a folded grid.
+ */
+export function foldGridX(total: number, maxX = 16384): { x: number; z: number } {
+  const x = Math.min(total, maxX)
+  return { x, z: Math.ceil(total / x) }
+}
+
 export function allocKVFor(
   device: GPUDevice,
   spec: ModelSpec,
@@ -2514,8 +2528,8 @@ export function buildDecodeEngine(
     // blockIdx.z * gridDim.x + blockIdx.x and guard on packGridDimX.
     const lmWGs = S.vocab / R.matmulRowsPerWG
     if (lmWGs > 65535) {
-      const lmX = 16384
-      dispatch(enc, R.matmulF32, bgLmHead!, lmX, 1, Math.ceil(lmWGs / lmX), 'lmHead')
+      const f = foldGridX(lmWGs)
+      dispatch(enc, R.matmulF32, bgLmHead!, f.x, 1, f.z, 'lmHead')
     } else {
       dispatch(enc, R.matmulF32, bgLmHead!, lmWGs, 1, 1, 'lmHead')
     }
@@ -4262,7 +4276,17 @@ export function buildDecodeEngine(
           dispatch(enc, P.moeCombine, blk.moe.combine, Math.ceil(S.d / 256), n, 1, 'cMoeCombine')
         } else {
           gemmDispatch(enc, blk.gateUp!, 2 * S.ffn, 'cGateUp')
-          dispatch(enc, P.siluMul, blk.silu!, n * FFN_WGS, 1, 1, 'cSiluMul')
+          // Folded like the LM head (recordEpilogue): silu_mul indexes
+          // blockIdx.z * gridDim.x + blockIdx.x guarded by packGridDimX, so a
+          // chunk whose n * FFN_WGS exceeds maxComputeWorkgroupsPerDimension
+          // splits across z instead of recording an invalid dispatch. qwen38
+          // at cap 1024 is 69632 wide (17408/256 per row) — the invalid
+          // command buffer that corrupted long-context chunked prefill while
+          // every kernel's numerics stayed exact. Below the limit this is
+          // byte-for-byte the old dispatch (z = 1).
+          const siluTotal = n * FFN_WGS
+          const siluFold = foldGridX(siluTotal)
+          dispatch(enc, P.siluMul, blk.silu!, siluFold.x, 1, siluFold.z, 'cSiluMul')
           gemmDispatch(enc, blk.ffnDown!, S.d, 'cFfnDown')
         }
         dispatch(enc, P.addNorm, blk.addNorm2, n, 1, 1, 'cAddNorm2')
