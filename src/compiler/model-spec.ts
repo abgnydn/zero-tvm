@@ -320,6 +320,14 @@ export interface ModelSpecBase {
    */
   decisionOnly?: boolean
   /**
+   * The checkpoint lives outside the public weight mirrors (a local merge,
+   * nothing uploaded), so only a dev host serving `.weights-local` can boot
+   * it. The roster hides such cards on any other host — a card that 401s at
+   * download is a broken button, not a teaser. Delete the flag the day the
+   * weights are published; every other surface keeps resolving the param.
+   */
+  localWeightsOnly?: boolean
+  /**
    * On-disk weight layout. 'mlc' is the ndarray/tensor-cache shard format with
    * symmetric q4f16_1 (group 32); 'mlx-safetensors' is a HuggingFace
    * safetensors checkpoint quantised MLX-affine (group 64, with biases).
@@ -1225,6 +1233,7 @@ export const KEV_06B: ModelSpec = makeModelSpec({
   weightFormat: 'mlx-safetensors',
   embeddingOnly: true,
   decisionOnly: true,
+  localWeightsOnly: true,
   paramNaming: mlxParamNaming(""),
 })
 
@@ -1256,6 +1265,7 @@ export const KEV_4B: ModelSpec = makeModelSpec({
   weightFormat: 'mlx-safetensors',
   embeddingOnly: true,
   decisionOnly: true,
+  localWeightsOnly: true,
   paramNaming: mlxParamNaming(""),
 })
 
@@ -1296,6 +1306,7 @@ export const KEV_4B_Q35: ModelSpec = makeModelSpec({
   partialRotaryFactor: 0.25,
   embeddingOnly: true,
   decisionOnly: true,
+  localWeightsOnly: true,
   paramNaming: mlxParamNaming("language_model."),
 })
 

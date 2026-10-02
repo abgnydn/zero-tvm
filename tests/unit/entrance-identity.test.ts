@@ -25,7 +25,7 @@
 import { describe, expect, it } from 'vitest'
 import { PHI3, QWEN36_35B_A3B } from '../../src/compiler/model-spec.js'
 import { SHIPPED_MODELS, modelBranding, specForParam } from '../../src/zero-tvm/model-registry.js'
-import { GROUPS } from '../../src/landing.js'
+import { GROUPS, groupsFor, isLocalDev } from '../../src/landing.js'
 import { laneOf, loreOf } from '../../src/landing-lore.js'
 
 describe('entrance identity', () => {
@@ -104,5 +104,30 @@ describe('entrance identity', () => {
     }
     // And the vector model still earns no card.
     expect(GROUPS.flatMap((g) => g.variants).some((x) => x.param === 'embed')).toBe(false)
+  })
+
+  it('hides local-weights cards off a dev host, and only those', () => {
+    // The defect this closes shipped: kev cards on prod 401 at download —
+    // the merges live in `.weights-local`, nothing uploaded. A card that
+    // cannot boot where it is shown is a broken button, not a teaser.
+    expect(isLocalDev(null)).toBe(true)   // node cannot know: include
+    expect(isLocalDev('localhost')).toBe(true)
+    expect(isLocalDev('127.0.0.1')).toBe(true)
+    expect(isLocalDev('macbook.local')).toBe(true)
+    expect(isLocalDev('zerotvm.com')).toBe(false)
+    expect(isLocalDev('www.zerotvm.com')).toBe(false)
+    const devParams = groupsFor(SHIPPED_MODELS, true).flatMap((g) => g.variants.map((x) => x.param))
+    const prodParams = groupsFor(SHIPPED_MODELS, false).flatMap((g) => g.variants.map((x) => x.param))
+    for (const param of ['kev', 'kev4b', 'kev4bq35']) {
+      expect(devParams, param).toContain(param)
+      expect(prodParams, param).not.toContain(param)
+    }
+    // Nothing else moves between hosts: the gate is per-spec, not a reorder.
+    expect(prodParams).toEqual(devParams.filter((p) => !p.startsWith('kev')))
+    // The registry itself is untouched — ?model=kev still resolves (and the
+    // entrance falls back to the flagship for it, by the compat rule).
+    for (const param of ['kev', 'kev4b', 'kev4bq35']) {
+      expect(specForParam(param).localWeightsOnly).toBe(true)
+    }
   })
 })
