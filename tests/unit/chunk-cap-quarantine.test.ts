@@ -2,10 +2,12 @@
 //
 // Chunked prefill has never been bit-equal to the per-token path. What it is
 // held to is empirical TOKEN identity, measured at specific caps. On qwen38
-// that fails — at ~16k of context the model answers correctly
-// per-token and at cap 256, invents tool names at the shipped cap of 1024, and
-// degrades to a generic greeting at 4096. The mechanism is not found yet, so
-// `maxChunkCap` bounds the damage where the bisection put the threshold.
+// that failed until 2026-09-28 — at ~16k of context the model answered
+// correctly per-token and at cap 256 and invented tool names at the shipped
+// cap of 1024. The mechanism is found now (an unfolded cSiluMul grid past
+// the 65535 dispatch limit — see chunk-grid-limits.test.ts), the dispatch
+// folds, and the quarantine below is lifted. The mechanism tests stay: the
+// quarantine FEATURE is how the next such bisection bounds the damage.
 //
 // This asserts the REAL resolveChunkCap, never a restatement of it. The first
 // test written for resolveInt8Mode copied its branch instead, stayed green when
@@ -41,20 +43,21 @@ describe('resolveChunkCap', () => {
   })
 })
 
-describe('the quarantine is where the bisection put it', () => {
-  it('qwen38 is capped at 256', () => {
-    // 256 is not a round number chosen for comfort: it is the largest cap the
-    // depth sweep found correct at 16k. Raising it needs a green run of
-    // gdn_chunk_chain_scale plus chunk-prefill-test at a depth that fails today.
-    expect(QWEN3_8_27B_4BIT.maxChunkCap).toBe(256)
-    expect(resolveChunkCap({}, QWEN3_8_27B_4BIT, true)).toBe(256)
+describe('the quarantine list is currently empty', () => {
+  it('qwen38 is unquarantined: the fold fixed the mechanism it was bounding', () => {
+    // Lifted 2026-09-28: CAP=1024 holds token identity on both arms at 2k
+    // (twice) and 4k with 0 GPU errors, and gdn_chunk_chain_scale is
+    // bit-exact at 1024 on qwen38 dims. If a cap regression ever reappears,
+    // THIS is where it gets bounded again — not as a tuning default.
+    expect(QWEN3_8_27B_4BIT.maxChunkCap).toBeUndefined()
+    expect(resolveChunkCap({}, QWEN3_8_27B_4BIT, true)).toBe(1024)
   })
 
-  it('no other shipped spec is quarantined without being listed here', () => {
+  it('no shipped spec is quarantined without being listed here', () => {
     // A quarantine is a known-broken marker. If one appears on another spec,
     // this test should be what makes someone say so out loud rather than it
     // spreading quietly as if it were a tuning default.
-    const QUARANTINED = new Set(['qwen38'])
+    const QUARANTINED = new Set<string>([])
     const found = SHIPPED_MODELS
       .filter((m) => m.spec.maxChunkCap != null)
       .map((m) => m.param)

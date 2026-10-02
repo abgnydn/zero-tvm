@@ -9,6 +9,13 @@
 // differ — but the tokens must not. Two engines over the same weights, one with
 // ?chunk=0, same prompt, greedy.
 //
+// COST NOTE: the per-token reference arm is quadratic in PROMPT (step i
+// attends over i tokens), so --long on a 27B model needs ~4 h in that arm —
+// raise ZTVM_PROTOCOL_MIN past it (harness default is 10 min) or the run
+// dies in a CDP timeout with no data, which looks like a failure but proves
+// nothing. PROMPT=4000 at CAP=1024 is the practical middle rung: 4 chunks
+// per arm, ~40 min wall-clock.
+//
 // Until 2026-08-11 this path was hybrid-and-MLC only. The gate now admits
 // plain-attention and MLX-affine specs, which is what this checks.
 

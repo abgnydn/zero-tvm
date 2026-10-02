@@ -1122,9 +1122,15 @@ export const QWEN3_8_27B_4BIT: ModelSpec = makeModelSpec({
   gdn: { kHeads: 16, vHeads: 48, headK: 128, headV: 128, convK: 4 },
   attnGate: true,
   partialRotaryFactor: 0.25,
-  // Quarantine, not tuning — see maxChunkCap. Bisected 2026-08-19: correct
-  // per-token and at 256, wrong at 1024, worse at 4096.
-  maxChunkCap: 256,
+  // Unquarantined 2026-09-28. The 2026-08-19 bisection (correct per-token and
+  // at 256, wrong at 1024, worse at 4096) was an unfolded cSiluMul grid, not
+  // numerics: at n=1024 the dispatch recorded 69632 workgroups in x against
+  // the 65535 limit, and the invalid command buffer poisoned every pass after
+  // it. cSiluMul now folds across z (foldGridX); CAP=1024 holds token identity
+  // on both arms at 2k (x2 runs) and 4k with 0 GPU errors, and
+  // gdn_chunk_chain_scale is bit-exact at 1024 on these dims. The 16k --long
+  // reference arm needs ~4 h (quadratic per-token prefill), so 16k itself is
+  // still unrun — that boundary is documented, not verified.
   paramNaming: mlxParamNaming("language_model."),
 })
 

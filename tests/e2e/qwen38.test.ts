@@ -1,12 +1,15 @@
 /**
  * E2E TESTS — Qwen3.8-27B (?model=qwen38) chat + validate pages
  *
- * The quarantined spec: 27B hybrid GDN, chunk cap held at 256 by
- * maxChunkCap while the corruption threshold sits somewhere in (256, 1024].
- * This suite is the END of that story — a model that boots, generates, and
- * answers sanely at its shipped configuration. It does not replace the
- * long-context sweep (PROMPT=16000 chunk-prefill-test --long), which is the
- * gate that watches the quarantine boundary itself.
+ * Formerly the quarantined spec (27B hybrid GDN, chunk cap held at 256 while
+ * the corruption threshold sat somewhere in (256, 1024]). Unquarantined
+ * 2026-09-28: the mechanism was an unfolded cSiluMul grid past the 65535
+ * dispatch limit, now folded. This suite is the END of that story — a model
+ * that boots, generates, and answers sanely at its shipped configuration.
+ * It does not replace the long-context sweep (PROMPT=16000
+ * chunk-prefill-test --long), which remains the gate watching the deep end —
+ * note its reference arm needs ~4 h (quadratic per-token prefill), so 16k
+ * itself is still unrun.
  *
  * GATED on the local weight mirror (.weights-local/Qwen3.8-27B-4bit). If
  * the mirror isn't primed the whole file skips LOUDLY instead of failing.

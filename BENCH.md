@@ -2464,3 +2464,22 @@ it is correct per-token and at cap 256, and invents tool names at 1024. The
 mechanism is unfound; `ModelSpec.maxChunkCap` quarantines that spec at 256, so
 this table's 1024 column no longer describes what qwen38 runs. Nothing here is
 retracted for the three specs it was measured on.
+
+### qwen38 cap 1024 identity restored (2026-09-28) — quarantine lifted
+
+Root cause of the break above: not numerics but an unfolded `cSiluMul`
+dispatch — at n=1024 qwen38 records 1024 × 17408/256 = 69632 workgroups in x
+against the 65535 limit, and the invalid command buffer poisoned every pass
+after it (which is why per-token and cap 256 stayed green and the kernels
+stayed exact). The shader already indexed `blockIdx.z * gridDim.x +
+blockIdx.x` guarded by `packGridDimX`; only the dispatch never used z. It
+folds now (shared `foldGridX` helper, same as the LM head).
+
+Evidence, same machine, `CAP=1024`: PROMPT=2000 both arms 24/24 identical,
+0 GPU errors (two runs, 5.99x/5.42x chunked-vs-per-token); PROMPT=4000 both
+arms 24/24 identical, 4 chunks/arm, 0 GPU errors; `gdn_chunk_chain_scale`
+bit-exact 1024 vs 4x256 vs 16x64 on qwen38 dims. `maxChunkCap: 256` removed —
+qwen38 ships at 1024 like the other chunking specs. Boundary honestly stated:
+the 16k `--long` reference arm needs ~4 h (quadratic per-token prefill on
+27B) and is still unrun; the folded set is pinned by
+`tests/unit/chunk-grid-limits.test.ts`.

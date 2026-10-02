@@ -24,8 +24,9 @@ const LIMIT = 65535
 const N = 1024
 
 /** Specs whose unfolded chunk grid exceeds the limit AND whose dispatch
- *  folds across z. Membership here is the claim; the e2e --long run is the
- *  proof (chunk-prefill-test.mjs qwen38 --long, CAP=1024). */
+ *  folds across z. Membership here is the claim; the proof is CAP=1024
+ *  token identity on both arms at PROMPT=2000 (twice) and 4000 with 0 GPU
+ *  errors, plus gdn_chunk_chain_scale bit-exact at 1024 on these dims. */
 const FOLDED = new Set(['qwen3-8-27b-4bit'])
 
 const gridOf = (spec: (typeof SHIPPED_MODELS)[number]['spec']): number =>
