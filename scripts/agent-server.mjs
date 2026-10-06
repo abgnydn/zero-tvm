@@ -115,6 +115,46 @@ function dispatch(job) {
   vlog(`-> tab  job ${job.id.slice(0, 8)} (${job.request.messages.length} messages)`)
 }
 
+/** FIFO of jobs the tab has not seen yet. The engine has ONE KV cache — two
+ *  concurrent generations interleave and corrupt each other silently (the
+ *  entrance's engine-lock exists for the same reason) — so the server holds
+ *  the HTTP connection open and serves one job at a time. A second request
+ *  WAITS; it is not rejected (pi retries 5xx with backoff and hangs ~2 min,
+ *  and a 4xx would lie — the request itself is fine). Jobs enter `pending`
+ *  only on dispatch; everything waiting lives here.
+ *
+ *  Cancellation: a client that disconnects while queued is dropped without
+ *  ever reaching the tab (`closed`, checked at dispatch). A client that
+ *  disconnects mid-run still burns its GPU time — the tab cannot preempt a
+ *  generation — but its result is discarded and the queue moves on. */
+const queue = []
+let activeId = null
+
+function pumpQueue() {
+  if (activeId !== null || !host) return
+  while (queue.length) {
+    const job = queue.shift()
+    if (job.closed) continue
+    activeId = job.id
+    try {
+      dispatch(job)
+    } catch (e) {
+      activeId = null
+      job.onError(e)
+    }
+    return
+  }
+}
+
+function finishJob(id) {
+  if (activeId === id) { activeId = null; pumpQueue() }
+}
+
+function enqueue(job) {
+  queue.push(job)
+  pumpQueue()
+}
+
 // Origins allowed to reach this server. `*` was wrong, and binding 127.0.0.1
 // does not save it: EventSource is a SIMPLE CORS GET, so any page the user has
 // open could `new EventSource('http://127.0.0.1:8017/agent/jobs')`, EVICT the
@@ -173,8 +213,18 @@ const server = createServer(async (req, res) => {
     res.write(': connected\n\n')
     host = res
     log(`tab connected, hosting "${hostModel}"`)
-    // Anything already queued was waiting for exactly this.
-    for (const job of pending.values()) dispatch(job)
+    // The one in-flight job, if it survived in `pending`, goes back to the
+    // tab — a disconnect mid-generation killed that run, and the engine
+    // replays from the prompt. Anything merely queued was never dispatched
+    // and waits its turn via pumpQueue; re-sending the whole map the old
+    // way handed the tab N jobs at once, which is the interleave this
+    // queue exists to prevent.
+    if (activeId !== null && pending.has(activeId)) {
+      try { dispatch(pending.get(activeId)) } catch (e) { log('re-dispatch failed:', e.message) }
+    } else {
+      activeId = null
+      pumpQueue()
+    }
     req.on('close', () => {
       if (host === res) { host = null; log('tab disconnected') }
     })
@@ -185,11 +235,16 @@ const server = createServer(async (req, res) => {
     let msg
     try { msg = await readBody(req) } catch { return fail(res, 400, 'bad JSON') }
     const job = pending.get(msg.id)
+    // A cancelled-while-active stream deleted its pending entry on disconnect;
+    // its done still frees the tab for the queue — finish first, then decide
+    // whether there is anyone to answer. Without this the active slot sticks
+    // and every later request queues forever behind a dead client.
+    finishJob(msg.id)
     if (!job) { json(res, 200, { ok: true, unknown: true }); return }
     try {
       if (msg.type === 'delta') job.onDelta(msg.text)
-      else if (msg.type === 'done') { pending.delete(msg.id); job.onDone(msg) }
-      else if (msg.type === 'error') { pending.delete(msg.id); job.onError(new Error(msg.message)) }
+      else if (msg.type === 'done') { pending.delete(msg.id); finishJob(msg.id); job.onDone(msg) }
+      else if (msg.type === 'error') { pending.delete(msg.id); finishJob(msg.id); job.onError(new Error(msg.message)) }
     } catch (e) { log('emit handler threw:', e.message) }
     json(res, 200, { ok: true })
     return
@@ -257,10 +312,27 @@ const server = createServer(async (req, res) => {
 
     if (!stream) {
       let text = ''
+      let closed = false
+      const job = { id, request, closed: false, onDelta: null, onDone: null, onError: null }
+      // `res`, not `req`: for a held response (body consumed, nothing written
+      // yet) req-close never fires on this Node — only the socket does. res
+      // fires on premature close in both cases; writableEnded tells the normal
+      // end (which also closes) apart from a client that went away.
+      res.on('close', () => {
+        if (res.writableEnded) return
+        closed = true
+        job.closed = true
+        const i = queue.indexOf(job)
+        if (i >= 0) queue.splice(i, 1)
+      })
       try {
         const done = await new Promise((resolve, reject) => {
-          dispatch({ id, request, onDelta: (t) => { text += t }, onDone: resolve, onError: reject })
+          job.onDelta = (t) => { text += t }
+          job.onDone = resolve
+          job.onError = reject
+          enqueue(job)
         })
+        if (closed) return
         json(res, 200, {
           id: `chatcmpl-${id}`, object: 'chat.completion', created, model,
           choices: [{
@@ -299,12 +371,20 @@ const server = createServer(async (req, res) => {
     chunk({ role: 'assistant', content: '' })
 
     let closed = false
-    req.on('close', () => { closed = true; pending.delete(id) })
+    // res-close, not req-close — see the non-streaming path: a held response
+    // never delivers req-close on this Node.
+    res.on('close', () => {
+      if (res.writableEnded) return
+      closed = true
+      pending.delete(id)
+      const qi = queue.findIndex((j) => j.id === id)
+      if (qi >= 0) queue.splice(qi, 1)
+    })
 
     try {
       const done = await new Promise((resolve, reject) => {
-        dispatch({
-          id, request,
+        enqueue({
+          id, request, closed: false,
           onDelta: (t) => { if (!closed) chunk({ content: t }) },
           onDone: resolve, onError: reject,
         })
@@ -339,7 +419,7 @@ const server = createServer(async (req, res) => {
   }
 
   if (path === '/' || path === '/health') {
-    json(res, 200, { ok: true, hosting: hostModel, tabConnected: !!host, pending: pending.size })
+    json(res, 200, { ok: true, hosting: hostModel, tabConnected: !!host, pending: pending.size, queued: queue.length, active: activeId?.slice(0, 8) ?? null })
     return
   }
 
