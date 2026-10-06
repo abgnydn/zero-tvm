@@ -90,6 +90,11 @@ jobs:
       - run: npm run test:kernels
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+      # 8-bit affine dense twins: scalar kernels, no subgroups needed, so they
+      # run here too — numerics vs CPU, not just compile.
+      - run: npm run test:kernels:int8
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
       # Every shipped spec's shaders must build under its own dims (prelude
       # consts, workgroup layouts, u32 address math) — a prelude edit that
       # breaks another spec fails here, not in a browser. No weights, no

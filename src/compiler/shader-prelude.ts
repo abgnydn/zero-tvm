@@ -44,7 +44,7 @@ const PAGE_SIZE       = ${P.pageSize};        // KV-cache slots per page
 const MAX_PAGES       = ${P.maxPages};       // KV-cache page budget
 const QKV_DIM         = ${P.qkvDim};      // Q_DIM + 2*KV_DIM (Q,K,V stacked projection rows)
 const HALF_HEAD_DIM   = ${P.halfHeadDim};        // HEAD_DIM / 2 (RoPE pair distance)
-const D_PACKED        = ${P.dPacked};       // D / 8  (u32 words per K=D weight row)
+const D_PACKED        = ${P.dPacked};       // d*bits/32 (u32 words per K=D weight row)
 const D_SCALES        = ${P.dScales};        // D / 32 (int4 scales per K=D weight row)
 const QKV_GROUP_PAIRS = ${P.qkvGroupPairs};      // HEADS * HALF_HEAD_DIM (RoPE pairs in the Q group)
 const HEAD_PAGE_STRIDE = ${P.headPageStride};     // PAGE_SIZE * HEAD_DIM (f16 per head per page)

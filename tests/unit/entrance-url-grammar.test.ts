@@ -132,7 +132,7 @@ describe('a ?model= that is PRESENT is the registry\'s question', () => {
     // "simplification" that sends kev to the absent-flag fallback would boot
     // the flagship where a decision console was asked for: a 20 GB download
     // instead of a 2.3 GB one, and a chat instead of decisions.
-    for (const s of ['?model=kev', '?model=kev4b&chat=1']) {
+    for (const s of ['?model=kev', '?model=kevq8', '?model=kev4b&chat=1']) {
       const param = new URLSearchParams(s).get('model')
       expect(specForParam(param).decisionOnly).toBe(true)
       expect(specOf(entranceIntent(s, '')).id, s).toBe(specForParam(param).id)

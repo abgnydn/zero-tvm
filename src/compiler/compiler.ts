@@ -17,6 +17,9 @@
 import { withPrelude, PHI3, type ModelSpec } from './shader-prelude'
 import { int4MatmulWGSL, int4MatmulEntry, int4MatmulTiledStWGSL, int4MatmulSgE1WGSL, int4MatmulSgE5WGSL } from './shaders/int4_matmul.gen'
 import embeddingAffineSrc from './shaders/embedding_affine.wgsl?raw'
+import embeddingAffineInt8Src from './shaders/embedding_affine_int8.wgsl?raw'
+import int8AffineMatvecSrc from './shaders/int8_affine_matvec.wgsl?raw'
+import int8AffineBatchedSrc from './shaders/int8_affine_batched.wgsl?raw'
 import moeRouterLogitsSrc from './shaders/moe_router_logits.wgsl?raw'
 import moeRouterLogitsF16Src from './shaders/moe_router_logits_f16.wgsl?raw'
 import moeRouterTopkSrc from './shaders/moe_router_topk.wgsl?raw'
@@ -91,6 +94,9 @@ export interface Pipelines {
    *  hard-symmetric with no bias binding, and binding an affine table to it is
    *  in-bounds and error-free — just wrong. */
   embeddingAffine: GPUComputePipeline
+  /** 8-bit twin (kevq8): byte unpack where the int4 reads nibbles. Same
+   *  bindings, so the engine swaps pipelines, not plumbing. */
+  embeddingAffineInt8: GPUComputePipeline
   rmsNorm: GPUComputePipeline
   qkvMatmul: GPUComputePipeline      // int4 matmul, K=3072→9216
   int4Matmul: GPUComputePipeline     // alias to the scalar int4_matmul (shared across QKV/O/FFN-down)
@@ -215,6 +221,12 @@ export interface Pipelines {
   int4MatmulTiledVec4hAffine: GPUComputePipeline | null
   int4MatmulF32SgVec4hAffine: GPUComputePipeline | null
   int4MatmulF32TiledVec4hAffine: GPUComputePipeline | null
+  // ── 8-bit affine dense twins (kevq8). Same bindings and PODArgs as the
+  // int4 scalar/batched-dyn affine pair (K_PACKED = K/4 here, not K/8), so
+  // the engine swaps pipelines, not plumbing. Scalar (no subgroups needed),
+  // always built: one GEMV + one batched kernel covers every projection.
+  int8AffineMatvec: GPUComputePipeline
+  int8AffineBatched: GPUComputePipeline
   // ── Sparse MoE block (Qwen3.6). Seven dispatches: router logits, top-k,
   // gate, up, silu_mul, down, combine. moeMatmul folds the expert into grid z.
   moeRouterLogits: GPUComputePipeline
@@ -324,6 +336,7 @@ export function compile(
   const pipelines: Pipelines = {
     embedding: createPipeline(device, embeddingSrc, 'embedding'),
     embeddingAffine: createPipeline(device, embeddingAffineSrc, 'embedding_affine'),
+    embeddingAffineInt8: createPipeline(device, embeddingAffineInt8Src, 'embedding_affine_int8'),
     rmsNorm: createPipeline(device, rmsNormSrc, 'rms_norm'),
     qkvMatmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
     int4Matmul: createPipeline(device, int4MatmulWGSL(), 'int4_matmul'),
@@ -413,6 +426,8 @@ export function compile(
     int4MatmulTiledVec4hAffine: subgroups ? mm({ subgroups: true, rowsPerWG: 4, vec4Half: true, affine: true }) : null,
     int4MatmulF32SgVec4hAffine: subgroups ? mm({ outF32: true, subgroups: true, vec4Half: true, affine: true }) : null,
     int4MatmulF32TiledVec4hAffine: subgroups ? mm({ outF32: true, subgroups: true, rowsPerWG: 4, vec4Half: true, affine: true }) : null,
+    int8AffineMatvec: createPipeline(device, int8AffineMatvecSrc, 'int8_affine_matvec'),
+    int8AffineBatched: createPipeline(device, int8AffineBatchedSrc, 'int8_affine_batched'),
     moeRouterLogits: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits'),
     moeRouterLogitsQ4: createPipeline(device, moeRouterLogitsSrc, 'moe_router_logits_q4'),
     moeRouterLogitsF16: createPipeline(device, moeRouterLogitsF16Src, 'moe_router_logits_f16'),

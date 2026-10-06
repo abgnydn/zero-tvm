@@ -359,18 +359,45 @@ export interface ResolvedPipelines {
  * same bind group. Every pick falls back to scalar when the requested _sg
  * pipeline wasn't compiled (subgroups feature off).
  */
+/**
+ * One matmul instance for one spec: the 8-bit branch first, everything else
+ * through resolveMatmul. Like the affine gate inside resolveMatmul, the
+ * checkpoint's quantization decides the family — a URL flag must never be
+ * able to serve int4 dequant math over int8 bytes (silent wrong logits) or
+ * vice versa. Single choke point: resolveVariantPipelines AND the GDN-out
+ * instance in engine-core both come through here.
+ */
+export function resolveMatmulForSpec(
+  flags: VariantFlags,
+  P: Pipelines,
+  spec: ModelSpec,
+  k: number,
+): { pipeline: GPUComputePipeline; pipelineF32: GPUComputePipeline; rowsPerWG: number; label: string } {
+  const affine = spec.weightFormat === 'mlx-safetensors'
+  if ((spec.weightBits ?? 4) === 8) {
+    if (!P.int8AffineMatvec) {
+      throw new Error(`buildDecodeEngine: spec ${spec.id} is 8-bit but int8AffineMatvec was not compiled`)
+    }
+    // pipelineF32 shares the slot: nothing reads pipelineF32 today (it is
+    // constructed but never dispatched — the LM head has its own pipelines),
+    // and an 8-bit spec has no F32-output twin. If one is ever wired, this is
+    // where it lands.
+    return { pipeline: P.int8AffineMatvec, pipelineF32: P.int8AffineMatvec, rowsPerWG: 1, label: 'int8_affine' }
+  }
+  return resolveMatmul(flags.matmul, P, flags.vec4, k, flags.vec4Half, affine, flags.vec4Affine)
+}
 export function resolveVariantPipelines(flags: VariantFlags, P: Pipelines, spec: ModelSpec = PHI3): ResolvedPipelines {
   // Per-instance vec4 gating: each matmul role passes its own K, so vec4
   // survives exactly on the instances whose K % 1024 == 0 (all of them for
   // Phi-3 — resolution unchanged there).
   // The checkpoint's quantization decides the kernel family, not a URL flag —
   // a spec whose weights are MLX-affine can never be served by a symmetric
-  // kernel, and the failure would be silent.
-  const affine = spec.weightFormat === 'mlx-safetensors'
+  // kernel, and the failure would be silent. (The `affine` computation lives
+  // in resolveMatmulForSpec now, which also owns the 8-bit branch.)
   const { pipeline: matmul, pipelineF32: matmulF32, rowsPerWG: matmulRowsPerWG, label: matmulLabel } =
-    resolveMatmul(flags.matmul, P, flags.vec4, spec.d, flags.vec4Half, affine, flags.vec4Affine)
-  const { pipeline: matmulOProj } = resolveMatmul(flags.matmul, P, flags.vec4, spec.qDim, flags.vec4Half, affine, flags.vec4Affine)
-  const { pipeline: matmulFfnDown } = resolveMatmul(flags.matmul, P, flags.vec4, spec.ffn, flags.vec4Half, affine, flags.vec4Affine)
+    resolveMatmulForSpec(flags, P, spec, spec.d)
+  const { pipeline: matmulOProj } = resolveMatmulForSpec(flags, P, spec, spec.qDim)
+  const { pipeline: matmulFfnDown } = resolveMatmulForSpec(flags, P, spec, spec.ffn)
   const attention = (flags.sgAttn && P.attentionSg) ? P.attentionSg : P.attention
   // ?splitk=N experiment: partial pass follows the sgAttn toggle (subgroup
   // reduce when available), combine is feature-free.

@@ -93,7 +93,7 @@ describe('entrance identity', () => {
     // kev hid behind the same embeddingOnly bit as the vector model, which
     // kept it off every surface. The split flag must earn it a card — and a
     // card that speaks decision, not chat or vector.
-    for (const param of ['kev', 'kev4b', 'kev4bq35']) {
+    for (const param of ['kev', 'kevq8', 'kev4b', 'kev4bq35']) {
       const spec = specForParam(param)
       expect(spec.decisionOnly).toBe(true)
       const slot = GROUPS.flatMap((g, gi) => g.variants.map((x) => ({ ...x, gi })))
@@ -118,7 +118,7 @@ describe('entrance identity', () => {
     expect(isLocalDev('www.zerotvm.com')).toBe(false)
     const devParams = groupsFor(SHIPPED_MODELS, true).flatMap((g) => g.variants.map((x) => x.param))
     const prodParams = groupsFor(SHIPPED_MODELS, false).flatMap((g) => g.variants.map((x) => x.param))
-    for (const param of ['kev', 'kev4b', 'kev4bq35']) {
+    for (const param of ['kev', 'kevq8', 'kev4b', 'kev4bq35']) {
       expect(devParams, param).toContain(param)
       expect(prodParams, param).not.toContain(param)
     }
@@ -126,7 +126,7 @@ describe('entrance identity', () => {
     expect(prodParams).toEqual(devParams.filter((p) => !p.startsWith('kev')))
     // The registry itself is untouched — ?model=kev still resolves (and the
     // entrance falls back to the flagship for it, by the compat rule).
-    for (const param of ['kev', 'kev4b', 'kev4bq35']) {
+    for (const param of ['kev', 'kevq8', 'kev4b', 'kev4bq35']) {
       expect(specForParam(param).localWeightsOnly).toBe(true)
     }
   })

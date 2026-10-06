@@ -335,6 +335,15 @@ export interface ModelSpecBase {
    */
   weightFormat?: 'mlc' | 'mlx-safetensors'
   /**
+   * MLX-affine quantization width in bits. Default 4: every shipped MLX
+   * checkpoint is q4/g64, and the int4 kernel family unpacks nibbles. 8 means
+   * q8/g64 with one byte per value in the same u32-word containers — the
+   * loader's raw trio path is width-agnostic (sizes come from the file
+   * headers), so this flag selects the int8 kernel twins in compile() and
+   * the engine, nothing else.
+   */
+  weightBits?: 4 | 8
+  /**
    * MLX checkpoints only: the record-name prefix before `model.*` / `lm_head`.
    * '' for a text-only checkpoint (`model.layers.0…`, `lm_head.weight`);
    * 'language_model.' for Qwen3.6's multimodal root
@@ -384,7 +393,7 @@ export interface ModelSpec extends ModelSpecBase {
   qkvDim: number        // qDim + 2*kvDim (fused QKV projection rows)
   gqaGroup: number      // heads / kvHeads
   halfHeadDim: number   // headDim / 2 (RoPE pair distance)
-  dPacked: number       // d / 8  (u32 words per K=d weight row)
+  dPacked: number       // d*bits/32 (u32 words per K=d weight row: d/8 at 4 bits, d/4 at 8)
   dScales: number       // d / 32 (int4 scales per K=d weight row)
   qkvGroupPairs: number // heads * halfHeadDim (RoPE pairs in the Q group)
   qkvPairs: number      // qkvDim / 2 (total QKV pairs — the qkv_fused grid)
@@ -620,7 +629,7 @@ export function makeModelSpec(base: ModelSpecBase): ModelSpec {
     qkvDim: qDim + 2 * kvDim,
     gqaGroup: base.heads / base.kvHeads,
     halfHeadDim: base.headDim / 2,
-    dPacked: base.d / 8,
+    dPacked: (base.d * (base.weightBits ?? 4)) / 32,
     dScales: base.d / 32,
     qkvGroupPairs: base.heads * (base.headDim / 2),
     qkvPairs: (qDim + 2 * kvDim) / 2,
@@ -1313,7 +1322,41 @@ export const KEV_4B_Q35: ModelSpec = makeModelSpec({
   embeddingOnly: true,
   decisionOnly: true,
   localWeightsOnly: true,
-  paramNaming: mlxParamNaming("language_model."),
+  paramNaming: mlxParamNaming(""),
+})
+
+// KEV-0.6B at 8 bits (same merge as KEV_06B, MLX affine 8-bit group 64):
+// the 4-bit build keeps 17/21 argmaxes against its own f32 forward, the 8-bit
+// build keeps 21/21 (docs/kev-parity/sweep-kev.txt) — so this is the 0.6B to
+// serve. First spec with weightBits 8: the int8 kernel twins (int8_affine_*)
+// run every projection, selected by the flag in compile() and the engine.
+export const KEV_06B_Q8: ModelSpec = makeModelSpec({
+  id: 'kev-0-6b-mlx-8bit',
+  d: 1024,
+  layers: 28,
+  heads: 16,
+  kvHeads: 8,
+  headDim: 128,
+  ffn: 3072,
+  vocab: 151936,
+  pageSize: 16,
+  maxPages: 512,
+  maxSeq: 32768,
+  ropeTheta: 1000000,
+  rmsEps: 0.000001,
+  tiedEmbeddings: true,
+  qkNorm: true,
+  stops: [151643],
+  chatTemplateId: 'chatml',
+  tokenizerKind: 'byteLevel',
+  hfRepo: 'abgunaydin/kev-0.6b-mlx-8bit',
+  manifestName: 'model.safetensors.index.json',
+  weightFormat: 'mlx-safetensors',
+  weightBits: 8,
+  embeddingOnly: true,
+  decisionOnly: true,
+  localWeightsOnly: true,
+  paramNaming: mlxParamNaming(""),
 })
 
 

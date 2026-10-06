@@ -1,31 +1,36 @@
 // INT8_AFFINE_MATVEC — GEMV over MLX-style 8-bit affine weights.
 //
-// Same scheme as moe_router_logits' inner loop, but exposed as a plain matvec with no
-// softmax or top-k: out[r] = Σ xᵢ·wᵢ with w = scale*q + bias over groups of 64,
-// q an unsigned byte, 4 per u32 word.
+// The decode-path twin of int8_affine_batched: out[r] = Σ xᵢ·wᵢ with
+// w = scale*q + bias over groups of 64, q an unsigned byte, 4 per u32 word.
 //
 //   Σ xᵢ·wᵢ = s·Σ xᵢ·qᵢ + b·Σ xᵢ
 //
-// Written for the pieces of a MoE block that ship at 8 bits while the bulk of
-// the model is 4-bit — currently just shared_expert_gate (a single row), which
-// is why this is a simple one-workgroup-per-row tree reduction rather than
-// anything tuned.
+// Uniforms and bindings mirror int4_matmul (scalar affine) exactly —
+// [out, inp, scales, wts, uni, biases] with uni = {K_PACKED, SCALES_PER_ROW,
+// N} — so the engine swaps PIPELINES, not plumbing, for 8-bit specs.
+// K_PACKED here is K/4 u32 words (a byte per value, not a nibble).
+//
+// f32 accumulate, f16 write — the same contract as the int4 matvec family,
+// so the engine's f16 activation buffers need no twin. One workgroup per
+// output row, 64-thread tree reduction; the row index folds across z with a
+// packGridDimX-style guard wherever a caller needs it.
 //
 // Grid: one workgroup per output row.
 
 enable f16;
 
-@group(0) @binding(0) var<storage, read_write> out_buf : array<f32>;   // [N]
-@group(0) @binding(1) var<storage, read> x : array<f16>;               // [K]
-@group(0) @binding(2) var<storage, read> w : array<u32>;               // [N, K/4]
-@group(0) @binding(3) var<storage, read> scales : array<f16>;          // [N, K/64]
-@group(0) @binding(4) var<storage, read> biases : array<f16>;          // [N, K/64]
+@group(0) @binding(0) var<storage, read_write> out_buf : array<f16>;   // [N]
+@group(0) @binding(1) var<storage, read> x : array<f16>;              // [K]
+@group(0) @binding(2) var<storage, read> scales : array<f16>;         // [N, K/64]
+@group(0) @binding(3) var<storage, read> w : array<u32>;              // [N, K/4]
+@group(0) @binding(4) var<uniform> podArgs : PODArgs;
+@group(0) @binding(5) var<storage, read> biases : array<f16>;        // [N, K/64]
 
 struct PODArgs {
-  K: u32,   // input dim
-  N: u32    // output rows
+  K_PACKED : u32,        // K / 4  (u32 words per weight row)
+  SCALES_PER_ROW : u32,  // K / 64 (affine group scales per weight row)
+  N : u32,               // output rows
 }
-@group(0) @binding(5) var<uniform> podArgs : PODArgs;
 
 var<workgroup> part : array<f32, 64>;
 
@@ -38,8 +43,8 @@ fn int8_affine_matvec(
   let row : u32 = blockIdx.z * gridDim.x + blockIdx.x;
   if (row >= podArgs.N) { return; }
   let tid : u32 = threadIdx.x;
-  let GPR : u32 = podArgs.K / 64u;    // groups per row
-  let WPR : u32 = podArgs.K / 4u;     // u32 words per row
+  let GPR : u32 = podArgs.SCALES_PER_ROW;   // groups per row
+  let WPR : u32 = podArgs.K_PACKED;         // u32 words per row
 
   var acc : f32 = 0.0;
   // One group per thread per pass; a group is 64 values = 16 u32 words, so the
@@ -66,5 +71,5 @@ fn int8_affine_matvec(
     if (tid < st) { part[tid] = part[tid] + part[tid + st]; }
     workgroupBarrier();
   }
-  if (tid == 0u) { out_buf[row] = part[0]; }
+  if (tid == 0u) { out_buf[row] = f16(part[0]); }
 }
