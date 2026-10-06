@@ -144,7 +144,7 @@ try {
     const weights = { root: {}, layers: [{}, layer, {}] }
 
     const variants = { ...V.SCALAR_VARIANTS, subgroups: device.features.has('subgroups') }
-    const engine = EC.buildDecodeEngine(device, weights, EC.allocKVPages(device, S), {
+    const engine = await EC.buildDecodeEngine(device, weights, EC.allocKVPages(device, S), {
       spec: S, variants, layerRange: { start: 1, end: 2 },
       pipelines: C.compile(device, S, variants),
     })

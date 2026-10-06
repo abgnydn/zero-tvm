@@ -245,9 +245,12 @@ npm run test:kernels:real     # kernels vs mlx_lm's own modules on real weights
 
 ## Chunk-prefill GEMM (`chunkGemm`)
 
-The chunk path picks a GEMM: **`e5` is the default since 2026-08-13** where the
-device has `chromium-experimental-subgroup-matrix`, degrading to `sgmat` (E1 on
-the same unit) when the cap does not tile by 64, else `matvec`. (`tiled` exists
+The chunk path picks a GEMM: **measured at boot since 2026-09-28**
+(`gemm-tune.ts` times the runnable ladder candidates on projection-shaped
+work and persists the winner per device+spec; explicit `chunkGemm` bypasses,
+single-candidate and probe failure fall back to the ladder). **`e5` is what
+the tune finds** where the device has `chromium-experimental-subgroup-matrix`,
+degrading to `sgmat` (E1 on the same unit) when the cap does not tile by 64, else `matvec`. (`tiled` exists
 but is unreachable by default — nothing sets `chunkTiled`, and `pickChunkGemm`
 never selects it on its own; it is an explicit `chunkGemm:'tiled'` only.) E5 is
 that unit at a 64(M)x32(N) tile with a swizzled B — 18-22% over E1 in isolation,

@@ -587,7 +587,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
     probeSubgroups: true,
     layerRange: stageRange ?? undefined,
     ...(poolSlots ? { expertPool: poolSlots } : {}),
-    buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
+    buildEngine: async ({ device, weights, sgSizeOk, spec: s }) => {
       const flags = variantsMod.parseVariantFlags(location.search, {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
@@ -598,7 +598,7 @@ async function runHost(existingRoom: string | null, stageRange: { start: number;
       // and then fork, which reads as a split bug and is not one.
       ;(window as unknown as Record<string, unknown>).__variants = { ...flags, fused }
       const kv = engineMod.allocKVFor(device, s, flags)
-      return engineMod.buildDecodeEngine(device, weights, kv, {
+      return await engineMod.buildDecodeEngine(device, weights, kv, {
         variants: flags, fused, spec: s, layerRange: stageRange ?? undefined,
         ...(poolSlots ? { expertPool: poolSlots } : {}),
       })
@@ -814,13 +814,13 @@ async function runHelper(roomId: string, range: { start: number; end: number }):
     optionalFeatures: ENGINE_GPU_FEATURES,
     probeSubgroups: true,
     layerRange: range,
-    buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
+    buildEngine: async ({ device, weights, sgSizeOk, spec: s }) => {
       const flags = variantsMod.parseVariantFlags(location.search, {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
       })
       ;(window as unknown as Record<string, unknown>).__variants = { ...flags, fused: false }
-      return engineMod.buildDecodeEngine(device, weights, engineMod.allocKVFor(device, s, flags), {
+      return await engineMod.buildDecodeEngine(device, weights, engineMod.allocKVFor(device, s, flags), {
         variants: flags, fused: false, spec: s, layerRange: range,
       })
     },

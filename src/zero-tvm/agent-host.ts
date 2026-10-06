@@ -169,12 +169,12 @@ async function main(): Promise<void> {
     // prefill. This surface exists for agents, where prefill dominates, so it
     // builds the chat-class engine the same way chat.ts does (and remembers
     // the flags: the KV pool fingerprints them).
-    buildEngine: ({ device, weights, sgSizeOk, spec: sp }) => {
+    buildEngine: async ({ device, weights, sgSizeOk, spec: sp }) => {
       flags = parseVariantFlags(location.search, {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
       })
-      return buildDecodeEngine(device, weights, allocKVFor(device, sp, flags), { spec: sp, variants: flags })
+      return await buildDecodeEngine(device, weights, allocKVFor(device, sp, flags), { spec: sp, variants: flags })
     },
   })
   if (!boot.ok) {

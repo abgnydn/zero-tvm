@@ -114,7 +114,7 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
       ...(new URLSearchParams(location.search).get('profile') === '1' ? PROFILE_GPU_FEATURES : [])],
     probeSubgroups: true,
     onDeviceLost: opts.onDeviceLost,
-    buildEngine: ({ device, weights, sgSizeOk, spec: s }) => {
+    buildEngine: async ({ device, weights, sgSizeOk, spec: s }) => {
       const flags = parseVariantFlags(search, {
         hasSubgroupsFeature: (device.features as ReadonlySet<string>).has('subgroups'),
         sgSizeOk,
@@ -166,7 +166,7 @@ export function bootChatEngine(opts: BootChatOptions): Promise<BootResult> {
       if (temperature > 0) {
         bootLog(`Sampling: temperature ${temperature}, top-p ${numFlag('topp', 1)}, min-p ${numFlag('minp', 0)}`)
       }
-      return buildDecodeEngine(device, weights, kv, {
+      return await buildDecodeEngine(device, weights, kv, {
         variants: { ...flags, int8KV },
         fused,
         spec: s,
