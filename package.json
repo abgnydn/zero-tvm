@@ -57,6 +57,7 @@
     "agent": "node scripts/agent.mjs",
     "agent-server": "node scripts/agent-server.mjs",
     "test:agent-server": "node scripts/agent-server-test.mjs",
+    "test:agent-queue": "node scripts/agent-queue-test.mjs",
     "add-model": "node scripts/add-model.mjs",
     "test:kernels:spec": "node tests/kernels/compile-spec.mjs",
     "test:kernels:all-specs": "node scripts/compile-all-specs.mjs",
