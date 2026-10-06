@@ -351,7 +351,7 @@ async function bootShared(opts: CreateEngineOptions & { ctx?: number }): Promise
   // and names it; duplicating a stale rule here is what refused a model the
   // engine supports.
   const kv = variants.int8KV ? allocKVPagesInt8(device, spec) : allocKVPages(device, spec)
-  const engine = buildDecodeEngine(device, weights, kv, {
+  const engine = await buildDecodeEngine(device, weights, kv, {
     spec, variants, fused, ...(opts.chunkGemm ? { chunkGemm: opts.chunkGemm } : {}),
     ...(opts.traceMoe ? { traceMoe: true } : {}),
     ...(opts.expertPool ? { expertPool: opts.expertPool } : {}),

@@ -26,6 +26,9 @@ import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
 import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
 import { AbsorbedRecord } from './absorbed-record.js'
 import { GdnRewindRing } from './gdn-rewind.js'
+import {
+  browserTuneStore, deviceFingerprint, resolveTunedGemm, timeClosures, TUNE_MS,
+} from './gemm-tune.js'
 import { ExpertPool } from './expert-pool.js'
 import type { SlabKind, SlabProj } from './slab-source.js'
 
@@ -583,10 +586,10 @@ export interface DecodeEngineOptions {
   /** Chunk GEMM selection: 'e5' (the matrix unit at a 64x32 tile with a
    *  swizzled B), 'sgmat' (E1 on the same unit), 'tiled', 'matvec'. Both
    *  matrix-unit kernels need the experimental subgroup-matrix feature.
-   *  Default: E5 since 2026-08-13 where its pipelines exist and the cap tiles
-   *  by 64, else sgmat, else matvec — see the ladder in buildChunkPrefill,
-   *  which is the authority. This comment said "opt-in pending an in-engine
-   *  A/B" for nine days after that A/B promoted it. */
+   *  Default: MEASURED at boot (gemm-tune.ts) among the runnable ladder
+   *  candidates, persisted per device+spec — the old "E5 where it runs"
+   *  ladder is the fallback when tuning is skipped or fails. An EXPLICIT
+   *  value bypasses tuning and keeps throw-instead-of-fallback semantics. */
   chunkGemm?: 'sgmat' | 'e5' | 'tiled' | 'matvec'
   /** Capture the router's expert choice per layer per token, for
    *  scripts/moe-trace.mjs. Costs one small buffer copy per MoE layer and one
@@ -667,12 +670,12 @@ export interface DecodeEngineOptions {
   layerRange?: { start: number; end: number }
 }
 
-export function buildDecodeEngine(
+export async function buildDecodeEngine(
   device: GPUDevice,
   weights: LoadedWeights,
   kv: GPUBuffer[] | { pages: GPUBuffer[]; scales?: GPUBuffer[] },
   opts: DecodeEngineOptions = {},
-): DecodeEngine {
+): Promise<DecodeEngine> {
   const variants = opts.variants ?? SCALAR_VARIANTS
   const fused = opts.fused ?? false
   const int8Mode = resolveInt8Mode(variants, opts.spec ?? PHI3)
@@ -3764,7 +3767,9 @@ export function buildDecodeEngine(
   }
 
   let chunkGemmUsed = 'matvec'
-  function buildChunkPrefill(): ChunkPrefill {
+  /** Where the pick came from: '' (static ladder), 'stored' or 'probed'. */
+  let chunkGemmTune = ''
+  async function buildChunkPrefill(): Promise<ChunkPrefill> {
     // Pooled chunks are capped at 16 tokens: the chunk's expert UNION must be
     // resident simultaneously, and the 1827-step routing trace puts the p100
     // union at C=16 at 84 of 128 experts — under a 96-slot pool with zero
@@ -3815,6 +3820,92 @@ export function buildDecodeEngine(
     // sgmat passes it on every chunking spec before it may default here.
     const sgmatPipes = AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat
     const e5Pipes = AFFINE ? P.int4MatmulSgE5Affine : P.int4MatmulSgE5
+    const matvecPipe = AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn
+    /** A batched-GEMM bind group, parameterized by pipeline: bg() maps array
+     *  position to binding index, so the bias buffer must come LAST and only
+     *  when the affine kernel is in use — a 6-buffer group against a 5-binding
+     *  layout is rejected outright, which is the loud failure we want rather
+     *  than a silent misbind. Production callers use `dynBg` (the picked
+     *  pipeline); the boot-time probe binds every candidate this same way. */
+    const dynBgFor = (pipe: GPUComputePipeline) => (
+      out: BindEntry,
+      inp: BindEntry,
+      scales: GPUBuffer,
+      wts: GPUBuffer,
+      uni: GPUBuffer,
+      biases?: GPUBuffer,
+    ) => bg(device, pipe, AFFINE ? [out, inp, scales, wts, uni, biases!] : [out, inp, scales, wts, uni])
+    // Boot-time autotune (gemm-tune.ts): the ladder below encodes what won on
+    // ONE machine, so the runnable candidates are timed on projection-shaped
+    // work here and the winner persists per device+spec. Capability first:
+    // this set mirrors pickChunkGemm's conditions exactly (tiled stays
+    // explicit-only — a timing probe cannot promote it). An EXPLICIT
+    // chunkGemm skips tuning entirely: bench arms pin their kernels, and the
+    // throw-instead-of-fallback below must see the request unmodified.
+    const tuneRunnable: ChunkGemmName[] = [
+      ...(dimsOK && CHUNK_CAP % 64 === 0 && e5Pipes ? ['e5' as const] : []),
+      ...(dimsOK && sgmatPipes ? ['sgmat' as const] : []),
+      ...(matvecPipe ? ['matvec' as const] : []),
+    ]
+    let tunedPick: ChunkGemmName | null = null
+    if (opts.chunkGemm == null && tuneRunnable.length > 1) {
+      // Probe projection: the dominant dense GEMM (gateUp, rows 2*ffn) or —
+      // where MoE layers have no dense FFN — the attention projection
+      // (cAttn), which is what actually varies with the pick (expert stacks
+      // do not). Real weight buffers, zeroed activations: math content does
+      // not affect dispatch timing, and real weights keep the memory-access
+      // pattern faithful. Dedicated buffers, destroyed after — the only
+      // shared inputs are read-only weights, so build state is untouched.
+      const lw0 = weights.layers[0]
+      const mw0 = S.moe ? lw0.moe : undefined
+      const probeN = S.moe ? S.cAttnDim : 2 * S.ffn
+      const probeScales = S.moe ? mw0?.gateScales : lw0.ffnScales
+      const probeWts = S.moe ? mw0?.gateWeights : lw0.ffnWeights
+      const probeBiases = S.moe ? mw0?.gateBiases : lw0.ffnBiases
+      const probeMs = TUNE_MS.filter((m) => m <= C)
+      if (probeScales && probeWts && probeMs.length) {
+        const probeMmax = Math.max(...probeMs)
+        const probeIn = makeBuf(device, probeMmax * S.d * 2, 'c.tuneIn')
+        const probeOut = makeBuf(device, probeMmax * probeN * 2, 'c.tuneOut')
+        const probeU = uniformBuf(device, [u32(S.dPacked), u32(S.d / QGROUP), u32(probeN), u32(0)])
+        const probePipes: Record<string, GPUComputePipeline | null> = {
+          e5: e5Pipes, sgmat: sgmatPipes, matvec: matvecPipe,
+        }
+        const probeGrid: Record<string, (m: number) => [number, number]> = {
+          e5: (m) => [Math.ceil(probeN / 32), Math.ceil(m / 64)],
+          sgmat: (m) => [Math.ceil(probeN / 64), Math.ceil(m / 32)],
+          matvec: (_m) => [Math.ceil(probeN / 4), 1],
+        }
+        try {
+          const runs: Partial<Record<ChunkGemmName, (m: number) => void>> = {}
+          for (const name of tuneRunnable) {
+            const group = dynBgFor(probePipes[name]!)(
+              probeOut, probeIn, probeScales, probeWts, probeU, probeBiases)
+            runs[name] = (m: number) => {
+              device.queue.writeBuffer(probeU, 0, new Uint32Array([S.dPacked, S.d / QGROUP, probeN, m]))
+              const enc = device.createCommandEncoder()
+              const [gx, gy] = probeGrid[name](m)
+              dispatch(enc, probePipes[name]!, group, gx, gy, 1, 'cTuneGemm')
+              device.queue.submit([enc.finish()])
+            }
+          }
+          const tuned = await resolveTunedGemm({
+            spec: S,
+            runnable: tuneRunnable,
+            store: browserTuneStore(),
+            adapterId: deviceFingerprint(device),
+            runProbe: () => timeClosures(device, runs, probeMs),
+          })
+          if (tuned) {
+            tunedPick = tuned.pick
+            chunkGemmTune = tuned.source
+          }
+        } catch { /* the ladder below is the fallback */ }
+        probeIn.destroy()
+        probeOut.destroy()
+        probeU.destroy()
+      }
+    }
     // E5 is the default as of 2026-08-13. It cleared the bar this file has held
     // since sgmat — token identity vs per-token prefill on EVERY chunking spec
     // family, not just the convenient one: llama32 and qwen3mlx (dense MLX
@@ -3822,7 +3913,7 @@ export function buildDecodeEngine(
     // in-engine on all three: +13.1% / +14.7% / +39.7% prefill.
     // It degrades to sgmat by itself when the cap does not tile by 64.
     const pick = pickChunkGemm({
-      want: opts.chunkGemm,
+      want: opts.chunkGemm ?? tunedPick ?? undefined,
       chunkTiled: opts.chunkTiled === true,
       dimsOK,
       capTiles64: CHUNK_CAP % 64 === 0,
@@ -3846,18 +3937,7 @@ export function buildDecodeEngine(
     // are equivalent. The ladder still applies when nothing was asked for.
     if (pick.rejected) throw new Error(pick.rejected)
     const dyn = gemm
-    /** A batched-GEMM bind group. bg() maps array position to binding index, so
-     *  the bias buffer must come LAST and only when the affine kernel is in
-     *  use — a 6-buffer group against a 5-binding layout is rejected outright,
-     *  which is the loud failure we want rather than a silent misbind. */
-    const dynBg = (
-      out: BindEntry,
-      inp: BindEntry,
-      scales: GPUBuffer,
-      wts: GPUBuffer,
-      uni: GPUBuffer,
-      biases?: GPUBuffer,
-    ) => bg(device, dyn, AFFINE ? [out, inp, scales, wts, uni, biases!] : [out, inp, scales, wts, uni])
+    const dynBg = dynBgFor(dyn)
     // Batched activation buffers ([C, dim] row-major).
     const CB = {
       inputIds: makeBuf(device, C * 4, 'c.inputIds'),
@@ -4368,10 +4448,10 @@ export function buildDecodeEngine(
     // WebGPU discards the whole submit for, silently — which reads as garbage
     // output rather than an error, and is how this was caught.
     !partial && !S.mla && pooledChunkOK && (opts.chunkedPrefill ?? true) && dynReady
-      ? buildChunkPrefill()
+      ? await buildChunkPrefill()
       : null
   {
-    const why = chunkPrefill ? `on (cap ${chunkPrefill.cap}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${S.moe ? ', moe' : ''}${pooling ? ', pooled' : ''})`
+    const why = chunkPrefill ? `on (cap ${chunkPrefill.cap}${AFFINE ? ', affine' : ''}, gemm ${chunkGemmUsed}${chunkGemmTune ? ` (${chunkGemmTune})` : ''}${S.moe ? ', moe' : ''}${pooling ? ', pooled' : ''})`
       : S.mla ? 'off (per-token — MLA has no chunked attention path)'
       : pooling ? (POOL_SLOTS >= 96
           ? 'off (per-token — pooled chunking is opt-in until its AC timing pair exists: ?chunk=1)'

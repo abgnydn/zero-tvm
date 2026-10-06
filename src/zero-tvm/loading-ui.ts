@@ -143,7 +143,7 @@ export interface BootEngineOptions {
   onDeviceLost?: (info: GPUDeviceLostInfo) => void
   /** Allocate the KV cache and build the engine. Default: f16 KV pages +
    * buildDecodeEngine defaults (unfused reference path, scalar shaders). */
-  buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean; spec: ModelSpec }) => DecodeEngine
+  buildEngine?: (ctx: { device: GPUDevice; weights: LoadedWeights; sgSizeOk: boolean; spec: ModelSpec }) => Promise<DecodeEngine>
   /** Load only ONE PIPELINE STAGE's weights (see loadWeights). The caller's
    *  buildEngine must pass the same range to buildDecodeEngine. */
   layerRange?: { start: number; end: number }
@@ -320,7 +320,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     // The page allocates its own KV cache (f16 or int8) and picks the engine
     // mode + shader variants. It may call log() for its own alloc messages.
     setProgress(96, 'Compiling shaders...')
-    engine = opts.buildEngine({ device, weights, sgSizeOk, spec })
+    engine = await opts.buildEngine({ device, weights, sgSizeOk, spec })
   } else {
     setProgress(96, 'Compiling shaders...')
     log('Compiling WGSL kernels (10 roles)')
@@ -337,7 +337,7 @@ export async function bootEngine(opts: BootEngineOptions = {}): Promise<BootResu
     // their own flags said int8.
     log(`Allocating KV cache (${spec.layers} layers × ${spec.maxPages} pages)`)
     const kvPages = allocKVFor(device, spec, variants ?? SCALAR_VARIANTS)
-    engine = buildDecodeEngine(device, weights, kvPages, { spec, variants })
+    engine = await buildDecodeEngine(device, weights, kvPages, { spec, variants })
   }
 
   // Pipeline warmup. createComputePipeline only registers shaders — Chrome's
