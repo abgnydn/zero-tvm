@@ -23,7 +23,7 @@
 import { LoadedWeights } from './weight-loader.js'
 import { ropeAttnScale, ropeInvFreqTable } from '../compiler/model-spec.js'
 import { compile, PHI3, type ModelSpec } from '../compiler/compiler.js'
-import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmul, type VariantFlags } from './variants.js'
+import { SCALAR_VARIANTS, resolveVariantPipelines, resolveMatmulForSpec, type VariantFlags } from './variants.js'
 import { AbsorbedRecord } from './absorbed-record.js'
 import { GdnRewindRing } from './gdn-rewind.js'
 import {
@@ -293,9 +293,9 @@ export function allocKVPagesInt8(device: GPUDevice, spec: ModelSpec = PHI3): { p
 // ============================================================
 
 // Quantization layout constants (Q4f16_1):
-//   8 int4 values packed into one u32
 //   group size of 32 weights shares one f16 scale
-const PACK = 8
+// PACK (values per u32 word: 8 at 4 bits, 4 at 8) is per-engine, derived
+// from spec.weightBits where S is in scope — see the shadowing definition.
 const GROUP = 32
 
 // Workgroup width shared by the elementwise shaders — derived from their
@@ -757,6 +757,13 @@ export async function buildDecodeEngine(
   // one exists so an affine spec WITHOUT qkNorm fails loudly instead of
   // running symmetric dequant math over affine nibbles.
   const AFFINE = S.weightFormat === 'mlx-safetensors'
+  // 8-bit weights (kevq8): the int8 kernel twins run every projection and
+  // the embedding lookup. Hoisted here (not inside buildChunkPrefill) so the
+  // decode path selects on it too.
+  const INT8 = (S.weightBits ?? 4) === 8
+  if (INT8 && S.moe) {
+    throw new Error(`buildDecodeEngine: spec ${S.id} is 8-bit but expert stacks are int4-only`)
+  }
   if (AFFINE && fused) {
     throw new Error(
       'buildDecodeEngine: fused QKV is incompatible with MLX-affine weights — '
@@ -764,7 +771,7 @@ export async function buildDecodeEngine(
     )
   }
 
-  // Per-matmul (K, M) shape uniforms compute K_PACKED = K/8 and
+  // Per-matmul (K, M) shape uniforms compute K_PACKED = K*bits/32 and
   // SCALES = K/QGROUP. K = d for the QKV/gate_up projections, qDim for o_proj
   // (== d when heads == kvHeads), ffn for down_proj.
   //
@@ -773,6 +780,11 @@ export async function buildDecodeEngine(
   // uniforms and index the scale array with it, so a 32 here against 64-wide
   // groups reads the WRONG SCALE for everything past the first group. It runs
   // clean, every value is finite, and the logits are nonsense.
+  //
+  // PACK shadows the module's 4-bit constant below: values per u32 word are
+  // 8 at 4 bits, 4 at 8 bits. Every K_PACKED site below divides by it, so one
+  // definition carries the width everywhere uniforms are built.
+  const PACK = (S.weightBits ?? 4) === 8 ? 4 : 8
   const QGROUP = AFFINE ? 64 : GROUP
   const QKV_K_PACKED    = S.d / PACK          // Phi-3: 384  (K=3072)
   const QKV_SCALES      = S.d / QGROUP        // Phi-3: 96
@@ -1451,11 +1463,10 @@ export async function buildDecodeEngine(
   // GDN out_proj is a K = GDN_V_DIM matmul instance — resolve its own
   // pipeline so the vec4 K-divisibility gate applies to the right K
   // (== R.matmulOProj on Qwen3.5, where gdnVDim == qDim == 4096).
-  // Same affine gate as resolveVariantPipelines — this is the fourth K instance
-  // and it is resolved here rather than there, so it has to repeat the test.
+  // Routed through resolveMatmulForSpec like the other three instances, so
+  // the affine/8-bit family choice lives in exactly one place.
   const matmulGdnOut = hybrid
-    ? resolveMatmul(variants.matmul, P, variants.vec4, S.gdnVDim, variants.vec4Half,
-                    S.weightFormat === 'mlx-safetensors').pipeline
+    ? resolveMatmulForSpec(variants, P, S, S.gdnVDim).pipeline
     : null
 
   // yarn scales attention LOGITS by mscale^2 on top of 1/sqrt(headDim). It is
@@ -1700,7 +1711,7 @@ export async function buildDecodeEngine(
   // Embedding and LM head belong to the FIRST and LAST stage respectively;
   // a middle stage builds neither, so it can run without ever having loaded
   // the two largest tensors in the model.
-  const embeddingPipeline = AFFINE ? P.embeddingAffine : P.embedding
+  const embeddingPipeline = INT8 ? P.embeddingAffineInt8 : AFFINE ? P.embeddingAffine : P.embedding
   const bgEmbedding = L0 !== 0 ? null : bg(device, embeddingPipeline, withBias(
     [B.residual, B.inputIds, weights.embdScales, weights.embdWeights, embU],
     weights.embdBiases, 'embed_tokens'))
@@ -2946,6 +2957,11 @@ export async function buildDecodeEngine(
   ): Promise<number[]> {
     const tokens: number[] = []
     if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    // No LM-head int8 twin exists: generating on 8-bit weights would run the
+    // int4 head over int8 bytes — in-bounds, error-free, wrong logits. The
+    // only 8-bit spec is decide-only (forwardHidden paths never sample), so
+    // this is a guard, not a missing feature.
+    if (INT8) throw new Error(`this engine is 8-bit (${S.id}): generate() has no int8 LM head — drive it with forwardHiddenAt*`)
 
     // Prefill from startPos to populate KV cache for the new tokens.
     // KV slots [0, startPos) already contain valid entries from the previous
@@ -3013,6 +3029,7 @@ export async function buildDecodeEngine(
    */
   async function forwardLogits(promptIds: number[]): Promise<Float32Array> {
     if (partial) throw new Error('this engine is one pipeline stage — drive it with pipelineStep, not the whole-model loops')
+    if (INT8) throw new Error(`this engine is 8-bit (${S.id}): forwardLogits() has no int8 LM head — drive it with forwardHiddenAt*`)
     if (promptIds.length === 0) throw new Error('forwardLogits: empty prompt')
     // Prefill all but the last token.
     for (let i = 0; i < promptIds.length - 1; i++) {
@@ -3821,6 +3838,19 @@ export async function buildDecodeEngine(
     const sgmatPipes = AFFINE ? P.int4MatmulSgMatAffine : P.int4MatmulSgMat
     const e5Pipes = AFFINE ? P.int4MatmulSgE5Affine : P.int4MatmulSgE5
     const matvecPipe = AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn
+    // 8-bit weights take a different kernel family entirely (int8_affine_*),
+    // selected by the checkpoint, never by flag — same doctrine as the affine
+    // gate. There is exactly one int8 kernel per role (no e5/sgmat/tiled
+    // ladder, no tune: a single runnable candidate defers to it by itself),
+    // so an EXPLICIT chunkGemm on an 8-bit spec names an int4 kernel over
+    // int8 bytes and throws rather than silently serving garbage. Expert
+    // stacks have no int8 twin either: 8-bit MoE is refused outright.
+    // (INT8 itself is hoisted to build scope, next to AFFINE, as is the
+    // MoE refusal.)
+    if (INT8 && opts.chunkGemm != null) {
+      throw new Error(`buildDecodeEngine: spec ${S.id} is 8-bit (int8AffineBatched); `
+        + `explicit chunkGemm:'${opts.chunkGemm}' names an int4 kernel`)
+    }
     /** A batched-GEMM bind group, parameterized by pipeline: bg() maps array
      *  position to binding index, so the bias buffer must come LAST and only
      *  when the affine kernel is in use — a 6-buffer group against a 5-binding
@@ -3848,7 +3878,7 @@ export async function buildDecodeEngine(
       ...(matvecPipe ? ['matvec' as const] : []),
     ]
     let tunedPick: ChunkGemmName | null = null
-    if (opts.chunkGemm == null && tuneRunnable.length > 1) {
+    if (opts.chunkGemm == null && !INT8 && tuneRunnable.length > 1) {
       // Probe projection: the dominant dense GEMM (gateUp, rows 2*ffn) or —
       // where MoE layers have no dense FFN — the attention projection
       // (cAttn), which is what actually varies with the pick (expert stacks
@@ -3921,16 +3951,17 @@ export async function buildDecodeEngine(
       sgmatReady: sgmatPipes != null,
       cap: CHUNK_CAP,
     })
-    const gemm = pick.used === 'e5' ? e5Pipes!
+    const gemm = INT8 ? P.int8AffineBatched
+      : pick.used === 'e5' ? e5Pipes!
       : pick.used === 'sgmat' ? sgmatPipes!
       : pick.used === 'tiled' ? (AFFINE ? P.int4MatmulTiledMAffine : P.int4MatmulTiledM)
       : (AFFINE ? P.int4MatmulBatchedDynAffine : P.int4MatmulBatchedDyn)!
-    const gemmTiledGrid = pick.used === 'sgmat' || pick.used === 'tiled'
-    chunkGemmUsed = pick.used
+    const gemmTiledGrid = !INT8 && (pick.used === 'sgmat' || pick.used === 'tiled')
+    chunkGemmUsed = INT8 ? 'int8' : pick.used
     // Kept as names (not re-derived at use): the dispatch grid below tiles
     // E5 64x32, E1 32x64, tiled 32x32 — the geometry follows the pick.
-    const e5OK = pick.used === 'e5'
-    const sgmatOK = pick.used === 'sgmat'
+    const e5OK = !INT8 && pick.used === 'e5'
+    const sgmatOK = !INT8 && pick.used === 'sgmat'
     // An EXPLICIT request that cannot be honoured is an error, not a fallback.
     // Silently substituting is how a kernel A/B measures the same code twice:
     // ask for 'e5', get sgmat, read two identical numbers, conclude the kernels
@@ -4040,14 +4071,14 @@ export async function buildDecodeEngine(
     //
     // THE AFFINE EMBEDDING, not P.embedding. This line is why plain-attention
     // chunking shipped broken on 2026-08-11: the per-token path picks
-    // `AFFINE ? P.embeddingAffine : P.embedding` (see embeddingPipeline above)
+    // `INT8 ? P.embeddingAffineInt8 : AFFINE ? P.embeddingAffine : P.embedding` (see embeddingPipeline above)
     // and this one bound P.embedding unconditionally — dequantizing MLX-affine
     // embedding weights with the SYMMETRIC formula, no bias, wrong by b per
     // group. Every chunked token's residual was corrupted from position 0,
     // which is exactly the observed failure: divergence at the FIRST generated
     // token on any prompt long enough to chunk, while MLC-format qwen35 (whose
     // embedding really is symmetric) stayed token-identical.
-    const cbgEmb = bg(device, AFFINE ? P.embeddingAffine : P.embedding, withBias(
+    const cbgEmb = bg(device, INT8 ? P.embeddingAffineInt8 : AFFINE ? P.embeddingAffine : P.embedding, withBias(
       [CB.residual, CB.inputIds, weights.embdScales, weights.embdWeights, cU.emb],
       weights.embdBiases, 'embed_tokens'))
     const cbgInitNorm = bg(device, P.rmsNorm, [CB.hidden1, CB.residual, weights.layers[0].normGamma1, cU.norm])
@@ -4247,7 +4278,11 @@ export async function buildDecodeEngine(
 
       // Tiled: 2-D grid over (N/32, n/32). Fallback matvec: N/4 on x alone.
       const gemmDispatch = (enc2: GPUCommandEncoder, bgx: GPUBindGroup, rows: number, label: string) =>
-        e5OK
+        INT8
+          // One workgroup per (output row, batch row) — the int8 batched
+          // kernel's own grid, not a tile of it.
+          ? dispatch(enc2, gemm, bgx, rows, n, 1, label)
+          : e5OK
           // E5 tiles are 64(M) x 32(N) — E1's, transposed.
           ? dispatch(enc2, gemm, bgx, Math.ceil(rows / 32), Math.ceil(n / 64), 1, label)
           : sgmatOK
@@ -4260,7 +4295,7 @@ export async function buildDecodeEngine(
       // A packed chunk continues a prefix that is already resident; position 0
       // of ITS token axis is not position 0 of the sequence.
       if (start === 0 && !packed) clearGdnState(enc)
-      dispatch(enc, AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
+      dispatch(enc, INT8 ? P.embeddingAffineInt8 : AFFINE ? P.embeddingAffine : P.embedding, cbgEmb, n * D_WGS, 1, 1, 'cEmbedding')
       dispatch(enc, P.rmsNorm, cbgInitNorm, n, 1, 1, 'cRmsNormInit')
       /** THE POOLED CUT. The chunk's routers have run for layer L; the expert
        *  matmuls need every routed expert of every token resident at once.

@@ -346,9 +346,12 @@ npm run test:kernels:qwen35    # includes attention_prefill_seg, bit-exact vs br
 
 Measured: engine vs mlx_lm 21/21 argmax on both checkpoints (max |Δp| 0.0019 /
 0.0016). Quantization is per checkpoint, not per recipe: kev-0.6b at 4-bit/g64
-keeps 17/21 argmaxes against its own f32 (8-bit keeps 21/21 — the engine has no
-8-bit dense kernels), kev-4b@qwen3 at 4-bit keeps 20/21 (max |Δp| 0.15), so the
-4B is the one to serve. Nico Martin's ONNX q4 kev-0.6b scores the same 17/21
+keeps 17/21 argmaxes against its own f32, so since 2026-09-28 the 0.6B to
+serve is `?model=kevq8` — the same merge at 8-bit/g64, 21/21 vs the committed
+torch-f32 dump (max |Δp| 0.093) via the int8 kernel twins (`int8_affine_*`,
+selected by `spec.weightBits`; scalar only, so chunked prefill pays the
+scalar tax against E5 — BENCH.md has the shapes). kev-4b@qwen3 at 4-bit keeps
+20/21 (max |Δp| 0.15). Nico Martin's ONNX q4 kev-0.6b scores the same 17/21
 against the same reference (`~/dev/open-jev-test/kev-records-vs-ref.mjs`).
 Latency numbers live in BENCH.md.
 

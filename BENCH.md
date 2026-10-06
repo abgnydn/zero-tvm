@@ -79,6 +79,34 @@ against the checkpoint's own f32 forward (max |Δp| 0.169); 8-bit keeps 21/21
 rewind path stays as the fallback for engines that cannot pack (int8 KV,
 pooled, MoE).
 
+## Kev-0.6B at 8 bits (`?model=kevq8`, 2026-09-28) — the 0.6B to serve
+
+The 4-bit 0.6B keeps 17/21 argmaxes against its own f32 forward; the sweep
+called 8-bit 21/21 in memory (`docs/kev-parity/sweep-kev.txt`) and the engine
+had no 8-bit dense kernels to serve it with. Now it does (`int8_affine_*`,
+selected by `spec.weightBits`; same bindings/uniforms as the int4 pair, so
+the engine swaps pipelines, not plumbing): `kev-parity.mjs --model kevq8`
+against the committed torch-f32 dump scores **21/21 argmax, max |Δp| 0.093**
+(tol 0.10 — cross-precision comparison; same-file fidelity keeps 0.05).
+Packed exact (max|Δ| 0 vs branch-by-branch), 0 GPU errors.
+
+Shapes (same machine/Chrome/state as the table above, `kev-bench.mjs`):
+
+| questions per call, state hot | Kev-0.6B q8 engine | Kev-0.6B q4 engine |
+|---|---|---|
+| 1 | 91 ms | 31 ms |
+| 5 | 422 ms | 50 ms |
+| 10 | 835 ms | 86 ms |
+| 25 | 2149 ms | 181 ms |
+
+The gap is kernel ladder, not routing: both pack (linear in branch tokens
+is expected — packing shares launches, not FLOPs), but the int8 kernels are
+scalar where the int4 path runs the E5 matrix unit, whose throughput rises
+~4x from M=60 to M=1500 while scalar stays flat. Subgroup/matrix-unit int8
+twins are future work; the scalar tax is documented, not hidden. `generate()`
+and `forwardLogits()` refuse 8-bit engines loudly (no int8 LM head) rather
+than serving int4 math over int8 bytes.
+
 ## Qwen3.6-35B-A3B MoE (2026-08-05) — no baseline exists
 
 **This model has no A/B column.** WebLLM ships zero Qwen3.6 builds, so the

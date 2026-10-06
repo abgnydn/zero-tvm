@@ -37,7 +37,7 @@ try{
   const kv = allocKVPages(dev, S)
   // Chat-shaped composition: subgroups + tiled matmul (what users actually
   // run); fused stays off — engine-core forces unfused for qkNorm/affine.
-  const engine = buildDecodeEngine(dev, weights, kv, {
+  const engine = await buildDecodeEngine(dev, weights, kv, {
     spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' },
   })
   say('engine built')
@@ -51,10 +51,10 @@ try{
   // nothing about the split the app actually runs.
   window.__splitCheck = async (ids, k, n, v) => {
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
-    const A = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+    const A = await buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: V, layerRange: { start: 0, end: k },
     })
-    const B = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+    const B = await buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: V, layerRange: { start: k, end: S.layers },
     })
     const step = async (tokenId, pos) => {
@@ -76,9 +76,9 @@ try{
   window.__chainCheck = async (ids, cuts, n, v) => {
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
     const bounds = [0, ...cuts, S.layers]
-    const stages = bounds.slice(0, -1).map((start, i) => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+    const stages = await Promise.all(bounds.slice(0, -1).map(async (start, i) => await buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: V, layerRange: { start, end: bounds[i + 1] },
-    }))
+    })))
     const step = async (tokenId, pos) => {
       let carry = await stages[0].pipelineStep({ tokenId }, pos)
       for (let i = 1; i < stages.length; i++) {
@@ -101,7 +101,7 @@ try{
     const mk = async (start, end) => {
       let bytes = 0
       const w = await loadWeights(dev, undefined, (s) => { bytes = s.bytesLoaded }, S, { start, end })
-      const e = buildDecodeEngine(dev, w, allocKVPages(dev, S), { spec: S, variants: V, layerRange: { start, end } })
+      const e = await buildDecodeEngine(dev, w, allocKVPages(dev, S), { spec: S, variants: V, layerRange: { start, end } })
       return { e, bytes }
     }
     const A = await mk(0, k)
@@ -121,7 +121,7 @@ try{
   // __splitCheck(v). Without it, "the split forks under app variants" cannot
   // be told apart from "app variants fork, split or not".
   window.__wholeCheck = async (ids, n, v) => {
-    const e = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+    const e = await buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) },
     })
     return Array.from(await e.generate(ids, 0, n, () => {}))
@@ -132,7 +132,7 @@ try{
   // same prompt. Two engines over the SAME weights, one with chunking off.
   window.__chunkCheck = async (ids, n, v, cap) => {
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
-    const mk = (chunkedPrefill, kv) => buildDecodeEngine(dev, weights, kv, {
+    const mk = async (chunkedPrefill, kv) => buildDecodeEngine(dev, weights, kv, {
       spec: S, variants: V, chunkedPrefill, ...(cap ? { chunkCap: cap } : {}),
       chunkTiled: new URLSearchParams(location.search).get('tiled') === '1',
       ...(new URLSearchParams(location.search).get('gemm')
@@ -146,7 +146,7 @@ try{
     // are freed here.
     const run = async (chunkedPrefill) => {
       const kv = allocKVPages(dev, S)
-      const e = mk(chunkedPrefill, kv)
+      const e = await mk(chunkedPrefill, kv)
       const t0 = performance.now()
       const out = []
       let ms = 0
@@ -176,7 +176,7 @@ try{
   window.__poolRun = async (promptIds, genTokens, extendIds, contTokens, tamper) => {
     const { poolSave, poolTryRestore, poolClear } = await import('/src/zero-tvm/kv-pool.ts')
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }
-    const mk = () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+    const mk = async () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: V, chunkedPrefill: false,
     })
     const cfg = (path) => ({
@@ -186,7 +186,7 @@ try{
     await poolClear()
 
     // Arm A: live session — prefill + decode, then save.
-    const A = mk()
+    const A = await mk()
     const gen = []
     await A.generatePipelined(promptIds, genTokens, (t) => gen.push(t), () => false)
     const saved = await poolSave(A, cfg('per-token'))
@@ -195,7 +195,7 @@ try{
     const full = [...promptIds, ...gen, ...extendIds]
 
     // Control: a fresh engine prefills the WHOLE extended prompt from zero.
-    const C = mk()
+    const C = await mk()
     const control = []
     await C.generatePipelined(full, contTokens, (t) => control.push(t), () => false)
     C.destroy()
@@ -231,7 +231,7 @@ try{
   window.__pageTableCheck = async (ids, perm, v) => {
     const V = { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled', ...(v || {}) }
     const run = async (table) => {
-      const e = buildDecodeEngine(dev, weights, allocKVPages(dev, S), { spec: S, variants: V })
+      const e = await buildDecodeEngine(dev, weights, allocKVPages(dev, S), { spec: S, variants: V })
       if (table) e.setPageTable(Int32Array.from(table))
       return Array.from(await e.forwardLogits(ids))
     }
@@ -289,7 +289,7 @@ try{
     const packed1 = flat(await engine.forwardHiddenPacked(state, branches))
     const packed2 = flat(await engine.forwardHiddenPacked(state, branches))
     const kv = allocKVPages(dev, S)
-    const e = buildDecodeEngine(dev, weights, kv, { spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' } })
+    const e = await buildDecodeEngine(dev, weights, kv, { spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' } })
     let plain
     try {
       plain = flat(await e.forwardHiddenAtMany(branches.map((b) => ({ ids: [...state, ...b.ids], positions: b.positions.map((p) => p + state.length) }))))
@@ -300,7 +300,7 @@ try{
     const rows = (e) => e.forwardHiddenAt(ids, positions).then((r) => r.map((v) => Array.from(v)))
     const fresh = async (chunkedPrefill) => {
       const kv = allocKVPages(dev, S)
-      const e = buildDecodeEngine(dev, weights, kv, {
+      const e = await buildDecodeEngine(dev, weights, kv, {
         spec: S, variants: { ...SCALAR_VARIANTS, subgroups:true, matmul:'tiled' }, chunkedPrefill,
       })
       try { return await rows(e) } finally { e.destroy(); for (const b of kv) b.destroy() }
@@ -320,7 +320,7 @@ try{
       const { parseVariantFlags } = await import('/src/zero-tvm/variants.ts')
       // Same construction as chat.ts:200 — location.search so ?sg=0-style
       // overrides still apply, and the subgroups feature gate from the device.
-      chatEngine = buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+      chatEngine = await buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
         spec: S,
         variants: parseVariantFlags(location.search, {
           hasSubgroupsFeature: dev.features.has('subgroups'),
@@ -373,14 +373,14 @@ try{
   // for the int8-KV snapshot shape (per-row scales must be present).
   window.__kvRoundTrip = async (promptIds, genA, genB, useInt8) => {
     const V = { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled', int8KV: !!useInt8 }
-    const mk = () => {
+    const mk = async () => {
       const kv = useInt8 ? allocKVPagesInt8(dev, S) : allocKVPages(dev, S)
       // Per-token prefill in ALL arms (mirroring __poolRun): the round trip
       // must stand on its own, not inherit chunked-vs-per-token equivalence
       // from a separate gate.
-      return buildDecodeEngine(dev, weights, kv, { spec: S, variants: V, chunkedPrefill: false })
+      return await buildDecodeEngine(dev, weights, kv, { spec: S, variants: V, chunkedPrefill: false })
     }
-    const A = mk()
+    const A = await mk()
     const pre = Array.from(await A.generate(promptIds, 0, genA, () => {}))
     const snap = await A.exportKV()
     A.destroy()
@@ -389,12 +389,12 @@ try{
       layers: snap.layers.map((b) => b.byteLength),
       scales: snap.scales.map((b) => b.byteLength),
       gdn: snap.gdn.map((b) => b.byteLength) }
-    const B = mk()
+    const B = await mk()
     const imported = B.importKV(snap)
     const cont = []
     await B.generatePipelined([...promptIds, ...pre], genB, (t) => cont.push(t), () => false)
     B.destroy()
-    const C = mk()
+    const C = await mk()
     const direct = []
     await C.generatePipelined([...promptIds, ...pre], genB, (t) => direct.push(t), () => false)
     C.destroy()
@@ -408,11 +408,11 @@ try{
   // (which needs startPos plumbing this probe does not second-guess), but it
   // exercises the same uniform rewrite twice in each direction.
   window.__samplerSwitch = async (promptIds, n) => {
-    const mk = () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
+    const mk = async () => buildDecodeEngine(dev, weights, allocKVPages(dev, S), {
       spec: S, variants: { ...SCALAR_VARIANTS, subgroups: true, matmul: 'tiled' },
     })
     const run = async (sampling) => {
-      const e = mk()
+      const e = await mk()
       if (sampling) e.setSampling(sampling)
       const out = Array.from(await e.generate(promptIds, 0, n, () => {}))
       e.destroy()
@@ -426,7 +426,7 @@ try{
     // Greedy again after sampling, on a fresh engine: setSampling(null) must
     // restore the greedy path exactly (same prefix => same tokens as g1).
     const g3 = await (async () => {
-      const e = mk()
+      const e = await mk()
       e.setSampling(samp)
       await e.generate(promptIds, 0, 2, () => {})
       e.setSampling(null)

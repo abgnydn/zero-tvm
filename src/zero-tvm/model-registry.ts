@@ -33,7 +33,7 @@ import { QWEN3_4B_MLX } from '../compiler/model-spec.ts'
 import { LLAMA_3_2_1B_INSTRUCT_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_30B_A3B_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_EMBEDDING_06B } from '../compiler/model-spec.ts'
-import { KEV_06B, KEV_4B, KEV_4B_Q35 } from '../compiler/model-spec.ts'
+import { KEV_06B, KEV_06B_Q8, KEV_4B, KEV_4B_Q35 } from '../compiler/model-spec.ts'
 import { QWEN3_5_9B_MLX_4BIT } from '../compiler/model-spec.ts'
 import { QWEN3_8_27B_4BIT } from '../compiler/model-spec.ts'
 // ADD-MODEL:IMPORTS
@@ -70,6 +70,7 @@ export const SHIPPED_MODELS: ReadonlyArray<{ param: string; spec: ModelSpec }> =
   // forwardHiddenAt. A roster card that opens the decision console, not the
   // chat — it answers questions, not conversation.
   { param: 'kev', spec: KEV_06B },
+  { param: 'kevq8', spec: KEV_06B_Q8 },
   { param: 'kev4b', spec: KEV_4B },
   { param: 'kev4bq35', spec: KEV_4B_Q35 },
   // ADD-MODEL:MODELS
@@ -310,6 +311,7 @@ const BRANDINGS: Record<string, ModelBrand> = {
   [QWEN3_EMBEDDING_06B.id]: { name: 'Qwen3-Embedding-0.6B', params: '0.6B embedding · last-token pooled', sizeLabel: '~0.35 GB', rateLabel: '' },
   // Decision model: output is a probability per option, so tok/s is not the unit.
   [KEV_06B.id]: { name: 'Kev-0.6B', params: '0.6B decision · pointer head', sizeLabel: '~0.4 GB', rateLabel: '' },
+  [KEV_06B_Q8.id]: { name: 'Kev-0.6B (8-bit)', params: '0.6B decision · pointer head · q8', sizeLabel: '~0.7 GB', rateLabel: '' },
   [KEV_4B.id]: { name: 'Kev-4B', params: '4B decision · pointer head', sizeLabel: '~2.3 GB', rateLabel: '' },
   [KEV_4B_Q35.id]: { name: 'Kev-4B (Qwen3.5)', params: '4B hybrid decision · DeltaNet', sizeLabel: '~2.5 GB', rateLabel: '' },
   [QWEN3_5_9B_MLX_4BIT.id]: { name: 'Qwen3.5-9B', params: '9B hybrid (DeltaNet)', sizeLabel: '~4.7 GB', rateLabel: '~43 t/s' },
